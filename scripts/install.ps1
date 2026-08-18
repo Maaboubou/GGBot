@@ -8,6 +8,7 @@ $VenvDir = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $Requirements = Join-Path $ProjectRoot "requirements.txt"
 $HashMarker = Join-Path $VenvDir ".requirements.sha256"
+$PlaywrightReady = $false
 
 function Write-Step([string]$Message) {
     Write-Host "[INFO] $Message" -ForegroundColor Cyan
@@ -29,8 +30,12 @@ $EnvironmentReady = $false
 if (-not $Force -and (Test-Path $VenvPython) -and (Test-Path $HashMarker)) {
     $SavedHash = (Get-Content $HashMarker -Raw).Trim()
     if ($SavedHash -eq $RequirementHash) {
-        & $VenvPython -c "import fastapi, flask, wxautox4" 2>$null
+        & $VenvPython -c "import fastapi, flask, wxautox4, playwright, yt_dlp, youtube_transcript_api, json_repair" 2>$null
         $EnvironmentReady = ($LASTEXITCODE -eq 0)
+        if ($EnvironmentReady) {
+            & $VenvPython -c "from pathlib import Path; from playwright.sync_api import sync_playwright; p = sync_playwright().start(); path = p.chromium.executable_path; p.stop(); raise SystemExit(0 if Path(path).is_file() else 1)" 2>$null
+            $PlaywrightReady = ($LASTEXITCODE -eq 0)
+        }
     }
 }
 
@@ -81,7 +86,7 @@ if (-not $EnvironmentReady) {
         Stop-Install "依赖安装失败，请检查网络、Python 版本和上方 pip 错误。"
     }
 
-    & $VenvPython -c "import fastapi, flask, wxautox4"
+    & $VenvPython -c "import fastapi, flask, wxautox4, playwright, yt_dlp, youtube_transcript_api, json_repair"
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "依赖安装完成，但关键模块导入检查失败。"
     }
@@ -90,6 +95,19 @@ if (-not $EnvironmentReady) {
 }
 else {
     Write-Step "虚拟环境和依赖已就绪，跳过重复安装"
+}
+
+if (-not $PlaywrightReady) {
+    Write-Step "安装链接摘要脑图所需的 Chromium（首次运行需要下载）"
+    & $VenvPython -m playwright install chromium
+    if ($LASTEXITCODE -ne 0) {
+        Stop-Install "Playwright Chromium 安装失败，请检查网络或代理后重试。"
+    }
+
+    & $VenvPython -c "from pathlib import Path; from playwright.sync_api import sync_playwright; p = sync_playwright().start(); path = p.chromium.executable_path; p.stop(); raise SystemExit(0 if Path(path).is_file() else 1)"
+    if ($LASTEXITCODE -ne 0) {
+        Stop-Install "Playwright 已执行安装，但 Chromium 运行时检查失败。"
+    }
 }
 
 $EnvFile = Join-Path $ProjectRoot ".env"

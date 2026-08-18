@@ -1,0 +1,365 @@
+{
+  "name": "summary_plus",
+  "display_name": "链接摘要",
+  "version": "1.0.0",
+  "description": "自动提取网页/公众号内容摘要；支持抖音、微博等平台视频下载并返回",
+  "author": "System",
+  "category": "content",
+  "ui": {
+    "icon": "bi-link-45deg",
+    "llm_tasks": {
+      "summary": {
+        "label": "内容摘要",
+        "description": "将链接、文章或长文整理为结构化摘要",
+        "category": "摘要",
+        "order": 10
+      },
+      "translate": {
+        "label": "摘要内容翻译",
+        "description": "将摘要结果翻译为指定语言",
+        "category": "摘要",
+        "order": 20
+      },
+      "bilibili_mindmap": {
+        "label": "B站视频思维导图",
+        "description": "将 B站视频内容整理为思维导图",
+        "category": "思维导图",
+        "order": 30
+      },
+      "youtube_mindmap": {
+        "label": "YouTube 视频思维导图",
+        "description": "将 YouTube 视频内容整理为思维导图",
+        "category": "思维导图",
+        "order": 40
+      }
+    },
+    "settings_groups": {
+      "summary": {
+        "title": "通用摘要",
+        "description": "链接摘要、脑图布局、回复规则、黑名单与通用提示词",
+        "order": 10
+      },
+      "local_asr": {
+        "title": "本地语音识别",
+        "description": "SenseVoice F32 本地转写开关、时长限制与资源路径",
+        "order": 20
+      },
+      "bilibili": {
+        "title": "B站",
+        "description": "B站视频下载、字幕、脑图与弹幕处理",
+        "order": 30
+      },
+      "xiaohongshu": {
+        "title": "小红书",
+        "description": "小红书视频与多图笔记处理",
+        "order": 40
+      },
+      "youtube": {
+        "title": "YouTube",
+        "description": "YouTube 字幕、代理与脑图生成",
+        "order": 50
+      },
+      "media": {
+        "title": "媒体工具",
+        "description": "FFmpeg、FFprobe 等本地媒体工具路径",
+        "order": 80
+      },
+      "browser": {
+        "title": "浏览器与页面提取",
+        "description": "Chrome 自动化、页面加载与命令超时",
+        "order": 90
+      }
+    }
+  },
+  "requires": [
+    "selenium",
+    "requests",
+    "yt-dlp",
+    "yt-dlp-danmaku",
+    "youtube-transcript-api",
+    "playwright",
+    "json-repair"
+  ],
+  "config_schema": {
+    "chrome_debug_port": {
+      "type": "integer",
+      "description": "Chrome远程调试端口",
+      "default": 19222
+    },
+    "chrome_path": {
+      "type": "string",
+      "description": "Chrome浏览器路径",
+      "default": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    },
+    "chrome_user_data_dir": {
+      "type": "string",
+      "description": "Chrome用户数据目录",
+      "default": "tmp/chrome_data"
+    },
+    "chrome_profile_dir": {
+      "type": "string",
+      "description": "Chrome配置文件目录名称",
+      "default": "Default"
+    },
+    "page_load_timeout": {
+      "type": "integer",
+      "description": "页面加载超时时间(秒)，用于等待页面完全加载",
+      "default": 15
+    },
+    "webdriver_command_timeout_sec": {
+      "type": "integer",
+      "description": "Selenium/ChromeDriver 单条命令超时时间(秒)，用于避免失效会话卡住摘要",
+      "default": 8
+    },
+    "special_translation_groups": {
+      "type": "array",
+      "description": "需要追加翻译的聊天名称列表（可选）",
+      "default": []
+    },
+    "special_translation_target_language": {
+      "type": "string",
+      "description": "特殊群组追加翻译的目标语言",
+      "default": "English"
+    },
+    "domain_blacklist": {
+      "type": "array",
+      "description": "域名黑名单列表，匹配的域名将不进行摘要处理。支持精确域名（如 example.com）和后缀通配符（如 .xyz 或 *.xyz，可屏蔽所有 xyz 域名）",
+      "default": [
+        "yangkeduo.com"
+      ]
+    },
+    "sender_blacklist": {
+      "type": "array",
+      "description": "发送者黑名单列表，列表中的用户发送的链接不会触发摘要处理（填写微信昵称或备注名，大小写不敏感）",
+      "default": []
+    },
+    "prompt_summary": {
+      "type": "textarea",
+      "title": "网页摘要提示词",
+      "description": "简洁摘要模式的提示词",
+      "default": "你是一名专业的新闻与活动内容总结助手。\n请严格按照以下固定格式输出内容，不要额外解释，不要输出与格式无关的内容：\n\n📖 一句话总结：\n（用简洁的一句话总结内容，概括时间、地点、主要事件或活动核心）\n\n🔑 关键要点：\n1. （要点一，必须包含时间或发生背景，最多30字）\n2. （要点二，必须是核心信息或重要细节，最多30字）\n3. （要点三，必须与结果、奖励、影响相关，最多30字）\n4. （要点四，补充相关数据或附加信息，最多30字）\n5. （要点五，提醒、扩展或额外重要信息，最多30字）\n\n🔑 额外规则\n\n格式中的 📖、🔑 必须保留。\n\n\"一句话总结\" 最多两句话，必须简明。\n\n\"关键要点\"始终保持 5条，编号从1到5。\n不允许出现「发生背景」「核心信息」等前缀说明，直接输出要点。\n不要输出“标签”部分，不要生成 #标签。\n\n不要生成解释性文字，不要在格式之外添加任何输出。\n\n如果信息不足，允许合理补全，但不能打破结构。"
+    },
+    "local_asr_enabled": {
+      "type": "boolean",
+      "title": "启用本地语音识别",
+      "description": "B站无字幕时使用本机 SenseVoice F32 转写；关闭后不会调用任何云端 ASR",
+      "default": false
+    },
+    "local_asr_max_duration_minutes": {
+      "type": "integer",
+      "title": "最大转写时长（分钟）",
+      "description": "无字幕视频超过该时长时不下载音频、不执行本地转写",
+      "minimum": 1,
+      "maximum": 180,
+      "default": 35
+    },
+    "local_asr_timeout_seconds": {
+      "type": "integer",
+      "title": "单次转写超时（秒）",
+      "description": "SenseVoice 子进程的最长执行时间，不包含视频音频下载",
+      "minimum": 30,
+      "maximum": 3600,
+      "level": "advanced",
+      "default": 600
+    },
+    "local_asr_runtime_path": {
+      "type": "string",
+      "title": "SenseVoice 运行时路径",
+      "description": "官方 Windows x64 AVX2 可执行文件路径",
+      "level": "developer",
+      "default": "data/models/sensevoice/llama-funasr-sensevoice.exe"
+    },
+    "local_asr_model_path": {
+      "type": "string",
+      "title": "SenseVoice F32 模型路径",
+      "description": "本地 SenseVoiceSmall F32 GGUF 权重路径",
+      "level": "developer",
+      "default": "data/models/sensevoice/sensevoice-small-f32.gguf"
+    },
+    "local_asr_vad_path": {
+      "type": "string",
+      "title": "FSMN-VAD 模型路径",
+      "description": "长音频静音检测与切段使用的 GGUF 模型路径",
+      "level": "developer",
+      "default": "data/models/sensevoice/fsmn-vad.gguf"
+    },
+    "danmaku_font_size": {
+      "type": "integer",
+      "description": "弹幕字体大小",
+      "level": "advanced",
+      "default": 30
+    },
+    "danmaku_line_spacing": {
+      "type": "number",
+      "description": "弹幕行间距",
+      "level": "advanced",
+      "default": 1.2
+    },
+    "danmaku_display_region_ratio": {
+      "type": "number",
+      "description": "弹幕显示区域比例",
+      "level": "advanced",
+      "default": 0.8
+    },
+    "danmaku_limit_window_seconds": {
+      "type": "number",
+      "description": "弹幕限流时间窗口（秒），小于等于0表示不限制",
+      "level": "advanced",
+      "default": 5
+    },
+    "danmaku_max_per_window": {
+      "type": "integer",
+      "description": "每个弹幕限流时间窗口最多保留的弹幕条数，小于等于0表示不限制",
+      "level": "advanced",
+      "default": 20
+    },
+    "bilibili_danmaku_webmask_enabled": {
+      "type": "boolean",
+      "description": "是否使用B站官方webmask实现人像/动物弹幕防遮挡；获取失败时自动回退普通弹幕压制",
+      "level": "advanced",
+      "default": true
+    },
+    "bilibili_video_crf": {
+      "type": "integer",
+      "description": "B站视频弹幕压制重编码质量，数值越小越清晰、文件越大；18接近原片，20较清晰，23为常规默认，32压缩明显",
+      "level": "advanced",
+      "default": 20
+    },
+    "bilibili_max_download_duration": {
+      "type": "integer",
+      "description": "B站视频允许下载的最大时长(秒)，超过该时长不下载视频而是直接提取字幕生成摘要或脑图",
+      "default": 120
+    },
+    "ffmpeg_dir": {
+      "type": "string",
+      "description": "FFmpeg目录（可选），例如 C:\\msys64\\ucrt64\\bin；为空则自动探测",
+      "level": "developer",
+      "default": ""
+    },
+    "ffmpeg_path": {
+      "type": "string",
+      "description": "ffmpeg可执行文件路径（可选），优先级高于ffmpeg_dir；为空则自动探测",
+      "level": "developer",
+      "default": ""
+    },
+    "ffprobe_path": {
+      "type": "string",
+      "description": "ffprobe可执行文件路径（可选），优先级高于ffmpeg_dir；为空则自动探测",
+      "level": "developer",
+      "default": ""
+    },
+    "bilibili_burn_danmu": {
+      "type": "boolean",
+      "description": "是否压制B站弹幕",
+      "default": true
+    },
+    "bili_cookie_email_alert_enabled": {
+      "type": "boolean",
+      "title": "Cookie 失效邮件提醒",
+      "description": "B站登录态刷新失败时发送邮件提醒",
+      "level": "advanced",
+      "default": true
+    },
+    "bili_cookie_alert_cooldown_sec": {
+      "type": "integer",
+      "title": "Cookie 提醒冷却（秒）",
+      "description": "同一类 B站 Cookie 失效邮件的最短发送间隔",
+      "minimum": 60,
+      "maximum": 604800,
+      "level": "advanced",
+      "default": 21600
+    },
+    "xhs_max_download_duration": {
+      "type": "integer",
+      "title": "小红书视频最大下载时长（秒）",
+      "description": "小红书视频允许下载的最大时长（秒），超过该时长时跳过下载",
+      "minimum": 1,
+      "default": 120
+    },
+    "xhs_max_images": {
+      "type": "integer",
+      "description": "小红书多图合并时的最大图片数量",
+      "default": 9
+    },
+    "mindmap_layout": {
+      "type": "select",
+      "title": "脑图布局",
+      "description": "脑图制图方向：horizontal 横向（传统思维导图）或 vertical 竖向（卡片摘要图）",
+      "options": [
+        "vertical",
+        "horizontal"
+      ],
+      "enum_labels": {
+        "vertical": "竖向卡片",
+        "horizontal": "横向思维导图"
+      },
+      "default": "vertical"
+    },
+    "prompt_bilibili_mindmap": {
+      "type": "textarea",
+      "title": "B站脑图提示词",
+      "description": "B站脑图生成的系统提示词",
+      "default": "Role\\n\\n你是一位顶级知识架构师，擅长将任意主题的长文提炼为兼具“专业深度”与“视觉密度”的思维导图 JSON。\\nInput\\n\\n用户将提供一段长文，你需要基于其内容生成符合以下规则的思维导图 JSON。\\n\\nCore Principles\\n1. 严格忠实原文：所有节点内容必须能在输入原文中找到直接依据，不得添加未提及信息。若信息缺失，则跳过绝对不编造。\\n2. 逻辑自由组织：根据实际论述顺序和内在脉络灵活组织层级，确保准确反映逻辑。\\n3. 深度与密度平衡：节点承载足够信息，非叶子节点极简概括，叶子节点用“核心点：关键解释”格式。\\n\\nOutput Rules\\n1. 根节点概括全文主题；非叶子节点≤10个字概括分支核心；叶子节点格式为“核心点(核心点由总结得出)：关键解释”（建议≤20字）。\\n2. 结构严格控制在3～4层。\\n3. 严禁出现仅有“背景”“影响”等空洞节点。\\n\\nOutput Format\\n仅返回一个纯 JSON 字符串，严禁包含 Markdown 或任何额外文字。结构：根节点为 title，子节点数组为 children。叶子节点省略 children 字段。\\n"
+    },
+    "prompt_youtube_mindmap": {
+      "type": "textarea",
+      "title": "YouTube 脑图提示词",
+      "description": "YouTube 字幕生成脑图时使用的系统提示词",
+      "default": "你是一位专业的知识架构师。请忠实梳理输入的 YouTube 字幕；若字幕为外语，使用中文表达。将内容组织为 3 至 4 层思维导图，非叶子节点简洁概括主题，叶子节点承载关键事实与解释。仅返回一个纯 JSON 对象，不得返回 Markdown、代码围栏或额外说明。结构必须为：{\"title\":\"主题\",\"children\":[{\"title\":\"分支\",\"children\":[{\"title\":\"要点：解释\"}]}]}。叶子节点不包含 children。不得补充字幕未提及的事实。"
+    },
+    "yt_transcript_proxy": {
+      "type": "string",
+      "description": "YouTube 字幕抓取的自定义代理（例如 http://proxy:port），为空则先直连",
+      "level": "advanced",
+      "default": ""
+    },
+    "yt_transcript_local_port": {
+      "type": "integer",
+      "description": "YouTube 字幕抓取直连失败后的本地保底代理端口",
+      "level": "advanced",
+      "default": 7897
+    }
+  },
+  "config": {
+    "chrome_debug_port": 19222,
+    "chrome_path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "chrome_user_data_dir": "tmp/chrome_data",
+    "chrome_profile_dir": "Default",
+    "page_load_timeout": 15,
+    "webdriver_command_timeout_sec": 8,
+    "special_translation_groups": [],
+    "special_translation_target_language": "English",
+    "domain_blacklist": [
+      "yangkeduo.com"
+    ],
+    "sender_blacklist": [],
+    "prompt_summary": "你是一名专业的新闻与活动内容总结助手。\n请严格按照以下固定格式输出内容，不要额外解释，不要输出与格式无关的内容：\n\n📖 一句话总结：\n（用简洁的一句话总结内容，概括时间、地点、主要事件或活动核心）\n\n🔑 关键要点：\n1. （要点一，必须包含时间或发生背景，最多30字）\n2. （要点二，必须是核心信息或重要细节，最多30字）\n3. （要点三，必须与结果、奖励、影响相关，最多30字）\n4. （要点四，补充相关数据或附加信息，最多30字）\n5. （要点五，提醒、扩展或额外重要信息，最多30字）\n\n🔑 额外规则\n\n格式中的 📖、🔑 必须保留。\n\n\"一句话总结\" 最多两句话，必须简明。\n\n\"关键要点\"始终保持 5条，编号从1到5。\n不允许出现「发生背景」「核心信息」等前缀说明，直接输出要点。\n不要输出“标签”部分，不要生成 #标签。\n\n不要生成解释性文字，不要在格式之外添加任何输出。\n\n如果信息不足，允许合理补全，但不能打破结构。",
+    "local_asr_enabled": false,
+    "local_asr_max_duration_minutes": 35,
+    "local_asr_timeout_seconds": 600,
+    "local_asr_runtime_path": "data/models/sensevoice/llama-funasr-sensevoice.exe",
+    "local_asr_model_path": "data/models/sensevoice/sensevoice-small-f32.gguf",
+    "local_asr_vad_path": "data/models/sensevoice/fsmn-vad.gguf",
+    "danmaku_font_size": 30,
+    "danmaku_line_spacing": 1.2,
+    "danmaku_display_region_ratio": 0.8,
+    "danmaku_limit_window_seconds": 5,
+    "danmaku_max_per_window": 20,
+    "bilibili_danmaku_webmask_enabled": true,
+    "bilibili_video_crf": 20,
+    "bilibili_max_download_duration": 120,
+    "ffmpeg_dir": "",
+    "ffmpeg_path": "",
+    "ffprobe_path": "",
+    "bilibili_burn_danmu": true,
+    "bili_cookie_email_alert_enabled": true,
+    "bili_cookie_alert_cooldown_sec": 21600,
+    "xhs_max_download_duration": 120,
+    "xhs_max_images": 9,
+    "mindmap_layout": "vertical",
+    "prompt_bilibili_mindmap": "Role\\n\\n你是一位顶级知识架构师，擅长将任意主题的长文提炼为兼具“专业深度”与“视觉密度”的思维导图 JSON。\\nInput\\n\\n用户将提供一段长文，你需要基于其内容生成符合以下规则的思维导图 JSON。\\n\\nCore Principles\\n1. 严格忠实原文：所有节点内容必须能在输入原文中找到直接依据，不得添加未提及信息。若信息缺失，则跳过绝对不编造。\\n2. 逻辑自由组织：根据实际论述顺序和内在脉络灵活组织层级，确保准确反映逻辑。\\n3. 深度与密度平衡：节点承载足够信息，非叶子节点极简概括，叶子节点用“核心点：关键解释”格式。\\n\\nOutput Rules\\n1. 根节点概括全文主题；非叶子节点≤10个字概括分支核心；叶子节点格式为“核心点(核心点由总结得出)：关键解释”（建议≤20字）。\\n2. 结构严格控制在3～4层。\\n3. 严禁出现仅有“背景”“影响”等空洞节点。\\n\\nOutput Format\\n仅返回一个纯 JSON 字符串，严禁包含 Markdown 或任何额外文字。结构：根节点为 title，子节点数组为 children。叶子节点省略 children 字段。\\n",
+    "prompt_youtube_mindmap": "你是一位专业的知识架构师。请忠实梳理输入的 YouTube 字幕；若字幕为外语，使用中文表达。将内容组织为 3 至 4 层思维导图，非叶子节点简洁概括主题，叶子节点承载关键事实与解释。仅返回一个纯 JSON 对象，不得返回 Markdown、代码围栏或额外说明。结构必须为：{\"title\":\"主题\",\"children\":[{\"title\":\"分支\",\"children\":[{\"title\":\"要点：解释\"}]}]}。叶子节点不包含 children。不得补充字幕未提及的事实。",
+    "yt_transcript_proxy": "",
+    "yt_transcript_local_port": 7897
+  }
+}

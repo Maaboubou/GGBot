@@ -10,7 +10,7 @@ GGBot 是一个运行在 Windows 上的本地微信自动化助手。它把微�
 - AI 助手：支持多个模型供应商、独立 API Key、任务路由、角色、Judge 主动回复、图片理解和连续对话。
 - 聊天记录：按聊天保存文本、图片、链接和引用消息，供检索、周报及 AI 上下文使用。
 - 聊天级权限：每个联系人或群聊可以分别选择允许使用的插件，群聊还可设置是否必须 `@机器人`。
-- 插件系统：内置翻译、汇率、周报、磁链检查和菜单翻译，并支持按 Manifest v2 规范继续扩展。
+- 插件系统：内置链接摘要、翻译、汇率、周报、磁链检查和菜单翻译，并支持按 Manifest v2 规范继续扩展。
 - 本地管理：通过 GGbot 管理面板维护聊天、插件、模型、任务路由、角色、Judge 和记忆设置。
 - 运行恢复：提供 GUI 启动器、日志查看、微信在线检查、监听恢复和 Windows 登录后自动启动脚本。
 
@@ -63,7 +63,8 @@ flowchart LR
 - 64 位 Python 3.11 或 3.12；安装 Python 时勾选 `Add Python to PATH`。
 - 使用 Git 获取和更新项目时，需要安装 [Git for Windows](https://git-scm.com/download/win)。
 - `wxautox4` 可能需要单独购买并激活授权；依赖包会由安装脚本自动安装。
-- 菜单翻译需要本机安装 Chrome。首次使用时 Selenium 可能需要联网获取匹配的浏览器驱动。
+- 菜单翻译和链接摘要需要本机安装 Chrome。首次使用时 Selenium 可能需要联网获取匹配的浏览器驱动。
+- 链接摘要的脑图渲染使用 Playwright Chromium，由一键安装脚本自动下载。
 - 周报助手需要另行安装、登录并配置 Codex CLI；不使用周报时无需安装 Codex。
 
 ## 获取、安装与启动
@@ -99,7 +100,7 @@ cd GGBot
 2. 在项目目录创建独立虚拟环境 `.venv`。
 3. 更新 `pip`、`setuptools` 和 `wheel`。
 4. 安装 `requirements.txt` 中的全部依赖，包括 `wxautox4`。
-5. 检查 `fastapi`、`flask` 和 `wxautox4` 能否正常导入。
+5. 安装链接摘要脑图所需的 Playwright Chromium，并检查关键模块与浏览器运行时。
 6. 从 `.env.example` 创建本地 `.env`，但不会覆盖已经存在的配置。
 7. 创建 `data/`、`logs/` 和 `tmp/` 运行目录。
 8. 打开 GUI 启动器，由启动器管理微信桥接和主应用。
@@ -158,6 +159,10 @@ Install.bat
 | `builtin_chatbot.judge` | 群聊主动回复判断 |
 | `builtin_translation.translate` | 文本翻译 |
 | `menu_translator.vision` | 菜单图片识别与翻译 |
+| `summary_plus.summary` | 网页与公众号内容摘要 |
+| `summary_plus.translate` | 为指定聊天追加摘要翻译 |
+| `summary_plus.bilibili_mindmap` | B站视频字幕思维导图 |
+| `summary_plus.youtube_mindmap` | YouTube 字幕思维导图 |
 
 图片回复还会使用 Chatbot 的视觉调用能力，最终显示的任务列表以当前插件声明和管理面板为准。
 
@@ -226,6 +231,7 @@ Install.bat
 | `WEB_CORS_ORIGINS` | 前后端分离时允许的明确来源，默认留空 |
 | `CODEX_PROXY_*` | 周报及本机 Codex 集成参数 |
 | `QQEMAIL_ADDR` / `QQEMAIL_CODE` | 可选的微信掉线或登录失败邮件通知 |
+| `TIKHUB_API_TOKEN` | 可选，部分抖音/TikTok/小红书媒体解析使用 |
 | `WECHAT_AUTOLOGIN_*` | Windows 登录后自动确认微信登录的等待与重试参数 |
 
 ## 内置插件
@@ -239,8 +245,11 @@ Install.bat
 | `Weekly` | 根据聊天记录生成并推送周报 | 定时任务；管理员私聊命令 |
 | `magnet_check` | 检查 InfoHash 或完整磁力链接并生成报告 | `验车 <InfoHash>` 或有效 magnet 链接 |
 | `menu_translator` | 收集菜单图片并生成双语结果 | 菜单翻译关键词及后续图片会话 |
+| `summary_plus` | 网页/公众号摘要、视频平台解析、字幕脑图 | 网页分享卡片或链接消息 |
 
 插件的最终触发词、聊天范围和定时条件以各自 `manifest.json` 及“插件”页面显示为准。
+
+链接摘要需要先为目标聊天授权 `summary_plus`，并在“任务路由”配置对应模型。普通网页和公众号链接使用独立的自动化 Chrome Profile；首次运行会创建 `tmp/chrome_data`。抖音、TikTok 和部分小红书媒体解析需要在 `.env` 填写可选的 `TIKHUB_API_TOKEN`。B站登录态会尝试从该 Profile 自动获取，生成的 `cookies.txt` 已被 Git 忽略，不会上传。视频合并、转码或弹幕压制还需要本机可用的 FFmpeg；只使用普通网页摘要时无需配置这些可选项。
 
 ## 权限与消息执行顺序
 
@@ -325,7 +334,7 @@ curl.exe http://127.0.0.1:5555/api/listeners/status
 
 ### Chrome Profile
 
-菜单翻译使用 Selenium 控制 Chrome。自动化 Profile 会在运行时创建并与日常 Chrome 用户资料分开，通常不需要手动配置或迁移。Profile 或临时缓存被清理后，下次使用会重新创建。
+菜单翻译和链接摘要使用 Selenium 控制 Chrome。链接摘要的自动化 Profile 默认位于 `tmp/chrome_data`，会在运行时创建并与日常 Chrome 用户资料分开，通常不需要手动配置或迁移。Profile 或临时缓存被清理后，下次使用会重新创建，但网站登录态也会随之清除。
 
 如果首次启动浏览器失败，请确认 Chrome 已安装、网络可以获取匹配驱动，并查看 `logs/app.log`。
 
@@ -398,6 +407,10 @@ curl.exe http://127.0.0.1:5555/health
 
 确认 Chrome 已安装，聊天已获得 `menu_translator` 权限，并先发送插件配置中的菜单翻译触发词，再在会话时限内发送图片。查看 `logs/app.log` 可确认浏览器和模型调用错误。
 
+### 链接没有生成摘要或脑图
+
+确认聊天已获得 `summary_plus` 权限，并已为 `summary_plus.summary` 及需要的脑图任务配置模型路由。普通链接还要确认 Chrome 能正常启动；脑图失败时可重新运行 `Install.bat` 检查 Playwright Chromium。B站、YouTube 或媒体下载问题通常还与登录态、字幕可用性、网络和 FFmpeg 有关，具体原因可在 `logs/app.log` 查看。
+
 ### 周报助手无法运行
 
 周报依赖本机 Codex CLI。确认 Codex 已安装并登录，然后根据实际安装位置设置 `CODEX_PROXY_USE_WSL`、`CODEX_PROXY_WSL_BIN` 或 `CODEX_PROXY_BIN`。不使用周报时可停用 `Weekly` 插件。
@@ -410,7 +423,7 @@ GGBot/
 │   ├── api/                    # FastAPI 路由与管理 API
 │   ├── core/                   # 事件总线、插件管理、消息顺序、微信管理
 │   ├── models/                 # SQLAlchemy 数据模型
-│   ├── plugins/                # 7 个内置插件及 Manifest
+│   ├── plugins/                # 8 个内置插件及 Manifest
 │   ├── services/               # AI、配置、记忆、监控和后台服务
 │   └── utils/                  # 微信媒体、发送、配置等通用工具
 ├── data/                       # SQLite、聊天记录和本地运行数据

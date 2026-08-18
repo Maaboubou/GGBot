@@ -1,0 +1,7 @@
+{
+  "schema_version": 2,
+  "listeners": [
+    {"event": "link_message_received", "handler": "handle_link_message", "title": "链接摘要", "trigger": {"kind": "link", "summary": "收到插件支持且未被黑名单或访问门禁拦截的分享链接", "config_keys": [], "conditions": ["平台识别、域名黑名单、发送者黑名单及登录门禁由插件固定逻辑判断"]}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "stop_on_consumed"}
+  ],
+  "jobs": []
+}

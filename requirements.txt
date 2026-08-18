@@ -12,6 +12,11 @@ urllib3
 certifi
 httpx
 selenium
+playwright>=1.58,<2
+yt-dlp>=2026.7.4
+yt-dlp-danmaku>=0.3,<1
+youtube-transcript-api>=1.2,<2
+json-repair>=0.59,<1
 
 # AI providers and local retrieval
 litellm

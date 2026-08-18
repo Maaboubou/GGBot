@@ -17,7 +17,8 @@
     ],
     "link_message_received": [
       "builtin_chat_logger:link_message_received:handle_link_message",
-      "magnet_check:link_message_received:handle_text"
+      "magnet_check:link_message_received:handle_text",
+      "summary_plus:link_message_received:handle_link_message"
     ],
     "quote_message_received": [
       "builtin_chat_logger:quote_message_received:handle_quote_message",

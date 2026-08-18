@@ -1,0 +1,370 @@
+"""Platform extraction/routing helpers for summary_plus."""
+
+import asyncio
+import logging
+import re
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+from app.core.event_bus import Event
+
+__all__ = [
+    "handle_link_message",
+]
+
+
+@dataclass(frozen=True)
+class PlatformRoute:
+    name: str
+    extract_share_url: Callable[[Any, str, str], Optional[str]]
+    async_handler: Callable[[Any, Any, str, str, logging.Logger], None]
+
+
+def _send_files(wx: Any, chat_name: str, file_path: str, logger: logging.Logger) -> None:
+    if hasattr(wx, "send_files"):
+        wx.send_files(chat_name, [file_path])
+        return
+    if hasattr(wx, "SendFiles"):
+        wx.SendFiles(file_path, chat_name)
+        return
+    logger.error("❌ 无法发送文件，未找到发送方法")
+
+
+def _send_summary_reply(
+    wx: Any,
+    chat_name: str,
+    message_id: Optional[str],
+    summary: str,
+    logger: logging.Logger,
+) -> bool:
+    """优先引用原链接消息回复；不可用或失败时回退普通发送。"""
+    quote_message = getattr(wx, "quote_message", None)
+    if message_id and callable(quote_message):
+        try:
+            if quote_message(chat_name, message_id, summary):
+                logger.info("✅ 网页摘要已引用原消息发送: %s:%s", chat_name, message_id)
+                return True
+            logger.warning("⚠️ 引用原消息发送摘要失败，回退普通发送: %s:%s", chat_name, message_id)
+        except Exception as e:
+            logger.warning("⚠️ 引用原消息发送摘要异常，回退普通发送: %s", e)
+
+    send_message = getattr(wx, "send_message", None)
+    if callable(send_message):
+        return bool(send_message(chat_name, summary))
+
+    logger.error("❌ 无法发送网页摘要，未找到 send_message 方法")
+    return False
+
+
+def _get_url_from_message(event: Event, message: str) -> Optional[str]:
+    url = event.data.get("url")
+    if url:
+        return url
+    url_match = re.search(r'(https?://[^\s<>\"]+)', message or "")
+    return url_match.group(1) if url_match else None
+
+
+def _resolve_pending_link_url(event: Event, wx: Any, chat_name: str, logger: logging.Logger) -> Optional[str]:
+    """当 wx_bot 只缓存了链接卡片时，按需请求真实 URL。"""
+    if not wx or not hasattr(wx, "resolve_link_url"):
+        return None
+
+    message_id = event.data.get("message_id")
+    if not message_id:
+        return None
+
+    try:
+        logger.info(f"🔗 链接事件未携带URL，按需解析链接卡片: {chat_name}:{message_id}")
+        url = wx.resolve_link_url(chat_name, message_id)
+        if url:
+            event.data["url"] = url
+            return url
+    except Exception as e:
+        logger.warning(f"⚠️ 按需解析链接卡片URL失败: {e}")
+    return None
+
+
+def _handle_douyin_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+    try:
+        video_url_list = svc.parse_douyin_video(share_url)
+        if video_url_list and wx:
+            video_path = svc._download_video(video_url_list)
+            if video_path:
+                _send_files(wx, chat_name, video_path, logger)
+                return
+            logger.info("❌ 视频下载失败")
+    except Exception as e:
+        logger.error(f"❌ 异步处理抖音视频失败: {e}", exc_info=True)
+
+
+def _handle_tiktok_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+    try:
+        video_url_list = svc.parse_tiktok_video(share_url)
+        if video_url_list and wx:
+            video_path = svc._download_video(video_url_list)
+            if video_path:
+                _send_files(wx, chat_name, video_path, logger)
+                return
+            logger.error(f"❌ TikTok 视频下载失败: {share_url}")
+    except Exception as e:
+        logger.error(f"❌ 异步处理 TikTok 视频失败: {e}", exc_info=True)
+
+
+def _handle_weibo_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+    try:
+        logger.info(f"📺 检测到微博链接，开始使用 yt-dlp 下载: {share_url}")
+        if not wx:
+            logger.info("ℹ️ 未找到 wx 上下文，跳过微博视频下载")
+            return
+
+        video_path = svc._download_weibo_video(share_url, timeout_sec=180)
+        if video_path:
+            _send_files(wx, chat_name, video_path, logger)
+            logger.info(f"✅ 微博视频发送完成: {share_url}")
+            return
+        logger.error(f"❌ 微博视频下载失败: {share_url}")
+    except Exception as e:
+        logger.error(f"❌ 异步处理微博视频失败: {e}", exc_info=True)
+
+
+def _handle_bilibili_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+    try:
+        if not svc._ensure_bili_cookie_login_ready(wx=wx, chat_name=chat_name):
+            logger.warning("⚠️ B站 Cookie 未就绪，将继续尝试后续字幕/API/ASR流程。")
+
+        duration = svc._check_bilibili_duration(share_url)
+        if duration is None:
+            logger.info(f"ℹ️ Bilibili 视频 {share_url} 获取时长失败，尝试直接获取字幕进行脑图制作。")
+            article_text = svc._bili_get_subtitles(share_url)
+            if article_text:
+                asyncio.run(svc._generate_bilibili_mindmap_async(share_url, wx, chat_name, article_text=article_text))
+            return
+
+        if duration <= 60:
+            logger.info(f"ℹ️ Bilibili 视频 {share_url} 时长 {duration}s <= 1 分钟，下载 1080p。")
+            if wx:
+                video_path = svc._download_bilibili_video(share_url, max_720p=False)
+                if video_path:
+                    video_path = svc._process_bilibili_video(video_path, source_url=share_url)
+                    _send_files(wx, chat_name, video_path, logger)
+                else:
+                    logger.error(f"❌ Bilibili 视频下载失败: {share_url}")
+            return
+
+        max_download_duration = getattr(svc, "bilibili_max_download_duration", 120)
+        if duration <= max_download_duration:
+            logger.info(f"ℹ️ Bilibili 视频 {share_url} 时长 {duration}s <= {max_download_duration}s，下载 720p。")
+            if wx:
+                video_path = svc._download_bilibili_video(share_url, max_720p=True)
+                if video_path:
+                    video_path = svc._process_bilibili_video(video_path, source_url=share_url)
+                    _send_files(wx, chat_name, video_path, logger)
+                else:
+                    logger.error(f"❌ Bilibili 视频下载失败: {share_url}")
+            return
+
+        logger.info(
+            "ℹ️ Bilibili 视频 %s 时长 %ss > %ss，进入脑图制作逻辑。",
+            share_url,
+            duration,
+            max_download_duration,
+        )
+        article_text = svc._bili_get_subtitles(share_url)
+        if article_text:
+            if duration < 10800:
+                logger.info(f"✅ 成功获取字幕，时长 {duration}s < 3 小时，利用字幕制作脑图。")
+                asyncio.run(svc._generate_bilibili_mindmap_async(share_url, wx, chat_name, article_text=article_text))
+            else:
+                logger.info(f"ℹ️ Bilibili 视频 {share_url} 时长 {duration}s >= 180 分钟，直接忽略。")
+            return
+
+        if not getattr(svc, "local_asr_enabled", True):
+            logger.info(f"ℹ️ Bilibili 视频 {share_url} 无字幕且本地 ASR 已关闭，直接忽略。")
+            return
+
+        max_asr_minutes = max(1, int(getattr(svc, "local_asr_max_duration_minutes", 35)))
+        max_asr_seconds = max_asr_minutes * 60
+        if duration > max_asr_seconds:
+            logger.info(
+                "ℹ️ Bilibili 视频 %s 时长 %ss，超过本地 ASR 上限 %s 分钟且无字幕，直接忽略。",
+                share_url,
+                duration,
+                max_asr_minutes,
+            )
+            return
+
+        logger.info(
+            "ℹ️ Bilibili 视频 %s 时长 %ss，无字幕，使用本地 SenseVoice ASR 制作脑图。",
+            share_url,
+            duration,
+        )
+        article_text = svc._bili_transcribe_local(share_url)
+        if article_text:
+            asyncio.run(
+                svc._generate_bilibili_mindmap_async(
+                    share_url,
+                    wx,
+                    chat_name,
+                    article_text=article_text,
+                )
+            )
+    except Exception as e:
+        logger.error(f"❌ 异步处理 Bilibili 视频失败: {e}", exc_info=True)
+
+
+def _handle_xhs_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+    try:
+        file_path = svc.process_xhs_note(share_url)
+        if file_path and wx:
+            _send_files(wx, chat_name, file_path, logger)
+        elif not file_path:
+            logger.info(f"ℹ️ 小红书笔记 {share_url} 处理完成，但未生成待发送文件（可能时长超限或非单图）")
+    except Exception as e:
+        logger.error(f"❌ 异步处理小红书视频/图片失败: {e}", exc_info=True)
+
+
+def _handle_youtube_async(svc: Any, wx: Any, chat_name: str, youtube_url: str, logger: logging.Logger) -> None:
+    loop = None
+    try:
+        logger.info(f"🎥 检测到 YouTube 链接，启动脑图制作流程: {youtube_url}")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(svc._generate_youtube_mindmap_async(youtube_url, wx, chat_name))
+    except Exception as e:
+        logger.error(f"❌ YouTube 异步处理线程报错: {e}", exc_info=True)
+    finally:
+        if loop is not None:
+            loop.close()
+
+
+def _extract_douyin_url(svc: Any, url: str, message: str) -> Optional[str]:
+    return svc._extract_douyin_share_url(url or "") or svc._extract_douyin_share_url(message)
+
+
+def _extract_tiktok_url(svc: Any, url: str, message: str) -> Optional[str]:
+    return svc._extract_tiktok_share_url(url or "") or svc._extract_tiktok_share_url(message)
+
+
+def _extract_weibo_url(svc: Any, url: str, message: str) -> Optional[str]:
+    return svc._extract_weibo_url(url or "") or svc._extract_weibo_url(message)
+
+
+def _extract_bilibili_url(svc: Any, url: str, message: str) -> Optional[str]:
+    return svc._extract_bilibili_share_url(url or "") or svc._extract_bilibili_share_url(message)
+
+
+def _extract_xhs_url(svc: Any, url: str, message: str) -> Optional[str]:
+    return svc._extract_xhs_share_url(url or "") or svc._extract_xhs_share_url(message)
+
+
+def _extract_youtube_url(svc: Any, url: str, message: str) -> Optional[str]:
+    return svc._extract_youtube_url(url or "") or svc._extract_youtube_url(message)
+
+
+PLATFORM_ROUTES = (
+    PlatformRoute("douyin", _extract_douyin_url, _handle_douyin_async),
+    PlatformRoute("tiktok", _extract_tiktok_url, _handle_tiktok_async),
+    PlatformRoute("weibo", _extract_weibo_url, _handle_weibo_async),
+    PlatformRoute("bilibili", _extract_bilibili_url, _handle_bilibili_async),
+    PlatformRoute("xiaohongshu", _extract_xhs_url, _handle_xhs_async),
+    PlatformRoute("youtube", _extract_youtube_url, _handle_youtube_async),
+)
+
+
+def _dispatch_platform_route(
+    route: PlatformRoute,
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    share_url: str,
+    logger: logging.Logger,
+) -> None:
+    threading.Thread(
+        target=route.async_handler,
+        args=(svc, wx, chat_name, share_url, logger),
+        daemon=True,
+    ).start()
+
+
+def handle_link_message(event: Event, svc: Any, logger: logging.Logger) -> bool:
+    """处理链接消息事件（平台直链下载/脑图 + 普通 URL 摘要）"""
+    try:
+        chat_name = event.data.get("chat_name", "")
+        message = event.data.get("message", "") or ""
+        url = _get_url_from_message(event, message)
+        sender = event.data.get("sender", "")
+        if svc._is_sender_blacklisted(sender):
+            logger.info(f"🚫 Sender 黑名单命中：{sender}，跳过处理")
+            return False
+
+        wx = event.context.get("wx")
+
+        if not url:
+            url = _resolve_pending_link_url(event, wx, chat_name, logger)
+
+        if url:
+            logger.info(f"🔗 summary_plus 准备处理URL: chat={chat_name}, url={url[:180]}")
+
+        if url and svc._is_blacklisted(url):
+            logger.info(f"🚫 域名黑名单命中：{url}，跳过处理")
+            return False
+
+        if url and url != "LINK_MESSAGE_CLICKED":
+            hupu_url = svc._extract_hupu_url(url) or svc._extract_hupu_url(message)
+            if hupu_url:
+                logger.info(f"🏀 检测到虎扑链接，优先尝试直返视频: {hupu_url}")
+                if wx:
+                    video_path = svc._download_hupu_video(hupu_url, timeout_sec=60)
+                    if video_path:
+                        _send_files(wx, chat_name, video_path, logger)
+                        logger.info(f"✅ 虎扑视频发送完成: {hupu_url}")
+                        return True
+                    logger.info(f"ℹ️ 虎扑视频下载失败，回退常规摘要流程: {hupu_url}")
+                else:
+                    logger.info("ℹ️ 未找到 wx 上下文，跳过虎扑视频直返并继续摘要流程")
+
+        for route in PLATFORM_ROUTES:
+            share_url = route.extract_share_url(svc, url or "", message)
+            if not share_url:
+                continue
+            _dispatch_platform_route(route, svc, wx, chat_name, share_url, logger)
+            return True
+
+        if not url:
+            return False
+
+        is_link_message = url == "LINK_MESSAGE_CLICKED"
+        logger.info(
+            "🧭 进入常规网页摘要流程: "
+            f"is_link_message={is_link_message}"
+        )
+        summary = svc.summarize_url(
+            url,
+            is_link_message=is_link_message,
+            chat_name=chat_name,
+            sender=sender,
+        )
+        logger.info(f"🧾 常规网页摘要流程返回: has_summary={bool(summary)}")
+
+        if not wx:
+            return bool(summary)
+
+        if not summary:
+            return True
+
+        _send_summary_reply(
+            wx,
+            chat_name,
+            event.data.get("message_id"),
+            summary,
+            logger,
+        )
+        if chat_name in svc.special_translation_groups:
+            translated = svc.translate_text_for_special_group(summary)
+            if translated:
+                wx.send_message(chat_name, translated)
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error handling link message: {e}", exc_info=True)
+        return False

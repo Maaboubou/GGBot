@@ -291,6 +291,62 @@ def _read_nvidia_temperatures() -> List[Dict[str, Any]]:
     return readings
 
 
+def _storage_sensor_priority(name: str) -> Optional[int]:
+    """Rank storage readings without mistaking auxiliary values for live temperature."""
+    normalized = re.sub(r"[_\-/]+", " ", str(name or "").casefold())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    # Hardware monitors commonly expose historical or secondary NVMe values
+    # beside the live drive temperature. They must never represent the drive
+    # on the compact dashboard, even when their value happens to be highest.
+    if re.search(r"\bmax(?:imum)?\b", normalized):
+        return None
+    if re.search(r"\bhot\s*spot\b", normalized):
+        return None
+    indexed_temperature = re.search(
+        r"\btemp(?:erature)?\s*(?:sensor\s*)?(?:#\s*)?(\d+)\b",
+        normalized,
+    )
+    if indexed_temperature and int(indexed_temperature.group(1)) >= 2:
+        return None
+
+    # These are the usual live/primary labels reported by smartmontools,
+    # psutil/hwmon, LibreHardwareMonitor, and OpenHardwareMonitor.
+    if re.search(r"\bcomposite\b", normalized):
+        return 0
+    if normalized in {"drivetemp", "drive temp", "drive temperature"}:
+        return 0
+    if re.fullmatch(
+        r"(?:(?:current|device|disk|storage|ssd|hdd|nvme) )?"
+        r"temp(?:erature)?(?: (?:celsius|current|#? ?1))?",
+        normalized,
+    ):
+        return 0
+
+    # Unknown but non-auxiliary labels remain usable as a last resort. Their
+    # source order is more predictable than selecting whichever reports the
+    # highest value.
+    return 1
+
+
+def _select_storage_reading(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    ranked = [
+        (priority, item)
+        for item in candidates
+        if (priority := _storage_sensor_priority(item.get("name", ""))) is not None
+    ]
+    if not ranked:
+        return None
+
+    primary = [item for priority, item in ranked if priority == 0]
+    if primary:
+        # There may be several physical drives. Taking the hottest *primary*
+        # reading is useful, unlike taking the maximum across every auxiliary
+        # sensor exposed by every drive.
+        return max(primary, key=lambda item: item["celsius"])
+    return ranked[0][1]
+
+
 def _summarize(readings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     labels = {
         "cpu": "CPU",
@@ -304,13 +360,19 @@ def _summarize(readings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         candidates = [item for item in readings if item["type"] == sensor_type]
         if not candidates:
             continue
-        hottest = max(candidates, key=lambda item: item["celsius"])
+        selected = (
+            _select_storage_reading(candidates)
+            if sensor_type == "storage"
+            else max(candidates, key=lambda item: item["celsius"])
+        )
+        if selected is None:
+            continue
         summary.append({
             "label": labels[sensor_type],
             "type": sensor_type,
-            "celsius": hottest["celsius"],
-            "source": hottest["source"],
-            "sensor_name": hottest["name"],
+            "celsius": selected["celsius"],
+            "source": selected["source"],
+            "sensor_name": selected["name"],
         })
     return summary
 

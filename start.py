@@ -92,8 +92,8 @@ def main():
     parser = argparse.ArgumentParser(description="WeChat Automation Assistant")
     parser.add_argument(
         "--host",
-        default=os.getenv("WEB_HOST", "127.0.0.1"),
-        help="Host to bind (default: WEB_HOST or 127.0.0.1)",
+        default=os.getenv("WEB_HOST", "0.0.0.0"),
+        help="Host to bind (default: WEB_HOST or 0.0.0.0)",
     )
     parser.add_argument(
         "--port",

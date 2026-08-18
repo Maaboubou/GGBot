@@ -774,7 +774,7 @@ if __name__ == "__main__":
     # 开发模式运行
     uvicorn.run(
         "app.main:app",
-        host=os.getenv("WEB_HOST", "127.0.0.1"),
+        host=os.getenv("WEB_HOST", "0.0.0.0"),
         port=int(os.getenv("WEB_PORT", "8888")),
         reload=True,
         log_level="info"

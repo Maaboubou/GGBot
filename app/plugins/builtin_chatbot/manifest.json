@@ -1,0 +1,51 @@
+{
+  "schema_version": 2,
+  "listeners": [
+    {
+      "event": "text_message_received",
+      "handler": "handle_text_message",
+      "title": "聊天回复",
+      "trigger": {
+        "kind": "mention_or_judge",
+        "summary": "私聊直接响应；群聊由 @、Judge 或回复续接判定",
+        "config_keys": ["allow_mention_trigger"],
+        "conditions": ["群聊主动回复还需绑定 Judge 并满足消息数、间隔和冷却条件"]
+      },
+      "scope": {"level": "global", "chat_types": ["group", "user"]},
+      "propagation": "continue"
+    },
+    {
+      "event": "image_message_received",
+      "handler": "handle_image_message",
+      "title": "图片 OCR 入库",
+      "trigger": {"kind": "dynamic", "summary": "开启 OCR 时异步提取图片文字并写入聊天上下文", "config_keys": [], "conditions": ["仅记录上下文，不消费消息"]},
+      "scope": {"level": "global", "chat_types": ["group", "user"]},
+      "propagation": "observe"
+    },
+    {
+      "event": "quote_image_message_received",
+      "handler": "handle_quote_image_message",
+      "title": "引用图片回复",
+      "trigger": {"kind": "mention_or_judge", "summary": "引用图片且满足私聊、@ 或群聊 Judge 条件", "config_keys": ["allow_mention_trigger"], "conditions": ["引用内容必须包含图片"]},
+      "scope": {"level": "global", "chat_types": ["group", "user"]},
+      "propagation": "continue"
+    },
+    {
+      "event": "quote_text_message_received",
+      "handler": "handle_text_message",
+      "title": "引用文本回复",
+      "trigger": {"kind": "mention_or_judge", "summary": "引用文本并满足私聊、@ 或群聊 Judge 条件", "config_keys": ["allow_mention_trigger"], "conditions": []},
+      "scope": {"level": "global", "chat_types": ["group", "user"]},
+      "propagation": "continue"
+    },
+    {
+      "event": "chatbot_followup_approved",
+      "handler": "handle_followup_approved",
+      "title": "回复续接批准",
+      "trigger": {"kind": "internal", "summary": "由聊天机器人内部的异步 Judge 批准后触发", "config_keys": [], "conditions": ["不是外部微信消息入口"]},
+      "scope": {"level": "global", "chat_types": ["group"]},
+      "propagation": "continue"
+    }
+  ],
+  "jobs": []
+}

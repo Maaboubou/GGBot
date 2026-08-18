@@ -1,0 +1,8 @@
+{
+  "schema_version": 2,
+  "listeners": [
+    {"event": "text_message_received", "handler": "handle_text", "title": "开始菜单翻译", "trigger": {"kind": "keyword", "summary": "消息包含任一菜单翻译关键词", "config_keys": ["trigger_keywords"], "conditions": ["命中后进入限时图片收集会话"]}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "stop_on_consumed"},
+    {"event": "image_message_received", "handler": "handle_image", "title": "接收菜单图片", "trigger": {"kind": "session", "summary": "当前聊天存在等待菜单图片的翻译会话", "config_keys": [], "conditions": []}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "stop_on_consumed"}
+  ],
+  "jobs": []
+}

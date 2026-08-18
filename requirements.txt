@@ -1,0 +1,45 @@
+# Web application and persistence
+fastapi>=0.140,<1
+uvicorn[standard]
+python-multipart>=0.0.32,<1
+Flask
+SQLAlchemy
+pydantic
+
+# HTTP and browser automation
+requests
+urllib3
+certifi
+httpx
+selenium
+
+# AI providers and local retrieval
+litellm
+openai
+google-genai
+tiktoken>=0.12,<1
+fastembed>=0.7,<1
+numpy>=1.26,<3
+
+# Images, OCR and reports
+Pillow>=10
+ddddocr
+NudeNet>=3.4,<4
+opencv-python-headless>=4.11,<5
+matplotlib
+lxml
+pandas
+
+# Windows integration and utilities
+psutil
+watchdog
+python-dotenv
+comtypes
+pytz
+pyperclip
+pyautogui
+PyGetWindow
+pypinyin
+
+# Verified with the current WeChat 4.x integration.
+wxautox4==41.1.1.post1

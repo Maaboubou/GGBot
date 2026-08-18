@@ -1,0 +1,1380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#faf9f5">
+    <title>GGBot 管理面板</title>
+
+    <!-- Restore the chosen theme before styles load to prevent a light/dark flash. -->
+    <script>
+        (() => {
+            const storageKey = 'wxauto.colorTheme';
+            let theme = 'light';
+            try {
+                const savedTheme = localStorage.getItem(storageKey);
+                theme = ['light', 'dark'].includes(savedTheme)
+                    ? savedTheme
+                    : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+            } catch (_) {
+                theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            }
+            document.documentElement.dataset.theme = theme;
+            document.documentElement.setAttribute('data-bs-theme', theme);
+            document.querySelector('meta[name="theme-color"]')
+                ?.setAttribute('content', theme === 'dark' ? '#181715' : '#faf9f5');
+        })();
+    </script>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+
+    <!-- Bootstrap 5 & Icons -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+
+    <!-- App CSS -->
+    <link href="/static/assets/css/style.css?v=3.6.2" rel="stylesheet">
+    <link href="/static/assets/css/dashboard.css?v=3.5.2" rel="stylesheet">
+</head>
+
+<body>
+
+    <!-- Mobile Overlay -->
+    <div class="mobile-overlay"></div>
+
+    <div class="wrapper">
+        <!-- Sidebar -->
+        <nav class="sidebar d-flex flex-column" id="sidebarNavigation">
+            <div class="sidebar-brand">
+                <i class="bi bi-robot"></i>
+                <span>GGBot 管理面板</span>
+            </div>
+            <button type="button" class="sidebar-collapse-toggle" id="sidebarCollapseToggle"
+                aria-label="折叠侧边栏" aria-controls="sidebarNavigation" aria-expanded="true" title="折叠侧边栏">
+                <i class="bi bi-chevron-left" aria-hidden="true"></i>
+            </button>
+
+            <div class="sidebar-menu flex-grow-1">
+                <div class="sidebar-section-label">工作台</div>
+                <li class="nav-item">
+                    <a href="/" class="nav-link" data-tab="dashboard">
+                        <i class="bi bi-speedometer2"></i>
+                        <span>概览</span>
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/chats" class="nav-link" data-tab="users">
+                        <i class="bi bi-chat-square-text"></i>
+                        <span>聊天</span>
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/assistant" class="nav-link" data-tab="roles">
+                        <i class="bi bi-stars"></i>
+                        <span>AI 助手</span>
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/plugins" class="nav-link" data-tab="plugins">
+                        <i class="bi bi-puzzle"></i>
+                        <span>插件</span>
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/ai" class="nav-link" data-tab="llm">
+                        <i class="bi bi-cpu"></i>
+                        <span>模型与调用</span>
+                    </a>
+                </li>
+
+                <div class="sidebar-section-label">管理</div>
+                <li class="nav-item">
+                    <a href="/operations/logs" class="nav-link" data-tab="logs">
+                        <i class="bi bi-activity"></i>
+                        <span>运行与日志</span>
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/system" class="nav-link" data-tab="settings">
+                        <i class="bi bi-sliders"></i>
+                        <span>系统</span>
+                    </a>
+                </li>
+            </div>
+
+            <div class="sidebar-footer p-3 border-top border-secondary border-opacity-25">
+                <small class="text-muted d-block mb-1">版本：2.0.1</small>
+                <div class="d-flex align-items-center text-muted gap-2">
+                    <button id="themeToggle" type="button" class="sidebar-theme-toggle"
+                        aria-label="切换到暗色模式" aria-pressed="false" title="切换到暗色模式">
+                        <i class="bi bi-moon-stars" aria-hidden="true"></i>
+                        <span class="visually-hidden" data-theme-label>暗色</span>
+                    </button>
+                    <a href="#" class="text-decoration-none text-muted hover-white"><i class="bi bi-github"></i></a>
+                    <a href="#" class="text-decoration-none text-muted hover-white"><i class="bi bi-book"></i></a>
+                </div>
+            </div>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="page-header">
+                <div class="d-flex align-items-center gap-3">
+                    <button class="btn btn-outline-secondary d-md-none mobile-toggle">
+                        <i class="bi bi-list"></i>
+                    </button>
+                    <div class="page-heading">
+                        <h1 class="page-title" id="pageTitle">概览</h1>
+                    </div>
+                </div>
+                <div class="page-global-actions">
+                    <button class="btn btn-surface page-icon-action" onclick="App.refreshCurrentTab()" title="刷新当前页面" aria-label="刷新当前页面">
+                        <i class="bi bi-arrow-clockwise text-primary"></i>
+                    </button>
+                    <div class="dropdown">
+                        <button class="btn btn-surface dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                            <i class="bi bi-power me-1"></i>重启
+                        </button>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li>
+                                <button id="restartWebButton" class="dropdown-item restart-action" onclick="App.restartWeb()" title="正在检查管理控制台是否支持 Web 单独重启">
+                                    <i class="bi bi-arrow-repeat me-2"></i>只重启 Web
+                                </button>
+                            </li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li>
+                                <button class="dropdown-item restart-action text-danger" onclick="App.restartSystem()">
+                                    <i class="bi bi-power me-2"></i>重启全部服务
+                                </button>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Tab: Dashboard -->
+            <div id="dashboard" class="tab-content">
+                <div class="dashboard-shell">
+                    <section class="modern-card dashboard-overview fade-in">
+                        <div class="dashboard-status-row">
+                            <div class="dashboard-health-metrics">
+                                <div><span>微信</span><strong id="dashboardWechatStatus">检测中</strong></div>
+                                <div><span>插件</span><strong id="dashboardPluginHealth">-</strong></div>
+                                <div title="当前 GGBot 进程的连续运行时长"><span>GGBot 已运行</span><strong id="dashboardUptime">-</strong></div>
+                                <div title="电脑自最近一次开机以来的时长"><span>本机已开机</span><strong id="dashboardSystemUptime">-</strong></div>
+                            </div>
+                            <small class="dashboard-updated-at" id="lastUpdateTime"><i class="bi bi-arrow-clockwise spinning"></i></small>
+                        </div>
+
+                        <div class="dashboard-kpi-grid">
+                            <article class="dashboard-kpi"><span class="dashboard-kpi-label"><i class="bi bi-chat-left-text"></i>今日消息</span><strong id="statTodayMessages">-</strong></article>
+                            <article class="dashboard-kpi"><span class="dashboard-kpi-label"><i class="bi bi-robot"></i>AI 回复</span><strong id="statAiReplies">-</strong></article>
+                            <article class="dashboard-kpi"><span class="dashboard-kpi-label"><i class="bi bi-lightning-charge"></i>模型调用</span><strong id="dashboardModelCalls">-</strong><em id="dashboardCallsMeta">本次运行</em></article>
+                            <article class="dashboard-kpi"><span class="dashboard-kpi-label"><i class="bi bi-braces"></i>Token</span><strong id="statTokenUsage">-</strong></article>
+                            <a class="dashboard-kpi dashboard-kpi-action" href="/ai/calls" onclick="event.preventDefault(); App.openDashboardErrors()"><span class="dashboard-kpi-label"><i class="bi bi-exclamation-triangle"></i>调用错误</span><strong id="dashboardErrors">-</strong><i class="bi bi-arrow-up-right dashboard-kpi-arrow" aria-hidden="true"></i></a>
+                        </div>
+                    </section>
+
+                    <div class="dashboard-content-grid">
+                        <section class="modern-card dashboard-activity-card fade-in">
+                            <div class="card-header-clean">
+                                <h6>最近动态</h6>
+                                <button class="dashboard-text-action" onclick="UI.switchTab('logs')">查看日志<i class="bi bi-arrow-right"></i></button>
+                            </div>
+                            <div id="recentActivities" class="custom-scrollbar dashboard-activity-list">
+                                <div class="loading-wrapper p-5">正在加载动态…</div>
+                            </div>
+                        </section>
+
+                        <aside class="modern-card dashboard-side-panel fade-in">
+                            <section class="dashboard-panel-section" id="codexCard">
+                                <div class="dashboard-section-heading">
+                                    <h6>Codex 额度</h6>
+                                    <button class="dashboard-icon-button" id="refreshCodexUsageBtn" onclick="App.refreshCodexUsage()" title="刷新 Codex 用量" aria-label="刷新 Codex 用量"><i class="bi bi-arrow-clockwise"></i></button>
+                                </div>
+                                <div class="dashboard-side-body" id="codexStatusOutput"><div class="loading-wrapper small">正在读取额度…</div></div>
+                            </section>
+
+                            <section class="dashboard-panel-section">
+                                <div class="dashboard-section-heading"><h6>资源占用</h6></div>
+                                <div class="dashboard-side-body" id="systemResources"><div class="loading-wrapper small">正在读取资源…</div></div>
+                            </section>
+
+                            <section class="dashboard-panel-section dashboard-chat-section">
+                                <div class="dashboard-section-heading">
+                                    <h6>今日活跃聊天</h6>
+                                    <span class="dashboard-count-pill" id="statActiveUsers">-</span>
+                                </div>
+                                <div class="dashboard-side-body" id="topUsers"><div class="loading-wrapper small">正在加载聊天…</div></div>
+                            </section>
+                        </aside>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Plugins -->
+            <div id="plugins" class="tab-content d-none workspace-page">
+                <div id="pluginsList">
+                    <!-- Loaded dynamically -->
+                </div>
+            </div>
+
+
+
+            <!-- Tab: Users -->
+            <div id="users" class="tab-content d-none workspace-page">
+                <div class="row g-0 workspace-split-shell">
+                    <div class="col-md-5 col-lg-4">
+                        <div class="card h-100 chat-list-card workspace-pane">
+                            <div class="chat-list-header">
+                                <div class="d-flex align-items-center justify-content-between gap-2">
+                                    <h6 class="mb-0"><i class="bi bi-ear me-2"></i>已管理的聊天</h6>
+                                    <div class="d-flex align-items-center gap-2">
+                                        <span class="chat-count-pill" id="managedChatsCount">0</span>
+                                        <button class="btn btn-primary btn-sm" onclick="App.showAddUserModal()">
+                                            <i class="bi bi-plus-lg me-1"></i>添加
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="chat-list-search"><i class="bi bi-search"></i><input type="search" id="chatListSearch" placeholder="搜索名称或备注"></div>
+                            </div>
+                            <div class="list-group list-group-flush overflow-auto custom-scrollbar"
+                                id="usersList" style="height: calc(100vh - 300px); min-height: 300px;">
+                                <!-- Users -->
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-7 col-lg-8">
+                        <div class="card h-100 workspace-pane workspace-pane-main" id="userPermissionsPanelContainer">
+                            <div class="card-body d-flex flex-column align-items-center justify-content-center text-muted"
+                                id="userPermissionsPanel">
+                                <i class="bi bi-chat-square-text fs-1 mb-3 opacity-25"></i>
+                                <h6>选择一个聊天</h6>
+                                <p class="small">查看其监听状态、可用能力和会话级配置。</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modals -->
+            <div class="modal fade" id="addUserModal" tabindex="-1">
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">添加监听聊天</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <form id="addUserForm">
+                                <div class="mb-3">
+                                    <label class="form-label">聊天名称 / WeChat ID <span
+                                            class="text-danger">*</span></label>
+                                    <input type="text" class="form-control" name="chat_name" required>
+                                    <div class="form-text">必须与 WeChat 中的名称完全一致。</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">备注（可选）</label>
+                                    <input type="text" class="form-control" name="remark">
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">发送者黑名单</label>
+                                    <textarea class="form-control" name="sender_blacklist" rows="5"
+                                        placeholder="每行填写一个发送者"></textarea>
+                                    <div class="form-text">
+                                        此聊天中来自这些发送者的消息会被所有插件忽略。
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">类型 <span class="text-danger">*</span></label>
+                                    <div class="d-flex gap-3">
+                                        <div class="form-check">
+                                            <input class="form-check-input" type="radio" name="is_group" id="typeUser"
+                                                value="false" checked>
+                                            <label class="form-check-label" for="typeUser"><i
+                                                    class="bi bi-person me-1"></i>个人</label>
+                                        </div>
+                                        <div class="form-check">
+                                            <input class="form-check-input" type="radio" name="is_group" id="typeGroup"
+                                                value="true">
+                                            <label class="form-check-label" for="typeGroup"><i
+                                                    class="bi bi-people me-1"></i>群聊</label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </form>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                            <button type="button" class="btn btn-primary" onclick="App.submitAddUser()">添加并监听</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Edit User Modal -->
+            <div class="modal fade" id="editUserModal" tabindex="-1">
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">编辑用户信息</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <form id="editUserForm">
+                                <input type="hidden" name="user_id">
+                                <div class="mb-3">
+                                    <label class="form-label">聊天名称</label>
+                                    <input type="text" class="form-control bg-light" name="chat_name_display" readonly
+                                        disabled>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">备注（可选）</label>
+                                    <input type="text" class="form-control" name="remark">
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">发送者黑名单</label>
+                                    <textarea class="form-control" name="sender_blacklist" rows="5"
+                                        placeholder="每行填写一个发送者"></textarea>
+                                    <div class="form-text">
+                                        此聊天中来自这些发送者的消息会被所有插件忽略。
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">聊天类型 <span class="text-danger">*</span></label>
+                                    <div class="d-flex gap-3">
+                                        <div class="form-check">
+                                            <input class="form-check-input" type="radio" name="is_group"
+                                                id="editTypeUser" value="false">
+                                            <label class="form-check-label" for="editTypeUser"><i
+                                                    class="bi bi-person me-1"></i>个人（👤）</label>
+                                        </div>
+                                        <div class="form-check">
+                                            <input class="form-check-input" type="radio" name="is_group"
+                                                id="editTypeGroup" value="true">
+                                            <label class="form-check-label" for="editTypeGroup"><i
+                                                    class="bi bi-people me-1"></i>群聊（👥）</label>
+                                        </div>
+                                    </div>
+                                    <div class="form-text mt-2">
+                                        <strong>重要：</strong>私聊无需 @ 提及，群聊则需要（权限中另有配置时除外）。
+                                    </div>
+                                </div>
+                            </form>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                            <button type="button" class="btn btn-primary" onclick="App.submitEditUser()">保存更改</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Roles -->
+            <div id="roles" class="tab-content d-none workspace-page">
+                <div class="assistant-section-nav workspace-subnav fade-in">
+                    <div class="assistant-section-tabs" role="tablist" aria-label="AI 助手配置分区">
+                        <button type="button" class="assistant-section-tab active" data-assistant-section="overview"
+                            onclick="App.setAssistantSection('overview')">
+                            <i class="bi bi-grid-1x2"></i><span>概览</span>
+                        </button>
+                        <button type="button" class="assistant-section-tab" data-assistant-section="chats"
+                            onclick="App.setAssistantSection('chats')">
+                            <i class="bi bi-chat-square-text"></i><span>聊天配置</span>
+                        </button>
+                        <button type="button" class="assistant-section-tab" data-assistant-section="roles"
+                            onclick="App.setAssistantSection('roles')">
+                            <i class="bi bi-person-badge"></i><span>角色与 Judge</span>
+                        </button>
+                    </div>
+                    <div class="assistant-command-actions">
+                        <button type="button" class="btn btn-light border" onclick="App.openMemoryLibraryHub()">
+                            <i class="bi bi-database-gear me-1"></i>记忆库
+                        </button>
+                        <button type="button" class="btn btn-primary" onclick="App.showAssistantGlobalSettings()">
+                            <i class="bi bi-sliders me-1"></i>全局设置
+                        </button>
+                    </div>
+                </div>
+
+                <section id="assistantOverviewSection" class="assistant-section-panel fade-in">
+                    <div class="assistant-overview-surface workspace-surface">
+                        <div id="assistantOverviewStats" class="assistant-metric-grid">
+                            <div class="assistant-loading-card">正在读取助手状态…</div>
+                        </div>
+                        <div class="assistant-overview-grid">
+                        <section class="assistant-overview-block">
+                            <div class="assistant-panel-header">
+                                <div>
+                                    <h5><i class="bi bi-toggles2 me-2"></i>全局行为</h5>
+                                </div>
+                                <button class="btn btn-sm btn-outline-primary" onclick="App.showAssistantGlobalSettings()">编辑</button>
+                            </div>
+                            <div id="assistantGlobalSummary" class="assistant-summary-list"></div>
+                        </section>
+                        <section class="assistant-overview-block">
+                            <div class="assistant-panel-header">
+                                <div>
+                                    <h5><i class="bi bi-cpu me-2"></i>模型路由</h5>
+                                </div>
+                                <button class="btn btn-sm btn-outline-primary" onclick="UI.switchTab('llm')">管理模型与调用</button>
+                            </div>
+                            <div id="assistantModelSummary" class="assistant-summary-list"></div>
+                        </section>
+                        </div>
+                    </div>
+                </section>
+
+                <section id="assistantChatsSection" class="assistant-section-panel d-none">
+                    <div class="assistant-toolbar workspace-toolbar">
+                        <div class="roles-search-wrapper">
+                            <i class="bi bi-search"></i>
+                            <input type="search" class="roles-search-input" id="assistantChatsSearch"
+                                placeholder="搜索聊天名称或备注…">
+                        </div>
+                        <select class="form-select form-select-sm assistant-filter-select" id="assistantChatsFilter">
+                            <option value="all">全部聊天</option>
+                            <option value="enabled">已启用 Chatbot</option>
+                            <option value="proactive">已启用主动回复</option>
+                            <option value="disabled">未启用 Chatbot</option>
+                        </select>
+                    </div>
+                    <div id="assistantChatsGrid" class="assistant-chat-grid"></div>
+                </section>
+
+                <section id="assistantRolesSection" class="assistant-section-panel d-none">
+                    <div class="roles-top-bar workspace-toolbar roles-toolbar">
+                        <h5>角色</h5>
+                        <div class="roles-search-wrapper">
+                            <i class="bi bi-search"></i>
+                            <input type="search" class="roles-search-input" id="rolesSearchInput"
+                                placeholder="搜索角色、Judge 或提示词…">
+                        </div>
+                        <div class="roles-stats-container">
+                            <span class="roles-stat-badge primary"><i class="bi bi-person-badge"></i> 角色：<strong id="statsTotalRoles">0</strong></span>
+                            <span class="roles-stat-badge success"><i class="bi bi-shield-check"></i> Judge：<strong id="statsTotalJudges">0</strong></span>
+                        </div>
+                        <button class="btn btn-sm btn-primary" onclick="App.showCreateRoleModal()"><i class="bi bi-plus-lg me-1"></i>新建角色</button>
+                    </div>
+                    <section class="assistant-collection-section mb-3">
+                        <div id="rolesGrid" class="roles-grid"></div>
+                    </section>
+                    <section class="assistant-collection-section">
+                        <div class="assistant-content-heading">
+                            <div><h5>Judge</h5></div>
+                            <button class="btn btn-sm btn-primary" onclick="App.showCreateJudgeModal()"><i class="bi bi-plus-lg me-1"></i>新建 Judge</button>
+                        </div>
+                        <div id="judgesGrid" class="roles-grid"></div>
+                    </section>
+                </section>
+            </div>
+
+            <!-- Tab: LLM Management -->
+            <div id="llm" class="tab-content d-none workspace-page">
+                <!-- Sub-navigation -->
+                <ul class="nav nav-pills console-subnav workspace-subnav" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="llm-models-tab" data-bs-toggle="pill" data-bs-target="#llm-models"
+                            type="button">
+                            <i class="bi bi-boxes me-1"></i> 模型连接
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="llm-mappings-tab" data-bs-toggle="pill"
+                            data-bs-target="#llm-mappings" type="button">
+                            <i class="bi bi-diagram-3 me-1"></i> 任务路由
+                        </button>
+                    </li>
+
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="llm-stats-tab" data-bs-toggle="pill" data-bs-target="#llm-stats"
+                            type="button">
+                            <i class="bi bi-graph-up me-1"></i> 用量
+                        </button>
+                    </li>
+
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="llm-codex-jobs-tab" data-bs-toggle="pill"
+                            data-bs-target="#llm-codex-jobs" type="button">
+                            <i class="bi bi-chat-square-dots me-1"></i> Codex 会话
+                        </button>
+                    </li>
+
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="llm-history-tab" data-bs-toggle="pill"
+                            data-bs-target="#llm-history" type="button">
+                            <i class="bi bi-journal-text me-1"></i> 调用诊断
+                        </button>
+                    </li>
+
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="llm-proxy-tab" data-bs-toggle="pill" data-bs-target="#llm-proxy"
+                            type="button">
+                            <i class="bi bi-globe me-1"></i> 网络
+                        </button>
+                    </li>
+                </ul>
+
+                <div class="tab-content">
+                    <!-- Call History Sub-Tab -->
+                    <div class="tab-pane fade d-none workspace-section" id="llm-history">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h5 class="fw-bold text-secondary mb-0">
+                                <i class="bi bi-journal-text me-2"></i>调用记录
+                            </h5>
+                            <button class="btn btn-outline-secondary btn-sm" onclick="LLMManager.loadCallHistory()">
+                                <i class="bi bi-arrow-clockwise me-1"></i> 刷新
+                            </button>
+                        </div>
+                        <div class="row g-0 workspace-split-shell workspace-diagnostic-shell">
+                            <!-- Left: Caller List -->
+                            <div class="col-md-4 col-lg-3">
+                                <div class="card h-100 workspace-pane">
+                                    <div class="card-header bg-white border-0 py-2">
+                                        <small class="text-muted fw-semibold text-uppercase">调用来源</small>
+                                    </div>
+                                    <div id="callHistorySourceList" class="list-group list-group-flush overflow-auto"
+                                        style="max-height: calc(100vh - 300px);">
+                                        <div class="text-center text-muted py-4 small">加载中…</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- Right: Detail Cards -->
+                            <div class="col-md-8 col-lg-9">
+                                <div id="callHistoryDetail" class="overflow-auto"
+                                    style="max-height: calc(100vh - 300px);">
+                                    <div class="text-center text-muted py-5">
+                                        <i class="bi bi-arrow-left-circle fs-2 d-block mb-2 opacity-25"></i>
+                                        <span>选择左侧调用来源查看详情</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Models Section -->
+                    <div class="tab-pane fade show active workspace-section" id="llm-models">
+                        <div class="llm-model-toolbar workspace-toolbar">
+                            <div class="llm-model-heading">
+                                <h5><i class="bi bi-boxes me-2"></i>模型连接</h5>
+                                <p>选择供应商与模型，密钥可直接保存为本机共享凭据；保存后可立即测试。</p>
+                            </div>
+                            <div class="llm-model-toolbar-actions">
+                                <label class="llm-model-search" for="llmModelSearch">
+                                    <i class="bi bi-search"></i>
+                                    <input type="search" id="llmModelSearch" placeholder="搜索配置或模型"
+                                        oninput="LLMManager.filterModels()">
+                                </label>
+                                <select class="form-select form-select-sm" id="llmProviderFilter"
+                                    aria-label="按供应商筛选" onchange="LLMManager.filterModels()">
+                                    <option value="">全部供应商</option>
+                                </select>
+                                <button class="btn btn-primary btn-sm" onclick="LLMManager.showAddModelModal()">
+                                    <i class="bi bi-plus-lg me-1"></i>添加模型
+                                </button>
+                            </div>
+                        </div>
+                        <div id="llmModelSummary" class="llm-model-summary" aria-live="polite"></div>
+                        <div id="llmModelsList" class="row g-3">
+                            <div class="col-12 text-center py-5">
+                                <div class="spinner-border text-primary" role="status"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Plugin Mappings Section -->
+                    <div class="tab-pane fade d-none workspace-section" id="llm-mappings">
+                        <div class="llm-route-workbench-intro">
+                            <div>
+                                <h5><i class="bi bi-diagram-3 me-2"></i>能力任务与模型路由</h5>
+                                <p>插件声明任务用途；在这里为每项任务选择主模型和失败后的备用模型。内部标识仅用于排障。</p>
+                            </div>
+                        </div>
+                        <div id="llmMappingsList">
+                            <div class="col-12 text-center py-5">
+                                <div class="spinner-border text-primary" role="status"></div>
+                            </div>
+                        </div>
+                    </div>
+
+
+
+                    <!-- Statistics Section -->
+                    <div class="tab-pane fade d-none workspace-section" id="llm-stats">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h5 class="fw-bold text-secondary mb-0"><i class="bi bi-graph-up me-2"></i>用量统计
+                            </h5>
+                            <button class="btn btn-outline-secondary btn-sm" onclick="LLMManager.refreshStats()">
+                                <i class="bi bi-arrow-clockwise me-1"></i> 刷新
+                            </button>
+                        </div>
+                        <div id="llmStatsList">
+                            <div class="col-12 text-center py-5">
+                                <div class="spinner-border text-primary" role="status"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Codex Sessions Section -->
+                    <div class="tab-pane fade d-none workspace-section" id="llm-codex-jobs">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <div>
+                                <h5 class="fw-bold text-secondary mb-0"><i class="bi bi-chat-square-dots me-2"></i>Codex 会话监控</h5>
+                                <div class="small text-muted">查看每个聊天对象对应的持久线程、轮数、上下文占用、缓存命中和精确 Token；下方保留运行任务及取消功能。</div>
+                            </div>
+                            <button class="btn btn-outline-secondary btn-sm" onclick="LLMManager.loadCodexJobs()">
+                                <i class="bi bi-arrow-clockwise me-1"></i> 刷新
+                            </button>
+                        </div>
+                        <div id="codexJobsList">
+                            <div class="col-12 text-center py-5">
+                                <div class="spinner-border text-primary" role="status"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Proxy Settings Section -->
+                    <div class="tab-pane fade d-none workspace-section" id="llm-proxy">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h5 class="fw-bold text-secondary mb-0">
+                                <i class="bi bi-globe me-2"></i>HTTP 代理设置
+                            </h5>
+                        </div>
+                        <div class="row justify-content-center">
+                            <div class="col-md-7">
+                                <div class="card workspace-form-surface">
+                                    <div class="card-body p-4">
+                                        <div class="alert alert-info d-flex align-items-start gap-2" role="alert">
+                                            <i class="bi bi-info-circle-fill flex-shrink-0 mt-1"></i>
+                                            <div>
+                                                <strong>直连优先，代理兜底</strong><br>
+                                                每次 LLM 调用先直连，若遇到网络错误（连接失败/超时/SSL）则自动通过代理重试一次。<br>
+                                                格式：<code>http://host:port</code>，留空即禁用代理。
+                                            </div>
+                                        </div>
+
+                                        <div class="mb-4">
+                                            <label class="form-label fw-semibold" for="proxyUrlInput">
+                                                <i class="bi bi-link-45deg me-1"></i>代理地址
+                                            </label>
+                                            <div class="input-group">
+                                                <span class="input-group-text"><i class="bi bi-hdd-network"></i></span>
+                                                <input type="text" class="form-control" id="proxyUrlInput"
+                                                    placeholder="http://100.x.x.x:6688">
+                                                <button class="btn btn-outline-secondary" type="button"
+                                                    onclick="document.getElementById('proxyUrlInput').value=''"
+                                                    title="清空">
+                                                    <i class="bi bi-x-lg"></i>
+                                                </button>
+                                            </div>
+                                            <div class="form-text">留空则禁用代理，直连所有 LLM 请求。</div>
+                                        </div>
+
+                                        <div class="d-flex align-items-center gap-3 flex-wrap">
+                                            <button class="btn btn-primary" onclick="LLMManager.saveProxy()">
+                                                <i class="bi bi-check-lg me-1"></i> 保存
+                                            </button>
+                                            <button class="btn btn-outline-secondary" id="proxyTestBtn"
+                                                onclick="LLMManager.testProxy()">
+                                                <i class="bi bi-wifi me-1"></i> 测试连接
+                                            </button>
+                                            <span id="proxyStatusBadge"
+                                                class="badge rounded-pill fs-6 bg-secondary">正在加载…</span>
+                                        </div>
+
+                                        <!-- 测试 URL 配置（折叠） -->
+                                        <div class="mt-3">
+                                            <a class="small text-muted text-decoration-none" data-bs-toggle="collapse"
+                                                href="#proxyTestUrlCollapse">
+                                                <i class="bi bi-chevron-down me-1"></i>高级：自定义测试 URL
+                                            </a>
+                                            <div class="collapse mt-2" id="proxyTestUrlCollapse">
+                                                <input type="text" class="form-control form-control-sm"
+                                                    id="proxyTestUrlInput" value="https://api.openai.com/v1/models"
+                                                    placeholder="https://api.openai.com/v1/models">
+                                                <div class="form-text">填入要测试可达性的目标 URL（HTTP 2xx-4xx 均视为网络通）</div>
+                                            </div>
+                                        </div>
+
+                                        <!-- 测试结果 -->
+                                        <div id="proxyTestResult" class="mt-3" style="display:none;"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- Tab: Settings -->
+            <div id="settings" class="tab-content d-none workspace-page">
+                <div class="d-flex justify-content-center align-items-center h-100">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">正在加载…</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Logs -->
+            <div id="logs" class="tab-content d-none workspace-page">
+                <div class="logs-container d-flex flex-column">
+                    <!-- Toolbar -->
+                    <div class="logs-toolbar">
+                        <div class="logs-toolbar-left">
+                            <div class="btn-group btn-group-sm logs-source-switch">
+                                <button class="btn btn-sm logs-type-btn active" data-log-type="app"
+                                    onclick="App.loadLogs('app')">App</button>
+                                <button class="btn btn-sm logs-type-btn" data-log-type="wx_bot"
+                                    onclick="App.loadLogs('wx_bot')">WxBot</button>
+                            </div>
+                            <div class="input-group input-group-sm logs-plugin-group">
+                                <span class="input-group-text"><i class="bi bi-funnel"></i></span>
+                                <select class="form-select form-select-sm" id="logPluginFilter">
+                                    <option value="">全部插件</option>
+                                </select>
+                            </div>
+                            <div class="input-group input-group-sm logs-search-group">
+                                <span class="input-group-text"><i class="bi bi-search"></i></span>
+                                <input type="text" class="form-control form-control-sm" id="logSearchInput"
+                                    placeholder="在当前日志中查找…" autocomplete="off">
+                                <span class="input-group-text logs-search-position" id="logSearchPosition" aria-live="polite">0/0</span>
+                                <button class="btn btn-sm btn-outline-secondary" id="logSearchPrevious"
+                                    onclick="App.navigateLogSearch(-1)" title="上一个结果（Shift+Enter）" disabled>
+                                    <i class="bi bi-chevron-up"></i>
+                                </button>
+                                <button class="btn btn-sm btn-outline-secondary" id="logSearchNext"
+                                    onclick="App.navigateLogSearch(1)" title="下一个结果（Enter）" disabled>
+                                    <i class="bi bi-chevron-down"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="logs-toolbar-right">
+                            <div class="input-group input-group-sm logs-lines-group" title="加载的最近日志行数">
+                                <span class="input-group-text"><i class="bi bi-list-ol"></i></span>
+                                <select class="form-select form-select-sm" id="logLinesSelect" aria-label="加载日志行数">
+                                    <option value="200">200 行</option>
+                                    <option value="500" selected>500 行</option>
+                                    <option value="1000">1000 行</option>
+                                    <option value="2000">2000 行</option>
+                                </select>
+                            </div>
+                            <button class="btn btn-sm btn-outline-secondary" id="logFollowBtn"
+                                onclick="App.toggleLogFollow()" title="自动跟踪最新日志">
+                                <i class="bi bi-arrow-down-circle"></i> 跟随
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary" onclick="App.loadLogs()" title="刷新">
+                                <i class="bi bi-arrow-clockwise"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Log Content -->
+                    <div id="logContent" class="logs-body">
+                        <div class="logs-placeholder">
+                            <i class="bi bi-terminal"></i>
+                            <span>加载日志中…</span>
+                        </div>
+                    </div>
+
+                    <!-- Status Bar -->
+                    <div class="logs-statusbar">
+                        <span id="logStatusInfo">就绪</span>
+                        <span class="logs-status-right">
+                            <span id="logAutoRefreshBadge" class="badge bg-secondary-subtle text-secondary d-none">
+                                <i class="bi bi-arrow-repeat"></i> <span id="logRefreshCountdown"></span>
+                            </span>
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- Configuration Modal -->
+    <div class="modal fade" id="configModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="configModalTitle">设置</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="configModalBody">
+                    <!-- Dynamic Form -->
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" id="configModalSaveBtn">保存更改</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chat Memory Library Pro-Console Modal -->
+    <div class="modal fade" id="memoryLibraryModal" tabindex="-1" aria-labelledby="memoryLibraryModalTitle"
+        aria-hidden="true">
+        <div class="modal-dialog modal-fullscreen">
+            <div class="modal-content bg-body-tertiary">
+                <div class="modal-header border-bottom py-2 px-4 bg-body">
+                    <div class="memory-library-heading">
+                        <h5 class="modal-title fw-bold m-0 d-flex align-items-center" id="memoryLibraryModalTitle">
+                            <span class="d-inline-flex align-items-center justify-content-center bg-primary-subtle text-primary rounded-3 me-2" style="width:34px; height:34px;">
+                                <i class="bi bi-database-gear"></i>
+                            </span>
+                            记忆库
+                        </h5>
+                        <div class="dropdown memory-user-switcher">
+                            <button class="memory-user-switcher-toggle" type="button" id="memoryLibraryUserSwitcher"
+                                data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false">
+                                <span class="memory-user-switcher-icon"><i class="bi bi-person-circle"></i></span>
+                                <span class="memory-user-switcher-copy">
+                                    <small>当前记忆库</small>
+                                    <strong id="memoryLibraryChatName">选择用户</strong>
+                                </span>
+                                <i class="bi bi-chevron-down memory-user-switcher-chevron"></i>
+                            </button>
+                            <div class="dropdown-menu memory-user-switcher-menu" aria-labelledby="memoryLibraryUserSwitcher">
+                                <div class="memory-user-switcher-search">
+                                    <i class="bi bi-search"></i>
+                                    <input type="search" id="memoryLibraryUserQuery" autocomplete="off"
+                                        placeholder="搜索用户或群聊" aria-label="搜索用户或群聊"
+                                        oninput="App.filterMemoryLibraryUsers()">
+                                </div>
+                                <div class="memory-user-switcher-options" id="memoryLibraryUserOptions"></div>
+                                <div class="memory-user-switcher-empty d-none" id="memoryLibraryUserEmpty">
+                                    没有匹配的用户
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+                </div>
+
+                <div class="modal-body p-3">
+                    <div id="memoryLibrarySummary" class="mb-3"></div>
+
+                    <div class="memory-workbench-root">
+
+                        <aside class="memory-sidebar-left">
+                            <div class="memory-sidebar-top">
+                                <div class="nav-title">分类</div>
+                                <div class="memory-nav-list">
+                                    <button class="memory-nav-btn active" data-bs-target="#memoryLibraryOverviewPane" type="button"
+                                        onclick="App.switchMemoryTab(this, '#memoryLibraryOverviewPane')">
+                                        <span><i class="bi bi-speedometer2"></i>概览</span>
+                                    </button>
+                                    <button class="memory-nav-btn" data-bs-target="#memoryLibraryEventsPane" type="button"
+                                        onclick="App.switchMemoryTab(this, '#memoryLibraryEventsPane')">
+                                        <span><i class="bi bi-clock-history"></i>记忆</span>
+                                        <span class="memory-nav-badge" id="memoryLibraryEventCount">0</span>
+                                    </button>
+                                    <button class="memory-nav-btn" data-bs-target="#memoryLibraryPeoplePane" type="button"
+                                        onclick="App.switchMemoryTab(this, '#memoryLibraryPeoplePane')">
+                                        <span><i class="bi bi-person-lines-fill"></i>人物</span>
+                                        <span class="memory-nav-badge" id="memoryLibraryPeopleCount">0</span>
+                                    </button>
+                                    <button class="memory-nav-btn" data-bs-target="#memoryLibraryReviewsPane" type="button"
+                                        onclick="App.switchMemoryTab(this, '#memoryLibraryReviewsPane')">
+                                        <span><i class="bi bi-shield-exclamation"></i>待复核</span>
+                                        <span class="memory-nav-badge" id="memoryLibraryReviewCount">0</span>
+                                    </button>
+                                    <button class="memory-nav-btn" data-bs-target="#memoryLibraryChangesPane" type="button"
+                                        onclick="App.switchMemoryTab(this, '#memoryLibraryChangesPane')">
+                                        <span><i class="bi bi-journal-check"></i>变更记录</span>
+                                    </button>
+                                    <button class="memory-nav-btn" data-bs-target="#memoryLibraryMaintenancePane" type="button"
+                                        onclick="App.switchMemoryTab(this, '#memoryLibraryMaintenancePane')">
+                                        <span><i class="bi bi-tools"></i>维护</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </aside>
+
+                        <main class="memory-main-feed">
+                            <div class="mem-pane" id="memoryLibraryOverviewPane" style="display:flex; flex-direction:column;">
+                                <div class="mem-feed-body" id="memoryLibraryOverviewContent"></div>
+                            </div>
+
+                            <div class="mem-pane" id="memoryLibraryEventsPane" style="display:none; flex-direction:column;">
+                                <div class="mem-feed-header">
+                                    <div class="mem-feed-controls">
+                                        <div class="mem-feed-search">
+                                            <i class="bi bi-search"></i>
+                                            <input id="memoryLibraryQuery" placeholder="搜索标题、摘要、参与者或关键词"
+                                                onkeydown="if(event.key === 'Enter'){ event.preventDefault(); App.searchMemoryLibraryEvents(); }">
+                                        </div>
+                                        <select class="mem-feed-select" id="memoryLibraryStatus" onchange="App.searchMemoryLibraryEvents()">
+                                            <option value="all">全部版本</option>
+                                            <option value="active">当前有效</option>
+                                            <option value="quarantined">待人工复核（已隔离）</option>
+                                            <option value="superseded">已被替代</option>
+                                            <option value="invalidated">已作废</option>
+                                        </select>
+                                        <div class="d-inline-flex align-items-center gap-1 small text-muted">
+                                            <span>从</span>
+                                            <input type="date" class="form-control form-control-sm px-1 py-1 text-center" id="memoryLibraryDateFrom" style="width:120px;" onchange="App.searchMemoryLibraryEvents()">
+                                            <span>到</span>
+                                            <input type="date" class="form-control form-control-sm px-1 py-1 text-center" id="memoryLibraryDateTo" style="width:120px;" onchange="App.searchMemoryLibraryEvents()">
+                                        </div>
+                                        <button class="btn btn-sm btn-primary px-3 fw-medium" type="button" onclick="App.searchMemoryLibraryEvents()">
+                                            <i class="bi bi-search me-1"></i>搜索
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="px-4 pt-2 small text-muted" id="memoryLibraryEventStatus"></div>
+                                <div class="mem-feed-body" id="memoryLibraryEventList"></div>
+                                <div class="d-flex justify-content-between align-items-center px-4 py-2 bg-body border-top" id="memoryLibraryPagination"></div>
+                            </div>
+
+                            <div class="mem-pane" id="memoryLibraryPeoplePane" style="display:none; flex-direction:column;">
+                                <div class="mem-feed-header">
+                                    <div class="mem-feed-search" style="max-width:360px;">
+                                        <i class="bi bi-person-bounding-box"></i>
+                                        <input id="memoryLibraryPeopleQuery" placeholder="筛选人物姓名或资料"
+                                            onkeydown="if(event.key === 'Enter'){ event.preventDefault(); App.searchMemoryLibraryPeople(); }">
+                                    </div>
+                                    <button class="btn btn-sm btn-primary" type="button" onclick="App.searchMemoryLibraryPeople()">
+                                        <i class="bi bi-search me-1"></i>搜索
+                                    </button>
+                                </div>
+                                <div class="mem-feed-body" id="memoryLibraryPeopleList"></div>
+                                <div class="d-flex justify-content-between align-items-center px-4 py-2 bg-body border-top" id="memoryLibraryPeoplePagination"></div>
+                            </div>
+
+                            <div class="mem-pane" id="memoryLibraryReviewsPane" style="display:none; flex-direction:column;">
+                                <div class="mem-feed-body" id="memoryLibraryReviewsContent"></div>
+                                <div class="d-flex justify-content-between align-items-center px-4 py-2 bg-body border-top" id="memoryLibraryReviewsPagination"></div>
+                            </div>
+
+                            <div class="mem-pane" id="memoryLibraryChangesPane" style="display:none; flex-direction:column;">
+                                <div class="mem-feed-body" id="memoryLibraryChangesContent"></div>
+                                <div class="d-flex justify-content-between align-items-center px-4 py-2 bg-body border-top" id="memoryLibraryChangesPagination"></div>
+                            </div>
+
+                            <div class="mem-pane" id="memoryLibraryMaintenancePane" style="display:none; flex-direction:column;">
+                                <div class="mem-feed-body" id="memoryLibraryMaintenanceContent"></div>
+                            </div>
+                        </main>
+
+                        <aside class="memory-inspect-drawer" id="memoryLibraryInspectDrawer">
+                            <div class="mem-drawer-header">
+                                <div class="mem-drawer-header-title" id="memDrawerTitle">
+                                    <i class="bi bi-layout-sidebar-inset-reverse"></i>详情
+                                </div>
+                                <button type="button" class="mem-drawer-close-btn" title="关闭" onclick="App.closeMemoryDrawer && App.closeMemoryDrawer()">
+                                    <i class="bi bi-x-lg"></i>
+                                </button>
+                            </div>
+                            <div class="mem-drawer-body" id="memDrawerContent">
+                                <div class="text-center text-muted py-5">
+                                    <i class="bi bi-layout-sidebar fs-2 d-block mb-2"></i>
+                                    选择一条记忆或人物资料后在这里查看详情
+                                </div>
+                            </div>
+                        </aside>
+
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Setting Modal -->
+    <div class="modal fade" id="addSettingModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-plus-circle me-2"></i>添加自定义设置</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="addSettingForm">
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">键名（变量名）<span
+                                    class="text-danger">*</span></label>
+                            <input type="text" class="form-control" id="newSettingKey"
+                                placeholder="例如 DEEPSEEK_API_KEY" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">值 <span class="text-danger">*</span></label>
+                            <input type="text" class="form-control" id="newSettingValue" placeholder="例如 sk-..."
+                                required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">分类</label>
+                            <input type="text" class="form-control" id="newSettingCategory"
+                                placeholder="例如 llm、system、default" value="default">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">说明</label>
+                            <input type="text" class="form-control" id="newSettingDescription"
+                                placeholder="可选说明">
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" onclick="UI.submitNewSetting()">添加设置</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add/Edit Model Modal -->
+    <div class="modal fade" id="addModelModal" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <div>
+                        <h5 class="modal-title" id="addModelModalTitle">添加模型</h5>
+                        <p class="modal-subtitle mb-0" id="addModelModalSubtitle">选择供应商和模型，填写 API Key 即可。</p>
+                    </div>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="addModelForm">
+                        <input type="hidden" id="modelEditMode" value="false">
+                        <input type="hidden" id="modelProviderPreset" value="openai">
+
+                        <div class="model-config-layout">
+                            <div class="model-config-main">
+                                <section class="model-form-section">
+                                    <div class="model-form-section-heading">
+                                        <span class="model-form-step">1</span>
+                                        <div>
+                                            <h6>供应商</h6>
+                                        </div>
+                                    </div>
+                                    <div class="model-provider-grid" role="list" aria-label="模型供应商">
+                                        <button type="button" class="model-provider-option active" data-model-provider="openai"
+                                            onclick="LLMManager.applyProviderPreset('openai')">
+                                            <i class="bi bi-stars"></i><span>OpenAI</span><small>官方 API</small>
+                                        </button>
+                                        <button type="button" class="model-provider-option" data-model-provider="anthropic"
+                                            onclick="LLMManager.applyProviderPreset('anthropic')">
+                                            <i class="bi bi-braces-asterisk"></i><span>Anthropic</span><small>Claude</small>
+                                        </button>
+                                        <button type="button" class="model-provider-option" data-model-provider="gemini"
+                                            onclick="LLMManager.applyProviderPreset('gemini')">
+                                            <i class="bi bi-gem"></i><span>Gemini</span><small>Google AI</small>
+                                        </button>
+                                        <button type="button" class="model-provider-option" data-model-provider="deepseek"
+                                            onclick="LLMManager.applyProviderPreset('deepseek')">
+                                            <i class="bi bi-water"></i><span>DeepSeek</span><small>官方 API</small>
+                                        </button>
+                                        <button type="button" class="model-provider-option" data-model-provider="openrouter"
+                                            onclick="LLMManager.applyProviderPreset('openrouter')">
+                                            <i class="bi bi-signpost-split"></i><span>OpenRouter</span><small>多模型网关</small>
+                                        </button>
+                                        <button type="button" class="model-provider-option" data-model-provider="local_codex"
+                                            onclick="LLMManager.applyProviderPreset('local_codex')">
+                                            <i class="bi bi-terminal"></i><span>本地 Codex</span><small>无需 API Key</small>
+                                        </button>
+                                        <button type="button" class="model-provider-option" data-model-provider="other"
+                                            onclick="LLMManager.applyProviderPreset('other')">
+                                            <i class="bi bi-grid"></i><span>其他供应商</span><small>LiteLLM 目录</small>
+                                        </button>
+                                        <button type="button" class="model-provider-option" data-model-provider="compatible"
+                                            onclick="LLMManager.applyProviderPreset('compatible')">
+                                            <i class="bi bi-hdd-network"></i><span>自定义接口</span><small>OpenAI 兼容</small>
+                                        </button>
+                                    </div>
+                                    <div class="model-provider-other d-none" id="modelOtherProviderGroup">
+                                        <label class="form-label" for="modelOtherProvider">LiteLLM 供应商</label>
+                                        <select class="form-select" id="modelOtherProvider"
+                                            onchange="LLMManager.selectOtherProvider(this.value)">
+                                            <option value="">选择供应商…</option>
+                                        </select>
+                                    </div>
+                                    <div class="model-template-row" id="modelTemplateGroup">
+                                        <label class="form-label" for="modelTemplateSelect"><i class="bi bi-copy me-1"></i>或从已有配置复制</label>
+                                        <select class="form-select form-select-sm" id="modelTemplateSelect">
+                                            <option value="">选择已有配置…</option>
+                                        </select>
+                                    </div>
+                                </section>
+
+                                <section class="model-form-section">
+                                    <div class="model-form-section-heading">
+                                        <span class="model-form-step">2</span>
+                                        <div>
+                                            <h6>模型与连接</h6>
+                                        </div>
+                                    </div>
+                                    <div class="row g-3">
+                                        <div class="col-md-5">
+                                            <label class="form-label" for="modelId">配置名称 <span class="text-danger">*</span></label>
+                                            <input type="text" class="form-control" id="modelId" placeholder="例如 main-chat"
+                                                maxlength="80" required>
+                                        </div>
+                                        <div class="col-md-7">
+                                            <label class="form-label" for="modelName">服务端模型 <span class="text-danger">*</span></label>
+                                            <div class="model-catalog-picker">
+                                                <input type="text" class="form-control" id="modelName"
+                                                    placeholder="输入或从 LiteLLM 目录选择" autocomplete="off"
+                                                    role="combobox" aria-expanded="false" aria-controls="modelCatalogMenu" required>
+                                                <button type="button" class="model-catalog-toggle" id="modelCatalogToggle"
+                                                    aria-label="展开模型目录" onclick="LLMManager.toggleModelCatalog()">
+                                                    <i class="bi bi-chevron-down"></i>
+                                                </button>
+                                                <div class="model-catalog-menu d-none" id="modelCatalogMenu" role="listbox"></div>
+                                            </div>
+                                            <div class="form-text" id="modelCatalogHint">选择供应商后加载可用模型。</div>
+                                        </div>
+                                        <div class="col-12" id="modelApiBaseGroup">
+                                            <label class="form-label" for="modelApiBase">API 地址 <span class="model-required-mark d-none" id="modelApiBaseRequired">*</span></label>
+                                            <input type="text" class="form-control" id="modelApiBase"
+                                                placeholder="https://example.com/v1">
+                                            <div class="form-text" id="modelApiBaseHelp">官方供应商通常无需填写；自定义接口必须填写完整地址。</div>
+                                        </div>
+                                    </div>
+                                </section>
+
+                                <section class="model-form-section" id="modelCredentialSection">
+                                    <div class="model-form-section-heading compact">
+                                        <span class="model-form-step">3</span>
+                                        <div>
+                                            <h6>API Key</h6>
+                                        </div>
+                                    </div>
+                                    <div class="model-credential-box">
+                                        <input type="hidden" id="modelCredentialMode" value="environment">
+                                        <input type="hidden" id="modelApiKeyEnv" value="OPENAI_API_KEY">
+                                        <div id="modelApiKeyEnvGroup" class="model-credential-field model-credential-panel">
+                                            <div class="input-group">
+                                                <input type="password" class="form-control" id="modelApiKeyEnvValue"
+                                                    placeholder="已保存可留空" autocomplete="new-password"
+                                                    oninput="LLMManager.onUnifiedCredentialInput()">
+                                                <button class="btn btn-outline-secondary" type="button"
+                                                    onclick="UI.togglePassword('modelApiKeyEnvValue')" aria-label="显示或隐藏 API Key">
+                                                    <i class="bi bi-eye"></i>
+                                                </button>
+                                            </div>
+                                            <div class="model-credential-status" id="modelSharedCredentialStatus" aria-live="polite"></div>
+                                        </div>
+                                    </div>
+                                </section>
+
+                                <details class="model-advanced-options" id="modelAdvancedOptions">
+                                    <summary><i class="bi bi-sliders me-2"></i>高级参数 <span>大多数模型保持默认即可</span></summary>
+                                    <div class="model-advanced-body">
+                                        <div class="row g-3">
+                                            <div class="col-sm-6 col-lg-4">
+                                                <label class="form-label" for="modelTemp">温度</label>
+                                                <input type="number" class="form-control" id="modelTemp" value="0.7"
+                                                    step="0.1" min="0" max="2">
+                                            </div>
+                                            <div class="col-sm-6 col-lg-4">
+                                                <label class="form-label" for="modelMaxTokens">最大输出 Token</label>
+                                                <input type="number" class="form-control" id="modelMaxTokens"
+                                                    placeholder="由模型决定" min="1" step="100">
+                                            </div>
+                                            <div class="col-sm-6 col-lg-4">
+                                                <label class="form-label" for="modelContextWindow">上下文窗口</label>
+                                                <input type="number" class="form-control" id="modelContextWindow"
+                                                    placeholder="从目录自动带入" min="1" step="1024">
+                                            </div>
+                                            <div class="col-sm-6 col-lg-4">
+                                                <label class="form-label" for="modelTimeout">超时（秒）</label>
+                                                <input type="number" class="form-control" id="modelTimeout"
+                                                    placeholder="使用系统默认" min="1" max="3600">
+                                            </div>
+                                            <div class="col-sm-6 col-lg-4">
+                                                <label class="form-label" for="modelMaxRetries">SDK 重试次数</label>
+                                                <input type="number" class="form-control" id="modelMaxRetries"
+                                                    placeholder="使用供应商默认" min="0" max="20">
+                                            </div>
+                                            <div class="col-sm-6 col-lg-4 d-none" id="modelProviderOverrideGroup">
+                                                <label class="form-label" for="modelProvider">LiteLLM 供应商标识</label>
+                                                <input type="text" class="form-control font-monospace" id="modelProvider"
+                                                    placeholder="例如 custom_openai">
+                                            </div>
+                                            <div class="col-sm-6 col-lg-4 d-none" id="modelCodexReasoningGroup">
+                                                <label class="form-label" for="modelCodexReasoning">Codex 推理强度</label>
+                                                <select class="form-select" id="modelCodexReasoning">
+                                                    <option value="medium">中</option>
+                                                    <option value="low">低</option>
+                                                    <option value="high">高</option>
+                                                    <option value="xhigh">极高</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="model-capability-options">
+                                            <label class="form-check">
+                                                <input type="checkbox" class="form-check-input" id="modelVision">
+                                                <span class="form-check-label">支持图片输入</span>
+                                            </label>
+                                            <label class="form-check">
+                                                <input type="checkbox" class="form-check-input" id="modelWebSearch">
+                                                <span class="form-check-label" id="modelWebSearchLabel">启用供应商 Web 搜索</span>
+                                            </label>
+                                            <label class="form-check d-none" id="modelCodexIsolatedGroup">
+                                                <input type="checkbox" class="form-check-input" id="modelCodexIsolated" checked>
+                                                <span class="form-check-label">使用隔离工作目录</span>
+                                            </label>
+                                        </div>
+                                        <div>
+                                            <label class="form-label" for="modelExtraBody">附加请求体（JSON）</label>
+                                            <textarea class="form-control font-monospace" id="modelExtraBody" rows="4"
+                                                placeholder='{"reasoning": {"enabled": true}}'></textarea>
+                                            <div class="form-text">仅用于供应商特有参数；必须是 JSON 对象。未知的旧配置字段在编辑时会保留。</div>
+                                        </div>
+                                    </div>
+                                </details>
+                            </div>
+
+                        </div>
+                        <div class="alert alert-danger d-none mt-3 mb-0" id="modelFormAlert" role="alert"></div>
+                    </form>
+                </div>
+                <div class="modal-footer model-modal-footer">
+                    <span class="model-catalog-source"><i class="bi bi-database me-1"></i>模型目录：本机 LiteLLM</span>
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                        <button type="button" class="btn btn-outline-primary" id="saveModelButton"
+                            onclick="LLMManager.saveModel()">保存</button>
+                        <button type="button" class="btn btn-primary" id="saveAndTestModelButton"
+                            onclick="LLMManager.saveModel({testAfterSave: true})">
+                            <i class="bi bi-lightning-charge me-1"></i>保存并测试
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Plugin Prompts Modal -->
+    <div class="modal fade" id="pluginPromptsModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="pluginPromptsModalTitle">管理提示词</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="pluginPromptsModalBody">
+                    <!-- Prompts will be loaded here -->
+                    <div class="text-center py-5">
+                        <div class="spinner-border text-primary" role="status"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Mapping Modal -->
+    <div class="modal fade" id="editMappingModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="editMappingModalTitle">配置模型路由</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="editMappingForm">
+                        <input type="hidden" id="mappingPluginName">
+                        <input type="hidden" id="mappingCallType">
+
+                        <div class="mb-3">
+                            <label class="form-label">任务</label>
+                            <input type="text" class="form-control" id="mappingFullName" readonly disabled>
+                            <div class="form-text">内部标识：<code id="mappingInternalName"></code></div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">主模型 <span class="text-danger">*</span></label>
+                            <select class="form-select" id="mappingPrimary" required>
+                                <option value="">选择模型…</option>
+                            </select>
+                            <div class="form-text">正常情况下优先使用的模型连接。</div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">备用模型（可选）</label>
+                            <select class="form-select" id="mappingFallback">
+                                <option value="">无（不使用备用模型）</option>
+                            </select>
+                            <div class="form-text">主模型调用失败后自动尝试；不需要容错时可以留空。</div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">覆盖参数（可选）</label>
+                            <div class="mb-2">
+                                <label class="form-label small">温度</label>
+                                <input type="number" class="form-control form-control-sm" id="mappingOverrideTemp"
+                                    step="0.1" min="0" max="2" placeholder="留空则使用模型配置">
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label small">最大 Token 数</label>
+                                <input type="number" class="form-control form-control-sm" id="mappingOverrideMaxTokens"
+                                    step="100" placeholder="留空则使用模型配置">
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label small">超时（秒）</label>
+                                <input type="number" class="form-control form-control-sm" id="mappingOverrideTimeout"
+                                    step="1" min="1" placeholder="留空则使用模型配置">
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label small">附加参数（JSON）</label>
+                                <textarea class="form-control form-control-sm font-monospace" id="mappingOverrideExtra"
+                                    rows="3" placeholder='{"response_format": {"type": "json_object"}}'></textarea>
+                            </div>
+                            <div class="form-text">字段留空时使用所选模型的配置。</div>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" onclick="LLMManager.saveMappingEdit()">保存映射</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+    <!-- App Scripts -->
+    <script src="/static/assets/js/api.js?v=3.4.1"></script>
+    <script src="/static/assets/js/ui.js?v=3.3.10"></script>
+    <script src="/static/assets/js/llm_manager.js?v=3.2.6"></script>
+    <script src="/static/assets/js/main.js?v=3.5.6"></script>
+    <script src="/static/assets/js/memory_console.js?v=1.0.1"></script>
+
+    <!-- ==================== Judge History Modal ==================== -->
+    <div class="modal fade" id="judgeHistoryModal" tabindex="-1" aria-labelledby="judgeHistoryModalLabel"
+        aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="judgeHistoryModalLabel">
+                        <i class="bi bi-clock-history me-2"></i>
+                        Judge 判断历史
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="modalJudgeHistoryContent"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+
+</html>

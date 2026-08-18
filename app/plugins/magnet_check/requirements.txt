@@ -1,0 +1,2 @@
+NudeNet>=3.4,<4
+Pillow>=10

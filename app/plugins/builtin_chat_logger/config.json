@@ -1,0 +1,41 @@
+{
+  "name": "builtin_chat_logger",
+  "display_name": "聊天记录",
+  "version": "1.0.0",
+  "description": "无差别记录所有聊天消息，支持文本、图片、链接和引用消息",
+  "author": "Project Contributors",
+  "category": "utility",
+  "requires": [],
+  "config_schema": {
+    "log_message_types": {
+      "type": "array",
+      "description": "记录的消息类型",
+      "default": [
+        "text",
+        "image",
+        "link",
+        "quote"
+      ]
+    },
+    "max_log_size_mb": {
+      "type": "integer",
+      "description": "单个聊天记录文件最大大小（MB）",
+      "default": 100
+    },
+    "max_log_days": {
+      "type": "integer",
+      "description": "聊天记录保留天数",
+      "default": 7
+    }
+  },
+  "config": {
+    "log_message_types": [
+      "text",
+      "image",
+      "link",
+      "quote"
+    ],
+    "max_log_size_mb": 100,
+    "max_log_days": 7
+  }
+}

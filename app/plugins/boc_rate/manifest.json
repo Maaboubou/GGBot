@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "listeners": [
+    {
+      "event": "text_message_received",
+      "handler": "handle_text",
+      "title": "汇率查询",
+      "trigger": {
+        "kind": "keyword",
+        "summary": "包含配置关键词或任一已知币种别名",
+        "config_keys": ["trigger_keywords"],
+        "conditions": ["币种别名由插件内置映射提供"]
+      },
+      "scope": {"level": "global", "chat_types": ["group", "user"]},
+      "propagation": "stop_on_consumed"
+    }
+  ],
+  "jobs": [
+    {
+      "id": "daily_rate_alert",
+      "title": "每日汇率异动提醒",
+      "trigger": {
+        "kind": "schedule",
+        "summary": "每天在配置时间检查欧元汇率异动",
+        "config_keys": ["DAILY_PUSH_TIME"],
+        "conditions": ["达到异动阈值时才推送"]
+      },
+      "scope": {"level": "global", "chat_types": ["group", "user"]}
+    }
+  ]
+}

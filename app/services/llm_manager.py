@@ -1,0 +1,2739 @@
+"""
+统一大模型管理服务 - 基于 LiteLLM
+支持 OpenAI、Gemini、DeepSeek 等 100+ 模型
+"""
+
+import asyncio
+import copy
+import litellm
+import json
+import logging
+import os
+import ssl
+import time
+import threading
+from typing import List, Dict, Optional, Any
+from pathlib import Path
+from datetime import datetime
+
+try:
+    import httpx as _httpx
+except ImportError:
+    _httpx = None
+
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
+
+from app.services.config_service import get_setting
+
+logger = logging.getLogger(__name__)
+
+# 全局锁：防止并发调用同时修改 HTTP_PROXY / HTTPS_PROXY 环境变量
+_proxy_env_lock = threading.Lock()
+
+# Google-only 工具名称集合（只有 gemini/ 直连才支持）
+_GOOGLE_ONLY_TOOLS: frozenset = frozenset({"google_search", "google_search_retrieval"})
+
+# Some OpenAI-compatible gateways return provider errors as normal assistant
+# content. Treat these short, known error payloads as failed calls so fallback
+# models can be tried.
+_RETRIABLE_CONTENT_FAILURE_MARKERS: tuple[str, ...] = (
+    "this model is overloaded right now",
+    "model is overloaded",
+    "please try again shortly or pick a different model",
+)
+
+
+def _is_google_only_tool(tool: dict) -> bool:
+    """判断一个 tool dict 是否是 Google 专属工具。"""
+    return isinstance(tool, dict) and bool(set(tool.keys()) & _GOOGLE_ONLY_TOOLS)
+
+
+class LLMManager:
+    """统一大模型管理服务"""
+    
+    def __init__(
+        self,
+        config_dir: str = "data",
+        telemetry_dir: Optional[str | Path] = None,
+    ):
+        self.config_dir = Path(config_dir)
+        self.models_path = self.config_dir / "llm_models.json"
+        self.mappings_path = self.config_dir / "llm_mappings.json"
+        self.legacy_config_path = self.config_dir / "llm_config.json"
+
+        telemetry_root = (
+            Path(telemetry_dir)
+            if telemetry_dir is not None
+            else Path("data")
+        )
+        self.stats_path = telemetry_root / "llm_stats.json"
+        self.daily_stats_path = telemetry_root / "llm_daily_stats.json"
+        self.call_history_path = telemetry_root / "llm_call_history.jsonl"
+        self.cache_diagnostics_path = (
+            telemetry_root / "llm_chat_cache_diagnostics.jsonl"
+        )
+        self.config = {"models": {}, "plugin_mappings": {}}
+        self.session_stats = {}
+        self.total_stats = {}
+        self.daily_stats = {}
+        self.call_history = {}  # key: "plugin.call_type" -> list[dict], 每key最多10条
+        self._call_history_lock = threading.RLock()
+        self._stats_lock = threading.RLock()
+        self._config_lock = threading.RLock()
+        self._last_models_mtime = None
+        self._last_mappings_mtime = None
+        self.last_used_model: Optional[str] = None  # 最近一次成功调用实际使用的模型名
+        self._proxy_cache: Optional[str] = None      # 缓存的代理 URL，避免每次 call 都读 DB
+        self._proxy_cache_dirty: bool = True          # True = 需要重新读 DB
+
+        self.load_config()
+        self.load_stats()
+        self.load_daily_stats()
+        self.load_call_history()
+
+        litellm.set_verbose = False
+        # fallback 到不支持某些参数的模型时，自动丢弃不支持的参数
+        litellm.drop_params = True
+
+        litellm.success_callback = [self._log_success]
+        litellm.failure_callback = [self._log_failure]
+
+        logger.info("✅ LLM Manager 初始化成功")
+        self.apply_proxy_env_vars()
+
+    # ─────────────────────────── 代理管理 ───────────────────────────
+
+    def apply_proxy_env_vars(self):
+        """
+        将代理配置写入 os.environ 并同步更新 litellm 的 aiohttp transport。
+
+        技术背景：litellm 默认使用 aiohttp transport（非 httpx），
+        aiohttp 不读取 HTTP_PROXY 环境变量，除非 litellm.aiohttp_trust_env=True。
+
+        性能优化：内部缓存代理 URL，若未发生变化则跳过 DB 读取和 session 重置。
+        调用时机：LLMManager 启动时 + Web UI 保存代理设置后（通过 mark_proxy_dirty()）
+        """
+        with _proxy_env_lock:
+            # 读取当前配置
+            new_proxy_url = self._get_proxy_url()
+
+            # 若缓存匹配且不是脏标记，直接返回（避免每次 call 都读 DB + 重置 session）
+            if not self._proxy_cache_dirty and new_proxy_url == self._proxy_cache:
+                return
+
+            self._proxy_cache = new_proxy_url
+            self._proxy_cache_dirty = False
+
+            proxy_vars = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                          "http_proxy", "https_proxy", "all_proxy"]
+            no_proxy_val = "localhost,127.0.0.1,::1,0.0.0.0"
+
+            if new_proxy_url:
+                for var in proxy_vars:
+                    os.environ[var] = new_proxy_url
+                os.environ["NO_PROXY"] = no_proxy_val
+                os.environ["no_proxy"] = no_proxy_val
+                os.environ["AIOHTTP_TRUST_ENV"] = "True"
+                litellm.aiohttp_trust_env = True
+                logger.info("🌐 代理已配置（地址已隐藏，NO_PROXY=%s）", no_proxy_val)
+            else:
+                for var in proxy_vars + ["NO_PROXY", "no_proxy", "AIOHTTP_TRUST_ENV"]:
+                    os.environ.pop(var, None)
+                litellm.aiohttp_trust_env = False
+                logger.info("🌐 代理已清除（直连模式，aiohttp_trust_env=False）")
+
+            # 重置 litellm 已缓存的 aiohttp ClientSession，使新 trust_env 立即生效
+            try:
+                from litellm.llms.custom_httpx.aiohttp_transport import LiteLLMAiohttpTransport
+                LiteLLMAiohttpTransport._shared_session = None
+                logger.debug("🔄 已重置 litellm aiohttp shared session")
+            except Exception:
+                pass
+
+    def mark_proxy_dirty(self):
+        """标记代理配置已变更，下次 call 时重新应用。供 Web UI 保存代理后调用。"""
+        self._proxy_cache_dirty = True
+
+    # ───────────────────────── 配置热更新 ─────────────────────────
+
+    def _check_and_reload_if_modified(self):
+        """检查配置文件是否被修改，如果是则自动重新加载"""
+        try:
+            modified = False
+            # 检查模型配置
+            if self.models_path.exists():
+                mtime = self.models_path.stat().st_mtime
+                if self._last_models_mtime is None or mtime > self._last_models_mtime:
+                    modified = True
+            
+            # 检查映射配置 
+            if self.mappings_path.exists():
+                mtime = self.mappings_path.stat().st_mtime
+                if self._last_mappings_mtime is None or mtime > self._last_mappings_mtime:
+                    modified = True
+
+            if modified:
+                logger.info("🔄 检测到配置文件变化，自动重新加载")
+                self.load_config()
+                logger.info("✅ 配置已自动热更新")
+        except Exception as e:
+            logger.error(f"❌ 检查配置文件修改时出错: {e}")
+
+    def load_config(self):
+        """Load both config files under the same lock used by atomic saves."""
+        with self._config_lock:
+            self._load_config_unlocked()
+
+    def _load_config_unlocked(self):
+        """加载配置文件（支持分离后的文件与旧版迁移）"""
+        migration_needed = False
+
+        # 1. 尝试加载新版模型配置
+        if self.models_path.exists():
+            with open(self.models_path, 'r', encoding='utf-8') as f:
+                self.config["models"] = json.load(f)
+            self._last_models_mtime = self.models_path.stat().st_mtime
+
+        # 2. 尝试加载新版映射配置
+        if self.mappings_path.exists():
+            with open(self.mappings_path, 'r', encoding='utf-8') as f:
+                self.config["plugin_mappings"] = json.load(f)
+            self._last_mappings_mtime = self.mappings_path.stat().st_mtime
+
+        # 3. 迁移逻辑：如果新文件不存在但旧文件存在
+        if (not self.models_path.exists() or not self.mappings_path.exists()) and self.legacy_config_path.exists():
+            logger.info(f"🚚 发现旧版配置文件 {self.legacy_config_path}，正在执行自动迁移...")
+            try:
+                with open(self.legacy_config_path, 'r', encoding='utf-8') as f:
+                    legacy_data = json.load(f)
+
+                if not self.models_path.exists() and "models" in legacy_data:
+                    self.config["models"] = legacy_data["models"]
+                if not self.mappings_path.exists() and "plugin_mappings" in legacy_data:
+                    self.config["plugin_mappings"] = legacy_data["plugin_mappings"]
+                
+                migration_needed = True
+            except Exception as e:
+                logger.error(f"❌ 迁移旧版配置失败: {e}")
+
+        # 4. 公开版首次启动保持空模型列表，由用户在 Web 控制台自行添加。
+        if not self.config.get("models") and not self.config.get("plugin_mappings"):
+            logger.info("📄 未找到模型配置，初始化为空配置")
+            self.config["models"] = {}
+            self.config["plugin_mappings"] = {}
+            migration_needed = True
+
+        # 没有模型时不写入任何预设模型 ID 或任务映射，避免制造无效配置。
+        if not self.config.get("models"):
+            if migration_needed:
+                self.save_config()
+            logger.info(
+                "📄 配置加载完成: models=0, mappings=%s",
+                len(self.config.get("plugin_mappings", {})),
+            )
+            return
+
+        legacy_defaults_enabled = str(
+            os.getenv("LLM_ENABLE_LEGACY_DEFAULT_MAPPINGS", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not legacy_defaults_enabled:
+            logger.info(
+                "📄 配置加载完成: models=%s, mappings=%s（未注入预设映射）",
+                len(self.config.get("models", {})),
+                len(self.config.get("plugin_mappings", {})),
+            )
+            return
+
+        # 自动补全可能缺失的配置项。
+        modified = False
+        chatbot_mappings = self.config.setdefault("plugin_mappings", {}).setdefault(
+            "builtin_chatbot",
+            {},
+        )
+        if "ocr" not in chatbot_mappings:
+            chatbot_mappings["ocr"] = {
+                "primary": "gpt4",
+                "fallback": ["gemini-flash"],
+                "override_params": {},
+            }
+            modified = True
+
+        if (
+            "followup_judge" not in chatbot_mappings
+            and "deepseek" in self.config.get("models", {})
+            and "deepseek-followup" not in self.config.get("models", {})
+        ):
+            followup_model = copy.deepcopy(self.config["models"]["deepseek"])
+            followup_model["temperature"] = 0.1
+            followup_model["max_tokens"] = 200
+            followup_model["timeout"] = 15
+            followup_model["extra_body"] = {
+                "thinking": {"type": "disabled"},
+            }
+            followup_model["enable_web_search"] = False
+            self.config["models"]["deepseek-followup"] = followup_model
+            modified = True
+
+        if "followup_judge" not in chatbot_mappings:
+            regular_judge = chatbot_mappings.get("judge") or {}
+            regular_primary = str(regular_judge.get("primary") or "").strip()
+            preferred_primary = (
+                "deepseek-followup"
+                if "deepseek-followup" in self.config.get("models", {})
+                else regular_primary or "gemini-flash"
+            )
+            fallback = []
+            if regular_primary and regular_primary != preferred_primary:
+                fallback.append(regular_primary)
+            chatbot_mappings["followup_judge"] = {
+                "primary": preferred_primary,
+                "fallback": fallback,
+                "override_params": {
+                    "temperature": 0.1,
+                    "max_tokens": 200,
+                    "timeout": 15,
+                    "response_format": {"type": "json_object"},
+                },
+            }
+            modified = True
+
+        # Event memory has independent mappings. Article-summary model choices
+        # are only a sensible first-install default, never a runtime coupling.
+        article_summary_mapping = (
+            self.config.get("plugin_mappings", {})
+            .get("summary_plus", {})
+            .get("summary", {})
+        )
+        default_memory_primary = (
+            article_summary_mapping.get("primary")
+            or "gemini-flash"
+        )
+        default_memory_fallback = list(
+            article_summary_mapping.get("fallback")
+            or ["deepseek"]
+        )
+        preferred_memory_primary = (
+            "codex-memory"
+            if "codex-memory" in self.config.get("models", {})
+            else default_memory_primary
+        )
+        preferred_memory_high = (
+            "codex-memory-high"
+            if "codex-memory-high" in self.config.get("models", {})
+            else preferred_memory_primary
+        )
+        preferred_memory_fallback = (
+            ["deepseek"]
+            if (
+                preferred_memory_primary == "codex-memory"
+                and "deepseek" in self.config.get("models", {})
+            )
+            else list(default_memory_fallback)
+        )
+        memory_dedup_primary = (
+            "deepseek-followup"
+            if "deepseek-followup" in self.config.get("models", {})
+            else default_memory_primary
+        )
+        memory_dedup_fallback = (
+            [default_memory_primary]
+            if default_memory_primary != memory_dedup_primary
+            else list(default_memory_fallback)
+        )
+        memory_defaults = {
+            "memory_event": {
+                "primary": preferred_memory_primary,
+                "fallback": preferred_memory_fallback,
+                "override_params": {
+                    "temperature": 0.2,
+                    "max_tokens": 4000,
+                    "timeout": 120,
+                    "response_format": {"type": "json_object"},
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                },
+            },
+            "memory_dedup": {
+                "primary": memory_dedup_primary,
+                "fallback": memory_dedup_fallback,
+                "override_params": {
+                    "temperature": 0.0,
+                    "max_tokens": 1000,
+                    "timeout": 45,
+                    "response_format": {"type": "json_object"},
+                },
+            },
+            "memory_verify": {
+                "primary": memory_dedup_primary,
+                "fallback": memory_dedup_fallback,
+                "override_params": {
+                    "temperature": 0.0,
+                    "max_tokens": 2000,
+                    "timeout": 60,
+                    "response_format": {"type": "json_object"},
+                },
+            },
+            "memory_stage": {
+                "primary": preferred_memory_primary,
+                "fallback": list(preferred_memory_fallback),
+                "override_params": {
+                    "temperature": 0.2,
+                    "max_tokens": 4000,
+                    "timeout": 180,
+                    "response_format": {"type": "json_object"},
+                },
+            },
+            "memory_person_observe": {
+                "primary": preferred_memory_primary,
+                "fallback": list(preferred_memory_fallback),
+                "override_params": {
+                    "temperature": 0.0,
+                    "max_tokens": 8000,
+                    "timeout": 180,
+                    "response_format": {"type": "json_object"},
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                },
+            },
+            "memory_person_period": {
+                "primary": preferred_memory_high,
+                "fallback": list(preferred_memory_fallback),
+                "override_params": {
+                    "temperature": 0.1,
+                    "max_tokens": 5000,
+                    "timeout": 180,
+                    "response_format": {"type": "json_object"},
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                },
+            },
+            "memory_person_consolidate": {
+                "primary": preferred_memory_high,
+                "fallback": list(preferred_memory_fallback),
+                "override_params": {
+                    "temperature": 0.1,
+                    "max_tokens": 7000,
+                    "timeout": 240,
+                    "response_format": {"type": "json_object"},
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                },
+            },
+        }
+        for call_type, mapping in memory_defaults.items():
+            if call_type not in chatbot_mappings:
+                chatbot_mappings[call_type] = mapping
+                modified = True
+            current = chatbot_mappings[call_type]
+            primary = str(current.get("primary") or "").strip()
+            fallback = []
+            for model_id in current.get("fallback") or []:
+                normalized = str(model_id or "").strip()
+                if normalized and normalized != primary and normalized not in fallback:
+                    fallback.append(normalized)
+            if fallback != list(current.get("fallback") or []):
+                current["fallback"] = fallback
+                modified = True
+            overrides = current.setdefault("override_params", {})
+            if "response_format" not in overrides:
+                overrides["response_format"] = {"type": "json_object"}
+                modified = True
+
+        if "summary_plus" in self.config.get("plugin_mappings", {}):
+            summary_mappings = self.config["plugin_mappings"]["summary_plus"]
+            if "bilibili_mindmap" not in summary_mappings:
+                summary_mappings["bilibili_mindmap"] = {
+                    "primary": "gpt-5.2",
+                    "fallback": ["OPENROUTER-DS"],
+                    "override_params": {},
+                }
+                modified = True
+
+        if migration_needed or modified:
+            self.save_config()
+
+        logger.info(
+            "📄 配置加载完成: models=%s, mappings=%s",
+            len(self.config.get("models", {})),
+            len(self.config.get("plugin_mappings", {})),
+        )
+
+    def save_config(self):
+        """保存配置文件（分两个文件保存）"""
+        with self._config_lock:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            models = copy.deepcopy(self.config.get("models", {}))
+            mappings = copy.deepcopy(self.config.get("plugin_mappings", {}))
+
+            def atomic_write(path: Path, payload: Dict[str, Any]) -> None:
+                temp_path = path.with_name(
+                    f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                try:
+                    with open(temp_path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, indent=2, ensure_ascii=False)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(temp_path, path)
+                finally:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            atomic_write(self.models_path, models)
+            atomic_write(self.mappings_path, mappings)
+            self._last_models_mtime = self.models_path.stat().st_mtime
+            self._last_mappings_mtime = self.mappings_path.stat().st_mtime
+            
+        logger.info(f"💾 配置已保存到 {self.models_path} 和 {self.mappings_path}")
+
+    def get_model_name(self, plugin_name: str, call_type: str) -> str:
+        """获取指定插件和调用类型对应的主模型名称"""
+        try:
+            mapping = self._get_mapping(plugin_name, call_type)
+            if not mapping:
+                return "Unknown"
+            primary_id = mapping.get("primary")
+            if not primary_id:
+                return "Unknown"
+            model_config = self.config.get("models", {}).get(primary_id)
+            if not model_config:
+                return "Unknown"
+            return model_config.get("model", "Unknown")
+        except Exception:
+            return "Unknown"
+
+    def is_local_codex_call(
+        self,
+        plugin_name: str,
+        call_type: str,
+    ) -> bool:
+        """Return whether the configured primary model uses local Codex."""
+        self._check_and_reload_if_modified()
+        mapping = self._get_mapping(plugin_name, call_type)
+        if not mapping:
+            return False
+        model_id = str(mapping.get("primary") or "").strip()
+        model_config = self.config.get("models", {}).get(model_id)
+        return bool(model_config and self._is_local_codex_model(model_config))
+
+    def count_rendered_prompt_tokens(
+        self,
+        plugin_name: str,
+        call_type: str,
+        messages: List[Dict],
+        *,
+        input_image_count: int = 0,
+    ) -> Optional[int]:
+        """Count the primary local-Codex prompt with its real text renderer.
+
+        Other providers use different chat serialization and tokenizers, so
+        callers receive ``None`` and can retain their provider-specific or
+        conservative fallback behavior.
+        """
+        self._check_and_reload_if_modified()
+        mapping = self._get_mapping(plugin_name, call_type)
+        if not mapping:
+            return None
+
+        primary_model_id = mapping.get("primary")
+        model_config = self.config.get("models", {}).get(primary_model_id)
+        if not model_config or not self._is_local_codex_model(model_config):
+            return None
+
+        primary_params = self._build_single_model_params(
+            model_cfg=model_config,
+            messages=messages,
+            caller_tools=None,
+            extra_kwargs=dict(mapping.get("override_params") or {}),
+        )
+        extra_body = primary_params.get("extra_body") or {}
+        web_search_value = primary_params.get(
+            "codex_web_search",
+            primary_params.get(
+                "web_search",
+                extra_body.get("codex_web_search", extra_body.get("web_search")),
+            ),
+        )
+        if isinstance(web_search_value, str):
+            native_web_search_enabled = web_search_value.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            native_web_search_enabled = bool(web_search_value)
+
+        from app.services.codex_proxy.client import count_codex_prompt_tokens
+
+        token_count = count_codex_prompt_tokens(
+            messages,
+            native_web_search_enabled=native_web_search_enabled,
+            input_image_count=input_image_count,
+        )
+        return token_count or None
+
+    # ─────────────────────── 核心参数构建 ────────────────────────
+
+    def _build_single_model_params(
+        self,
+        model_cfg: dict,
+        messages: List[Dict],
+        caller_tools: Optional[List] = None,
+        extra_kwargs: Optional[dict] = None,
+    ) -> dict:
+        """
+        为**单个模型**干净地构建完整的 litellm.completion() 参数字典。
+
+        设计原则：
+        - 不修改任何输入参数（纯函数）
+        - 不依赖外部可变状态（除 self.config）
+        - 所有工具过滤逻辑集中在此处，只需维护一份
+
+        Args:
+            model_cfg:          来自 config["models"][id] 的模型配置
+            messages:           消息列表（只读引用，函数内部会 copy 处理）
+            caller_tools:       调用方传入的原始 tools 列表（如 [{"google_search": {}}]）
+            extra_kwargs:       其余透传给 litellm 的参数（不含 tools / model / messages）
+
+        Returns:
+            整洁的参数字典，可直接传给 litellm.completion(**params)
+        """
+        model_str = model_cfg["model"]
+        params: dict = {
+            "model": model_str,
+            "messages": messages,
+        }
+        params["_wxautox_supports_vision"] = bool(
+            model_cfg.get("supports_vision")
+            or model_cfg.get("vision")
+            or model_cfg.get("image_input")
+        )
+
+        # ── temperature ──
+        if "temperature" in model_cfg:
+            params["temperature"] = model_cfg["temperature"]
+
+        # ── max_tokens ──
+        if "max_tokens" in model_cfg:
+            params["max_tokens"] = model_cfg["max_tokens"]
+
+        # ── timeout ──
+        if "timeout" in model_cfg:
+            params["timeout"] = model_cfg["timeout"]
+
+        # ── 认证 ──
+        # 显式提供 api_key/api_base：若配置不存在则设为 None。
+        # 关键用途：当此模型作为 fallback 出现时，显式的 None 会阻止其继承主模型的参数（LiteLLM 默认会继承顶层参数）。
+        api_key = self._resolve_env(model_cfg.get("api_key"))
+        api_base = self._resolve_env(model_cfg.get("api_base"))
+        custom_llm_provider = self._resolve_env(
+            model_cfg.get("custom_llm_provider") or model_cfg.get("provider")
+        )
+        params["api_key"] = api_key if api_key else None
+        params["api_base"] = api_base if api_base else None
+        params["custom_llm_provider"] = custom_llm_provider if custom_llm_provider else None
+
+        # 本地 Codex CLI 代理一次失败通常已经等到 CODEX_PROXY_TIMEOUT。
+        # OpenAI/LiteLLM 默认会对 5xx 自动重试，导致单个群聊 worker 被 600s * 多次重试阻塞。
+        # 对本地 Codex 代理禁用 SDK 层重试，让失败尽快交给业务 fallback/队列继续处理。
+        api_base_l = str(api_base or "").lower()
+        if "max_retries" in model_cfg:
+            params["max_retries"] = int(model_cfg.get("max_retries") or 0)
+        elif "/api/codex/" in api_base_l or api_base_l.endswith("/api/codex/v1"):
+            params["max_retries"] = 0
+
+        # ── 响应格式与额外参数 ──
+        # 优先级：extra_kwargs > model_cfg
+        # 关键修复：确保 extra_body 永远是字典，且 response_format 只有在非 None 时才设置
+        
+        # 1. response_format
+        if extra_kwargs and "response_format" in extra_kwargs:
+            val = extra_kwargs["response_format"]
+            if val: params["response_format"] = copy.deepcopy(val)
+        else:
+            val = model_cfg.get("response_format")
+            if val: params["response_format"] = copy.deepcopy(val)
+
+        # 2. extra_body (核心修复: 强制为 dict)
+        if extra_kwargs and "extra_body" in extra_kwargs:
+            params["extra_body"] = copy.deepcopy(extra_kwargs["extra_body"]) or {}
+        else:
+            params["extra_body"] = copy.deepcopy(model_cfg.get("extra_body")) or {}
+        
+        if params["extra_body"] is None:
+            params["extra_body"] = {}
+
+        # ── 自定义价格 ──
+        # LiteLLM 对新模型的价格表可能滞后；允许在模型配置里显式写入
+        # 官方每 token 价格，供 response_cost 自动计算使用。
+        _PRICING_KEYS = (
+            "input_cost_per_token",
+            "output_cost_per_token",
+            "cache_read_input_token_cost",
+            "cache_creation_input_token_cost",
+        )
+        for key in _PRICING_KEYS:
+            if extra_kwargs and key in extra_kwargs:
+                params[key] = extra_kwargs[key]
+            elif key in model_cfg:
+                params[key] = model_cfg[key]
+
+        # ── 工具处理（集中在此处，消除三处重复逻辑）──
+        self._apply_tools(params, model_str, model_cfg, caller_tools)
+
+        # ── 映射/调用透传参数 ──
+        # call() 已剔除调用方的 temperature/max_tokens/timeout，因此这里的
+        # 同名核心参数来自 mapping.override_params，必须覆盖模型级默认值。
+        if extra_kwargs:
+            for k, v in extra_kwargs.items():
+                if k not in ("tools", "model", "messages", "api_key", "api_base"):
+                    params[k] = v
+
+        # ── 针对 DeepSeek Reasoner 官方 API 的兼容性脱敏 ──
+        # R1 官方目前对 response_format: json_object 的支持不稳定，偶发返回空响应。
+        # 且 LiteLLM 在处理 R1 返回 reasoning_content + json_object 时存在解析风险。
+        if params.get("model", "").endswith("deepseek-reasoner") and "response_format" in params:
+            api_base = params.get("api_base", "")
+            if not api_base or "deepseek.com" in api_base:
+                logger.warning(f"🛡️ 已从 deepseek-reasoner (官方) 移除 response_format 参数以避免空响应错误。建议在 Prompt 中明确 JSON 要求。")
+                params.pop("response_format", None)
+
+        return params
+
+    def _apply_tools(
+        self,
+        params: dict,
+        model_str: str,
+        model_cfg: dict,
+        caller_tools: Optional[List],
+    ) -> None:
+        """
+        将正确的 tools 配置写入 params（就地修改 params）。
+
+        规则：
+        1. Gemini 直连（gemini/ 前缀）：保留 caller_tools 中的所有工具，
+           包括 google_search。
+        2. Moonshot/Kimi：剔除 google_search 工具，若 enable_web_search=True
+           注入 $web_search builtin_function。
+        3. OpenRouter / 其他：剔除 google_search 工具；若 enable_web_search=True
+           通过 extra_body.plugins 注入 web 插件。
+        4. 若最终没有任何工具，**不设置 tools 键**（避免 tools=None 或 tools=[] 报错）。
+        """
+        is_gemini = model_str.startswith("gemini/")
+        is_moonshot = model_str.startswith("moonshot/")
+        enable_web_search = model_cfg.get("enable_web_search") is True
+
+        # ── 处理 caller_tools ──
+        if caller_tools:
+            if is_gemini:
+                # Gemini 直连：所有工具都支持（包括 google_search）
+                valid_tools = list(caller_tools)
+            else:
+                # 非 Gemini：剔除 Google 专属工具
+                valid_tools = [t for t in caller_tools if not _is_google_only_tool(t)]
+
+            if valid_tools:
+                params["tools"] = valid_tools
+            # 没有有效工具时，不设置 tools 键（关键修复：不写 tools=None）
+
+        # ── 注入平台 web search 配置 ──
+        if enable_web_search:
+            if is_moonshot:
+                tools = params.get("tools") or []
+                has_web = any(
+                    isinstance(t, dict) and t.get("function", {}).get("name") == "$web_search"
+                    for t in tools
+                )
+                if not has_web:
+                    tools.append({"type": "builtin_function", "function": {"name": "$web_search"}})
+                params["tools"] = tools
+            else:
+                # OpenRouter / 其他：通过 extra_body.plugins 注入
+                if params.get("extra_body") is None:
+                    params["extra_body"] = {}
+                plugins = params["extra_body"].get("plugins", [])
+                if not any(isinstance(p, dict) and p.get("id") == "web" for p in plugins):
+                    plugins.append({"id": "web"})
+                    params["extra_body"]["plugins"] = plugins
+
+    # ─────────────────────────── 主调用接口 ──────────────────────────
+
+    def call(
+        self,
+        plugin_name: str,
+        call_type: str,
+        messages: List[Dict],
+        **kwargs
+    ) -> str:
+        """
+        统一调用接口
+
+        Args:
+            plugin_name: 插件名称 (如 "builtin_chatbot")
+            call_type:   调用类型 (如 "chat", "search", "vision", "judge")
+            messages:    OpenAI 格式的消息数组
+            **kwargs:    额外参数 (temperature, max_tokens, tools …)
+
+        Returns:
+            模型返回的文本内容
+        """
+        self._check_and_reload_if_modified()
+
+        # ── 1. 获取配置 ──
+        mapping = self._get_mapping(plugin_name, call_type)
+        if not mapping:
+            raise ValueError(f"❌ 未找到配置: {plugin_name}.{call_type}")
+
+        primary_model_id = str(mapping.get("primary") or "").strip()
+        if not primary_model_id:
+            raise ValueError(f"❌ 未配置主模型: {plugin_name}.{call_type}")
+
+        model_config = self.config["models"].get(primary_model_id)
+        if not model_config:
+            raise ValueError(f"❌ 模型不存在: {primary_model_id}")
+
+        # ── 2. 从 kwargs 中提取特殊参数（不修改原始 kwargs）──
+        caller_tools        = kwargs.get("tools")       # 调用方 tools（如 google_search）
+        attachment_capture  = kwargs.get("_wxautox_attachment_capture")
+        allow_image_input   = bool(kwargs.get("_wxautox_allow_image_input"))
+        codex_chat_id       = str(kwargs.get("_wxautox_chat_id") or "").strip()
+        codex_role_name     = str(kwargs.get("_wxautox_role_name") or "").strip()
+        history_chat_name   = str(
+            kwargs.get("_wxautox_chat_name") or codex_chat_id
+        ).strip()
+        memory_trace        = kwargs.get("_wxautox_memory_trace")
+        history_mode        = str(
+            kwargs.get("_wxautox_history_mode") or "full"
+        ).strip().lower()
+        usage_capture       = kwargs.get("_wxautox_usage_capture")
+        codex_output_schema = (
+            copy.deepcopy(kwargs.get("_wxautox_codex_output_schema"))
+            if isinstance(kwargs.get("_wxautox_codex_output_schema"), dict)
+            else None
+        )
+        history_metadata = {
+            "chat_name": history_chat_name,
+            "role_name": codex_role_name,
+            "trace_id": (
+                str(memory_trace.get("trace_id") or "")
+                if isinstance(memory_trace, dict)
+                else ""
+            ),
+            "memory_trace": (
+                copy.deepcopy(memory_trace)
+                if isinstance(memory_trace, dict)
+                else None
+            ),
+            "history_mode": history_mode,
+            "_usage_capture": usage_capture,
+        }
+        codex_retry         = bool(kwargs.get("_wxautox_codex_retry"))
+        codex_reasoning_effort = str(
+            kwargs.get("_wxautox_codex_reasoning_effort") or "inherit"
+        ).strip().lower()
+        codex_reasoning_summary = str(
+            kwargs.get("_wxautox_codex_reasoning_summary") or "inherit"
+        ).strip().lower()
+        codex_web_search_mode = str(
+            kwargs.get("_wxautox_codex_web_search_mode") or "inherit"
+        ).strip().lower()
+        try:
+            codex_timeout_seconds = max(0, int(kwargs.get("_wxautox_codex_timeout_seconds") or 0))
+        except (TypeError, ValueError):
+            codex_timeout_seconds = 0
+        try:
+            codex_max_turns = max(0, int(kwargs.get("_wxautox_codex_max_turns") or 0))
+        except (TypeError, ValueError):
+            codex_max_turns = 0
+        codex_exec_fallback = bool(kwargs.get("_wxautox_codex_exec_fallback", True))
+        mapping_overrides = mapping.get("override_params", {})
+
+        # 映射覆盖参数来自用户配置；插件调用参数不能覆盖模型核心配置。
+        extra_kwargs = dict(mapping_overrides)
+
+        _MODEL_CONFIG_ONLY_KEYS = {"temperature", "max_tokens", "timeout"}
+        _HANDLED_KEYS = frozenset({
+            "tools",
+            "_wxautox_attachment_capture",
+            "_wxautox_allow_image_input",
+            "_wxautox_chat_id",
+            "_wxautox_chat_name",
+            "_wxautox_role_name",
+            "_wxautox_memory_trace",
+            "_wxautox_history_mode",
+            "_wxautox_usage_capture",
+            "_wxautox_codex_output_schema",
+            "_wxautox_codex_retry",
+            "_wxautox_codex_reasoning_effort",
+            "_wxautox_codex_reasoning_summary",
+            "_wxautox_codex_web_search_mode",
+            "_wxautox_codex_timeout_seconds",
+            "_wxautox_codex_max_turns",
+            "_wxautox_codex_exec_fallback",
+        } | _MODEL_CONFIG_ONLY_KEYS)
+        for k, v in kwargs.items():
+            if k not in _HANDLED_KEYS:
+                extra_kwargs[k] = v
+
+        # ── 3. 构建主模型参数 ──
+        primary_params = self._build_single_model_params(
+            model_cfg=model_config,
+            messages=messages,
+            caller_tools=caller_tools,
+            extra_kwargs=extra_kwargs,
+        )
+        if allow_image_input:
+            primary_params.setdefault("extra_body", {})["wxautox_allow_image_input"] = True
+
+        # ── 5. 构建 fallback 列表 ──
+        fallback_models = mapping.get("fallback", [])
+        fallback_list = []
+        if fallback_models:
+            for fb_id in fallback_models:
+                if fb_id == primary_model_id:
+                    continue
+                fb_cfg = self.config["models"].get(fb_id)
+                if not fb_cfg:
+                    continue
+                # fallback 也使用同样的干净构建逻辑，核心参数使用 fallback 自身模型配置。
+                fb_params = self._build_single_model_params(
+                    model_cfg=fb_cfg,
+                    messages=messages,
+                    caller_tools=caller_tools,
+                    extra_kwargs=extra_kwargs,
+                )
+                fallback_list.append(fb_params)
+
+            if fallback_list:
+                primary_params["fallbacks"] = fallback_list
+
+        # ── 6. 代理检查（缓存机制：无变化时为 no-op）──
+        self.apply_proxy_env_vars()
+
+        # ── 7. 执行调用 ──
+        timeout_label = primary_params.get("timeout", "model/default")
+        logger.info(
+            f"🤖 LLM 调用: {plugin_name}.{call_type} -> "
+            f"{primary_model_id} ({model_config['model']}) [timeout={timeout_label}]"
+        )
+
+        def _do_call(params: dict) -> tuple:
+            """
+            单次 litellm.completion() 调用。
+            深拷贝 params 防止 LiteLLM 的 fallback 机制污染原始参数字典。
+            """
+            t0 = time.time()
+            safe_params = copy.deepcopy(params)
+            safe_params["drop_params"] = True
+            configured_supports_vision = bool(safe_params.pop("_wxautox_supports_vision", False))
+            fallback_vision_flags = {}
+            if "fallbacks" in safe_params and isinstance(safe_params["fallbacks"], list):
+                for fb in safe_params["fallbacks"]:
+                    fallback_vision_flags[id(fb)] = bool(fb.pop("_wxautox_supports_vision", False))
+
+            # 视觉降级：主模型不支持视觉时剔除图片（fallback 由 litellm 处理）。
+            # OCR 和 vision 强依赖图片，必须保留图片输入并由模型调用结果决定成败。
+            target_model = safe_params.get("model", "")
+            try:
+                supports_vision = configured_supports_vision or litellm.supports_vision(target_model) or "grok" in target_model.lower()
+            except Exception:
+                supports_vision = configured_supports_vision or "grok" in target_model.lower()
+
+            # 特殊处理：不仅检查主模型，如果 call_type 需要剔除图片，对所有 fallback 也要剔除
+            if call_type not in ["ocr", "vision"]:
+                # 处理主模型
+                if "messages" in safe_params and safe_params["messages"]:
+                    if "perplexity/" in target_model or not supports_vision:
+                        safe_params["messages"] = self._strip_images_from_messages(
+                            safe_params["messages"]
+                        )
+                
+                # 处理 fallback 模型
+                if "fallbacks" in safe_params and isinstance(safe_params["fallbacks"], list):
+                    for fb in safe_params["fallbacks"]:
+                        fb_model = fb.get("model", "")
+                        fb_configured_supports_vision = fallback_vision_flags.get(id(fb), False)
+                        try:
+                            fb_supports_vision = fb_configured_supports_vision or litellm.supports_vision(fb_model) or "grok" in fb_model.lower()
+                        except Exception:
+                            fb_supports_vision = fb_configured_supports_vision or "grok" in fb_model.lower()
+                        
+                        if "perplexity/" in fb_model or not fb_supports_vision:
+                            if "messages" in fb and fb["messages"]:
+                                fb["messages"] = self._strip_images_from_messages(fb["messages"])
+                        
+                        # 特殊处理：Grok 视觉格式转换 (自建反向 Grok 兼容性)
+                        if "grok" in fb_model.lower():
+                             if "messages" in fb and fb["messages"]:
+                                fb["messages"] = self._transform_messages_for_grok(fb["messages"])
+
+            # ── 针对 Grok 模型族的主消息格式转换 ──
+            if "grok" in target_model.lower():
+                if "messages" in safe_params and safe_params["messages"]:
+                    safe_params["messages"] = self._transform_messages_for_grok(
+                        safe_params["messages"]
+                    )
+
+            resp = litellm.completion(**safe_params)
+            return resp, time.time() - t0
+
+        def _try_single_params(params: dict) -> tuple:
+            max_empty_retries = 3
+            last_resp, last_time, last_result = None, 0, ""
+
+            for attempt in range(max_empty_retries):
+                try:
+                    response, response_time = _do_call(params)
+                except Exception as direct_exc:
+                    proxy_url = self._get_proxy_url()
+                    if proxy_url and self._is_network_error(direct_exc):
+                        logger.warning(
+                            f"⚠️ 直连失败 ({type(direct_exc).__name__}: {str(direct_exc)[:80]})，"
+                            "代理已通过环境变量配置（地址已隐藏），重试中..."
+                        )
+                        response, response_time = _do_call(params)
+                        logger.info(f"✅ 代理重试成功 ({response_time:.2f}s)")
+                    else:
+                        raise
+
+                # ── 8. Kimi 二阶段 web search（移出 _do_call，避免代理重试重跑 stage-1）──
+                response = self._handle_kimi_stage2(response, params, params.get("timeout"))
+
+                result = response.choices[0].message.content
+                if result:
+                    result = result.strip()
+                else:
+                    result = ""
+
+                if not result:
+                    result = self._recover_empty_response_with_stream(
+                        response=response,
+                        model_config=model_config,
+                        primary_params=params,
+                        call_timeout=params.get("timeout"),
+                    )
+                
+                if self._is_retriable_content_failure(result):
+                    actual_model = self._resolve_actual_model(response, model_config)
+                    logger.warning(
+                        f"⚠️ LLM 返回可重试错误文本 [{actual_model}]，准备触发 fallback: "
+                        f"{result[:160]}"
+                    )
+                    return response, response_time, ""
+
+                if result:
+                    return response, response_time, result
+                
+                # 记录最后一次结果供兜底返回
+                last_resp, last_time, last_result = response, response_time, result
+                
+                if attempt < max_empty_retries - 1:
+                    actual_model = self._resolve_actual_model(response, model_config)
+                    logger.warning(
+                        f"⚠️ LLM 返回空响应 [{actual_model}]，"
+                        f"正在进行第 {attempt + 2}/{max_empty_retries} 次重试..."
+                    )
+                    time.sleep(1)  # 增加 1 秒延迟，避免过于频繁地请求不稳定服务器
+            
+            return last_resp, last_time, last_result
+
+        if self._is_local_codex_model(model_config):
+            try:
+                response, response_time, result = self._call_local_codex_cli(
+                    model_config=model_config,
+                    messages=messages,
+                    params=primary_params,
+                    allow_image_input=allow_image_input,
+                    chat_id=codex_chat_id,
+                    role_name=codex_role_name,
+                    retry=codex_retry,
+                    codex_reasoning_effort=codex_reasoning_effort,
+                    codex_reasoning_summary=codex_reasoning_summary,
+                    codex_web_search_mode=codex_web_search_mode,
+                    codex_timeout_seconds=codex_timeout_seconds,
+                    codex_max_turns=codex_max_turns,
+                    codex_exec_fallback=codex_exec_fallback,
+                    codex_output_schema=codex_output_schema,
+                )
+                if not result:
+                    raise ValueError("Local Codex CLI returned empty response")
+
+                codex_backend = (
+                    str(response.get("backend") or "")
+                    if isinstance(response, dict)
+                    else ""
+                )
+                backend_label = "local_codex_app_server" if codex_backend == "codex_app_server" else "local_codex_cli"
+                self.last_used_model = f"{backend_label}/{model_config.get('model', primary_model_id)}"
+                response_attachments = self._extract_attachments_from_response(response)
+                if isinstance(attachment_capture, list):
+                    attachment_capture.clear()
+                    attachment_capture.extend(response_attachments)
+                token_usage = self._extract_token_usage(response)
+                self._record_stats(
+                    plugin_name,
+                    call_type,
+                    primary_model_id,
+                    response,
+                    response_time,
+                    token_usage=token_usage,
+                )
+                self._record_cache_diagnostics(
+                    plugin_name=plugin_name,
+                    call_type=call_type,
+                    model_id=primary_model_id,
+                    actual_model=self.last_used_model,
+                    messages=messages,
+                    response_time=response_time,
+                    token_usage=token_usage,
+                    success=True,
+                )
+                self._record_call_history(
+                    plugin_name,
+                    call_type,
+                    primary_model_id,
+                    messages,
+                    result,
+                    response_time,
+                    self.last_used_model,
+                    token_usage.get("total_tokens", 0),
+                    success=True,
+                    reasoning_text=self._extract_reasoning_from_response(response),
+                    token_usage=token_usage,
+                    metadata=history_metadata,
+                )
+                logger.info(
+                    f"✅ Local Codex CLI 成功: {len(result)} 字符 ({response_time:.2f}s) "
+                    f"[实际模型: {self.last_used_model}]"
+                )
+                return result
+            except Exception as local_exc:
+                self._record_error(plugin_name, call_type, primary_model_id)
+                self._record_call_history(
+                    plugin_name,
+                    call_type,
+                    primary_model_id,
+                    messages,
+                    "",
+                    0,
+                    f"local_codex_cli/{model_config.get('model', primary_model_id)}",
+                    0,
+                    success=False,
+                    error=str(local_exc),
+                    metadata=history_metadata,
+                )
+                logger.error(f"❌ Local Codex CLI 调用失败: {plugin_name}.{call_type} -> {local_exc}")
+                if not fallback_list:
+                    raise
+                logger.info("🔄 Local Codex CLI 失败，尝试 fallback 模型")
+                for fb_params in fallback_list:
+                    try:
+                        fb_p = copy.deepcopy(fb_params)
+                        fb_p.pop("fallbacks", None)
+                        fb_response, fb_response_time, fb_result = _try_single_params(fb_p)
+                        if not fb_result:
+                            continue
+                        self.last_used_model = self._resolve_actual_model(fb_response, model_config)
+                        token_usage = self._extract_token_usage(fb_response)
+                        self._record_stats(plugin_name, call_type, primary_model_id, fb_response, fb_response_time, token_usage=token_usage)
+                        self._record_cache_diagnostics(
+                            plugin_name=plugin_name,
+                            call_type=call_type,
+                            model_id=primary_model_id,
+                            actual_model=self.last_used_model,
+                            messages=messages,
+                            response_time=fb_response_time,
+                            token_usage=token_usage,
+                            success=True,
+                        )
+                        self._record_call_history(
+                            plugin_name,
+                            call_type,
+                            primary_model_id,
+                            messages,
+                            fb_result,
+                            fb_response_time,
+                            self.last_used_model,
+                            token_usage.get("total_tokens", 0),
+                            success=True,
+                            reasoning_text=self._extract_reasoning_from_response(fb_response),
+                            token_usage=token_usage,
+                            metadata=history_metadata,
+                        )
+                        logger.info(f"✅ Fallback 成功: {len(fb_result)} 字符 ({fb_response_time:.2f}s) [实际模型: {self.last_used_model}]")
+                        return fb_result
+                    except Exception as fb_exc:
+                        logger.warning(f"⚠️ Local Codex fallback 调用失败: {fb_params.get('model')} -> {fb_exc}")
+                raise local_exc
+
+        try:
+            # 1. 尝试主模型（内部已包含 LiteLLM 针对 API 异常的 fallback）
+            response, response_time, result = _try_single_params(primary_params)
+            
+            # 2. 如果结果依然为空，说明 API 成功但没有内容或返回了可重试错误文本，手动执行一次 fallback
+            if not result:
+                actual_model = self._resolve_actual_model(response, model_config)
+                logger.warning(f"⚠️ LLM 成功返回但内容不可用 [{actual_model}]，准备执行手动 fallback...")
+                
+                fallback_success = False
+                fallback_list_local = locals().get("fallback_list", [])
+                if fallback_list_local:
+                    for fb_params in fallback_list_local:
+                        logger.info(f"🔄 手动 Fallback 重试: {fb_params.get('model')}")
+                        try:
+                            # 为防止嵌套 fallback，移除内部的 fallbacks 键
+                            fb_p = copy.deepcopy(fb_params)
+                            fb_p.pop("fallbacks", None)
+                            fb_response, fb_response_time, fb_result = _try_single_params(fb_p)
+                            if fb_result:
+                                response = fb_response
+                                response_time = fb_response_time
+                                result = fb_result
+                                fallback_success = True
+                                break
+                            else:
+                                logger.warning(f"⚠️ Fallback 模型 {fb_params.get('model')} 同样返回空内容")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Fallback 模型 {fb_params.get('model')} 调用失败: {e}")
+                            continue
+                            
+                if not fallback_success:
+                    self.last_used_model = self._resolve_actual_model(response, model_config)
+                    error_msg = (
+                        f"LLM 返回空响应/失败内容且所有 Fallback 均失效 "
+                        f"[实际模型: {self.last_used_model}]"
+                    )
+                    self._record_cache_diagnostics(
+                        plugin_name=plugin_name,
+                        call_type=call_type,
+                        model_id=primary_model_id,
+                        actual_model=self.last_used_model,
+                        messages=messages,
+                        response_time=response_time,
+                        token_usage=self._extract_token_usage(response),
+                        success=False,
+                        error=error_msg,
+                    )
+                    raise ValueError(
+                        error_msg
+                    )
+
+            # 记录实际使用的模型名（fallback 时 resp.model 是真正生效的模型）
+            self.last_used_model = self._resolve_actual_model(response, model_config)
+            response_attachments = self._extract_attachments_from_response(response)
+            if isinstance(attachment_capture, list):
+                attachment_capture.clear()
+                attachment_capture.extend(response_attachments)
+
+            # ── 9. 统计 & 返回 ──
+            token_usage = self._extract_token_usage(response)
+            self._record_stats(
+                plugin_name, call_type, primary_model_id,
+                response, response_time, token_usage=token_usage
+            )
+            self._record_cache_diagnostics(
+                plugin_name=plugin_name,
+                call_type=call_type,
+                model_id=primary_model_id,
+                actual_model=self.last_used_model,
+                messages=messages,
+                response_time=response_time,
+                token_usage=token_usage,
+                success=True,
+                stream_recovered=bool(
+                    getattr(response, "_stream_recovered_empty_content", False)
+                ),
+                stream_recovered_chars=int(
+                    getattr(response, "_stream_recovered_chars", 0) or 0
+                ),
+            )
+
+            # 记录调用历史（请求+响应，最多若干条/来源）
+            self._record_call_history(
+                plugin_name, call_type, primary_model_id,
+                messages, result, response_time,
+                self.last_used_model, token_usage.get("total_tokens", 0), success=True,
+                reasoning_text=self._extract_reasoning_from_response(response),
+                token_usage=token_usage,
+                metadata=history_metadata,
+            )
+
+            logger.info(
+                f"✅ LLM 成功: {len(result)} 字符 ({response_time:.2f}s) "
+                f"[实际模型: {self.last_used_model}]"
+            )
+            return result
+
+        except Exception as e:
+            self._record_error(plugin_name, call_type, primary_model_id)
+            self._record_call_history(
+                plugin_name, call_type, primary_model_id,
+                messages, "", 0,
+                model_config.get("model", "unknown"), 0,
+                success=False, error=str(e),
+                metadata=history_metadata,
+            )
+            logger.error(f"❌ LLM 调用失败: {plugin_name}.{call_type} -> {e}")
+            raise
+
+    # ──────────────────────── Kimi 二阶段处理 ────────────────────────
+
+    def _recover_empty_response_with_stream(
+        self,
+        response,
+        model_config: dict,
+        primary_params: dict,
+        call_timeout: Optional[int],
+    ) -> str:
+        """
+        某些模型/网关在非流式 chat.completions 下会返回空 content，
+        但在 stream=True 时能正常逐块返回文本。
+
+        当前已确认 https://quiz.playoffer.cn/codex 的 gpt-5.4 存在该行为。
+        DeepSeek 官方 deepseek-v4-pro 也观察到非流式成功但 content 为空、
+        同参数 stream=True 可恢复 delta.content 的情况。
+        这里做一次定向流式补救，避免把“服务端非流式序列化问题”误判成模型无回复。
+        """
+        actual_model = self._resolve_actual_model(response, model_config)
+        provider = (
+            getattr(getattr(response, "_hidden_params", {}), "get", lambda *_: None)("custom_llm_provider")
+            or model_config.get("custom_llm_provider")
+            or model_config.get("provider")
+            or ""
+        )
+        api_base = self._resolve_env(model_config.get("api_base")) or primary_params.get("api_base") or ""
+        provider_l = str(provider or "").lower()
+        actual_model_l = str(actual_model or "").lower()
+        param_model_l = str(primary_params.get("model") or "").lower()
+        api_base_l = str(api_base or "").lower()
+        is_official_deepseek = (
+            (
+                param_model_l.startswith("deepseek/")
+                or actual_model_l.startswith("deepseek/")
+                or provider_l == "deepseek"
+            )
+            and "openrouter" not in param_model_l
+            and "openrouter" not in api_base_l
+            and provider_l != "custom_openai"
+        )
+        # 判定是否值得尝试流式补救：
+        # 1. 明确已知的“非流式返回空”的网关 (quiz.playoffer / 100.121.xx)
+        # 2. 所有的 custom_openai 兼容提供商
+        # 3. 任何包含 grok 字样的模型 (针对用户反馈)
+        # 4. DeepSeek 官方 API（已实测同参数 stream=True 可恢复文本）
+        should_try_stream = (
+            provider_l in ["custom_openai"] or
+            "quiz.playoffer.cn/codex" in api_base or
+            "100.121.36.39" in api_base or
+            "grok" in actual_model_l or
+            is_official_deepseek
+        )
+
+        if not should_try_stream:
+            return ""
+
+        logger.warning(
+            f"⚠️ 检测到非流式空响应，尝试用 stream=True 重取文本 [{actual_model}]"
+        )
+
+        try:
+            stream_params = copy.deepcopy(primary_params)
+            if call_timeout is not None:
+                stream_params["timeout"] = call_timeout
+            stream_params["drop_params"] = True
+            stream_params["stream"] = True
+            stream_params.pop("fallbacks", None)
+
+            chunks = litellm.completion(**stream_params)
+            parts = []
+            for chunk in chunks:
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = getattr(chunk.choices[0], "delta", None)
+                text = getattr(delta, "content", None) if delta else None
+                if text:
+                    parts.append(text)
+
+            recovered = "".join(parts).strip()
+            if recovered:
+                try:
+                    setattr(response, "_stream_recovered_empty_content", True)
+                    setattr(response, "_stream_recovered_chars", len(recovered))
+                except Exception:
+                    pass
+                logger.info(
+                    f"✅ 已通过流式补救恢复文本: {len(recovered)} 字符 [实际模型: {actual_model}]"
+                )
+            return recovered
+        except Exception as stream_exc:
+            logger.warning(
+                f"⚠️ 流式补救失败 [{actual_model}]: {type(stream_exc).__name__}: {stream_exc}"
+            )
+            return ""
+
+    # ──────────────────────── Kimi 二阶段处理 ────────────────────────
+
+    def _handle_kimi_stage2(self, resp, primary_params: dict, call_timeout: Optional[int]):
+        """
+        处理 Kimi (Moonshot) 原生 web search 的二阶段调用。
+        当第一阶段的 finish_reason 为 "tool_calls" 且包含 $web_search 时，
+        发起第二阶段请求以获取真实的联网结果。
+
+        设计：与 _do_call 完全解耦，代理重试只重跑 stage-1，不影响此处。
+        """
+        resp_model_str = (getattr(resp, "model", "") or "").lower()
+        primary_model_str = primary_params.get("model", "")
+        is_kimi_resp = (
+            primary_model_str.startswith("moonshot/")
+            or "moonshot" in resp_model_str
+            or "kimi" in resp_model_str
+        )
+
+        if not is_kimi_resp:
+            return resp
+        if not (resp.choices and resp.choices[0].finish_reason == "tool_calls"):
+            return resp
+
+        msg = resp.choices[0].message
+        if not any(
+            t.function.name == "$web_search"
+            for t in getattr(msg, "tool_calls", [])
+        ):
+            return resp
+
+        logger.info("🔍 Kimi 请求原生 Web Search 插件，正在获取第二阶段联网结果...")
+
+        # 找到 Kimi 的完整配置（支持 Kimi 是 fallback 模型的场景）
+        kimi_model, kimi_api_key, kimi_api_base, kimi_temperature = \
+            self._resolve_kimi_config(primary_model_str, primary_params)
+
+        # 构建第二阶段参数（不含 tools / fallbacks）
+        stage2_messages = list(primary_params["messages"])
+        stage2_messages.append(msg)
+        for tool_call in msg.tool_calls:
+            if tool_call.function.name == "$web_search":
+                stage2_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "content": tool_call.function.arguments,
+                })
+
+        kimi_params: dict = {
+            "model": kimi_model,
+            "messages": stage2_messages,
+        }
+        if call_timeout is not None:
+            kimi_params["timeout"] = call_timeout
+        if kimi_api_key:
+            kimi_params["api_key"] = kimi_api_key
+        if kimi_api_base:
+            kimi_params["api_base"] = kimi_api_base
+        if kimi_temperature is not None:
+            kimi_params["temperature"] = kimi_temperature
+
+        logger.info(
+            f"🔑 [Kimi-Stage2] model={kimi_model!r} | "
+            f"api_key={'set(' + kimi_api_key[:8] + '...)' if kimi_api_key else 'NONE'} | "
+            f"api_base={kimi_api_base!r}"
+        )
+
+        try:
+            resp = litellm.completion(**kimi_params)
+        except Exception as exc1:
+            logger.warning(f"⚠️ Kimi 第二阶段失败 ({type(exc1).__name__}: {str(exc1)[:80]})，重试一次...")
+            try:
+                resp = litellm.completion(**kimi_params)
+            except Exception as exc2:
+                logger.error(f"❌ Kimi 第二阶段彻底失败，降级为空结果: {exc2}")
+                # 构造最小化的合法 ModelResponse 避免上层崩溃
+                from litellm.utils import ModelResponse, Choices, Message as LLMMessage
+                empty_resp = ModelResponse()
+                empty_resp.choices = [
+                    Choices(
+                        finish_reason="stop",
+                        index=0,
+                        message=LLMMessage(role="assistant", content=""),
+                    )
+                ]
+                resp = empty_resp
+
+        return resp
+
+    def _resolve_kimi_config(self, primary_model_str: str, primary_params: dict):
+        """
+        解析 Kimi (Moonshot) 的完整连接配置。
+        支持 Kimi 是主模型或 fallback 模型两种场景。
+        返回 (model, api_key, api_base, temperature)
+        """
+        if primary_model_str.startswith("moonshot/"):
+            # Kimi 是主模型
+            return (
+                primary_model_str,
+                primary_params.get("api_key"),
+                primary_params.get("api_base"),
+                primary_params.get("temperature"),
+            )
+
+        # Kimi 是 fallback：从 config["models"] 实时解析
+        for _mid, _mcfg in self.config.get("models", {}).items():
+            if "moonshot" in _mcfg.get("model", ""):
+                return (
+                    _mcfg["model"],
+                    self._resolve_env(_mcfg["api_key"]) if "api_key" in _mcfg else None,
+                    self._resolve_env(_mcfg["api_base"]) if "api_base" in _mcfg else None,
+                    _mcfg.get("temperature"),
+                )
+
+        # 最终兜底（理论上不应到达这里）
+        resp_model = primary_params.get("model", "kimi-k2-turbo-preview")
+        kimi_model = resp_model if "moonshot" in resp_model else f"moonshot/{resp_model}"
+        return kimi_model, None, None, None
+
+    # ─────────────────────── 工具方法 ──────────────────────────
+
+    @staticmethod
+    def _strip_images_from_messages(messages: List[Dict]) -> List[Dict]:
+        """从消息列表中剔除图片内容（用于不支持视觉的模型）"""
+        cleaned = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_only = [
+                    item for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                if text_only:
+                    new_msg = copy.deepcopy(msg)
+                    new_msg["content"] = text_only
+                    cleaned.append(new_msg)
+            else:
+                cleaned.append(msg)
+        return cleaned
+
+    @staticmethod
+    def _transform_messages_for_grok(messages: List[Dict]) -> List[Dict]:
+        """
+        针对自建 Grok 模型转换消息格式。
+        将 {"type": "image_url", "image_url": {"url": "data:..."}} 
+        转换为 {"type": "file", "file": {"file_data": "data:..."}}
+        """
+        if not messages:
+            return messages
+            
+        new_messages = copy.deepcopy(messages)
+        transformed_count = 0
+        for msg in new_messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "image_url":
+                        img_url = item.get("image_url", {}).get("url")
+                        if img_url:
+                            item["type"] = "file"
+                            item["file"] = {"file_data": img_url}
+                            item.pop("image_url", None)
+                            transformed_count += 1
+        
+        if transformed_count > 0:
+            logger.info(f"✨ Transformed {transformed_count} vision items for Grok format")
+        return new_messages
+
+    @staticmethod
+    def _resolve_actual_model(response, model_config: dict) -> str:
+        """从 LiteLLM response 中还原实际使用的完整模型名（含 provider 前缀）"""
+        actual = getattr(response, "model", None) or model_config["model"]
+        provider = model_config.get("custom_llm_provider") or model_config.get("provider") or ""
+        try:
+            provider = response._hidden_params.get("custom_llm_provider", "") or provider
+        except Exception:
+            pass
+        if provider and "/" not in actual:
+            actual = f"{provider}/{actual}"
+        return actual
+
+    def _get_mapping(self, plugin_name: str, call_type: str) -> Optional[Dict]:
+        """获取插件调用映射"""
+        return self.config.get("plugin_mappings", {}).get(plugin_name, {}).get(call_type)
+
+    def _get_proxy_url(self) -> Optional[str]:
+        """从数据库读取代理配置，返回代理 URL 或 None（禁用）"""
+        proxy_url = get_setting("LLM_PROXY_URL", "")
+        if proxy_url and isinstance(proxy_url, str) and proxy_url.strip():
+            return proxy_url.strip()
+        return None
+
+    def _is_network_error(self, exc: Exception) -> bool:
+        """判断异常是否为网络连接级别错误（值得用代理重试）"""
+        err_str = str(exc).lower()
+        network_keywords = [
+            "connection", "timeout", "ssl", "certificate", "network",
+            "refused", "unreachable", "handshake", "reset by peer",
+            "eof occurred", "timed out", "name or service not known",
+            "temporary failure in name resolution", "no route to host",
+            "server disconnected",
+        ]
+        if any(kw in err_str for kw in network_keywords):
+            return True
+
+        retriable_types = [ConnectionError, TimeoutError, ssl.SSLError]
+        if _httpx:
+            retriable_types += [
+                _httpx.ConnectError, _httpx.TimeoutException,
+                _httpx.RemoteProtocolError, _httpx.ReadError,
+            ]
+        if _requests:
+            retriable_types += [
+                _requests.exceptions.ConnectionError,
+                _requests.exceptions.Timeout,
+                _requests.exceptions.SSLError,
+            ]
+        return isinstance(exc, tuple(retriable_types))
+
+    @staticmethod
+    def _is_retriable_content_failure(content: str) -> bool:
+        """
+        判断模型是否把上游临时故障作为普通文本返回。
+
+        这类返回不是 API exception，LiteLLM 不会自动 fallback；这里把短错误
+        文本视为失败，交给现有手动 fallback 逻辑处理。
+        """
+        if not content or not isinstance(content, str):
+            return False
+
+        normalized = " ".join(content.strip().lower().split())
+        if len(normalized) > 500:
+            return False
+
+        return any(marker in normalized for marker in _RETRIABLE_CONTENT_FAILURE_MARKERS)
+
+    def _resolve_env(self, value: str) -> str:
+        """
+        解析环境变量 (格式: env::VAR_NAME)
+        优先从数据库读取（使用 get_setting），如果没有则从环境变量读取
+        """
+        if isinstance(value, str) and value.startswith("env::"):
+            var_name = value[5:]
+            db_value = get_setting(var_name)
+            if db_value:
+                return db_value
+            env_value = os.getenv(var_name, "")
+            if not env_value:
+                logger.warning(f"⚠️ 配置项未设置: {var_name} (数据库和环境变量都没有)")
+            return env_value
+        return value
+
+    def _run_coroutine_sync(self, coro):
+        """Run a coroutine from sync code; use a helper thread if an event loop is already active."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        result_box: Dict[str, Any] = {}
+        error_box: Dict[str, BaseException] = {}
+
+        def runner():
+            try:
+                result_box["result"] = asyncio.run(coro)
+            except BaseException as exc:
+                error_box["error"] = exc
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        thread.join()
+        if "error" in error_box:
+            raise error_box["error"]
+        return result_box.get("result")
+
+    @staticmethod
+    def _is_local_codex_model(model_config: dict) -> bool:
+        provider = str(model_config.get("provider") or model_config.get("custom_llm_provider") or "").lower()
+        api_base = str(model_config.get("api_base") or "").lower()
+        return provider == "local_codex_cli" or "/api/codex/" in api_base or api_base.endswith("/api/codex/v1")
+
+    def _call_local_codex_cli(
+        self,
+        model_config: dict,
+        messages: List[Dict],
+        params: dict,
+        allow_image_input: bool,
+        chat_id: str = "",
+        role_name: str = "",
+        retry: bool = False,
+        codex_reasoning_effort: str = "inherit",
+        codex_reasoning_summary: str = "inherit",
+        codex_web_search_mode: str = "inherit",
+        codex_timeout_seconds: int = 0,
+        codex_max_turns: int = 0,
+        codex_exec_fallback: bool = True,
+        codex_output_schema: Optional[dict] = None,
+    ) -> tuple:
+        """Call persistent App Server for chatbot chats, with codex exec fallback."""
+        from app.services.codex_proxy.client import CodexCliClient
+
+        extra_body = copy.deepcopy(params.get("extra_body") or {})
+        timeout = int(params.get("timeout") or model_config.get("timeout") or 600)
+        payload = {
+            "model": params.get("model") or model_config.get("model") or "gpt-5.6-sol",
+            "timeout": timeout,
+            "messages": messages,
+            "extra_body": extra_body,
+        }
+        configured_reasoning_effort = str(
+            model_config.get("codex_reasoning_effort") or ""
+        ).strip().lower()
+        if configured_reasoning_effort:
+            payload["reasoning_effort"] = configured_reasoning_effort
+        if "codex_web_search" in model_config:
+            payload["codex_web_search"] = model_config.get("codex_web_search")
+        configured_sandbox = str(
+            model_config.get("codex_sandbox") or ""
+        ).strip().lower()
+        if configured_sandbox:
+            payload["codex_sandbox"] = configured_sandbox
+        if "codex_isolated_workdir" in model_config:
+            payload["codex_isolated_workdir"] = model_config.get(
+                "codex_isolated_workdir"
+            )
+        if codex_output_schema:
+            payload["output_schema"] = copy.deepcopy(codex_output_schema)
+        # Preserve direct top-level flags if present.
+        for key in ("reasoning_effort", "web_search", "codex_web_search"):
+            if key in params:
+                payload[key] = params[key]
+        if codex_reasoning_effort != "inherit":
+            payload["reasoning_effort"] = codex_reasoning_effort
+        if codex_reasoning_summary != "inherit":
+            payload["codex_reasoning_summary"] = codex_reasoning_summary
+        if codex_web_search_mode != "inherit":
+            payload["codex_web_search"] = codex_web_search_mode
+        if codex_timeout_seconds > 0:
+            timeout = codex_timeout_seconds
+            payload["timeout"] = timeout
+        if allow_image_input:
+            payload["wxautox_allow_image_input"] = True
+            payload.setdefault("extra_body", {})["wxautox_allow_image_input"] = True
+
+        t0 = time.time()
+        response = None
+        if chat_id:
+            try:
+                from app.services.codex_app_server import get_codex_app_server_manager
+
+                response = get_codex_app_server_manager().chat(
+                    payload,
+                    chat_id=chat_id,
+                    role_name=role_name or None,
+                    retry=retry,
+                    max_turns=codex_max_turns,
+                )
+            except Exception as app_server_exc:
+                if not codex_exec_fallback:
+                    raise
+                logger.warning(
+                    "⚠️ Codex App Server 调用失败，自动降级为独立 codex exec: %s",
+                    app_server_exc,
+                    exc_info=True,
+                )
+        if response is None:
+            response = self._run_coroutine_sync(CodexCliClient(timeout_seconds=timeout).chat(payload))
+        response_time = time.time() - t0
+        choices = response.get("choices") or [] if isinstance(response, dict) else []
+        message = (choices[0].get("message") if choices else {}) or {}
+        result = str(message.get("content") or "").strip()
+        return response, response_time, result
+
+    # ─────────────────────── 统计 ────────────────────────────
+
+    def _extract_reasoning_from_response(self, response) -> str:
+        """尽力提取供应商实际返回的 reasoning/thinking 文本。"""
+        if not response:
+            return ""
+
+        def read(obj, key):
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        def stringify(value) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, list):
+                parts = [stringify(item) for item in value]
+                return "\n".join(part for part in parts if part).strip()
+            if isinstance(value, dict):
+                for key in ("text", "content", "reasoning", "summary"):
+                    text = stringify(value.get(key))
+                    if text:
+                        return text
+                try:
+                    return json.dumps(value, ensure_ascii=False, indent=2)
+                except Exception:
+                    return str(value)
+            return str(value).strip()
+
+        choices = read(response, "choices") or []
+        if not choices:
+            return ""
+
+        first_choice = choices[0]
+        message = read(first_choice, "message") or read(first_choice, "delta")
+        carriers = [message, first_choice]
+        for carrier in (message, first_choice):
+            carriers.extend([
+                read(carrier, "additional_kwargs"),
+                read(carrier, "model_extra"),
+                read(carrier, "provider_specific_fields"),
+            ])
+
+        for carrier in carriers:
+            for field in ("reasoning_content", "reasoning", "thinking", "reasoning_details"):
+                text = stringify(read(carrier, field))
+                if text:
+                    return text
+
+        return ""
+
+    def _extract_attachments_from_response(self, response) -> List[Dict[str, Any]]:
+        """从兼容 OpenAI 的扩展响应中提取可选附件。"""
+        if not response:
+            return []
+
+        def read(obj, key):
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get(key)
+            getter = getattr(obj, "get", None)
+            if callable(getter):
+                try:
+                    value = getter(key)
+                    if value is not None:
+                        return value
+                except Exception:
+                    pass
+            return getattr(obj, key, None)
+
+        carriers = [response]
+        choices = read(response, "choices") or []
+        if choices:
+            first_choice = choices[0]
+            message = read(first_choice, "message") or read(first_choice, "delta")
+            carriers.extend([first_choice, message])
+            for carrier in (message, first_choice):
+                carriers.extend([
+                    read(carrier, "additional_kwargs"),
+                    read(carrier, "model_extra"),
+                    read(carrier, "provider_specific_fields"),
+                ])
+
+        attachments: List[Dict[str, Any]] = []
+        seen = set()
+        for carrier in carriers:
+            raw_items = read(carrier, "attachments")
+            if not isinstance(raw_items, list):
+                continue
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path")
+                if not path or path in seen:
+                    continue
+                seen.add(path)
+                attachments.append(dict(item))
+        return attachments
+
+    def _extract_token_usage(self, response) -> dict:
+        """从模型返回的 usage 中提取可选 token 明细；缺字段时安全退化。"""
+        usage = None
+        if response:
+            if isinstance(response, dict):
+                usage = response.get("usage")
+            else:
+                usage = getattr(response, "usage", None)
+        if not usage:
+            return {}
+
+        total_tokens = self._usage_value(usage, "total_tokens")
+        prompt_tokens = self._usage_value(usage, "prompt_tokens")
+        completion_tokens = self._usage_value(usage, "completion_tokens")
+        if not prompt_tokens:
+            prompt_tokens = self._usage_value(usage, "input_tokens")
+        if not completion_tokens:
+            completion_tokens = self._usage_value(usage, "output_tokens")
+
+        prompt_details = self._usage_value(usage, "prompt_tokens_details", {}) or {}
+        completion_details = self._usage_value(usage, "completion_tokens_details", {}) or {}
+
+        cached_tokens = (
+            self._usage_value(prompt_details, "cached_tokens")
+            or self._usage_value(usage, "cached_tokens")
+            or self._usage_value(usage, "cache_read_input_tokens")
+            or self._usage_value(usage, "prompt_cache_hit_tokens")
+        )
+        cache_miss_tokens = (
+            self._usage_value(usage, "prompt_cache_miss_tokens")
+            or self._usage_value(usage, "cache_miss_input_tokens")
+        )
+        reasoning_tokens = (
+            self._usage_value(completion_details, "reasoning_tokens")
+            or self._usage_value(usage, "reasoning_tokens")
+        )
+
+        result = {}
+        for key, value in {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_miss_tokens": cache_miss_tokens,
+            "reasoning_tokens": reasoning_tokens,
+        }.items():
+            if value:
+                result[key] = value
+        if cached_tokens or cache_miss_tokens:
+            denom = cached_tokens + cache_miss_tokens
+            if denom:
+                result["cache_hit_rate"] = round(cached_tokens / denom, 6)
+        if isinstance(usage, dict):
+            metadata = {
+                key: usage[key]
+                for key in ("estimated", "encoding", "source")
+                if key in usage
+            }
+        else:
+            metadata = {
+                key: getattr(usage, key)
+                for key in ("estimated", "encoding", "source")
+                if getattr(usage, key, None) is not None
+            }
+        for key, value in metadata.items():
+            if key == "estimated":
+                result[key] = bool(value)
+            elif value:
+                result[key] = value
+        return result
+
+    def load_call_history(self):
+        """从本地 JSONL 恢复 LLM 调用历史（每个来源保留最近若干条）。"""
+        max_history_per_key = self._call_history_limit()
+        if not self.call_history_path.exists():
+            return
+
+        try:
+            loaded = {}
+            with open(self.call_history_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    key = (
+                        entry.get("key")
+                        or f"{entry.get('plugin_name', '')}.{entry.get('call_type', '')}"
+                    )
+                    if key == ".":
+                        continue
+
+                    entry.pop("key", None)
+                    loaded.setdefault(key, []).append(entry)
+                    if len(loaded[key]) > max_history_per_key:
+                        loaded[key] = loaded[key][-max_history_per_key:]
+
+            with self._call_history_lock:
+                self.call_history = loaded
+            logger.info(f"✅ 已加载 LLM 调用历史: {sum(len(v) for v in loaded.values())} 条")
+        except Exception as e:
+            logger.warning(f"⚠️ 加载 LLM 调用历史失败: {e}")
+
+    def _save_call_history(self):
+        """将当前内存中的调用历史落盘为 JSONL。"""
+        try:
+            self.call_history_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.call_history_path.with_suffix(".jsonl.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for key, entries in self.call_history.items():
+                    for entry in entries:
+                        record = {"key": key, **entry}
+                        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            os.replace(tmp_path, self.call_history_path)
+        except Exception as e:
+            logger.warning(f"⚠️ 保存 LLM 调用历史失败: {e}")
+
+    def _record_call_history(self, plugin_name: str, call_type: str, model_id: str,
+                             messages: list, response_text: str, response_time: float,
+                             actual_model: str, tokens: int, success: bool, error: str = "",
+                             reasoning_text: str = "", token_usage: dict = None,
+                             metadata: Optional[dict] = None):
+        """记录每次 LLM 调用的请求/响应到内存和本地 JSONL。"""
+        max_history_per_key = self._call_history_limit()
+        key = f"{plugin_name}.{call_type}"
+        raw_metadata = metadata if isinstance(metadata, dict) else {}
+        usage_capture = raw_metadata.get("_usage_capture")
+        safe_metadata = copy.deepcopy(
+            {
+                key: value
+                for key, value in raw_metadata.items()
+                if not str(key).startswith("_")
+            }
+        )
+        history_mode = str(
+            safe_metadata.get("history_mode") or "full"
+        ).strip().lower()
+        if history_mode not in {"full", "summary", "none"}:
+            history_mode = "full"
+
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "plugin_name": plugin_name,
+            "call_type": call_type,
+            "model_id": model_id,
+            "actual_model": actual_model,
+            "messages": messages,
+            "response_text": response_text if response_text else "",
+            "reasoning_text": reasoning_text if reasoning_text else "",
+            "response_time": round(response_time, 3),
+            "tokens": tokens,
+            "token_usage": token_usage or {},
+            "success": success,
+            "error": error if error else "",
+            "chat_name": str(safe_metadata.get("chat_name") or ""),
+            "role_name": str(safe_metadata.get("role_name") or ""),
+            "trace_id": str(safe_metadata.get("trace_id") or ""),
+            "memory_trace": (
+                safe_metadata.get("memory_trace")
+                if isinstance(safe_metadata.get("memory_trace"), dict)
+                else None
+            ),
+        }
+        if isinstance(usage_capture, list):
+            usage_capture.append(
+                {
+                    "timestamp": entry["timestamp"],
+                    "plugin_name": plugin_name,
+                    "call_type": call_type,
+                    "model_id": model_id,
+                    "actual_model": actual_model,
+                    "response_time": entry["response_time"],
+                    "tokens": tokens,
+                    "token_usage": copy.deepcopy(entry["token_usage"]),
+                    "success": success,
+                    "error": entry["error"],
+                    "chat_name": entry["chat_name"],
+                    "trace_id": entry["trace_id"],
+                }
+            )
+        if history_mode == "none":
+            return
+        if history_mode == "summary":
+            entry["messages"] = []
+            entry["response_text"] = ""
+            entry["reasoning_text"] = ""
+        with self._call_history_lock:
+            if key not in self.call_history:
+                self.call_history[key] = []
+            self.call_history[key].append(entry)
+            if len(self.call_history[key]) > max_history_per_key:
+                self.call_history[key] = self.call_history[key][-max_history_per_key:]
+            self._save_call_history()
+
+    @staticmethod
+    def _call_history_limit() -> int:
+        try:
+            return max(10, int(get_setting("LLM_CALL_HISTORY_PER_KEY", "") or 50))
+        except Exception:
+            return 50
+
+    @staticmethod
+    def _cache_diagnostics_limit() -> int:
+        try:
+            return max(50, int(get_setting("LLM_CHAT_CACHE_DIAGNOSTICS_LIMIT", "") or 500))
+        except Exception:
+            return 500
+
+    @staticmethod
+    def _stable_hash(value: Any) -> str:
+        import hashlib
+        try:
+            payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            payload = str(value)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _message_text_for_diagnostics(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        parts.append(str(item.get("text", "")))
+                    elif item.get("type"):
+                        parts.append(f"[{item.get('type')}]")
+                else:
+                    parts.append(str(item))
+            return "\n".join(parts)
+        return str(content or "")
+
+    def _record_cache_diagnostics(
+        self,
+        plugin_name: str,
+        call_type: str,
+        model_id: str,
+        actual_model: str,
+        messages: list,
+        response_time: float,
+        token_usage: dict,
+        success: bool,
+        error: str = "",
+        stream_recovered: bool = False,
+        stream_recovered_chars: int = 0,
+    ) -> None:
+        """为总回复调用保存较长的 KV cache 诊断流水，便于排查命中突变。"""
+        if plugin_name != "builtin_chatbot" or call_type != "chat":
+            return
+
+        usage = token_usage or {}
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        cached_tokens = int(usage.get("cached_tokens", 0) or 0)
+        cache_miss_tokens = int(usage.get("cache_miss_tokens", 0) or 0)
+        cache_denominator = cached_tokens + cache_miss_tokens
+        if not cache_denominator and prompt_tokens:
+            cache_denominator = prompt_tokens
+            cache_miss_tokens = max(prompt_tokens - cached_tokens, 0)
+
+        message_summaries = []
+        for idx, message in enumerate(messages or []):
+            text = self._message_text_for_diagnostics(message.get("content") if isinstance(message, dict) else message)
+            message_summaries.append({
+                "index": idx,
+                "role": message.get("role", "") if isinstance(message, dict) else "",
+                "chars": len(text),
+                "hash": self._stable_hash(text),
+                "preview": text[:180],
+            })
+
+        last_user = next(
+            (item for item in reversed(message_summaries) if item.get("role") == "user"),
+            message_summaries[-1] if message_summaries else {},
+        )
+        system_messages = [item for item in message_summaries if item.get("role") == "system"]
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "key": f"{plugin_name}.{call_type}",
+            "model_id": model_id,
+            "actual_model": actual_model,
+            "success": success,
+            "response_time": round(response_time, 3),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            "cache_hit_tokens": cached_tokens,
+            "cache_miss_tokens": cache_miss_tokens,
+            "cache_hit_rate": round(cached_tokens / cache_denominator, 6) if cache_denominator else 0,
+            "usage_estimated": bool(usage.get("estimated", False)),
+            "usage_source": str(usage.get("source") or usage.get("encoding") or ""),
+            "request_hash": self._stable_hash(messages or []),
+            "message_count": len(messages or []),
+            "message_summaries": message_summaries,
+            "system_hashes": [item.get("hash") for item in system_messages],
+            "last_user_hash": last_user.get("hash", ""),
+            "last_user_preview": last_user.get("preview", ""),
+            "stream_recovered": bool(stream_recovered),
+            "stream_recovered_chars": int(stream_recovered_chars or 0),
+            "error": error,
+        }
+
+        try:
+            self.cache_diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = []
+            if self.cache_diagnostics_path.exists():
+                with open(self.cache_diagnostics_path, "r", encoding="utf-8") as f:
+                    existing = [line.rstrip("\n") for line in f if line.strip()]
+            existing.append(json.dumps(record, ensure_ascii=False, default=str))
+            limit = self._cache_diagnostics_limit()
+            existing = existing[-limit:]
+            tmp_path = self.cache_diagnostics_path.with_suffix(".jsonl.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(existing))
+                if existing:
+                    f.write("\n")
+            os.replace(tmp_path, self.cache_diagnostics_path)
+        except Exception as exc:
+            logger.warning(f"⚠️ 保存 LLM cache 诊断记录失败: {exc}")
+
+    def get_call_history(self, plugin_name: str = None, call_type: str = None) -> dict:
+        """获取调用历史记录，可按插件/类型筛选"""
+        with self._call_history_lock:
+            if plugin_name and call_type:
+                key = f"{plugin_name}.{call_type}"
+                return {key: list(self.call_history.get(key, []))}
+            result = {}
+            for key, entries in self.call_history.items():
+                parts = key.split(".", 1)
+                p_name, c_type = parts[0], parts[1] if len(parts) > 1 else ""
+                if plugin_name and p_name != plugin_name:
+                    continue
+                if call_type and c_type != call_type:
+                    continue
+                result[key] = list(entries)
+            return result
+
+    @staticmethod
+    def _history_entry_summary(entry: dict, index: int) -> dict:
+        messages = entry.get("messages") or []
+        response_text = entry.get("response_text") or ""
+        reasoning_text = entry.get("reasoning_text") or ""
+        memory_trace = (
+            entry.get("memory_trace")
+            if isinstance(entry.get("memory_trace"), dict)
+            else None
+        )
+        has_memory_trace = bool(
+            memory_trace
+            and (
+                memory_trace.get("events")
+                or memory_trace.get("people")
+                or (
+                    isinstance(memory_trace.get("stage"), dict)
+                    and memory_trace["stage"].get("included")
+                )
+            )
+        )
+        return {
+            "index": index,
+            "timestamp": entry.get("timestamp"),
+            "plugin_name": entry.get("plugin_name"),
+            "call_type": entry.get("call_type"),
+            "model_id": entry.get("model_id"),
+            "actual_model": entry.get("actual_model"),
+            "response_time": entry.get("response_time", 0),
+            "tokens": entry.get("tokens", 0),
+            "token_usage": entry.get("token_usage") or {},
+            "success": entry.get("success", False),
+            "message_count": len(messages),
+            "response_size": len(response_text),
+            "reasoning_size": len(reasoning_text),
+            "has_reasoning": bool(reasoning_text),
+            "has_error": bool(entry.get("error")),
+            "chat_name": entry.get("chat_name") or "",
+            "role_name": entry.get("role_name") or "",
+            "trace_id": entry.get("trace_id") or "",
+            "has_memory_trace": has_memory_trace,
+            "memory_event_count": len(memory_trace.get("events") or []) if memory_trace else 0,
+            "memory_people_count": len(memory_trace.get("people") or []) if memory_trace else 0,
+            "memory_has_stage": bool(
+                memory_trace
+                and isinstance(memory_trace.get("stage"), dict)
+                and memory_trace["stage"].get("included")
+            ),
+            "response_preview": response_text[:240],
+            "error_preview": (entry.get("error") or "")[:240],
+        }
+
+    def get_call_history_summaries(
+        self,
+        plugin_name: str,
+        call_type: str,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> dict:
+        """获取轻量调用历史详情列表，避免一次性传输完整 messages/response。"""
+        key = f"{plugin_name}.{call_type}"
+        with self._call_history_lock:
+            entries = list(self.call_history.get(key, []))
+
+        total = len(entries)
+        offset = max(0, offset)
+        limit = max(1, min(int(limit or 10), 50))
+        indexed = list(enumerate(entries))
+        indexed.reverse()
+        page = indexed[offset:offset + limit]
+
+        return {
+            "key": key,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "entries": [self._history_entry_summary(entry, index) for index, entry in page],
+        }
+
+    def get_call_history_entry(
+        self,
+        plugin_name: str,
+        call_type: str,
+        index: int,
+    ) -> Optional[dict]:
+        """按原始 index 获取单条完整调用历史。"""
+        key = f"{plugin_name}.{call_type}"
+        with self._call_history_lock:
+            entries = self.call_history.get(key, [])
+            if index < 0 or index >= len(entries):
+                return None
+            return dict(entries[index])
+
+    def get_call_history_summary(self) -> list:
+        """获取调用历史概览：列出所有已记录的 plugin.call_type 及其最新调用时间"""
+        summaries = []
+        with self._call_history_lock:
+            for key, entries in self.call_history.items():
+                if not entries:
+                    continue
+                parts = key.split(".", 1)
+                latest = entries[-1]
+                summaries.append({
+                    "key": key,
+                    "plugin_name": parts[0],
+                    "call_type": parts[1] if len(parts) > 1 else "",
+                    "count": len(entries),
+                    "last_call": latest["timestamp"],
+                    "last_success": latest["success"],
+                    "last_model": latest.get("actual_model", latest.get("model_id", "")),
+                })
+        summaries.sort(key=lambda x: x["last_call"], reverse=True)
+        return summaries
+
+    def get_chat_cache_diagnostics(self, limit: int = 100) -> list:
+        """读取 builtin_chatbot.chat 的 KV cache 诊断流水，最新记录在前。"""
+        if not self.cache_diagnostics_path.exists():
+            return []
+
+        try:
+            safe_limit = min(max(int(limit or 100), 1), self._cache_diagnostics_limit())
+        except Exception:
+            safe_limit = 100
+
+        records = []
+        try:
+            with open(self.cache_diagnostics_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as exc:
+            logger.warning(f"⚠️ 读取 LLM cache 诊断记录失败: {exc}")
+            return []
+
+        return list(reversed(records[-safe_limit:]))
+
+    @staticmethod
+    def _empty_stats_entry() -> dict:
+        return {
+            "count": 0, "total_tokens": 0, "total_cost": 0.0,
+            "model_usage": {}, "last_call": None,
+            "response_times": [], "error_count": 0,
+            "cache_hit_tokens": 0, "cache_miss_tokens": 0,
+            "cache_observed_calls": 0, "cache_hit_rate": 0.0,
+        }
+
+    @staticmethod
+    def _today_key() -> str:
+        return datetime.now().date().isoformat()
+
+    def _get_today_stats(self) -> dict:
+        today = self._today_key()
+        stats = self.daily_stats.setdefault(today, {})
+        # 控制文件增长，保留最近 31 天。
+        if len(self.daily_stats) > 31:
+            for day in sorted(self.daily_stats.keys())[:-31]:
+                self.daily_stats.pop(day, None)
+        return stats
+
+    def _record_stats_usage(self, plugin_name: str, call_type: str, model_id: str, usage):
+        """记录调用统计 - 专门处理 Usage 对象"""
+        key = f"{plugin_name}.{call_type}"
+        timestamp = datetime.now().isoformat()
+        today_stats = self._get_today_stats()
+        for stats_dict in [self.session_stats, self.total_stats, today_stats]:
+            if key not in stats_dict:
+                stats_dict[key] = self._empty_stats_entry()
+            tokens = (getattr(usage, "total_tokens", 0) or 0) if usage else 0
+            stats_dict[key]["count"] += 1
+            stats_dict[key]["total_tokens"] += tokens
+            stats_dict[key]["last_call"] = timestamp
+            stats_dict[key]["model_usage"][model_id] = \
+                stats_dict[key]["model_usage"].get(model_id, 0) + 1
+        self.save_stats()
+
+    @staticmethod
+    def _usage_value(obj, key: str, default: int = 0):
+        if not obj:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default) or default
+        return getattr(obj, key, default) or default
+
+    def _calculate_configured_cost(self, model_id: str, response) -> float:
+        """在 LiteLLM 未返回 response_cost 时，按本地模型配置估算费用。"""
+        if not response or not getattr(response, "usage", None):
+            return 0.0
+
+        model_config = self.config.get("models", {}).get(model_id, {})
+        pricing = self._resolve_cost_pricing(model_config)
+        input_cost = pricing.get("input_cost_per_token")
+        output_cost = pricing.get("output_cost_per_token")
+        if input_cost is None and output_cost is None:
+            return 0.0
+
+        usage = response.usage
+        prompt_tokens = self._usage_value(usage, "prompt_tokens")
+        completion_tokens = self._usage_value(usage, "completion_tokens")
+
+        # 兼容不同提供商/LiteLLM 版本可能使用的字段名。
+        if not prompt_tokens:
+            prompt_tokens = self._usage_value(usage, "input_tokens")
+        if not completion_tokens:
+            completion_tokens = self._usage_value(usage, "output_tokens")
+
+        details = self._usage_value(usage, "prompt_tokens_details", {}) or {}
+        cached_tokens = (
+            self._usage_value(details, "cached_tokens")
+            or self._usage_value(usage, "cached_tokens")
+            or self._usage_value(usage, "cache_read_input_tokens")
+            or self._usage_value(usage, "prompt_cache_hit_tokens")
+        )
+        cache_miss_tokens = self._usage_value(usage, "prompt_cache_miss_tokens")
+        if cache_miss_tokens:
+            non_cached_prompt_tokens = cache_miss_tokens
+        else:
+            non_cached_prompt_tokens = max(prompt_tokens - cached_tokens, 0)
+
+        cost = 0.0
+        if input_cost is not None:
+            cost += non_cached_prompt_tokens * float(input_cost)
+        cache_read_cost = pricing.get("cache_read_input_token_cost")
+        if cache_read_cost is not None and cached_tokens:
+            cost += cached_tokens * float(cache_read_cost)
+        elif input_cost is not None and cached_tokens:
+            cost += cached_tokens * float(input_cost)
+        if output_cost is not None:
+            cost += completion_tokens * float(output_cost)
+        return cost
+
+    def _resolve_cost_pricing(self, model_config: dict) -> dict:
+        pricing = {
+            "input_cost_per_token": model_config.get("input_cost_per_token"),
+            "output_cost_per_token": model_config.get("output_cost_per_token"),
+            "cache_read_input_token_cost": model_config.get("cache_read_input_token_cost"),
+        }
+        if any(value is not None for value in pricing.values()):
+            return pricing
+
+        model_name = str(model_config.get("model", "")).lower()
+        provider = str(model_config.get("custom_llm_provider") or model_config.get("provider") or "").lower()
+        api_base = str(self._resolve_env(model_config.get("api_base", "")) or "").lower()
+        is_official_deepseek = (
+            model_name.startswith("deepseek/")
+            and (not provider or provider == "deepseek")
+            and ("openrouter" not in api_base)
+        )
+        if not is_official_deepseek:
+            return pricing
+
+        # DeepSeek 官方价格，单位：CNY/token（文档按 CNY/百万 tokens 标价）。
+        # deepseek-chat / deepseek-reasoner 是 deepseek-v4-flash 的兼容模型名。
+        if "v4-pro" in model_name:
+            return {
+                "input_cost_per_token": 3 / 1_000_000,
+                "output_cost_per_token": 6 / 1_000_000,
+                "cache_read_input_token_cost": 0.025 / 1_000_000,
+            }
+        if "v4-flash" in model_name or "deepseek-chat" in model_name or "deepseek-reasoner" in model_name:
+            return {
+                "input_cost_per_token": 1 / 1_000_000,
+                "output_cost_per_token": 2 / 1_000_000,
+                "cache_read_input_token_cost": 0.02 / 1_000_000,
+            }
+        return pricing
+
+    def _record_stats(
+        self,
+        plugin_name: str,
+        call_type: str,
+        model_id: str,
+        response,
+        response_time: float = 0.0,
+        token_usage: dict = None,
+    ):
+        """记录调用统计"""
+        with self._stats_lock:
+            self._record_stats_unlocked(
+                plugin_name,
+                call_type,
+                model_id,
+                response,
+                response_time,
+                token_usage,
+            )
+
+    def _record_stats_unlocked(
+        self,
+        plugin_name: str,
+        call_type: str,
+        model_id: str,
+        response,
+        response_time: float = 0.0,
+        token_usage: dict = None,
+    ):
+        key = f"{plugin_name}.{call_type}"
+        today_stats = self._get_today_stats()
+        for stats_dict in [self.session_stats, self.total_stats, today_stats]:
+            if key not in stats_dict:
+                stats_dict[key] = self._empty_stats_entry()
+            # 向后兼容（旧数据可能缺字段）
+            for fk, fv in self._empty_stats_entry().items():
+                stats_dict[key].setdefault(fk, fv)
+
+        tokens = 0
+        cost = 0.0
+        if isinstance(response, dict) and response.get("usage"):
+            tokens = int(self._usage_value(response.get("usage"), "total_tokens") or 0)
+        elif not isinstance(response, dict) and hasattr(response, "usage") and response.usage:
+            tokens = getattr(response.usage, "total_tokens", 0) or 0
+        if not isinstance(response, dict) and hasattr(response, "_hidden_params") and "response_cost" in response._hidden_params:
+            cost = response._hidden_params.get("response_cost") or 0.0
+        if cost == 0.0:
+            cost = self._calculate_configured_cost(model_id, response)
+        usage = token_usage or self._extract_token_usage(response)
+        cached_tokens = int(usage.get("cached_tokens", 0) or 0)
+        cache_miss_tokens = int(usage.get("cache_miss_tokens", 0) or 0)
+
+        timestamp = datetime.now().isoformat()
+        for stats_dict in [self.session_stats, self.total_stats, today_stats]:
+            stats_dict[key]["count"] += 1
+            stats_dict[key]["total_tokens"] += tokens
+            stats_dict[key]["total_cost"] += cost
+            stats_dict[key]["last_call"] = timestamp
+            if cached_tokens or cache_miss_tokens:
+                stats_dict[key]["cache_hit_tokens"] += cached_tokens
+                stats_dict[key]["cache_miss_tokens"] += cache_miss_tokens
+                stats_dict[key]["cache_observed_calls"] += 1
+                denom = stats_dict[key]["cache_hit_tokens"] + stats_dict[key]["cache_miss_tokens"]
+                stats_dict[key]["cache_hit_rate"] = round(
+                    stats_dict[key]["cache_hit_tokens"] / denom, 6
+                ) if denom else 0.0
+            rts = stats_dict[key]["response_times"]
+            rts.append(response_time)
+            if len(rts) > 10:
+                stats_dict[key]["response_times"] = rts[-10:]
+            stats_dict[key]["model_usage"][model_id] = \
+                stats_dict[key]["model_usage"].get(model_id, 0) + 1
+
+        self.save_stats()
+
+    def _record_error(self, plugin_name: str, call_type: str, model_id: str):
+        """记录错误统计"""
+        with self._stats_lock:
+            self._record_error_unlocked(plugin_name, call_type, model_id)
+
+    def _record_error_unlocked(
+        self,
+        plugin_name: str,
+        call_type: str,
+        model_id: str,
+    ):
+        key = f"{plugin_name}.{call_type}"
+        today_stats = self._get_today_stats()
+        for stats_dict in [self.session_stats, self.total_stats, today_stats]:
+            if key not in stats_dict:
+                stats_dict[key] = self._empty_stats_entry()
+            stats_dict[key]["error_count"] = stats_dict[key].get("error_count", 0) + 1
+        self.save_stats()
+
+    def _log_success(self, kwargs, response_obj, start_time, end_time):
+        """LiteLLM 成功回调"""
+        duration = end_time - start_time
+        model = kwargs.get("model", "unknown")
+        logger.debug(f"✅ LLM Success: {model} - {duration:.2f}s")
+
+    def _log_failure(self, kwargs, response_obj, start_time, end_time):
+        """LiteLLM 失败回调"""
+        model = kwargs.get("model", "unknown")
+        logger.error(f"❌ LLM Failure: {model}")
+
+    # ─────────────────────── 持久化统计 ───────────────────────
+
+    def load_stats(self):
+        """加载历史统计数据"""
+        if self.stats_path.exists():
+            try:
+                with open(self.stats_path, "r", encoding="utf-8") as f:
+                    self.total_stats = json.load(f)
+                logger.info(f"📊 已加载历史统计: {len(self.total_stats)} 项")
+            except Exception as e:
+                logger.error(f"❌ 加载统计数据失败: {e}")
+                self.total_stats = {}
+        else:
+            logger.info("📊 未找到历史统计文件，从空白开始")
+            self.total_stats = {}
+
+    def load_daily_stats(self):
+        """加载按自然日聚合的统计数据"""
+        if self.daily_stats_path.exists():
+            try:
+                with open(self.daily_stats_path, "r", encoding="utf-8") as f:
+                    self.daily_stats = json.load(f)
+                logger.info(f"📊 已加载每日统计: {len(self.daily_stats)} 天")
+            except Exception as e:
+                logger.error(f"❌ 加载每日统计失败: {e}")
+                self.daily_stats = {}
+        else:
+            self.daily_stats = {}
+
+    def save_stats(self):
+        """保存统计数据到文件"""
+        try:
+            self.stats_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.stats_path, "w", encoding="utf-8") as f:
+                json.dump(self.total_stats, f, indent=2, ensure_ascii=False)
+            with open(self.daily_stats_path, "w", encoding="utf-8") as f:
+                json.dump(self.daily_stats, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"❌ 保存统计数据失败: {e}")
+
+    def get_stats(self) -> Dict:
+        """获取统计数据"""
+        return {
+            "today": self.daily_stats.get(self._today_key(), {}),
+            "session": self.session_stats,
+            "total": self.total_stats,
+        }
+
+    # ─────────────────────── 配置 CRUD ────────────────────────
+
+    def get_config(self) -> Dict:
+        """获取当前配置"""
+        return self.config
+
+    def update_model(self, model_id: str, config: Dict):
+        """更新模型配置（完全替换）"""
+        with self._config_lock:
+            if "models" not in self.config:
+                self.config["models"] = {}
+            self.config["models"][model_id] = config
+            self.save_config()
+        logger.info(f"✅ 模型配置已更新: {model_id}")
+
+    def rename_model(self, old_id: str, new_id: str):
+        """Atomically rename a model ID and every mapping that references it."""
+        with self._config_lock:
+            self._rename_model_unlocked(old_id, new_id)
+
+    def _rename_model_unlocked(self, old_id: str, new_id: str):
+        """重命名模型 ID，并同步更新插件映射"""
+        if "models" not in self.config or old_id not in self.config["models"]:
+            return
+
+        if old_id == new_id:
+            return
+
+        # Rename in models (preserve order if possible)
+        new_models = {}
+        for k, v in self.config["models"].items():
+            if k == old_id:
+                new_models[new_id] = v
+            else:
+                new_models[k] = v
+        self.config["models"] = new_models
+
+        # Update plugin mappings
+        if "plugin_mappings" in self.config:
+            for plugin_name, mappings in self.config["plugin_mappings"].items():
+                for call_type, mapping in mappings.items():
+                    changed = False
+                    if mapping.get("primary") == old_id:
+                        mapping["primary"] = new_id
+                        changed = True
+                    if "fallback" in mapping and isinstance(mapping["fallback"], list):
+                        for i, fb in enumerate(mapping["fallback"]):
+                            if fb == old_id:
+                                mapping["fallback"][i] = new_id
+                                changed = True
+                    if changed:
+                        logger.info(f"🔄 自动更新映射: {plugin_name}.{call_type} 引用了 {old_id} -> {new_id}")
+
+        self.save_config()
+        logger.info(f"✅ 模型ID已重命名: {old_id} -> {new_id}")
+
+    def reorder_models(self, order: List[str]):
+        """Atomically reorder models without racing config saves."""
+        with self._config_lock:
+            self._reorder_models_unlocked(order)
+
+    def _reorder_models_unlocked(self, order: List[str]):
+        """根据给定的 ID 列表重新排序模型"""
+        if "models" not in self.config:
+            return
+
+        current_models = self.config["models"]
+        new_models = {}
+
+        for model_id in order:
+            if model_id in current_models:
+                new_models[model_id] = current_models[model_id]
+
+        for model_id, cfg in current_models.items():
+            if model_id not in new_models:
+                new_models[model_id] = cfg
+
+        self.config["models"] = new_models
+        self.save_config()
+        logger.info(f"✅ 模型顺序已更新")
+
+    def delete_model(self, model_id: str):
+        """删除模型配置"""
+        with self._config_lock:
+            if model_id in self.config.get("models", {}):
+                del self.config["models"][model_id]
+                self.save_config()
+                logger.info(f"🗑️ 模型配置已删除: {model_id}")
+
+    def update_mapping(self, plugin_name: str, call_type: str, mapping: Dict):
+        """更新插件映射"""
+        with self._config_lock:
+            if "plugin_mappings" not in self.config:
+                self.config["plugin_mappings"] = {}
+            if plugin_name not in self.config["plugin_mappings"]:
+                self.config["plugin_mappings"][plugin_name] = {}
+            self.config["plugin_mappings"][plugin_name][call_type] = mapping
+            self.save_config()
+        logger.info(f"✅ 插件映射已更新: {plugin_name}.{call_type}")
+
+    def _get_default_config(self) -> Dict:
+        """公开发行版不内置模型、密钥引用或任务映射。"""
+        return {"models": {}, "plugin_mappings": {}}
+
+
+# ─────────────── 全局单例 ────────────────
+
+_llm_manager_instance: Optional[LLMManager] = None
+
+
+def get_llm_manager() -> LLMManager:
+    """获取 LLM Manager 单例"""
+    global _llm_manager_instance
+    if _llm_manager_instance is None:
+        _llm_manager_instance = LLMManager()
+    return _llm_manager_instance
+
+
+def reload_llm_config():
+    """重新加载配置（热更新）"""
+    global _llm_manager_instance
+    if _llm_manager_instance:
+        _llm_manager_instance.load_config()
+        logger.info("🔄 LLM 配置已重新加载")
+    else:
+        logger.warning("⚠️ LLM Manager 未初始化")

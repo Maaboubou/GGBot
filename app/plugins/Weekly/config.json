@@ -1,0 +1,100 @@
+{
+  "name": "Weekly",
+  "display_name": "周报助手",
+  "version": "1.0.0",
+  "description": "每周总结群聊周报，多页图片由 Codex 生成并合并为 PDF 推送",
+  "author": "Project Contributors",
+  "category": "utility",
+  "config_schema": {
+    "WEEKLY_PUSH_WEEKDAY": {
+      "type": "string",
+      "description": "每周任务执行星期，支持 MON/TUE/WED/THU/FRI/SAT/SUN 或 1-7（1=周一）",
+      "default": "MON"
+    },
+    "WEEKLY_PUSH_TIME": {
+      "type": "string",
+      "description": "每周任务执行时间（北京时间，格式：HH:MM）",
+      "default": "09:00"
+    },
+    "WEEKLY_PAGE_COUNT": {
+      "type": "number",
+      "description": "周报固定页数，建议 6-10",
+      "default": 8
+    },
+    "WEEKLY_INITIAL_ISSUE": {
+      "type": "number",
+      "description": "状态文件不存在时使用的初始期数；之后每次成功推送自动 +1",
+      "default": 1
+    },
+    "WEEKLY_CODEX_MODEL": {
+      "type": "string",
+      "description": "Codex 模型名称",
+      "default": "gpt-5.6-sol"
+    },
+    "WEEKLY_CODEX_TIMEOUT_SECONDS": {
+      "type": "number",
+      "description": "Codex 生成周报页计划的超时时间",
+      "default": 900
+    },
+    "WEEKLY_IMAGE_BATCH_TIMEOUT_SECONDS": {
+      "type": "number",
+      "description": "Codex 子代理批量生成全部周报图片的超时时间",
+      "default": 3600
+    },
+    "WEEKLY_ADMIN_CHAT": {
+      "type": "string",
+      "description": "Weekly 失败通知和私聊管理命令接收人",
+      "default": ""
+    },
+    "WEEKLY_NOTIFY_FAILURE": {
+      "type": "boolean",
+      "description": "周报生成失败时是否私聊通知管理员",
+      "default": false
+    },
+    "WEEKLY_PDF_MAX_MB": {
+      "type": "number",
+      "description": "最终 PDF 体积上限 MB，插件会自动压缩到该值以下",
+      "default": 10
+    },
+    "WEEKLY_PDF_JPEG_QUALITY": {
+      "type": "number",
+      "description": "PDF 内嵌 JPEG 初始质量",
+      "default": 72
+    },
+    "WEEKLY_MAX_LOG_CHARS": {
+      "type": "number",
+      "description": "传给 Codex 的聊天记录最大字符数，避免提示词过大",
+      "default": 360000
+    },
+    "WEEKLY_TASK_LOCK_STALE_SECONDS": {
+      "type": "number",
+      "description": "任务锁过期秒数；用于防止插件热重载导致同一时间多个周报任务并行",
+      "default": 7200
+    },
+    "WEEKLY_EDITOR_NAME": {
+      "type": "string",
+      "description": "周报首页显示的编辑署名",
+      "default": "微信助手"
+    }
+  },
+  "features": [
+    "push",
+    "admin"
+  ],
+  "config": {
+    "WEEKLY_PUSH_WEEKDAY": "MON",
+    "WEEKLY_PUSH_TIME": "09:00",
+    "WEEKLY_PAGE_COUNT": 8,
+    "WEEKLY_INITIAL_ISSUE": 1,
+    "WEEKLY_CODEX_MODEL": "gpt-5.6-sol",
+    "WEEKLY_CODEX_TIMEOUT_SECONDS": 900,
+    "WEEKLY_IMAGE_BATCH_TIMEOUT_SECONDS": 3600,
+    "WEEKLY_ADMIN_CHAT": "",
+    "WEEKLY_NOTIFY_FAILURE": false,
+    "WEEKLY_PDF_MAX_MB": 10,
+    "WEEKLY_PDF_JPEG_QUALITY": 72,
+    "WEEKLY_MAX_LOG_CHARS": 360000,
+    "WEEKLY_TASK_LOCK_STALE_SECONDS": 7200,
+    "WEEKLY_EDITOR_NAME": "微信助手"
+  }
+}

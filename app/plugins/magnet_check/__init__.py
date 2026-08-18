@@ -1,0 +1,1 @@
+"""Magnet link inspection plugin."""

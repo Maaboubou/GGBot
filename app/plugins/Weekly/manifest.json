@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "listeners": [
+    {
+      "event": "text_message_received",
+      "handler": "handle_text",
+      "title": "管理员周报命令",
+      "trigger": {
+        "kind": "keyword",
+        "summary": "仅指定私聊管理员发送周报帮助、状态、失败或重试命令",
+        "config_keys": [],
+        "conditions": ["固定命令：周报帮助 / 周报状态 / 周报失败 / 周报重试", "群聊消息不会触发"]
+      },
+      "scope": {
+        "level": "global",
+        "chat_types": ["user"],
+        "chat_name_config_key": "WEEKLY_ADMIN_CHAT"
+      },
+      "propagation": "stop_on_consumed"
+    }
+  ],
+  "jobs": [
+    {
+      "id": "weekly_push",
+      "title": "每周周报推送",
+      "trigger": {
+        "kind": "schedule",
+        "summary": "按配置的星期与时间自动推送",
+        "config_keys": ["WEEKLY_PUSH_WEEKDAY", "WEEKLY_PUSH_TIME"],
+        "conditions": []
+      },
+      "scope": {"level": "global", "chat_types": ["group", "user"]}
+    }
+  ]
+}

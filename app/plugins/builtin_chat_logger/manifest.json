@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "listeners": [
+    {"event": "text_message_received", "handler": "handle_text_message", "title": "记录文本", "trigger": {"kind": "always", "summary": "记录所有已分配聊天的文本消息", "config_keys": [], "conditions": []}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "observe"},
+    {"event": "image_message_received", "handler": "handle_image_message", "title": "记录图片", "trigger": {"kind": "always", "summary": "记录所有已分配聊天的图片消息", "config_keys": [], "conditions": []}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "observe"},
+    {"event": "link_message_received", "handler": "handle_link_message", "title": "记录链接", "trigger": {"kind": "always", "summary": "记录所有已分配聊天的链接消息", "config_keys": [], "conditions": []}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "observe"},
+    {"event": "quote_message_received", "handler": "handle_quote_message", "title": "记录引用", "trigger": {"kind": "always", "summary": "记录所有已分配聊天的通用引用消息", "config_keys": [], "conditions": []}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "observe"}
+  ],
+  "jobs": []
+}

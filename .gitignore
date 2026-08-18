@@ -1,0 +1,32 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+*.log.*
+cookies.txt
+*.session
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# All runtime data is private. Keep only the placeholder.
+data/*
+!data/.gitkeep
+logs/
+tmp/
+.restart_signal
+
+# Plugin-generated private data and reports
+app/plugins/boc_rate/exchange_rate_cache/
+app/plugins/magnet_check/reports/
+app/plugins/menu_translator/images/
+app/plugins/menu_translator/pdfs/
+
+# Local Codex artifacts
+.codex/
+wxautox文件下载/

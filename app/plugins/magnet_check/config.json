@@ -1,0 +1,95 @@
+{
+  "name": "magnet_check",
+  "display_name": "磁链检查",
+  "version": "1.2.0",
+  "description": "默认响应消息开头的“验车 + InfoHash”，可选启用完整磁链扫描，并返回资源 PNG 报告图。",
+  "author": "Project Contributors",
+  "category": "utility",
+  "requires": [
+    "Pillow",
+    "NudeNet"
+  ],
+  "config_schema": {
+    "trigger_word": {
+      "type": "string",
+      "title": "验车触发词",
+      "description": "消息以该词开头，后接有效 InfoHash 时触发",
+      "group": "trigger",
+      "default": "验车"
+    },
+    "timeout": {
+      "type": "number",
+      "title": "查询超时时间（秒）",
+      "description": "资源接口和截图下载的超时时间。",
+      "default": 30,
+      "minimum": 3,
+      "maximum": 120,
+      "step": 1
+    },
+    "max_screenshots": {
+      "type": "integer",
+      "title": "最大截图数量",
+      "description": "报告图中最多展示的资源截图数量。",
+      "default": 6,
+      "minimum": 1,
+      "maximum": 12,
+      "step": 1
+    },
+    "enable_full_magnet_match": {
+      "type": "boolean",
+      "title": "启用完整磁链匹配",
+      "description": "开启后扫描消息中的 magnet:? 完整磁链；默认关闭，不影响“验车 + InfoHash”触发。",
+      "default": false
+    },
+    "detection_threshold": {
+      "type": "number",
+      "title": "NudeNet 检测阈值",
+      "description": "越低检测越严格、0.05 最严，0.50 最宽松；当前建议 0.12。",
+      "default": 0.12,
+      "minimum": 0.05,
+      "maximum": 0.5,
+      "step": 0.01
+    },
+    "inference_resolution": {
+      "type": "integer",
+      "title": "NudeNet 推理分辨率",
+      "description": "越高越容易识别小目标，但会增加 CPU 和内存占用；建议 960。",
+      "default": 960,
+      "minimum": 320,
+      "maximum": 1280,
+      "step": 32
+    },
+    "blur_strength": {
+      "type": "number",
+      "title": "敏感图片模糊强度",
+      "description": "0.10 代表 10%，1.00 代表 100%；检测命中后对整张图片生效。",
+      "default": 1,
+      "minimum": 0.1,
+      "maximum": 1,
+      "step": 0.05
+    },
+    "use_system_proxy": {
+      "type": "boolean",
+      "title": "使用 Windows 系统代理",
+      "description": "默认关闭，避免失效代理阻断查询。",
+      "default": false
+    },
+    "output_dir": {
+      "type": "string",
+      "title": "报告保存目录",
+      "description": "相对路径以插件目录为基准。",
+      "default": "reports"
+    }
+  },
+  "config": {
+    "trigger_word": "验车",
+    "timeout": 30,
+    "max_screenshots": 6,
+    "enable_full_magnet_match": false,
+    "detection_threshold": 0.12,
+    "inference_resolution": 960,
+    "blur_strength": 1,
+    "use_system_proxy": false,
+    "output_dir": "reports"
+  }
+}

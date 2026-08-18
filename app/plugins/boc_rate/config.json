@@ -1,0 +1,49 @@
+{
+  "name": "boc_rate",
+  "display_name": "汇率查询",
+  "version": "2.0.0",
+  "description": "中国银行外汇牌价查询与走势图（智能缓存与翻页，复用历史缓存文件）",
+  "author": "Project Contributors",
+  "category": "finance",
+  "features": [
+    "push"
+  ],
+  "config_schema": {
+    "trigger_keywords": {
+      "type": "array",
+      "title": "触发关键词",
+      "description": "消息包含任一关键词或币种名称时查询中行牌价",
+      "group": "trigger",
+      "default": [
+        "汇率",
+        "中行",
+        "牌价"
+      ]
+    },
+    "cache_expire_hours": {
+      "type": "integer",
+      "description": "汇率数据缓存过期时间（小时）",
+      "default": 1
+    },
+    "DAILY_PUSH_TIME": {
+      "type": "string",
+      "description": "每日任务执行时间（北京时间，格式：HH:MM）",
+      "default": "10:00"
+    },
+    "ALERT_THRESHOLD_PERCENT": {
+      "type": "number",
+      "description": "欧元汇率异动阈值（百分比，绝对值大于该阈值则提醒）",
+      "default": 0.5
+    }
+  },
+  "config": {
+    "trigger_keywords": [
+      "汇率",
+      "中行",
+      "牌价"
+    ],
+    "cache_expire_hours": 1,
+    "DAILY_PUSH_TIME": "10:00",
+    "ALERT_THRESHOLD_PERCENT": 0.5
+  }
+}

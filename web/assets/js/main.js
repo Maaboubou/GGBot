@@ -1,0 +1,2990 @@
+/**
+ * Main Application Module
+ */
+
+const App = {
+    // State
+    currentTab: UI.getInitialTab(),
+    refreshInterval: null,
+    logRefreshInterval: null,
+    logAbortController: null,
+    logControlsReady: false,
+    isLoading: false,
+    logFollowEnabled: false,
+    currentLogContent: '',
+    currentLogSearchQuery: '',
+    currentLogSearchMatches: [],
+    currentLogSearchIndex: -1,
+    currentLogStatusBase: '就绪',
+    lastLiveCodexStatus: null,
+    webRestartSupported: false,
+    webRestartUnavailableReason: '正在检查管理控制台状态…',
+    automationView: 'library',
+    automationCapabilities: [],
+    automationRouting: null,
+    automationSelectedEvent: null,
+    automationSelectedChatId: null,
+    automationRouteMode: 'sort',
+    automationDraftEvent: null,
+    automationDraftKeys: null,
+    automationOrderDirty: false,
+    automationOrderSaving: false,
+    managedChatSelectionRequest: 0,
+
+    async init() {
+        console.log('App Initializing...');
+        UI.init(); // Setup UI listeners
+
+        // Global Error Handler
+        window.addEventListener('unhandledrejection', event => {
+            console.error('Unhandled promise rejection:', event.reason);
+        });
+
+        // Health Check
+        try {
+            await API.system.checkHealth();
+            await this.configureRestartControls();
+
+            // Set up Polling
+            this.startAutoRefresh();
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) {
+                    this.stopAutoRefresh();
+                    if (this.logAbortController) this.logAbortController.abort();
+                } else {
+                    this.startAutoRefresh();
+                    this.refreshCurrentTab();
+                }
+            });
+
+            // Load only the requested route. The previous startup path loaded
+            // Dashboard and every LLM sub-view even when neither was visible.
+            UI.switchTab(this.currentTab, { history: false });
+        } catch (e) {
+            UI.showError('系统初始化失败：' + e.message, 'alert');
+        }
+    },
+
+    async refreshCurrentTab() {
+        if (document.hidden) return;
+        if (this.isLoading) return;
+        // Don't auto-refresh settings or forms to avoid overwriting user input
+        if (['settings', 'users', 'roles', 'llm'].includes(this.currentTab)) return;
+
+        await this.loadTab(this.currentTab, true);
+    },
+
+    startAutoRefresh() {
+        if (this.refreshInterval || document.hidden) return;
+        this.refreshInterval = setInterval(() => this.refreshCurrentTab(), 30000);
+    },
+
+    stopAutoRefresh() {
+        if (!this.refreshInterval) return;
+        clearInterval(this.refreshInterval);
+        this.refreshInterval = null;
+    },
+
+    async loadTab(tabName, isBackground = false) {
+        this.currentTab = tabName;
+        this.isLoading = true;
+
+        try {
+            switch (tabName) {
+                case 'dashboard':
+                    await this.refreshDashboard();
+                    break;
+                case 'plugins':
+                    await this.loadPlugins(!isBackground);
+                    break;
+                case 'wechat':
+                    await this.loadWeChat();
+                    break;
+                case 'users':
+                    await this.loadUsers();
+                    break;
+                case 'roles':
+                    await this.loadRoles();
+                    break;
+                case 'llm':
+                    await LLMManager.init();
+                    break;
+                case 'logs':
+                    if (!isBackground) this.setupLogControls();
+                    await this.loadLogs(null, !isBackground);
+                    break;
+                case 'settings':
+                    this.loadSettings();
+                    break;
+            }
+        } catch (e) {
+            console.error(`Failed to load tab ${tabName}:`, e);
+            if (!isBackground) {
+                UI.showError(`加载页面 ${tabName} 失败：${e.message}`);
+            }
+        } finally {
+            this.isLoading = false;
+        }
+    },
+
+    async restartSystem() {
+        return this.restartManagedService('all', {
+            confirmMessage: '确定要重启全部服务吗？Web 和微信 Bot 都会短暂中断。',
+            confirmTitle: '重启全部服务',
+            overlayTitle: '系统重启中',
+            overlayMessage: '正在重启全部服务…'
+        });
+    },
+
+    async configureRestartControls() {
+        const webButton = document.getElementById('restartWebButton');
+        if (!webButton) return;
+
+        try {
+            const capabilities = await API.system.getRestartCapabilities();
+            const webRestartSupported = capabilities?.signal_protocol >= 2
+                && capabilities?.services?.includes('web');
+            this.webRestartSupported = webRestartSupported;
+            this.webRestartUnavailableReason = capabilities?.reason
+                || '当前管理面板进程不支持单独重启 Web 服务。请完整关闭并重新打开 GGBot 管理面板。';
+            webButton.disabled = false;
+            webButton.classList.toggle('restart-supported', webRestartSupported);
+            webButton.classList.toggle('text-secondary', !webRestartSupported);
+            webButton.setAttribute('aria-disabled', webRestartSupported ? 'false' : 'true');
+            webButton.title = webRestartSupported
+                ? '只重启 Web，微信 Bot 保持运行'
+                : this.webRestartUnavailableReason;
+        } catch (e) {
+            this.webRestartSupported = false;
+            this.webRestartUnavailableReason = '无法确认管理面板能力。请完整关闭并重新打开 GGBot 管理面板。';
+            webButton.disabled = false;
+            webButton.classList.remove('restart-supported');
+            webButton.classList.add('text-secondary');
+            webButton.setAttribute('aria-disabled', 'true');
+            webButton.title = this.webRestartUnavailableReason;
+        }
+    },
+
+    async restartWeb() {
+        if (!this.webRestartSupported) {
+            UI.showError(this.webRestartUnavailableReason, 'alert');
+            return;
+        }
+        return this.restartManagedService('web', {
+            confirmMessage: '确定只重启 Web 服务吗？微信 Bot 将保持运行。',
+            confirmTitle: '只重启 Web',
+            overlayTitle: 'Web 服务重启中',
+            overlayMessage: '正在重启 Web 服务…'
+        });
+    },
+
+    async restartManagedService(service, options) {
+        if (!await UI.confirm(options.confirmMessage, {
+            title: options.confirmTitle,
+            confirmText: '重启',
+            variant: 'warning'
+        })) return;
+
+        // 立即显示重连 Overlay，不等待 API 响应
+        // 原因：重启请求会让服务器立刻下线，fetch 必然以 NetworkError 结束，
+        // 这是正常现象而非错误。
+        UI.showRestartOverlay(options.overlayTitle, options.overlayMessage);
+
+        // 发出重启请求（fire-and-forget），NetworkError 视为成功
+        try {
+            await API.system.restart(service);
+        } catch (e) {
+            // NetworkError / TypeError 表示服务器已经开始重启，属于预期行为
+            if (!(e instanceof TypeError) && !e.message.includes('NetworkError') && !e.message.includes('Failed to fetch')) {
+                // 真正的意外错误才取消 overlay 并提示
+                UI.hideRestartOverlay();
+                UI.showError('无法触发重启：' + e.message);
+                return;
+            }
+        }
+
+        // 延迟 3 秒后开始轮询（给服务器时间真正重启）
+        setTimeout(() => {
+            this.pollForRecovery();
+        }, 3000);
+    },
+
+    async pollForRecovery() {
+        const check = async () => {
+            try {
+                await API.system.checkHealth();
+                // 恢复成功，刷新页面
+                window.location.reload();
+            } catch (e) {
+                // 还未恢复，继续轮询
+                setTimeout(check, 2000);
+            }
+        };
+        check();
+    },
+
+    // --- Tab Actions ---
+
+    async refreshDashboard() {
+        try {
+            // Fetch all dashboard data in parallel
+            const [dashStats, recentActivities, topUsers, systemStatus, wxStatus, wxInfo, llmStats, codexStatus] = await Promise.all([
+                API.request('/api/dashboard/stats'),
+                API.request('/api/dashboard/recent-activities?limit=14'),
+                API.request('/api/dashboard/top-users?limit=5'),
+                API.system.getStatus(),
+                API.wechat.getStatus(),
+                API.wechat.getMyInfo().catch(() => ({})),
+                API.plugins.getStats(),
+                API.request('/api/dashboard/codex-status').catch((e) => ({ status: 'error', quota_message: e.message }))
+            ]);
+
+            // Render all dashboard components
+            this.renderDashboardStats(dashStats);
+            this.renderRecentActivities(recentActivities.activities);
+            this.renderTopUsers(topUsers.users);
+            this.renderSystemResources(systemStatus);
+            this.renderWeChatStatus(wxStatus, wxInfo);
+            this.renderLLMStats(llmStats.stats || llmStats);
+            this.renderCodexStatus(codexStatus);
+            this.renderDashboardSummary(systemStatus, llmStats.stats || llmStats);
+
+            // Update last update time
+            const now = new Date();
+            document.getElementById('lastUpdateTime').textContent = `更新 ${now.toLocaleTimeString('zh-CN')}`;
+        } catch (e) {
+            console.error('Failed to refresh dashboard:', e);
+        }
+    },
+
+    openDashboardErrors() {
+        const path = '/ai/calls';
+        if (UI.normalizePath(window.location.pathname) !== path) {
+            window.history.pushState({ tab: 'llm', section: 'llm-history' }, '', path);
+        }
+        UI.switchTab('llm', { history: false });
+    },
+
+    async refreshCodexUsage() {
+        const button = document.getElementById('refreshCodexUsageBtn');
+        const container = document.getElementById('codexStatusOutput');
+        try {
+            if (button) {
+                button.disabled = true;
+                button.innerHTML = '<span class="spinner-border spinner-border-sm" aria-hidden="true"></span>';
+            }
+            if (container) {
+                container.innerHTML = `
+                    <div class="text-center text-muted py-3">
+                        <div class="spinner-border spinner-border-sm me-2" aria-hidden="true"></div>
+                        正在刷新 Codex 用量…
+                    </div>
+                `;
+            }
+
+            const data = await API.request('/api/dashboard/codex-status/refresh', { method: 'POST' });
+            this.renderCodexStatus(data);
+        } catch (e) {
+            console.error('Failed to refresh Codex usage:', e);
+            this.renderCodexStatus({
+                status: 'error',
+                logged_in: false,
+                quota_available: false,
+                quota_message: e.message || '刷新 Codex 用量失败',
+                updated_at: new Date().toISOString(),
+            });
+        } finally {
+            if (button) {
+                button.disabled = false;
+                button.innerHTML = '<i class="bi bi-arrow-clockwise"></i>';
+            }
+        }
+    },
+
+    renderDashboardStats(stats) {
+        document.getElementById('statTodayMessages').textContent = Number(stats?.today_messages || 0).toLocaleString();
+        document.getElementById('statAiReplies').textContent = Number(stats?.today_ai_replies || 0).toLocaleString();
+        document.getElementById('statActiveUsers').textContent = Number(stats?.active_users || 0).toLocaleString();
+
+        // Format token usage
+        const tokens = Number(stats?.token_usage || 0);
+        let tokenDisplay;
+        if (tokens >= 1000000) {
+            tokenDisplay = (tokens / 1000000).toFixed(1) + 'M';
+        } else if (tokens >= 1000) {
+            tokenDisplay = (tokens / 1000).toFixed(1) + 'K';
+        } else {
+            tokenDisplay = tokens.toString();
+        }
+        document.getElementById('statTokenUsage').textContent = tokenDisplay;
+    },
+
+    renderRecentActivities(activities) {
+        const container = document.getElementById('recentActivities');
+        if (!activities || activities.length === 0) {
+            container.innerHTML = '<div class="p-4 text-center text-muted">暂无活动记录</div>';
+            return;
+        }
+
+        const html = activities.map(activity => {
+            const icon = activity.is_bot ?
+                '<i class="bi bi-robot text-success"></i>' :
+                '<i class="bi bi-person text-primary"></i>';
+            const time = String(activity.time || '').split(' ')[1] || '';
+
+            return `
+                <div class="dashboard-activity-row">
+                    <div class="dashboard-activity-icon ${activity.is_bot ? 'bot' : 'person'}">${icon}</div>
+                    <div class="flex-grow-1 min-w-0">
+                        <div class="dashboard-activity-title">
+                            <strong class="text-truncate">${this.escapeHtml(activity.chat_name || '未知聊天')}</strong>
+                            <small>${this.escapeHtml(time)}</small>
+                        </div>
+                        <div class="dashboard-activity-preview text-truncate">${this.escapeHtml(activity.sender || '未知')}: ${this.escapeHtml(activity.preview || '')}</div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        container.innerHTML = html;
+    },
+
+    renderTopUsers(users) {
+        const container = document.getElementById('topUsers');
+        if (!users || users.length === 0) {
+            container.innerHTML = '<div class="text-center text-muted small">暂无数据</div>';
+            return;
+        }
+
+        const html = users.map((user, index) => `
+            <div class="dashboard-chat-rank">
+                <span class="dashboard-rank-index">${index + 1}</span>
+                <div class="min-w-0">
+                    <strong class="text-truncate">${this.escapeHtml(user.chat_name || '未知聊天')}</strong>
+                </div>
+                <span class="dashboard-rank-count">${Number(user.message_count || 0).toLocaleString()}</span>
+            </div>
+        `).join('');
+
+        container.innerHTML = html;
+    },
+
+    renderSystemResources(status) {
+        const container = document.getElementById('systemResources');
+        if (!container) return;
+
+        const cpu = Number(status?.cpu_percent || 0);
+        const memory = Number(status?.memory_percent || 0);
+        const disk = Number(status?.disk_percent || 0);
+        const systemUptime = status?.system_uptime || '未知';
+        const appUptime = status?.uptime || '未知';
+        const temperature = status?.temperature;
+        const temperatureSensors = Array.isArray(temperature?.sensors)
+            ? temperature.sensors.filter(sensor => Number.isFinite(Number(sensor?.celsius)))
+            : [];
+
+        const resourceRow = (label, value) => {
+            const tone = value >= 85 ? 'danger' : value >= 65 ? 'warning' : 'success';
+            const safeValue = Math.max(0, Math.min(100, value));
+            return `
+                <div class="dashboard-resource-item ${tone}">
+                    <div><span>${label}</span><strong>${value.toFixed(1)}%</strong></div>
+                    <span class="dashboard-resource-track"><i style="width: ${safeValue}%"></i></span>
+                </div>
+            `;
+        };
+
+        const temperatureHtml = temperatureSensors.length > 0
+            ? `<div class="dashboard-temperature-row">
+                    <span>温度</span>
+                    <div>${temperatureSensors.slice(0, 2).map(sensor => {
+                        const value = Number(sensor.celsius);
+                        const tone = value >= 90 ? 'danger' : value >= 75 ? 'warning' : 'success';
+                        const details = [sensor.sensor_name, sensor.source].filter(Boolean).join(' · ');
+                        return `<span class="dashboard-temperature ${tone}" title="${this.escapeHtml(details)}">${this.escapeHtml(sensor.label || '温度')} ${value.toFixed(1)}°C</span>`;
+                    }).join('')}</div>
+                </div>`
+            : '';
+
+        this.systemResourceSnapshot = { cpu, memory, disk, systemUptime, appUptime };
+        container.innerHTML = `
+            <div class="dashboard-resource-grid">
+                ${resourceRow('CPU', cpu)}
+                ${resourceRow('内存', memory)}
+                ${resourceRow('磁盘', disk)}
+            </div>
+            ${temperatureHtml}
+        `;
+    },
+
+    renderWeChatStatus(wxStatus, wxInfo) {
+        const container = document.getElementById('dashboardWechatStatus');
+        if (!container) return;
+        const isOnline = wxStatus?.status === 'connected' || wxStatus?.running === true;
+        const botName = wxInfo?.display_name || wxStatus?.stats?.bot_name || '未知';
+        container.innerHTML = `
+            <span class="dashboard-inline-state ${isOnline ? 'online' : 'offline'}" title="${this.escapeHtml(botName)}">
+                <i class="bi bi-wechat"></i>${isOnline ? '在线' : '离线'}
+            </span>
+        `;
+    },
+
+    renderLLMStats(stats) {
+        const totalCalls = Number(stats?.total_calls || 0);
+        const errorCount = Number(stats?.error_count || 0);
+        const avgResponseTime = Number(stats?.avg_response_time || 0);
+
+        // Format response time
+        let responseTimeDisplay;
+        if (avgResponseTime >= 1) {
+            responseTimeDisplay = avgResponseTime.toFixed(1) + ' 秒';
+        } else if (avgResponseTime > 0) {
+            responseTimeDisplay = (avgResponseTime * 1000).toFixed(0) + ' 毫秒';
+        } else {
+            responseTimeDisplay = '-';
+        }
+
+        const callsElement = document.getElementById('dashboardModelCalls');
+        const errorsElement = document.getElementById('dashboardErrors');
+        const callsMetaElement = document.getElementById('dashboardCallsMeta');
+        if (callsElement) callsElement.textContent = totalCalls.toLocaleString();
+        if (errorsElement) {
+            errorsElement.textContent = errorCount.toLocaleString();
+            const errorLink = errorsElement.closest('.dashboard-kpi');
+            errorLink?.classList.toggle('has-errors', errorCount > 0);
+            if (errorLink) {
+                errorLink.title = errorCount > 0
+                    ? `查看 ${errorCount.toLocaleString()} 次调用错误`
+                    : '查看调用诊断';
+            }
+        }
+        if (callsMetaElement) callsMetaElement.textContent = `平均 ${responseTimeDisplay}`;
+    },
+
+    renderDashboardSummary(systemStatus, stats) {
+        const enabledPlugins = Number(stats?.enabled_plugins || 0);
+        const loadedPlugins = Number(stats?.loaded_plugins || 0);
+        const pluginHealth = document.getElementById('dashboardPluginHealth');
+        const appUptime = document.getElementById('dashboardUptime');
+        const systemUptime = document.getElementById('dashboardSystemUptime');
+        if (pluginHealth) pluginHealth.textContent = enabledPlugins ? `${loadedPlugins}/${enabledPlugins} 运行` : `${loadedPlugins} 运行`;
+        if (appUptime) appUptime.textContent = this.systemResourceSnapshot?.appUptime || systemStatus?.uptime || '未知';
+        if (systemUptime) systemUptime.textContent = this.systemResourceSnapshot?.systemUptime || systemStatus?.system_uptime || '未知';
+    },
+
+    localizeCodexQuotaMessage(message) {
+        const text = String(message || '');
+        const exactLabels = {
+            'Codex app-server did not return account rate limits': 'Codex app-server 未返回账户限额',
+            'Latest rollout file does not contain rate_limits yet': '最新 rollout 文件尚未包含 rate_limits',
+            'Read from latest Codex rollout rate_limits': '已从最新 Codex rollout 文件读取 rate_limits',
+            'Live refresh failed; showing last successful live usage': '实时刷新失败，正在显示最近一次成功获取的实时用量',
+            'Live refresh failed; showing cached rollout data': '实时刷新失败，正在显示缓存的 rollout 数据',
+            'Failed to fetch': '网络请求失败'
+        };
+        if (exactLabels[text]) return exactLabels[text];
+        if (text.startsWith('No rollout files found under ')) {
+            return `未在以下目录找到 rollout 文件：${text.slice('No rollout files found under '.length)}`;
+        }
+        if (text.startsWith('Failed to read rollout file: ')) {
+            return `读取 rollout 文件失败：${text.slice('Failed to read rollout file: '.length)}`;
+        }
+        return text;
+    },
+
+    renderCodexStatus(data) {
+        const container = document.getElementById('codexStatusOutput');
+        if (!container) return;
+
+        // A dashboard poll can finish after a manual refresh. Keep the newest
+        // successful app-server result instead of letting an old rollout win.
+        const hasLiveUsage = data?.usage_source === 'app_server' && !!data?.quota_available;
+        if (hasLiveUsage) {
+            const incomingTime = Date.parse(data.updated_at || '') || 0;
+            const savedTime = Date.parse(this.lastLiveCodexStatus?.updated_at || '') || 0;
+            if (!this.lastLiveCodexStatus || incomingTime >= savedTime) {
+                this.lastLiveCodexStatus = data;
+            } else {
+                data = this.lastLiveCodexStatus;
+            }
+        } else if (this.lastLiveCodexStatus) {
+            data = this.lastLiveCodexStatus;
+        }
+
+        const loggedIn = !!data?.logged_in;
+        const statusClass = loggedIn ? 'online' : 'offline';
+        const statusText = data?.usage_source === 'app_server'
+            ? (data?.served_from_snapshot ? '最近实时用量' : '实时用量')
+            : (loggedIn ? '缓存用量' : '尚未刷新');
+        const model = data?.model || 'gpt-5.5';
+        const version = data?.version || '-';
+        const authMode = data?.auth_mode || (loggedIn ? 'chatgpt' : '-');
+        const planType = data?.plan_type ? ` / ${data.plan_type}` : '';
+        const updatedAt = data?.updated_at ? this.formatDashboardTime(data.updated_at) : '';
+        const quotaMessage = data?.quota_available
+            ? (data?.quota || 'Codex 已返回用量信息')
+            : this.localizeCodexQuotaMessage(data?.quota_message || '点击刷新以读取当前 Codex 账户限额。');
+        const primaryLimit = this.renderCodexLimit(data?.rate_limits?.primary, '主要限额');
+        const secondaryLimit = this.renderCodexLimit(data?.rate_limits?.secondary, '次要限额');
+
+        container.innerHTML = `
+            <div class="dashboard-codex-meta">
+                <span class="dashboard-inline-state ${statusClass}"><i class="bi bi-circle-fill"></i>${statusText}</span>
+                ${updatedAt ? `<small>${this.escapeHtml(updatedAt)}</small>` : ''}
+            </div>
+            <div class="dashboard-codex-identity" title="Codex ${this.escapeHtml(version)}">
+                <strong>${this.escapeHtml(model)}</strong>
+                <span>${this.escapeHtml(authMode + planType)}</span>
+            </div>
+            ${primaryLimit || secondaryLimit ? `
+                <div class="dashboard-codex-limits">
+                    ${primaryLimit}
+                    ${secondaryLimit}
+                </div>
+            ` : ''}
+            ${!data?.quota_available ? `
+                <div class="dashboard-codex-empty">
+                    <i class="bi bi-info-circle"></i><span>${this.escapeHtml(quotaMessage)}</span>
+                </div>
+            ` : ''}
+        `;
+    },
+
+    renderCodexLimit(limit, label) {
+        if (!limit || typeof limit.used_percent !== 'number') return '';
+
+        const used = Math.max(0, Math.min(100, limit.used_percent));
+        const rawRemaining = typeof limit.remaining_percent === 'number'
+            ? limit.remaining_percent
+            : 100 - used;
+        const remaining = Math.max(0, Math.min(100, rawRemaining));
+        const tone = remaining <= 10 ? 'danger' : remaining <= 30 ? 'warning' : 'success';
+        const resetTime = limit.resets_at ? new Date(limit.resets_at * 1000) : null;
+        const resetText = resetTime && !Number.isNaN(resetTime.getTime())
+            ? resetTime.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+            : '-';
+        const windowText = limit.window_minutes ? this.formatMinutes(limit.window_minutes) : '-';
+
+        return `
+            <article class="dashboard-codex-limit ${tone}">
+                <div>
+                    <span>${this.escapeHtml(label)}</span>
+                    <strong>${remaining.toFixed(remaining % 1 === 0 ? 0 : 1)}%</strong>
+                </div>
+                <span class="dashboard-resource-track"><i style="width: ${remaining}%"></i></span>
+                <small>${this.escapeHtml(windowText)} 窗口 · ${this.escapeHtml(resetText)} 重置 · 已用 ${used.toFixed(used % 1 === 0 ? 0 : 1)}%</small>
+            </article>
+        `;
+    },
+
+    renderJudgeOutput(data) {
+        const container = document.getElementById('judgeOutput');
+
+        if (!data || !data.judge_output) {
+            container.innerHTML = `
+                <div class="text-center text-muted small">
+                    <i class="bi bi-info-circle me-1"></i>
+                    ${this.escapeHtml(data?.reason || '暂无数据')}
+                </div>
+            `;
+            return;
+        }
+
+        const history = Array.isArray(data.history) && data.history.length > 0
+            ? data.history.slice(0, 10)
+            : [data];
+        const latest = history[0] || data;
+        const shouldReply = latest.should_reply;
+        const reason = latest.reason || '无原因';
+        const timestamp = latest.timestamp || '';
+        const judgeName = latest.judge_name || latest.judge_output?.judge_name || '';
+
+        // 格式化时间（只显示时分秒）
+        const timeDisplay = this.formatDashboardTime(timestamp);
+
+        const html = `
+            <div class="mb-2">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span class="badge ${shouldReply ? 'bg-success' : 'bg-secondary'}">
+                        ${shouldReply ? '✅ 需要回复' : '⏸️ 无需回复'}
+                    </span>
+                    <div class="d-flex align-items-center gap-2">
+                        ${timeDisplay ? `<small class="text-muted">${this.escapeHtml(timeDisplay)}</small>` : ''}
+                        ${history.length > 1 ? `
+                            <button class="btn btn-sm btn-outline-secondary py-0 px-2" onclick="App.showJudgeHistoryModal()">
+                                <i class="bi bi-clock-history me-1"></i>历史
+                            </button>
+                        ` : ''}
+                    </div>
+                </div>
+                ${judgeName ? `<div class="small text-muted mb-2"><strong>Judge：</strong>${this.escapeHtml(judgeName)}</div>` : ''}
+                <div class="small text-muted">
+                    <strong>原因：</strong><br>
+                    ${this.escapeHtml(reason)}
+                </div>
+            </div>
+        `;
+
+        container.innerHTML = html;
+        container.dataset.history = JSON.stringify(history);
+    },
+
+    showJudgeHistoryModal() {
+        const container = document.getElementById('judgeOutput');
+        const historyData = container?.dataset.history;
+        const history = historyData ? JSON.parse(historyData) : [];
+        const body = document.getElementById('modalJudgeHistoryContent');
+
+        if (!body) return;
+
+        if (!history.length) {
+            body.innerHTML = `
+                <div class="text-center text-muted py-3">
+                    <i class="bi bi-info-circle me-1"></i>
+                    暂无 Judge 历史记录
+                </div>
+            `;
+        } else {
+            body.innerHTML = history.map((item, idx) => {
+                const itemShouldReply = item.should_reply;
+                const itemReason = item.reason || '无原因';
+                const itemTime = this.formatDashboardTime(item.timestamp || '');
+                const itemJudgeName = item.judge_name || item.judge_output?.judge_name || '';
+                const itemRoleName = item.role_name || '';
+                const itemAtmosphere = item.atmosphere || '';
+                return `
+                    <div class="py-3 ${idx > 0 ? 'border-top' : ''}">
+                        <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+                            <span class="badge ${itemShouldReply ? 'bg-success' : 'bg-secondary'}">
+                                ${itemShouldReply ? '需要回复' : '无需回复'}
+                            </span>
+                            ${itemTime ? `<small class="text-muted">${this.escapeHtml(itemTime)}</small>` : ''}
+                        </div>
+                        <div class="small text-muted mb-2">
+                            ${itemJudgeName ? `<strong>Judge：</strong>${this.escapeHtml(itemJudgeName)}` : ''}
+                            ${itemRoleName ? `${itemJudgeName ? ' &nbsp;|&nbsp; ' : ''}<strong>角色：</strong>${this.escapeHtml(itemRoleName)}` : ''}
+                        </div>
+                        ${itemAtmosphere ? `<div class="small text-muted mb-2"><strong>氛围：</strong>${this.escapeHtml(itemAtmosphere)}</div>` : ''}
+                        <div class="small text-break" style="white-space: pre-wrap;">${this.escapeHtml(itemReason)}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        const modal = new bootstrap.Modal(document.getElementById('judgeHistoryModal'));
+        modal.show();
+    },
+
+    renderMemoryTraceSummary(trace) {
+        const enabled = trace.enabled !== false;
+        const events = Array.isArray(trace.events) ? trace.events.length : 0;
+        const people = Array.isArray(trace.people) ? trace.people.length : 0;
+        const hasStage = Boolean(trace.stage && trace.stage.included);
+        const tokens = Number(trace.tokens || 0);
+        const budget = Number(trace.token_budget || 0);
+        const latency = Number(trace.retrieval_ms || 0);
+
+        return `
+            <div class="border rounded-3 bg-body-tertiary p-2 mb-3">
+                <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+                    <span class="small fw-semibold">
+                        <i class="bi bi-database-check text-primary me-1"></i>
+                        本轮已注入记忆
+                    </span>
+                    <span class="badge ${enabled ? 'text-bg-success' : 'text-bg-secondary'}">
+                        ${enabled ? `${tokens.toLocaleString()} / ${budget.toLocaleString()} tokens` : '已关闭'}
+                    </span>
+                </div>
+                <div class="d-flex flex-wrap gap-1">
+                    <span class="badge text-bg-light border">阶段 ${hasStage ? '1' : '0'}</span>
+                    <span class="badge text-bg-light border">事件 ${events}</span>
+                    <span class="badge text-bg-light border">人物 ${people}</span>
+                    <span class="badge text-bg-light border">检索 ${latency.toLocaleString()} 毫秒</span>
+                    <span class="badge text-bg-light border">
+                        向量 ${trace.vector_ready ? '就绪' : '未使用'}
+                    </span>
+                </div>
+            </div>
+        `;
+    },
+
+    renderMemoryTrace(trace, namespace = '') {
+        if (!trace) {
+            return '<div class="text-muted text-center py-4">此调用没有记忆审计记录。</div>';
+        }
+        if (trace.enabled === false) {
+            return `
+                <div class="alert alert-secondary mb-0">
+                    <i class="bi bi-database-x me-1"></i>本轮记忆功能已关闭，没有向提示词注入记忆。
+                </div>
+            `;
+        }
+
+        const events = Array.isArray(trace.events) ? trace.events : [];
+        const people = Array.isArray(trace.people) ? trace.people : [];
+        const droppedEvents = Array.isArray(trace.dropped_events) ? trace.dropped_events : [];
+        const droppedPeople = Array.isArray(trace.dropped_people) ? trace.dropped_people : [];
+        const stage = trace.stage || {};
+        const safeTraceId = `${trace.trace_id || 'memory'}-${namespace || 'record'}`
+            .replace(/[^a-zA-Z0-9_-]/g, '');
+
+        let html = `
+            <div class="alert alert-info py-2 small">
+                <i class="bi bi-info-circle me-1"></i>
+                这里展示的是<strong>实际注入本轮提示词</strong>的记忆；它不等同于模型内部一定采用了这些内容。
+            </div>
+            ${this.renderMemoryTraceSummary(trace)}
+        `;
+
+        html += `
+            <section class="mb-4">
+                <h6 class="d-flex align-items-center gap-2">
+                    <i class="bi bi-layers text-primary"></i>阶段记忆
+                    <span class="badge ${stage.included ? 'text-bg-success' : 'text-bg-secondary'}">
+                        ${stage.included ? '已注入' : '未注入'}
+                    </span>
+                </h6>
+        `;
+        if (stage.included) {
+            html += `
+                <div class="border rounded-3 p-3 bg-body-tertiary">
+                    <div class="d-flex flex-wrap gap-2 mb-2 small text-muted">
+                        <span>来源事件 #${Number(stage.source_event_id || 0)}</span>
+                        ${stage.updated_at ? `<span>更新于 ${this.escapeHtml(stage.updated_at)}</span>` : ''}
+                        ${stage.truncated ? '<span class="badge text-bg-warning">按预算截断</span>' : ''}
+                    </div>
+                    <div style="white-space: pre-wrap;">${this.escapeHtml(stage.text || '')}</div>
+                </div>
+            `;
+        } else {
+            html += '<div class="text-muted small">本轮没有阶段记忆注入提示词。</div>';
+        }
+        html += '</section>';
+
+        html += `
+            <section class="mb-4">
+                <h6><i class="bi bi-people text-primary me-2"></i>人物记忆 <span class="badge text-bg-light border">${people.length}</span></h6>
+        `;
+        if (people.length) {
+            html += '<div class="vstack gap-2">';
+            people.forEach(person => {
+                const reasons = Array.isArray(person.selection_reasons) ? person.selection_reasons : [];
+                html += `
+                    <div class="border rounded-3 p-3">
+                        <div class="d-flex justify-content-between gap-2 mb-1">
+                            <strong>${this.escapeHtml(person.name || '未知人物')}</strong>
+                            <small class="text-muted">来源事件 #${Number(person.source_event_id || 0)}</small>
+                        </div>
+                        <div class="d-flex flex-wrap gap-1 mb-2">
+                            ${reasons.map(reason => `<span class="badge text-bg-light border">${this.escapeHtml(reason)}</span>`).join('')}
+                        </div>
+                        <div class="small" style="white-space: pre-wrap;">${this.escapeHtml(person.profile_text || '')}</div>
+                    </div>
+                `;
+            });
+            html += '</div>';
+        } else {
+            html += '<div class="text-muted small">本轮没有人物资料注入提示词。</div>';
+        }
+        html += '</section>';
+
+        html += `
+            <section class="mb-4">
+                <h6><i class="bi bi-journal-text text-primary me-2"></i>事件记忆 <span class="badge text-bg-light border">${events.length}</span></h6>
+        `;
+        if (events.length) {
+            html += '<div class="vstack gap-2">';
+            events.forEach((event, index) => {
+                const score = Math.max(0, Math.min(1, Number(event.retrieval_score || 0)));
+                const scorePercent = Math.round(score * 100);
+                const reasons = Array.isArray(event.match_reasons) ? event.match_reasons : [];
+                const participants = Array.isArray(event.participants) ? event.participants : [];
+                const keywords = Array.isArray(event.keywords) ? event.keywords : [];
+                const breakdown = event.score_breakdown || {};
+                const sourceTargetId = `memory-source-${safeTraceId}-${Number(event.id || index)}`;
+                const timeRange = [event.start_time, event.end_time].filter(Boolean).join(' ～ ');
+
+                html += `
+                    <details class="border rounded-3 overflow-hidden" ${index === 0 ? 'open' : ''}>
+                        <summary class="p-3 bg-body-tertiary" style="cursor: pointer;">
+                            <div class="d-inline-flex flex-wrap align-items-center gap-2">
+                                <strong>#${Number(event.id || 0)} ${this.escapeHtml(event.title || '未命名事件')}</strong>
+                                <span class="badge text-bg-primary">相关度 ${scorePercent}%</span>
+                                ${event.certainty ? `<span class="badge text-bg-light border">${this.escapeHtml(event.certainty)}</span>` : ''}
+                            </div>
+                        </summary>
+                        <div class="p-3">
+                            <div class="progress mb-2" role="progressbar" aria-label="记忆相关度"
+                                 aria-valuenow="${scorePercent}" aria-valuemin="0" aria-valuemax="100"
+                                 style="height: 5px;">
+                                <div class="progress-bar" style="width: ${scorePercent}%"></div>
+                            </div>
+                            <div class="d-flex flex-wrap gap-1 mb-2">
+                                ${reasons.map(reason => `<span class="badge text-bg-info">${this.escapeHtml(reason)}</span>`).join('')}
+                            </div>
+                            ${timeRange ? `<div class="small text-muted mb-2"><i class="bi bi-clock me-1"></i>${this.escapeHtml(timeRange)}</div>` : ''}
+                            <div class="mb-2" style="white-space: pre-wrap;">${this.escapeHtml(event.summary || '')}</div>
+                            ${participants.length ? `<div class="small mb-1"><strong>参与者：</strong>${participants.map(value => this.escapeHtml(value)).join('、')}</div>` : ''}
+                            ${keywords.length ? `<div class="small mb-1"><strong>关键词：</strong>${keywords.map(value => this.escapeHtml(value)).join('、')}</div>` : ''}
+                            ${(event.decisions || []).length ? `<div class="small mb-1"><strong>结论：</strong>${event.decisions.map(value => this.escapeHtml(value)).join('；')}</div>` : ''}
+                            ${(event.open_items || []).length ? `<div class="small mb-1"><strong>未完成：</strong>${event.open_items.map(value => this.escapeHtml(value)).join('；')}</div>` : ''}
+                            <details class="mt-3">
+                                <summary class="small text-muted" style="cursor: pointer;">查看检索得分明细</summary>
+                                <div class="d-flex flex-wrap gap-1 mt-2">
+                                    ${Object.entries(breakdown).map(([key, value]) => `
+                                        <span class="badge text-bg-light border">
+                                            ${this.escapeHtml(this.memoryScoreLabel(key))} ${Number(value || 0).toFixed(3)}
+                                        </span>
+                                    `).join('')}
+                                </div>
+                            </details>
+                            <div class="d-flex flex-wrap gap-2 mt-3">
+                                <button class="btn btn-sm btn-outline-primary"
+                                        onclick="App.loadMemoryEventSource(${Number(event.id || 0)}, '${sourceTargetId}', this)">
+                                    <i class="bi bi-chat-left-text me-1"></i>查看原始消息
+                                </button>
+                                <details>
+                                    <summary class="btn btn-sm btn-outline-secondary">实际注入文本</summary>
+                                    <pre class="mt-2 mb-0 p-2 bg-body-tertiary border rounded small"
+                                         style="white-space: pre-wrap; max-height: 260px; overflow: auto;">${this.escapeHtml(event.prompt_text || '')}</pre>
+                                </details>
+                            </div>
+                            <div id="${sourceTargetId}" class="mt-3"
+                                 data-chat-name="${this.escapeHtml(trace.chat_name || '')}"></div>
+                        </div>
+                    </details>
+                `;
+            });
+            html += '</div>';
+        } else {
+            html += '<div class="text-muted small">本轮没有历史事件注入提示词。</div>';
+        }
+        html += '</section>';
+
+        if (droppedEvents.length || droppedPeople.length) {
+            html += `
+                <details class="border rounded-3 p-3">
+                    <summary class="small fw-semibold" style="cursor: pointer;">
+                        因 Token 预算未注入的候选（事件 ${droppedEvents.length}，人物 ${droppedPeople.length}）
+                    </summary>
+                    <div class="mt-2 small text-muted">
+                        ${droppedEvents.map(event => `
+                            <div>#${Number(event.id || 0)} ${this.escapeHtml(event.title || '未命名事件')}</div>
+                        `).join('')}
+                        ${droppedPeople.map(person => `
+                            <div>${this.escapeHtml(person.name || '未知人物')}</div>
+                        `).join('')}
+                    </div>
+                </details>
+            `;
+        }
+        return html;
+    },
+
+    memoryScoreLabel(key) {
+        return {
+            semantic: '语义',
+            lexical: '文字',
+            keyword: '关键词',
+            participant: '人物',
+            recency: '时效',
+            importance: '重要度'
+        }[key] || key;
+    },
+
+    async loadMemoryEventSource(eventId, targetId, button) {
+        const target = document.getElementById(targetId);
+        if (!target || target.dataset.loaded === 'true') return;
+        const chatName = target.dataset.chatName || '';
+        if (!chatName) {
+            target.innerHTML = '<div class="alert alert-warning py-2 mb-0">缺少群聊名称，无法读取来源消息。</div>';
+            return;
+        }
+
+        const originalHtml = button ? button.innerHTML : '';
+        if (button) {
+            button.disabled = true;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>读取中';
+        }
+        target.innerHTML = '<div class="text-muted small">正在读取事件对应的原始群聊消息……</div>';
+        try {
+            const params = new URLSearchParams({
+                chat_name: chatName,
+                event_id: String(eventId)
+            });
+            const response = await API.request(`/api/chatbot/roles/memory-event-source?${params.toString()}`);
+            const messages = response?.data?.messages || [];
+            if (!messages.length) {
+                target.innerHTML = `
+                    <div class="alert alert-secondary py-2 mb-0 small">
+                        没有找到对应的原始消息；聊天日志可能已轮转或清理。
+                    </div>
+                `;
+            } else {
+                target.innerHTML = `
+                    <div class="border rounded-3 p-2 bg-body-tertiary">
+                        <div class="small fw-semibold mb-2">原始消息（${messages.length}）</div>
+                        <div class="vstack gap-2" style="max-height: 360px; overflow-y: auto;">
+                            ${messages.map(message => `
+                                <div class="bg-body border rounded p-2 small">
+                                    <div class="d-flex justify-content-between gap-2 text-muted mb-1">
+                                        <span>#${Number(message._log_cursor || 0)} · ${this.escapeHtml(message.sender || '未知')}</span>
+                                        <span>${this.escapeHtml(message.time || '')}</span>
+                                    </div>
+                                    <div style="white-space: pre-wrap;">${this.escapeHtml(message.content || '')}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+            target.dataset.loaded = 'true';
+        } catch (error) {
+            target.innerHTML = `
+                <div class="alert alert-danger py-2 mb-0 small">
+                    读取原始消息失败：${this.escapeHtml(error.message || String(error))}
+                </div>
+            `;
+        } finally {
+            if (button) {
+                button.disabled = false;
+                button.innerHTML = originalHtml;
+            }
+        }
+    },
+
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text == null ? '' : String(text);
+        return div.innerHTML;
+    },
+
+    formatDashboardTime(timestamp) {
+        if (!timestamp) return '';
+        if (typeof timestamp === 'string' && timestamp.includes(' ')) {
+            return timestamp.split(' ')[1] || '';
+        }
+        const date = new Date(timestamp);
+        return Number.isNaN(date.getTime()) ? String(timestamp) : date.toLocaleTimeString('zh-CN');
+    },
+
+    formatMinutes(minutes) {
+        if (!minutes) return '-';
+        if (minutes % 1440 === 0) {
+            return `${minutes / 1440}天`;
+        } else if (minutes % 60 === 0) {
+            return `${minutes / 60}小时`;
+        } else {
+            return `${minutes}分钟`;
+        }
+    },
+
+    async loadPlugins(showSpinner = true) {
+        if (!showSpinner && this.automationOrderDirty) return;
+        if (showSpinner) {
+            UI.showLoading('pluginsList');
+        }
+        const [capabilitiesData, routingData] = await Promise.all([
+            API.capabilities.getAll(),
+            API.automation.getOverview({ chatId: this.automationSelectedChatId })
+        ]);
+        this.automationCapabilities = capabilitiesData.capabilities || [];
+        this.automationRouting = routingData;
+        if (!(routingData.event_types || []).some(item => item.id === this.automationSelectedEvent)) {
+            this.automationSelectedEvent = routingData.event_types?.[0]?.id || null;
+        }
+        this.renderAutomationWorkbench();
+    },
+
+    renderAutomationWorkbench() {
+        UI.renderAutomationWorkbench(
+            this.automationCapabilities,
+            this.automationRouting,
+            {
+                view: this.automationView,
+                selectedEvent: this.automationSelectedEvent,
+                selectedChatId: this.automationSelectedChatId,
+                routeMode: this.automationRouteMode,
+                draftEvent: this.automationDraftEvent,
+                draftKeys: this.automationDraftKeys,
+                dirty: this.automationOrderDirty,
+                saving: this.automationOrderSaving
+            }
+        );
+    },
+
+    async confirmDiscardAutomationDraft() {
+        if (!this.automationOrderDirty) return true;
+        return UI.confirm('当前执行顺序尚未应用。放弃这次调整吗？', {
+            title: '放弃顺序调整',
+            confirmText: '放弃调整',
+            variant: 'warning'
+        });
+    },
+
+    clearAutomationDraft() {
+        this.automationDraftEvent = null;
+        this.automationDraftKeys = null;
+        this.automationOrderDirty = false;
+        this.automationOrderSaving = false;
+    },
+
+    async setAutomationView(view) {
+        if (!['routes', 'library'].includes(view) || view === this.automationView) return;
+        if (!await this.confirmDiscardAutomationDraft()) {
+            this.renderAutomationWorkbench();
+            return;
+        }
+        this.clearAutomationDraft();
+        this.automationView = view;
+        this.renderAutomationWorkbench();
+    },
+
+    async selectAutomationEvent(eventType) {
+        if (!eventType || eventType === this.automationSelectedEvent) return;
+        if (!await this.confirmDiscardAutomationDraft()) {
+            this.renderAutomationWorkbench();
+            return;
+        }
+        this.clearAutomationDraft();
+        this.automationSelectedEvent = eventType;
+        this.renderAutomationWorkbench();
+    },
+
+    setAutomationRouteMode(mode) {
+        if (!['sort', 'detail'].includes(mode) || mode === this.automationRouteMode) return;
+        this.automationRouteMode = mode;
+        this.renderAutomationWorkbench();
+    },
+
+    async selectAutomationChat(chatId) {
+        const normalized = chatId === '' || chatId === null || chatId === undefined
+            ? null
+            : Number(chatId);
+        if (normalized === this.automationSelectedChatId) return;
+        if (!await this.confirmDiscardAutomationDraft()) {
+            this.renderAutomationWorkbench();
+            return;
+        }
+        this.clearAutomationDraft();
+        this.automationSelectedChatId = Number.isFinite(normalized) ? normalized : null;
+        await this.loadPlugins(true);
+    },
+
+    currentAutomationKeys() {
+        const liveItems = this.automationRouting?.routes?.[this.automationSelectedEvent] || [];
+        const liveKeys = liveItems.map(item => item.listener_key);
+        if (this.automationDraftEvent === this.automationSelectedEvent && Array.isArray(this.automationDraftKeys)) {
+            return [
+                ...this.automationDraftKeys.filter(key => liveKeys.includes(key)),
+                ...liveKeys.filter(key => !this.automationDraftKeys.includes(key))
+            ];
+        }
+        return liveKeys;
+    },
+
+    setAutomationDraft(keys) {
+        const liveKeys = (this.automationRouting?.routes?.[this.automationSelectedEvent] || [])
+            .map(item => item.listener_key);
+        const normalized = keys.filter((key, index) => liveKeys.includes(key) && keys.indexOf(key) === index);
+        liveKeys.forEach(key => {
+            if (!normalized.includes(key)) normalized.push(key);
+        });
+        this.automationDraftEvent = this.automationSelectedEvent;
+        this.automationDraftKeys = normalized;
+        this.automationOrderDirty = normalized.some((key, index) => key !== liveKeys[index]);
+        if (!this.automationOrderDirty) this.clearAutomationDraft();
+        this.renderAutomationWorkbench();
+    },
+
+    captureAutomationOrder() {
+        const routeList = document.getElementById('automationRouteList');
+        if (!routeList) return;
+        const keys = [...routeList.querySelectorAll('.automation-route-step')]
+            .map(step => step.dataset.listenerKey)
+            .filter(Boolean);
+        this.setAutomationDraft(keys);
+    },
+
+    undoAutomationOrder() {
+        this.clearAutomationDraft();
+        this.renderAutomationWorkbench();
+    },
+
+    async saveAutomationOrder() {
+        if (!this.automationOrderDirty || !this.automationSelectedEvent || this.automationOrderSaving) return;
+        this.automationOrderSaving = true;
+        this.renderAutomationWorkbench();
+        try {
+            await API.automation.updateOrder(
+                this.automationSelectedEvent,
+                this.currentAutomationKeys(),
+                this.automationRouting?.signature || null
+            );
+            this.clearAutomationDraft();
+            UI.showSuccess('执行顺序已保存并立即生效');
+            await this.loadPlugins(false);
+        } catch (error) {
+            this.automationOrderSaving = false;
+            this.renderAutomationWorkbench();
+            UI.showError('执行顺序未应用：' + error.message);
+        }
+    },
+
+    async togglePlugin(name, checked) {
+        try {
+            await API.plugins.toggle(name, checked);
+            UI.showSuccess(`${name} ${checked ? '已启用' : '已禁用'}`);
+            await this.loadPlugins(false);
+        } catch (e) {
+            UI.showError(e.message);
+            await this.loadPlugins(false);
+        }
+    },
+
+    async reloadPlugin(name) {
+        if (!await UI.confirm(`确定要重新加载插件 ${name} 吗？`, {
+            title: '重新加载插件',
+            confirmText: '重新加载'
+        })) return;
+        try {
+            await API.plugins.reload(name);
+            UI.showSuccess('插件已重新加载');
+            await this.loadPlugins();
+        } catch (e) {
+            UI.showError(e.message);
+        }
+    },
+
+    async showPluginDetails(name) {
+        try {
+            const data = await API.capabilities.getDetail(name);
+            document.getElementById('configModalTitle').textContent = `能力详情：${data.capability?.display_name || name}`;
+            document.getElementById('configModalBody').innerHTML = `
+                <pre id="pluginDetailsJson" class="m-0 p-3 bg-light rounded small" style="max-height:60vh;overflow:auto;"></pre>
+            `;
+            document.getElementById('pluginDetailsJson').textContent = JSON.stringify(data, null, 2);
+            const saveBtn = document.getElementById('configModalSaveBtn');
+            if (saveBtn) {
+                saveBtn.onclick = null;
+                saveBtn.classList.add('d-none');
+            }
+            new bootstrap.Modal(document.getElementById('configModal')).show();
+        } catch (e) {
+            UI.showError('加载能力详情失败：' + e.message);
+        }
+    },
+
+    async showPluginSettings(name, options = {}) {
+        return this.showCapabilitySettings(name, options);
+    },
+
+    async showCapabilitySettings(name, options = {}) {
+        try {
+            const [detailResponse, settings] = await Promise.all([
+                API.capabilities.getDetail(name),
+                API.capabilities.getSettings(name)
+            ]);
+            const capability = detailResponse.capability || {};
+            this.currentCapabilitySettings = settings;
+            this.currentCapabilityId = name;
+
+            document.getElementById('configModalTitle').textContent = `配置 · ${capability.display_name || name}`;
+            document.getElementById('configModalBody').innerHTML = UI.renderCapabilitySettingsForm(settings, capability);
+
+            const saveBtn = document.getElementById('configModalSaveBtn');
+            saveBtn.classList.remove('d-none');
+            saveBtn.onclick = () => this.saveCapabilitySettings(name);
+
+            const modalElement = document.getElementById('configModal');
+            new bootstrap.Modal(modalElement).show();
+            UI.bindCapabilitySettingsControls(modalElement);
+            if (options.focusGroup) {
+                UI.focusCapabilitySettingsGroup(modalElement, options.focusGroup);
+            }
+        } catch (e) {
+            UI.showError('加载设置失败：' + e.message);
+        }
+    },
+
+    async saveCapabilitySettings(name) {
+        const form = document.getElementById('capabilitySettingsForm');
+        if (!form) return;
+        if (!form.checkValidity()) {
+            form.reportValidity();
+            return;
+        }
+
+        const values = {};
+        form.querySelectorAll('[data-config-key]').forEach(input => {
+            if (input.disabled) return;
+            const key = input.dataset.configKey;
+            const type = input.dataset.configType;
+            const sensitive = input.dataset.sensitive === 'true';
+            if (sensitive && input.value === '') return;
+
+            if (type === 'boolean') {
+                values[key] = input.checked;
+            } else if (type === 'integer') {
+                values[key] = Number.parseInt(input.value, 10);
+            } else if (type === 'number') {
+                values[key] = Number.parseFloat(input.value);
+            } else if (type === 'array') {
+                values[key] = input.value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
+            } else {
+                values[key] = input.value;
+            }
+        });
+
+        const saveBtn = document.getElementById('configModalSaveBtn');
+        const originalHtml = saveBtn.innerHTML;
+        saveBtn.disabled = true;
+        saveBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>正在应用';
+        try {
+            await API.capabilities.updateSettings(name, values);
+            const modal = bootstrap.Modal.getInstance(document.getElementById('configModal'));
+            if (modal) modal.hide();
+            UI.showSuccess('设置已保存并应用');
+            await this.loadPlugins(false);
+        } catch (e) {
+            UI.showError('保存失败：' + e.message);
+        } finally {
+            saveBtn.disabled = false;
+            saveBtn.innerHTML = originalHtml;
+        }
+    },
+
+    // Users & Listeners
+    async loadUsers() {
+        try {
+            const [usersData, listenersData] = await Promise.all([
+                API.users.getAll(),
+                API.wechat.getListeners()
+            ]);
+
+            const dbUsers = usersData || [];
+            // Handle different structure of listeners response
+            const activeChatsMap = listenersData.listened_chats || listenersData || {};
+            const activeChatNames = new Set(Object.keys(activeChatsMap));
+
+            // Merge Data
+            // Map: chat_name -> { id: int|null, chat_name: str, has_permission_config: bool, is_listening: bool }
+            const mergedMap = new Map();
+
+            // 1. Add DB Users
+            dbUsers.forEach(u => {
+                mergedMap.set(u.chat_name, {
+                    ...u,
+                    has_permission_config: true,
+                    is_listening: activeChatNames.has(u.chat_name)
+                });
+            });
+
+            // 2. Add Active Listeners not in DB
+            activeChatNames.forEach(name => {
+                if (!mergedMap.has(name)) {
+                    mergedMap.set(name, {
+                        id: null, // No DB ID yet
+                        chat_name: name,
+                        has_permission_config: false,
+                        is_listening: true,
+                        remark: '', // Default empty remark
+                        is_group: false // Unknown, assume false or handle in UI
+                    });
+                }
+            });
+
+            const mergedList = Array.from(mergedMap.values()).sort((a, b) => {
+                // Sort by: Listening -> Configured -> Name
+                if (a.is_listening !== b.is_listening) return b.is_listening - a.is_listening;
+                return a.chat_name.localeCompare(b.chat_name);
+            });
+
+            this._managedChats = mergedList;
+            UI.updateMetric('managedChatsCount', mergedList.length);
+            UI.renderUsersList(mergedList);
+            const search = document.getElementById('chatListSearch');
+            if (search && !search.dataset.bound) {
+                search.dataset.bound = 'true';
+                search.addEventListener('input', UI.debounce(() => {
+                    const query = search.value.trim().toLowerCase();
+                    UI.renderUsersList((this._managedChats || []).filter(chat => (
+                        !query || `${chat.chat_name} ${chat.remark || ''}`.toLowerCase().includes(query)
+                    )));
+                }, 120));
+            }
+            if (!this.currentThreadName) {
+                const firstManagedChat = mergedList.find(chat => chat.id);
+                if (firstManagedChat) {
+                    await this.selectUser(firstManagedChat.chat_name, firstManagedChat.id);
+                }
+            }
+        } catch (e) {
+            UI.showError('加载用户失败：' + e.message);
+        }
+    },
+
+    showAddUserModal() {
+        // Reset form
+        const form = document.getElementById('addUserForm');
+        if (form) form.reset();
+
+        // Show Modal
+        const el = document.getElementById('addUserModal');
+        if (el && window.bootstrap) {
+            const modal = new bootstrap.Modal(el);
+            modal.show();
+        }
+    },
+
+    async submitAddUser() {
+        const form = document.getElementById('addUserForm');
+        if (!form) return;
+
+        const chatName = form.chat_name.value.trim();
+        const remark = form.remark.value.trim();
+        const isGroup = form.is_group.value === 'true';
+        const senderBlacklist = this.normalizeSenderBlacklist(form.sender_blacklist?.value || '');
+
+        if (!chatName) {
+            UI.showError('聊天名称不能为空');
+            return;
+        }
+
+        try {
+            // This API call creates the user in DB AND adds the listener via WeChatManager
+            await API.users.addUser(chatName, remark, isGroup, senderBlacklist);
+
+            // Close modal
+            const el = document.getElementById('addUserModal');
+            const modal = bootstrap.Modal.getInstance(el);
+            if (modal) modal.hide();
+
+            // Refresh list
+            this.loadUsers();
+
+            // Optionally select the new user
+            // We need the ID, but addUser response has it.
+            // For simplicity, just reload for now.
+        } catch (e) {
+            UI.showError('添加用户失败：' + e.message);
+        }
+    },
+
+    formatSenderBlacklist(rawValue) {
+        if (!rawValue) return '';
+        try {
+            const parsed = JSON.parse(rawValue);
+            if (Array.isArray(parsed)) {
+                return parsed.map(item => String(item || '').trim()).filter(Boolean).join('\n');
+            }
+        } catch (e) {
+            // Accept existing/plain text values.
+        }
+        return String(rawValue);
+    },
+
+    normalizeSenderBlacklist(rawValue) {
+        const names = String(rawValue || '')
+            .split(/\r?\n|,/)
+            .map(sender => sender.trim())
+            .filter(Boolean);
+        const unique = [...new Set(names)];
+        return unique.length > 0 ? JSON.stringify(unique) : null;
+    },
+
+    async showEditUserModal(userId, chatName, isGroup) {
+        const form = document.getElementById('editUserForm');
+        if (!form) return;
+        const fields = form.elements;
+
+        form.reset();
+        fields.user_id.value = userId;
+        fields.chat_name_display.value = chatName || '';
+        fields.remark.value = '';
+        fields.sender_blacklist.value = '';
+        const typeInput = form.querySelector(`input[name="is_group"][value="${isGroup ? 'true' : 'false'}"]`);
+        if (typeInput) typeInput.checked = true;
+
+        const el = document.getElementById('editUserModal');
+        const modal = el && window.bootstrap ? bootstrap.Modal.getOrCreateInstance(el) : null;
+        if (modal) modal.show();
+
+        try {
+            const user = await API.request(`/api/permissions/users/${userId}`);
+            fields.chat_name_display.value = user.chat_name || chatName || '';
+            fields.remark.value = user.remark || '';
+            fields.sender_blacklist.value = this.formatSenderBlacklist(user.sender_blacklist || '');
+            const resolvedType = form.querySelector(`input[name="is_group"][value="${user.is_group ? 'true' : 'false'}"]`);
+            if (resolvedType) resolvedType.checked = true;
+        } catch (e) {
+            UI.showError('加载用户信息失败：' + e.message);
+        }
+    },
+
+    async submitEditUser() {
+        const form = document.getElementById('editUserForm');
+        if (!form) return;
+        const fields = form.elements;
+
+        const userId = parseInt(fields.user_id.value, 10);
+        if (!userId) {
+            UI.showError('用户 ID 无效');
+            return;
+        }
+
+        try {
+            const payload = {
+                remark: fields.remark.value.trim() || null,
+                is_group: fields.is_group.value === 'true',
+                sender_blacklist: this.normalizeSenderBlacklist(fields.sender_blacklist.value)
+            };
+            const updated = await API.users.updateUser(userId, payload);
+
+            const el = document.getElementById('editUserModal');
+            const modal = bootstrap.Modal.getInstance(el);
+            if (modal) modal.hide();
+
+            UI.showSuccess('用户信息已保存');
+            await this.loadUsers();
+            if (this.currentThreadName === updated.chat_name) {
+                await this.selectUser(updated.chat_name, updated.id);
+            }
+        } catch (e) {
+            UI.showError('保存用户信息失败：' + e.message);
+        }
+    },
+
+    async removeListener(chatName) {
+        if (!await UI.confirm(`确定要停止监听 ${chatName} 吗？`, {
+            title: '停止监听',
+            confirmText: '停止',
+            variant: 'warning'
+        })) return;
+        try {
+            await API.wechat.removeListener(chatName);
+            // Refresh
+            this.loadUsers();
+        } catch (e) {
+            UI.showError(e.message);
+        }
+    },
+
+    // Permission Management Integration
+    async selectUser(chatName, userId) {
+        const selectedChatName = String(chatName || '');
+        if (!selectedChatName) return;
+        const requestId = ++this.managedChatSelectionRequest;
+        this.currentThreadName = selectedChatName;
+        UI.setActiveManagedChat(selectedChatName);
+        UI.renderManagedChatPending(selectedChatName);
+
+        try {
+            const [capabilitiesData, userDetail] = await Promise.all([
+                API.capabilities.getAll(),
+                userId
+                    ? API.request(`/api/permissions/users/${userId}`)
+                    : Promise.resolve({ chat_name: selectedChatName, permissions: [] })
+            ]);
+
+            // A slower response for a previously selected chat must never
+            // replace the panel for the user's latest selection.
+            if (requestId !== this.managedChatSelectionRequest
+                || this.currentThreadName !== selectedChatName) return;
+
+            UI.renderChatCapabilities(
+                userDetail,
+                capabilitiesData.capabilities || []
+            );
+        } catch (e) {
+            if (requestId !== this.managedChatSelectionRequest) return;
+            UI.renderManagedChatError(selectedChatName);
+            UI.showError('加载用户详情失败：' + e.message);
+        }
+    },
+
+    async saveUserPermissions(userId, chatName) {
+        try {
+            const targetChatName = chatName || this.currentThreadName;
+            // If creating new user (userId is null)
+            let targetId = userId;
+            if (!targetId) {
+                // Create user first
+                const newUser = await API.users.addUser(targetChatName, "Auto-created");
+                targetId = newUser.id;
+                // Update list to reflect new ID (optional, but good practice)
+            }
+
+            const checks = document.querySelectorAll('.permission-check:checked');
+            const permissions = [];
+
+            checks.forEach(c => {
+                const pluginName = c.value;
+                const mentionCheck = document.getElementById(`mention-${pluginName}`);
+                const pushCheck = document.getElementById(`push-${pluginName}`);
+                const proactiveCheck = document.getElementById(`proactive-${pluginName}`);
+                const followupCheck = document.getElementById(`followup-enabled-${pluginName}`);
+                const ignoredSendersText = document.getElementById(`ignored-senders-${pluginName}`)?.value || '';
+                const ignoredSenders = ignoredSendersText
+                    .split(/\r?\n/)
+                    .map(sender => sender.trim())
+                    .filter(Boolean);
+
+                // Add base permission
+                permissions.push({
+                    plugin_name: pluginName,
+                    require_mention: mentionCheck ? mentionCheck.checked : false,
+                    proactive_enabled: proactiveCheck ? proactiveCheck.checked : false,
+                    followup_enabled: followupCheck ? followupCheck.checked : false,
+                    followup_window_seconds: Number(document.getElementById(`followup-window-${pluginName}`)?.value || 60),
+                    followup_merge_seconds: Number(document.getElementById(`followup-merge-${pluginName}`)?.value || 3),
+                    followup_max_turns: Number(document.getElementById(`followup-max-turns-${pluginName}`)?.value || 3),
+                    memory_profile: document.getElementById(`memory-profile-${pluginName}`)?.value || null,
+                    ignored_senders: ignoredSenders.length > 0 ? JSON.stringify([...new Set(ignoredSenders)]) : null
+                });
+
+                // Add push permission if checked
+                if (pushCheck && pushCheck.checked) {
+                    permissions.push({
+                        plugin_name: `${pluginName}#push`,
+                        require_mention: false
+                    });
+                }
+            });
+
+            await API.users.updatePermissions(targetId, { permissions });
+
+            UI.showSuccess('权限已保存');
+
+            // Refresh to ensure IDs are synced if we just created it
+            await this.loadUsers();
+            // Re-select to update UI state
+            this.selectUser(targetChatName, targetId);
+
+        } catch (e) {
+            UI.showError('保存权限失败：' + e.message);
+        }
+    },
+
+    async openAssistantChatEditorFromChats(userId) {
+        try {
+            const overview = await API.assistant.getOverview();
+            this._assistantOverview = overview;
+            this._roles = overview.roles || [];
+            this._judges = overview.judges || [];
+            this._chatbotUsers = overview.chats || [];
+            this.showAssistantChatEditor(userId);
+        } catch (error) {
+            UI.showError('加载 AI 助手聊天配置失败：' + error.message);
+        }
+    },
+
+    async deleteUser(userId, chatName) {
+        if (!await UI.confirm('确定删除此用户吗？删除后将停止监听并移除所有权限。', {
+            title: '删除用户',
+            confirmText: '删除',
+            variant: 'danger'
+        })) return;
+        try {
+            // First try to stop listening (if currently active)
+            try {
+                await API.wechat.removeListener(chatName);
+            } catch (e) {
+                console.log('Note: Could not remove listener (may not be active):', e.message);
+            }
+
+            // Delete from database
+            await API.users.delete(userId);
+
+            // Refresh the users list
+            this.loadUsers();
+
+            // Clear the permissions panel if the deleted user was selected
+            const container = document.getElementById('userPermissionsPanelContainer');
+            if (container) {
+                container.innerHTML = `
+                    <div class="card-body d-flex flex-column align-items-center justify-content-center text-muted" id="userPermissionsPanel">
+                        <i class="bi bi-hand-index-thumb fs-1 mb-3 opacity-25"></i>
+                        <p>请从列表中选择聊天以配置权限。</p>
+                    </div>
+                `;
+            }
+        } catch (e) {
+            UI.showError('删除用户失败：' + e.message);
+        }
+    },
+
+    async loadRoles() {
+        try {
+            // One aggregated request replaces the previous N+1 sequence (users,
+            // each user's permissions, role binding and Judge binding).
+            const overview = await API.assistant.getOverview();
+            const roles = overview.roles || [];
+            const judges = overview.judges || [];
+            const chats = overview.chats || [];
+
+            this._assistantOverview = overview;
+            this._roles = roles;
+            this._judges = judges;
+            this._chatbotUsers = chats;
+
+            UI.updateMetric('statsTotalRoles', roles.length);
+            UI.updateMetric('statsTotalJudges', judges.length);
+            this.renderAssistantOverview(overview);
+            this.renderAssistantChats(chats);
+            this.renderPremiumRoles(roles);
+            this.renderPremiumJudges(judges);
+            this.setAssistantSection(this.getAssistantSectionFromPath(), { history: false });
+
+            const searchInput = document.getElementById('rolesSearchInput');
+            if (searchInput && !searchInput.dataset.bound) {
+                searchInput.dataset.bound = "true";
+                searchInput.addEventListener('input', UI.debounce((e) => {
+                    this.filterAndRenderRoles(e.target.value);
+                }, 150));
+            }
+
+            const chatsSearch = document.getElementById('assistantChatsSearch');
+            const chatsFilter = document.getElementById('assistantChatsFilter');
+            if (chatsSearch && !chatsSearch.dataset.bound) {
+                chatsSearch.dataset.bound = 'true';
+                chatsSearch.addEventListener('input', UI.debounce(() => {
+                    this.filterAssistantChats();
+                }, 150));
+            }
+            if (chatsFilter && !chatsFilter.dataset.bound) {
+                chatsFilter.dataset.bound = 'true';
+                chatsFilter.addEventListener('change', () => this.filterAssistantChats());
+            }
+
+        } catch (e) {
+            console.error('Error loading roles/judges:', e);
+            UI.showError('加载 AI 助手控制中心失败：' + e.message);
+        }
+    },
+
+    getAssistantSectionFromPath() {
+        const path = UI.normalizePath(window.location.pathname);
+        if (path === '/assistant/chats') return 'chats';
+        if (path === '/assistant/roles') return 'roles';
+        return 'overview';
+    },
+
+    setAssistantSection(section, options = {}) {
+        const sections = ['overview', 'chats', 'roles'];
+        const selected = sections.includes(section) ? section : 'overview';
+        const ids = {
+            overview: 'assistantOverviewSection',
+            chats: 'assistantChatsSection',
+            roles: 'assistantRolesSection'
+        };
+        document.querySelectorAll('[data-assistant-section]').forEach(button => {
+            const active = button.dataset.assistantSection === selected;
+            button.classList.toggle('active', active);
+            button.setAttribute('aria-selected', String(active));
+        });
+        Object.entries(ids).forEach(([key, id]) => {
+            document.getElementById(id)?.classList.toggle('d-none', key !== selected);
+        });
+        if (options.history !== false) {
+            const paths = { overview: '/assistant', chats: '/assistant/chats', roles: '/assistant/roles' };
+            const path = paths[selected];
+            if (UI.normalizePath(window.location.pathname) !== path) {
+                window.history.pushState({ tab: 'roles', section: selected }, '', path);
+            }
+        }
+    },
+
+    renderAssistantOverview(overview) {
+        const summary = overview.summary || {};
+        const capability = overview.capability || {};
+        const metricContainer = document.getElementById('assistantOverviewStats');
+        if (metricContainer) {
+            const metrics = [
+                ['bi-activity', '运行状态', capability.status === 'running' ? '正在运行' : '未运行', capability.status === 'running' ? 'success' : 'muted'],
+                ['bi-chat-square-text', '已启用聊天', `${summary.enabled_chat_count || 0} / ${summary.chat_count || 0}`, 'primary'],
+                ['bi-broadcast', '主动回复', `${summary.proactive_chat_count || 0} 个聊天`, 'warning'],
+                ['bi-person-badge', '角色 / Judge', `${summary.role_count || 0} / ${summary.judge_count || 0}`, 'violet']
+            ];
+            metricContainer.innerHTML = metrics.map(([icon, label, value, tone]) => `
+                <div class="assistant-metric-card ${tone}">
+                    <i class="bi ${icon}"></i>
+                    <div><small>${label}</small><strong>${value}</strong></div>
+                </div>
+            `).join('');
+        }
+
+        const flags = overview.global || {};
+        const globalSummary = document.getElementById('assistantGlobalSummary');
+        if (globalSummary) {
+            const defaultRole = (overview.roles || []).find(role => role.name === flags.default_role);
+            const rows = [
+                ['默认角色', defaultRole?.display_name || flags.default_role || '未设置'],
+                ['主动回复', '按群聊独立启用'],
+                ['@触发', flags.allow_mention_trigger ? '允许' : '关闭'],
+                ['长期记忆', flags.memory_enabled ? '开启' : '关闭'],
+                ['网页搜索 / 图片识别', `${flags.search_enabled ? '搜索开启' : '搜索关闭'} · ${flags.ocr_enabled ? 'OCR 开启' : 'OCR 关闭'}`]
+            ];
+            globalSummary.innerHTML = rows.map(([label, value]) => `
+                <div><span>${label}</span><strong>${UI.escapeHtml(String(value))}</strong></div>
+            `).join('');
+        }
+
+        const modelSummary = document.getElementById('assistantModelSummary');
+        if (modelSummary) {
+            const mappings = Object.entries(overview.models?.mappings || {});
+            if (!mappings.length) {
+                modelSummary.innerHTML = '<div class="assistant-empty-inline">尚未配置 Chatbot 模型路由。</div>';
+            } else {
+                const labels = {
+                    chat: '对话回复', judge: '主动判断', memory_event: '记忆事件',
+                    memory_verify: '记忆校验', memory_stage: '阶段摘要', memory_person_observe: '人物观察'
+                };
+                modelSummary.innerHTML = mappings.slice(0, 6).map(([type, mapping]) => `
+                    <div><span>${UI.escapeHtml(labels[type] || type)}</span><strong>${UI.escapeHtml(mapping.primary || '未设置')}</strong></div>
+                `).join('');
+            }
+        }
+    },
+
+    filterAssistantChats() {
+        const query = (document.getElementById('assistantChatsSearch')?.value || '').trim().toLowerCase();
+        const filter = document.getElementById('assistantChatsFilter')?.value || 'all';
+        const chats = (this._chatbotUsers || []).filter(chat => {
+            const matchesText = !query || `${chat.chat_name} ${chat.remark || ''}`.toLowerCase().includes(query);
+            const matchesState = filter === 'all'
+                || (filter === 'enabled' && chat.enabled)
+                || (filter === 'disabled' && !chat.enabled)
+                || (filter === 'proactive' && chat.enabled && chat.proactive_enabled);
+            return matchesText && matchesState;
+        });
+        this.renderAssistantChats(chats);
+    },
+
+    renderAssistantChats(chats) {
+        const container = document.getElementById('assistantChatsGrid');
+        if (!container) return;
+        if (!chats.length) {
+            container.innerHTML = `
+                <div class="assistant-empty-state">
+                    <i class="bi bi-chat-square"></i><strong>没有匹配的聊天</strong>
+                    <span>可以在“聊天”页添加监听对象，然后在这里配置 AI 助手。</span>
+                </div>`;
+            return;
+        }
+        container.innerHTML = chats.map(chat => {
+            const name = UI.escapeHtml(chat.remark || chat.chat_name);
+            const rawName = UI.escapeHtml(chat.chat_name);
+            const role = UI.escapeHtml(chat.role?.display_name || '默认角色');
+            const judge = UI.escapeHtml(chat.judge?.display_name || '未启用');
+            const memory = chat.memory || {};
+            const memoryLabels = {
+                inherit: memory.effective_enabled ? '继承全局 · 开启' : '继承全局 · 关闭',
+                off: '此聊天关闭',
+                custom: '此聊天自定义'
+            };
+            const triggerCard = chat.is_group
+                ? `<div><span>Judge</span><strong>${judge}</strong><small>${chat.proactive_enabled ? '主动回复开启' : '主动回复关闭'}</small></div>`
+                : '<div><span>触发方式</span><strong>收到消息</strong><small>私聊直接回复，无需 Judge</small></div>';
+            return `
+                <article class="assistant-chat-card ${chat.enabled ? 'enabled' : 'disabled'}">
+                    <div class="assistant-chat-card-head">
+                        <div class="assignment-avatar" style="background:${this.getAvatarColor(chat.chat_name)}">${UI.escapeHtml(this.getInitials(chat.remark || chat.chat_name))}</div>
+                        <div class="assistant-chat-identity">
+                            <strong title="${rawName}">${name}</strong>
+                            <small>${chat.remark ? rawName + ' · ' : ''}${chat.is_group ? '群聊' : '私聊'}${chat.is_listening ? ' · 正在监听' : ' · 未监听'}</small>
+                        </div>
+                        <span class="assistant-state-pill ${chat.enabled ? 'on' : 'off'}">${chat.enabled ? 'Chatbot 已启用' : '未启用'}</span>
+                    </div>
+                    <div class="assistant-chat-config">
+                        <div><span>角色</span><strong>${role}</strong><small>${chat.role_source === 'chat' ? '聊天覆盖' : '继承全局'}</small></div>
+                        ${triggerCard}
+                        <div><span>连续对话</span><strong>${chat.followup_enabled ? '开启' : '关闭'}</strong><small>${chat.followup_enabled ? `${chat.followup_window_seconds} 秒 · ${chat.followup_max_turns} 轮` : '需要重新触发'}</small></div>
+                        <div><span>长期记忆</span><strong>${memoryLabels[memory.mode] || memoryLabels.inherit}</strong><small>${memory.mode === 'custom' ? '仅覆盖必要参数' : (memory.mode === 'off' ? '不读取也不生成新记忆' : '随全局设置自动调整')}</small></div>
+                    </div>
+                    <div class="assistant-chat-card-footer">
+                        <button class="btn btn-sm btn-light border" onclick="App.showAssistantChatEditor(${Number(chat.id)})"><i class="bi bi-sliders me-1"></i>配置聊天</button>
+                    </div>
+                </article>`;
+        }).join('');
+    },
+
+    async showAssistantGlobalSettings() {
+        await this.showCapabilitySettings('builtin_chatbot');
+    },
+
+    showAssistantChatEditor(userId) {
+        const chat = (this._chatbotUsers || []).find(item => item.id === userId);
+        if (!chat) return;
+        const memory = chat.memory || { mode: 'inherit', overrides: {} };
+        const globalMemory = this._assistantOverview?.global?.memory || {};
+        const memoryOverrides = memory.overrides || {};
+        const memoryValue = (key, fallback) => (
+            memoryOverrides[key] !== undefined
+                ? memoryOverrides[key]
+                : (globalMemory[key] !== undefined ? globalMemory[key] : fallback)
+        );
+        const roleOptions = (this._roles || []).map(role => `
+            <option value="${role.id}" ${chat.role_source === 'chat' && chat.role?.id === role.id ? 'selected' : ''}>${UI.escapeHtml(role.display_name)}</option>
+        `).join('');
+        const judgeOptions = (this._judges || []).map(judge => `
+            <option value="${judge.id}" ${chat.judge?.id === judge.id ? 'selected' : ''}>${UI.escapeHtml(judge.display_name)}</option>
+        `).join('');
+        const defaultJudge = (this._judges || []).find(judge => judge.name === 'default_judge') || (this._judges || [])[0] || null;
+        const proactiveControl = chat.is_group ? `
+                    <label class="assistant-setting-switch"><span><strong>启用主动回复</strong><small>此处是唯一开关；开启后由所选 Judge 判断是否参与群聊。</small></span><input class="form-check-input" type="checkbox" name="proactive_enabled" ${chat.proactive_enabled ? 'checked' : ''} ${(this._judges || []).length ? '' : 'disabled'}></label>` : '';
+        const judgeControl = chat.is_group ? `
+                        <div class="col-md-6 assistant-dependent-control" data-judge-control><label class="form-label">主动判断 Judge</label><select class="form-select" name="judge_id" data-default-judge-id="${defaultJudge?.id || ''}" data-bound-judge-id="${chat.judge?.id || ''}"><option value="">请先开启主动回复</option>${judgeOptions}</select><div class="form-text" data-judge-help></div></div>` : '';
+        const botNicknameControl = chat.is_group ? `
+                <div class="assistant-editor-section">
+                    <h6>群内 @ 名称</h6>
+                    <label class="form-label">手动昵称</label>
+                    <input class="form-control" name="bot_group_nickname" maxlength="128" value="${UI.escapeHtml(chat.bot_group_nickname || '')}" placeholder="例如：微信助手（不需要填 @）">
+                    <div class="form-text">当群昵称与全局机器人名不同时使用。当前生效：@${UI.escapeHtml(chat.bot_group_nickname_effective || '')}</div>
+                    <label class="assistant-setting-switch mt-3"><span><strong>自动校准</strong><small>当天首条有效群消息到达后，后台读取微信“我在本群的昵称”；每群每 24 小时最多一次。</small></span><input class="form-check-input" type="checkbox" name="bot_group_nickname_auto_enabled" ${chat.bot_group_nickname_auto_enabled ? 'checked' : ''}></label>
+                    <div class="form-text">最近精确读取：${UI.escapeHtml(chat.bot_group_nickname_detected || '尚未校准')}${chat.bot_group_nickname_checked_at ? ` · ${UI.escapeHtml(chat.bot_group_nickname_checked_at)}` : ''}。手动名称会一直作为备用别名。</div>
+                </div>` : '';
+        document.getElementById('configModalTitle').textContent = `聊天配置 · ${chat.remark || chat.chat_name}`;
+        document.getElementById('configModalBody').innerHTML = `
+            <form id="assistantChatForm" class="assistant-chat-form">
+                <div class="assistant-editor-intro">
+                    <div class="assignment-avatar" style="background:${this.getAvatarColor(chat.chat_name)}">${UI.escapeHtml(this.getInitials(chat.remark || chat.chat_name))}</div>
+                    <div><strong>${UI.escapeHtml(chat.remark || chat.chat_name)}</strong><small>${UI.escapeHtml(chat.chat_name)} · ${chat.is_group ? '群聊' : '私聊'}</small></div>
+                </div>
+                <div class="assistant-editor-section">
+                    <h6>助手状态</h6>
+                    <label class="assistant-setting-switch"><span><strong>在此聊天中启用 Chatbot</strong><small>关闭后不处理此聊天的 AI 对话。</small></span><input class="form-check-input" type="checkbox" name="enabled" ${chat.enabled ? 'checked' : ''}></label>
+                    ${proactiveControl}
+                    <label class="assistant-setting-switch"><span><strong>允许连续对话</strong><small>Bot 回复后，短时间内无需再次 @ 也可继续对话。</small></span><input class="form-check-input" type="checkbox" name="followup_enabled" ${chat.followup_enabled ? 'checked' : ''}></label>
+                </div>
+                <div class="assistant-editor-section">
+                    <h6>${chat.is_group ? '角色与主动判断' : '角色'}</h6>
+                    <div class="row g-3">
+                        <div class="${chat.is_group ? 'col-md-6' : 'col-12'}"><label class="form-label">角色</label><select class="form-select" name="role_id"><option value="">继承全局默认角色</option>${roleOptions}</select></div>
+                        ${judgeControl}
+                    </div>
+                </div>
+                ${botNicknameControl}
+                <div class="assistant-editor-section">
+                    <h6>连续对话</h6>
+                    <div class="row g-3">
+                        <div class="col-md-4"><label class="form-label">有效窗口（秒）</label><input class="form-control" name="followup_window_seconds" type="number" min="10" max="600" value="${chat.followup_window_seconds}"></div>
+                        <div class="col-md-4"><label class="form-label">消息合并（秒）</label><input class="form-control" name="followup_merge_seconds" type="number" min="1" max="30" value="${chat.followup_merge_seconds}"></div>
+                        <div class="col-md-4"><label class="form-label">最多轮数</label><input class="form-control" name="followup_max_turns" type="number" min="1" max="10" value="${chat.followup_max_turns}"></div>
+                    </div>
+                </div>
+                <div class="assistant-editor-section assistant-memory-editor">
+                    <div class="d-flex justify-content-between align-items-start gap-3 mb-3">
+                        <div><h6 class="mb-1">长期记忆</h6><div class="form-text m-0">先选择工作方式；只有“自定义”才显示聊天级参数。</div></div>
+                        <div class="d-flex flex-wrap gap-2 justify-content-end">
+                            <button class="btn btn-sm btn-light border" type="button" onclick="App.showCapabilitySettings('builtin_chatbot', {focusGroup: 'memory'})"><i class="bi bi-globe2 me-1"></i>全局记忆默认</button>
+                            <button class="btn btn-sm btn-light border" type="button" onclick="App.openChatMemoryLibrary(${Number(chat.id)})"><i class="bi bi-database me-1"></i>查看记忆库</button>
+                        </div>
+                    </div>
+                    <div class="assistant-memory-mode-grid">
+                        <label class="assistant-memory-mode-card">
+                            <input type="radio" name="memory_mode" value="inherit" ${memory.mode === 'inherit' ? 'checked' : ''} onchange="App.syncAssistantMemoryMode(this.form)">
+                            <span><i class="bi bi-diagram-2"></i><strong>继承全局</strong><small>推荐。以后调整全局策略时，此聊天自动跟进。</small></span>
+                        </label>
+                        <label class="assistant-memory-mode-card">
+                            <input type="radio" name="memory_mode" value="off" ${memory.mode === 'off' ? 'checked' : ''} onchange="App.syncAssistantMemoryMode(this.form)">
+                            <span><i class="bi bi-slash-circle"></i><strong>此聊天关闭</strong><small>不检索记忆，也不再生成新的记忆内容。</small></span>
+                        </label>
+                        <label class="assistant-memory-mode-card">
+                            <input type="radio" name="memory_mode" value="custom" ${memory.mode === 'custom' ? 'checked' : ''} onchange="App.syncAssistantMemoryMode(this.form)">
+                            <span><i class="bi bi-toggles"></i><strong>此聊天自定义</strong><small>只为这个聊天覆盖常用记忆参数。</small></span>
+                        </label>
+                    </div>
+                    <div class="assistant-memory-custom ${memory.mode === 'custom' ? '' : 'd-none'}" id="assistantMemoryCustom">
+                        <div class="assistant-memory-custom-switches">
+                            <label class="assistant-setting-switch"><span><strong>证据复核</strong><small>低可信内容先进入待复核区，不直接参与回答。</small></span><input class="form-check-input" type="checkbox" name="memory_verification_enabled" ${memoryValue('memory_verification_enabled', true) ? 'checked' : ''}></label>
+                            <label class="assistant-setting-switch"><span><strong>人物记忆</strong><small>从有来源的观察证据维护人物事实和关系。</small></span><input class="form-check-input" type="checkbox" name="memory_person_v3_enabled" ${memoryValue('memory_person_v3_enabled', true) ? 'checked' : ''}></label>
+                        </div>
+                        <div class="row g-3 mt-1">
+                            <div class="col-md-6"><label class="form-label">检索时间范围（天）</label><input class="form-control" name="memory_retention_days" type="number" min="0" max="3650" value="${Number(memoryValue('memory_retention_days', 365))}"><div class="form-text">仅限制回答时检索的历史范围；不会删除数据。填 0 表示不限。</div></div>
+                            <div class="col-md-6"><label class="form-label">每次最多召回</label><input class="form-control" name="memory_retrieval_top_k" type="number" min="1" max="20" value="${Number(memoryValue('memory_retrieval_top_k', 6))}"><div class="form-text">值越大，上下文更全，但会占用更多模型输入。</div></div>
+                        </div>
+                        <div class="assistant-memory-advanced-link"><i class="bi bi-info-circle"></i><span>抽取批次、向量模型和后台维护等低频参数统一在全局设置中管理，避免每个聊天重复配置。</span></div>
+                    </div>
+                </div>
+                <div class="assistant-editor-section">
+                    <h6>局部黑名单</h6>
+                    <label class="form-label">忽略的发送者</label>
+                    <textarea class="form-control" name="ignored_senders" rows="4" placeholder="每行一个发送者">${UI.escapeHtml((chat.ignored_senders || []).join('\n'))}</textarea>
+                    <div class="form-text">仅影响此聊天中的 Chatbot，不影响其他自动化。</div>
+                </div>
+            </form>`;
+        const assistantForm = document.getElementById('assistantChatForm');
+        const proactiveToggle = assistantForm?.elements.proactive_enabled;
+        const judgeSelect = assistantForm?.elements.judge_id;
+        const judgeControlElement = assistantForm?.querySelector('[data-judge-control]');
+        const judgeHelp = assistantForm?.querySelector('[data-judge-help]');
+        const syncJudgeRequirement = () => {
+            if (!proactiveToggle || !judgeSelect) return;
+            const enabled = proactiveToggle.checked;
+            judgeSelect.required = enabled;
+            if (enabled) {
+                judgeSelect.disabled = false;
+                if (!judgeSelect.value) {
+                    judgeSelect.value = judgeSelect.dataset.boundJudgeId || judgeSelect.dataset.defaultJudgeId || '';
+                }
+            } else {
+                if (judgeSelect.value) judgeSelect.dataset.boundJudgeId = judgeSelect.value;
+                judgeSelect.value = '';
+                judgeSelect.disabled = true;
+            }
+            judgeControlElement?.classList.toggle('is-disabled', !enabled);
+            if (judgeHelp) judgeHelp.textContent = enabled
+                ? '选择负责判断是否插话的 Judge；未选择时自动使用默认 Judge。'
+                : '主动回复未开启，Judge 不参与运行，因此暂不可选择。';
+        };
+        proactiveToggle?.addEventListener('change', syncJudgeRequirement);
+        syncJudgeRequirement();
+        this.syncAssistantMemoryMode(assistantForm);
+        const saveButton = document.getElementById('configModalSaveBtn');
+        saveButton.classList.remove('d-none');
+        saveButton.onclick = () => this.saveAssistantChat(userId);
+        new bootstrap.Modal(document.getElementById('configModal')).show();
+    },
+
+    syncAssistantMemoryMode(form) {
+        if (!form) return;
+        const mode = form.elements.memory_mode?.value || 'inherit';
+        document.getElementById('assistantMemoryCustom')?.classList.toggle('d-none', mode !== 'custom');
+        form.querySelectorAll('.assistant-memory-mode-card').forEach(card => {
+            card.classList.toggle('selected', card.querySelector('input')?.checked);
+        });
+    },
+
+    async saveAssistantChat(userId) {
+        const form = document.getElementById('assistantChatForm');
+        const chat = (this._chatbotUsers || []).find(item => item.id === userId);
+        if (!form || !form.checkValidity()) {
+            form?.reportValidity();
+            return;
+        }
+        const valueOrNull = name => form.elements[name]?.value ? Number(form.elements[name].value) : null;
+        const proactiveEnabled = Boolean(chat?.is_group && form.elements.proactive_enabled?.checked);
+        const judgeId = chat?.is_group
+            ? (proactiveEnabled
+                ? valueOrNull('judge_id')
+                : (Number(form.elements.judge_id?.dataset.boundJudgeId) || null))
+            : null;
+        const memoryMode = form.elements.memory_mode?.value || 'inherit';
+        if (proactiveEnabled && !judgeId) {
+            UI.showError('启用主动回复需要选择一个 Judge');
+            return;
+        }
+        const payload = {
+            enabled: form.elements.enabled.checked,
+            proactive_enabled: proactiveEnabled,
+            followup_enabled: form.elements.followup_enabled.checked,
+            followup_window_seconds: Number(form.elements.followup_window_seconds.value),
+            followup_merge_seconds: Number(form.elements.followup_merge_seconds.value),
+            followup_max_turns: Number(form.elements.followup_max_turns.value),
+            ignored_senders: [...new Set(form.elements.ignored_senders.value.split(/\r?\n|,/).map(value => value.trim()).filter(Boolean))],
+            role_id: valueOrNull('role_id'),
+            judge_id: judgeId,
+            memory_mode: memoryMode,
+            memory_overrides: memoryMode === 'custom' ? {
+                memory_enabled: true,
+                memory_verification_enabled: form.elements.memory_verification_enabled.checked,
+                memory_person_v3_enabled: form.elements.memory_person_v3_enabled.checked,
+                memory_retention_days: Number(form.elements.memory_retention_days.value),
+                memory_retrieval_top_k: Number(form.elements.memory_retrieval_top_k.value)
+            } : {},
+            ...(chat?.is_group ? {
+                bot_group_nickname: form.elements.bot_group_nickname.value.trim().replace(/^@+/, '').trim(),
+                bot_group_nickname_auto_enabled: form.elements.bot_group_nickname_auto_enabled.checked
+            } : {})
+        };
+        const saveButton = document.getElementById('configModalSaveBtn');
+        const original = saveButton.innerHTML;
+        saveButton.disabled = true;
+        saveButton.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>正在保存';
+        try {
+            await API.assistant.updateChat(userId, payload);
+            bootstrap.Modal.getInstance(document.getElementById('configModal'))?.hide();
+            UI.showSuccess('聊天的 AI 助手配置已保存');
+            if (this.currentTab === 'users') {
+                const selectedName = this.currentThreadName;
+                await this.loadUsers();
+                if (selectedName) await this.selectUser(selectedName, userId);
+            } else {
+                await this.loadRoles();
+            }
+        } catch (error) {
+            UI.showError('保存失败：' + error.message);
+        } finally {
+            saveButton.disabled = false;
+            saveButton.innerHTML = original;
+        }
+    },
+
+    getAvatarColor(name) {
+        const colors = [
+            'linear-gradient(135deg, var(--primary), var(--primary-active))',
+            'linear-gradient(135deg, var(--accent-teal), var(--primary))',
+            'linear-gradient(135deg, var(--success), var(--accent-teal))',
+            'linear-gradient(135deg, var(--accent-amber), var(--warning))',
+            'linear-gradient(135deg, var(--body-strong), var(--ink))',
+            'linear-gradient(135deg, var(--muted), var(--body-strong))',
+            'linear-gradient(135deg, var(--primary), var(--accent-amber))',
+            'linear-gradient(135deg, var(--accent-teal), var(--success))'
+        ];
+        let hash = 0;
+        for (let i = 0; i < name.length; i++) {
+            hash = name.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        const index = Math.abs(hash) % colors.length;
+        return colors[index];
+    },
+
+    getInitials(name) {
+        if (!name) return '??';
+        const cleanName = name.replace(/[^\w\s\u4e00-\u9fa5]/g, '').trim();
+        if (cleanName.length === 0) return name.substring(0, Math.min(2, name.length));
+
+        const isChinese = /^[\u4e00-\u9fa5]+$/.test(cleanName);
+        if (isChinese) {
+            return cleanName.substring(0, Math.min(2, cleanName.length));
+        }
+
+        const words = cleanName.split(/\s+/);
+        if (words.length >= 2) {
+            return (words[0][0] + words[1][0]).toUpperCase();
+        }
+        return cleanName.substring(0, Math.min(2, cleanName.length)).toUpperCase();
+    },
+
+    filterAndRenderRoles(query) {
+        const normalizeSearchValue = value => String(value ?? '').toLowerCase();
+        const q = normalizeSearchValue(query).trim();
+
+        // Filter roles
+        const filteredRoles = (this._roles || []).filter(r =>
+            normalizeSearchValue(r.display_name).includes(q) ||
+            normalizeSearchValue(r.name).includes(q) ||
+            normalizeSearchValue(r.description).includes(q) ||
+            normalizeSearchValue(r.prompt).includes(q)
+        );
+
+        // Filter judges
+        const filteredJudges = (this._judges || []).filter(j =>
+            normalizeSearchValue(j.display_name).includes(q) ||
+            normalizeSearchValue(j.name).includes(q) ||
+            normalizeSearchValue(j.description).includes(q) ||
+            normalizeSearchValue(j.prompt).includes(q)
+        );
+
+        this.renderPremiumRoles(filteredRoles);
+        this.renderPremiumJudges(filteredJudges);
+    },
+
+    renderPremiumRoles(rolesList) {
+        const container = document.getElementById('rolesGrid');
+        if (!container) return;
+
+        const roleCards = rolesList.map(r => {
+            const rawPrompt = String(r.prompt || '');
+            const promptPreview = UI.escapeHtml(rawPrompt.substring(0, 160)) + (rawPrompt.length > 160 ? '...' : '');
+            const displayName = UI.escapeHtml(r.display_name || r.name || '未命名角色');
+            const description = UI.escapeHtml(r.description || '暂无描述');
+            const roleId = Number(r.id);
+            const userCount = Number(r.user_count || 0);
+            const countBadge = `<span class="badge bg-light text-secondary border rounded-pill"><i class="bi bi-people me-1"></i>${userCount} 个启用</span>`;
+
+            return `
+                <div class="premium-card-modern premium-role-card fade-in">
+                    <div class="card-body p-3 flex-grow-1">
+                        <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
+                            <h6 class="card-title fw-bold text-truncate mb-0" style="font-size: 0.95rem;" title="${displayName}">${displayName}</h6>
+                            ${countBadge}
+                        </div>
+                        <small class="text-muted text-truncate d-block mb-3" style="font-size: 0.8rem;">${description}</small>
+
+                        <div class="prompt-snippet" title="系统提示词预览">${promptPreview || '<span class="text-muted">提示词为空。</span>'}</div>
+
+                        <div class="d-flex flex-wrap gap-1 mt-2">
+                            ${r.output_split_enabled
+                                ? `<span class="badge bg-success-subtle text-success border border-success-subtle rounded-pill" style="font-size: 0.72rem;"><i class="bi bi-scissors me-1"></i>拆分 ${Number(r.output_max_chars || 0)}×${Number(r.output_max_count || 0)}</span>`
+                                : `<span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle rounded-pill" style="font-size: 0.72rem;"><i class="bi bi-chat-left-dots me-1"></i>单条消息</span>`}
+                            ${r.output_strip_trailing_period ? `<span class="badge bg-info-subtle text-info border border-info-subtle rounded-pill" style="font-size: 0.72rem;"><i class="bi bi-eraser me-1"></i>移除句号</span>` : ''}
+                        </div>
+                    </div>
+                    <div class="premium-card-footer">
+                        <button class="btn btn-sm btn-outline-primary flex-fill" onclick="App.showRoleEditor(${roleId})" title="编辑角色规则">
+                            <i class="bi bi-pencil me-1"></i> 编辑
+                        </button>
+                        <button class="btn btn-sm btn-outline-danger"
+                                onclick="App.deleteRole(${roleId})"
+                                title="${userCount > 0 ? `无法删除：有 ${userCount} 个用户正在使用此角色` : '删除'}"
+                                ${userCount > 0 ? 'disabled' : ''}>
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        container.innerHTML = roleCards || '<div class="assistant-empty-inline">还没有角色，请创建第一个角色。</div>';
+    },
+
+    renderPremiumJudges(judgesList) {
+        const container = document.getElementById('judgesGrid');
+        if (!container) return;
+
+        const judgeCards = judgesList.map(j => {
+            const rawPrompt = String(j.prompt || '');
+            const promptPreview = UI.escapeHtml(rawPrompt.substring(0, 160)) + (rawPrompt.length > 160 ? '...' : '');
+            const displayName = UI.escapeHtml(j.display_name || j.name || '未命名 Judge');
+            const description = UI.escapeHtml(j.description || '暂无描述');
+            const judgeId = Number(j.id);
+            const userCount = Number(j.user_count || 0);
+            const isBuiltin = j.is_builtin === true
+                || String(j.is_builtin ?? '').trim().toLowerCase() === 'true';
+            const canDelete = !isBuiltin && userCount === 0;
+            const deleteTitle = isBuiltin
+                ? '内置 Judge 无法删除'
+                : (userCount > 0
+                    ? `无法删除：有 ${userCount} 个用户正在使用此 Judge`
+                    : '删除');
+            const modeBadge = j.prompt_mode === 'template'
+                ? '<span class="badge bg-primary-subtle text-primary border border-primary-subtle rounded-pill" style="font-size: 0.72rem;">模板</span>'
+                : '<span class="badge bg-success-subtle text-success border border-success-subtle rounded-pill" style="font-size: 0.72rem;">简洁</span>';
+
+            return `
+                <div class="premium-card-modern premium-judge-card fade-in">
+                    <div class="card-body p-3 flex-grow-1">
+                        <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
+                            <h6 class="card-title fw-bold text-truncate mb-0" style="font-size: 0.95rem;" title="${displayName}">${displayName}</h6>
+                            ${modeBadge}
+                        </div>
+                        <small class="text-muted text-truncate d-block mb-3" style="font-size: 0.8rem;">${description}</small>
+
+                        <div class="prompt-snippet" title="判断规则预览">${promptPreview || '<span class="text-muted">规则为空。</span>'}</div>
+
+                        <div class="timing-grid mt-2">
+                            <div class="timing-item" title="触发阈值">
+                                <i class="bi bi-chat-left-dots text-primary"></i>
+                                <span>触发：${Number(j.trigger_msg_threshold || 0)} 条消息</span>
+                            </div>
+                            <div class="timing-item" title="触发间隔（分钟）">
+                                <i class="bi bi-clock text-primary"></i>
+                                <span>间隔：${Number(j.trigger_interval_minutes || 0)} 分钟</span>
+                            </div>
+                            <div class="timing-item" title="冷却阈值">
+                                <i class="bi bi-hourglass text-warning"></i>
+                                <span>冷却：${Number(j.cooldown_msg_threshold || 0)} 条消息</span>
+                            </div>
+                            <div class="timing-item" title="冷却时间（分钟）">
+                                <i class="bi bi-shield text-warning"></i>
+                                <span>冷却：${Number(j.cooldown_minutes || 0)} 分钟</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="premium-card-footer">
+                        <button class="btn btn-sm btn-outline-primary flex-fill" onclick="App.showJudgeEditor(${judgeId})" title="编辑 Judge 设置">
+                            <i class="bi bi-pencil me-1"></i> 编辑
+                        </button>
+                        <button class="btn btn-sm btn-outline-danger"
+                                onclick="App.deleteJudge(${judgeId})"
+                                title="${UI.escapeHtml(deleteTitle)}"
+                                ${canDelete ? '' : 'disabled'}>
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        container.innerHTML = judgeCards || '<div class="assistant-empty-inline">还没有 Judge，主动回复将不会生效。</div>';
+    },
+
+    renderTabbedRoleEditorForm(role = {}, isCreate = false) {
+        const splitEnabled = !!role.output_split_enabled;
+        const maxChars = UI.escapeHtml(role.output_max_chars ?? 120);
+        const maxCount = UI.escapeHtml(role.output_max_count ?? 3);
+        const stripPeriod = role.output_strip_trailing_period !== false;
+        const interval = UI.escapeHtml(role.output_interval_seconds ?? 1.0);
+        const roleId = UI.escapeHtml(role.id || '');
+        const displayName = UI.escapeHtml(role.display_name || '');
+        const internalName = UI.escapeHtml(role.name || '');
+        const description = UI.escapeHtml(role.description || '');
+        const prompt = UI.escapeHtml(role.prompt || '');
+
+        return `
+            <form id="roleForm" class="p-1">
+                <input type="hidden" name="id" value="${roleId}">
+
+                <!-- Tab Controls -->
+                <ul class="nav editor-modal-tabs mb-4" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="role-prompt-tab" data-bs-toggle="tab" data-bs-target="#role-prompt-panel" type="button" role="tab">
+                            <i class="bi bi-chat-square-quote"></i> 系统身份
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="role-output-tab" data-bs-toggle="tab" data-bs-target="#role-output-panel" type="button" role="tab">
+                            <i class="bi bi-sliders"></i> 输出拆分
+                        </button>
+                    </li>
+                </ul>
+
+                <!-- Tab Contents -->
+                <div class="tab-content">
+                    <!-- Panel 1: Identity & System Prompt -->
+                    <div class="tab-pane fade show active" id="role-prompt-panel" role="tabpanel">
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">显示名称 <span class="text-danger">*</span></label>
+                                <input type="text" class="form-control" name="display_name" value="${displayName}" placeholder="例如：客户服务" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">内部 ID（唯一）<span class="text-danger">*</span></label>
+                                <input type="text" class="form-control ${!isCreate ? 'bg-light' : ''}" name="name" value="${internalName}" placeholder="例如：support_role" ${!isCreate ? 'disabled readonly' : 'required'}>
+                                ${isCreate ? '<div class="form-text" style="font-size:0.75rem;">仅支持字母、数字和下划线，创建后无法修改。</div>' : ''}
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold">简要描述</label>
+                            <input type="text" class="form-control" name="description" value="${description}" placeholder="简要说明角色用途">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold d-flex justify-content-between align-items-center">
+                                <span>系统提示词 <span class="text-danger">*</span></span>
+                                <span class="badge bg-secondary-subtle text-secondary rounded-pill fw-normal" style="font-size:0.75rem;">LLM 指令</span>
+                            </label>
+                            <textarea class="form-control font-monospace border-secondary border-opacity-25" name="prompt" rows="10" placeholder="你是一名专业的聊天助手……" style="font-size: 0.85rem; line-height: 1.5;" required>${prompt}</textarea>
+                            <div class="form-text mt-2" style="font-size: 0.78rem; line-height: 1.45;">
+                                <strong class="text-primary"><i class="bi bi-info-circle"></i> 动态变量：</strong><br>
+                                <code>{chat_text}</code> - 最近消息 &nbsp;|&nbsp;
+                                <code>{search_results}</code> - Web 搜索上下文 &nbsp;|&nbsp;
+                                <code>{sender}</code> - 当前用户 &nbsp;|&nbsp;
+                                <code>{content}</code> - 用户消息
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Panel 2: Human-like Splitting Controls -->
+                    <div class="tab-pane fade" id="role-output-panel" role="tabpanel">
+                        <div class="bg-light p-3 rounded mb-4 border d-flex justify-content-between align-items-center">
+                            <div>
+                                <h6 class="fw-bold mb-1 text-dark">模拟真人输入</h6>
+                                <p class="text-muted mb-0" style="font-size: 0.78rem;">按角色拆分消息，让 Bot 回复显得更自然。</p>
+                            </div>
+                            <div class="form-check form-switch modern-toggle">
+                                <input class="form-check-input" type="checkbox" role="switch" name="output_split_enabled" ${splitEnabled ? 'checked' : ''}>
+                            </div>
+                        </div>
+
+                        <div class="row g-3">
+                            <div class="col-md-4">
+                                <label class="form-label fw-semibold">单段字符上限</label>
+                                <div class="input-group input-group-sm">
+                                    <input type="number" class="form-control" name="output_max_chars" min="10" max="2000" value="${maxChars}">
+                                    <span class="input-group-text">字符</span>
+                                </div>
+                                <div class="form-text" style="font-size:0.75rem;">单段消息的最大长度。</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label fw-semibold">最多消息段数</label>
+                                <div class="input-group input-group-sm">
+                                    <input type="number" class="form-control" name="output_max_count" min="1" max="10" value="${maxCount}">
+                                    <span class="input-group-text">条</span>
+                                </div>
+                                <div class="form-text" style="font-size:0.75rem;">一条回复最多拆分成多少段。</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label fw-semibold">发送间隔</label>
+                                <div class="input-group input-group-sm">
+                                    <input type="number" class="form-control" name="output_interval_seconds" min="0" max="10" step="0.1" value="${interval}">
+                                    <span class="input-group-text">秒</span>
+                                </div>
+                                <div class="form-text" style="font-size:0.75rem;">各消息段之间的发送间隔。</div>
+                            </div>
+                        </div>
+
+                        <div class="form-check mt-4 border-top pt-3">
+                            <input class="form-check-input" type="checkbox" name="output_strip_trailing_period" id="stripTrailingPeriod" ${stripPeriod ? 'checked' : ''}>
+                            <label class="form-check-label fw-semibold" for="stripTrailingPeriod" style="font-size:0.88rem;">移除末尾句号</label>
+                            <div class="form-text" style="font-size:0.75rem;">自动移除回复末尾的句号（。或 .），使表达更自然。</div>
+                        </div>
+                    </div>
+                </div>
+            </form>
+        `;
+    },
+
+    renderTabbedJudgeEditorForm(judge = {}, isCreate = false) {
+        const triggerMsgs = UI.escapeHtml(judge.trigger_msg_threshold ?? 5);
+        const triggerMinutes = UI.escapeHtml(judge.trigger_interval_minutes ?? 1);
+        const cooldownMsgs = UI.escapeHtml(judge.cooldown_msg_threshold ?? triggerMsgs);
+        const cooldownMinutes = UI.escapeHtml(judge.cooldown_minutes ?? triggerMinutes);
+        const judgeId = UI.escapeHtml(judge.id || '');
+        const displayName = UI.escapeHtml(judge.display_name || '');
+        const internalName = UI.escapeHtml(judge.name || '');
+        const description = UI.escapeHtml(judge.description || '');
+        const prompt = UI.escapeHtml(judge.prompt || '');
+
+        return `
+            <form id="judgeForm" class="p-1">
+                <input type="hidden" name="id" value="${judgeId}">
+
+                <!-- Tab Controls -->
+                <ul class="nav editor-modal-tabs mb-4" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="judge-rules-tab" data-bs-toggle="tab" data-bs-target="#judge-rules-panel" type="button" role="tab">
+                            <i class="bi bi-shield-check"></i> 判断规则
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="judge-timing-tab" data-bs-toggle="tab" data-bs-target="#judge-timing-panel" type="button" role="tab">
+                            <i class="bi bi-clock"></i> 触发时机
+                        </button>
+                    </li>
+                </ul>
+
+                <!-- Tab Contents -->
+                <div class="tab-content">
+                    <!-- Panel 1: Decision Prompt -->
+                    <div class="tab-pane fade show active" id="judge-rules-panel" role="tabpanel">
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">显示名称 <span class="text-danger">*</span></label>
+                                <input type="text" class="form-control" name="display_name" value="${displayName}" placeholder="例如：主动销售 Judge" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">内部 ID（唯一）<span class="text-danger">*</span></label>
+                                <input type="text" class="form-control ${!isCreate ? 'bg-light' : ''}" name="name" value="${internalName}" placeholder="例如：strict_judge" ${!isCreate ? 'disabled readonly' : 'required'}>
+                                ${isCreate ? '<div class="form-text" style="font-size:0.75rem;">仅支持字母、数字和下划线，创建后无法修改。</div>' : ''}
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold">简要描述</label>
+                            <input type="text" class="form-control" name="description" value="${description}" placeholder="简要说明此 Judge 的用途">
+                        </div>
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">提示词判断模式</label>
+                                <select class="form-select" name="prompt_mode" onchange="App.onJudgePromptModeChange(this.value)">
+                                    <option value="simple" ${judge.prompt_mode === 'simple' || !judge.prompt_mode ? 'selected' : ''}>简洁（推荐）</option>
+                                    <option value="template" ${judge.prompt_mode === 'template' ? 'selected' : ''}>模板（高级）</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 d-flex align-items-end">
+                                <div id="judgePromptModeHint" class="form-text mt-0 bg-light p-2 rounded border" style="font-size: 0.75rem; line-height: 1.4;">
+                                    简洁模式会自动注入上下文，系统会强制要求 JSON 输出格式。
+                                </div>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold d-flex justify-content-between align-items-center">
+                                <span>Judge 判断规则 <span class="text-danger">*</span></span>
+                                <span class="badge bg-secondary-subtle text-secondary rounded-pill fw-normal" style="font-size:0.75rem;">判断提示词</span>
+                            </label>
+                            <textarea class="form-control font-monospace border-secondary border-opacity-25" name="prompt" rows="9" placeholder="指定触发 Bot 的用户意图条件……" style="font-size: 0.85rem; line-height: 1.5;" required>${prompt}</textarea>
+
+                            <div id="judgeTemplateTools" class="mt-2 d-none">
+                                <button type="button" class="btn btn-sm btn-outline-secondary" onclick="App.insertJudgeTemplateVar('{{chat_text}}')">
+                                    <i class="bi bi-braces me-1"></i> 插入 {{chat_text}}
+                                </button>
+                                <small class="text-muted ms-2">高级用法：使用 <code>{{chat_text}}</code> 注入自定义聊天上下文。</small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Panel 2: Cadence Timing Controls -->
+                    <div class="tab-pane fade" id="judge-timing-panel" role="tabpanel">
+                        <div class="alert alert-info py-2 px-3 small border-info border-opacity-25 mb-4 d-flex align-items-start gap-2">
+                            <i class="bi bi-info-circle-fill mt-1 text-info"></i>
+                            <div>
+                                <strong>触发频率规则：</strong>主动判断按以下时间限制执行。消息较多或间隔较短时会触发检查，判断拒绝后则进入冷却期。
+                            </div>
+                        </div>
+
+                        <h6 class="fw-bold mb-3 text-dark border-bottom pb-2"><i class="bi bi-lightning text-primary me-1"></i>触发时机规则</h6>
+                        <div class="row g-3 mb-4">
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">触发消息数</label>
+                                <div class="input-group input-group-sm">
+                                    <input type="number" class="form-control" name="trigger_msg_threshold" min="0" max="1000" value="${triggerMsgs}">
+                                    <span class="input-group-text">条</span>
+                                </div>
+                                <div class="form-text" style="font-size:0.75rem;">未回复消息达到此数量时主动检查。</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">触发间隔上限</label>
+                                <div class="input-group input-group-sm">
+                                    <input type="number" class="form-control" name="trigger_interval_minutes" min="0" max="1440" value="${triggerMinutes}">
+                                    <span class="input-group-text">分钟</span>
+                                </div>
+                                <div class="form-text" style="font-size:0.75rem;">距上一条 AI 消息达到此时长时主动检查。</div>
+                            </div>
+                        </div>
+
+                        <h6 class="fw-bold mb-3 text-dark border-bottom pb-2"><i class="bi bi-hourglass-split text-warning me-1"></i>冷却规则（判断拒绝后）</h6>
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">冷却消息数</label>
+                                <div class="input-group input-group-sm">
+                                    <input type="number" class="form-control" name="cooldown_msg_threshold" min="0" max="1000" value="${cooldownMsgs}">
+                                    <span class="input-group-text">条</span>
+                                </div>
+                                <div class="form-text" style="font-size:0.75rem;">Judge 拒绝后，在收到这些消息前跳过主动检查。</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">冷却时长</label>
+                                <div class="input-group input-group-sm">
+                                    <input type="number" class="form-control" name="cooldown_minutes" min="0" max="1440" value="${cooldownMinutes}">
+                                    <span class="input-group-text">分钟</span>
+                                </div>
+                                <div class="form-text" style="font-size:0.75rem;">Judge 拒绝后，在此时长内跳过主动检查。</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </form>
+        `;
+    },
+
+    showCreateRoleModal() {
+        const html = this.renderTabbedRoleEditorForm({}, true);
+        document.getElementById('configModalBody').innerHTML = html;
+        document.getElementById('configModalTitle').textContent = '创建新角色';
+
+        const saveBtn = document.getElementById('configModalSaveBtn');
+        saveBtn.classList.remove('d-none');
+        saveBtn.onclick = async () => {
+            await this.saveRole(null);
+        };
+
+        new bootstrap.Modal(document.getElementById('configModal')).show();
+    },
+
+    async showRoleEditor(roleId) {
+        try {
+            const result = await API.roles.getDetail(roleId);
+            const role = result.role;
+
+            const html = this.renderTabbedRoleEditorForm(role, false);
+            document.getElementById('configModalBody').innerHTML = html;
+            document.getElementById('configModalTitle').textContent = `编辑角色：${role.display_name}`;
+
+            const saveBtn = document.getElementById('configModalSaveBtn');
+            saveBtn.classList.remove('d-none');
+            saveBtn.onclick = async () => {
+                await this.saveRole(roleId);
+            };
+
+            new bootstrap.Modal(document.getElementById('configModal')).show();
+
+        } catch (e) {
+            UI.showError(e.message);
+        }
+    },
+
+    async saveRole(roleId) {
+        try {
+            const form = document.getElementById('roleForm');
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+
+            const data = {
+                display_name: form.display_name.value,
+                description: form.description.value,
+                prompt: form.prompt.value,
+                output_split_enabled: form.output_split_enabled.checked,
+                output_max_chars: parseInt(form.output_max_chars.value || '120', 10),
+                output_max_count: parseInt(form.output_max_count.value || '3', 10),
+                output_strip_trailing_period: form.output_strip_trailing_period.checked,
+                output_interval_seconds: parseFloat(form.output_interval_seconds.value || '1')
+            };
+
+            // If creating, we also need the name
+            if (!roleId) {
+                data.name = form.name.value;
+                await API.roles.create(data);
+            } else {
+                await API.roles.update(roleId, data);
+            }
+
+            const modal = bootstrap.Modal.getInstance(document.getElementById('configModal'));
+            if (modal) modal.hide();
+
+            // Refresh UI to show changes
+            this.loadRoles();
+        } catch (e) {
+            UI.showError('操作失败：' + e.message);
+        }
+    },
+
+    async deleteRole(roleId) {
+        if (!await UI.confirm('确定删除此角色吗？该操作无法撤销。', {
+            title: '删除角色',
+            confirmText: '删除',
+            variant: 'danger'
+        })) return;
+        try {
+            await API.roles.delete(roleId);
+            this.loadRoles();
+        } catch (e) {
+            UI.showError('删除角色失败：' + e.message);
+        }
+    },
+
+    showCreateJudgeModal() {
+        const html = this.renderTabbedJudgeEditorForm({}, true);
+        document.getElementById('configModalBody').innerHTML = html;
+        document.getElementById('configModalTitle').textContent = '创建新 Judge';
+
+        const saveBtn = document.getElementById('configModalSaveBtn');
+        saveBtn.classList.remove('d-none');
+        saveBtn.onclick = async () => {
+            await this.saveJudge(null);
+        };
+
+        new bootstrap.Modal(document.getElementById('configModal')).show();
+        this.onJudgePromptModeChange('simple');
+    },
+
+    async showJudgeEditor(judgeId) {
+        try {
+            const result = await API.judges.getDetail(judgeId);
+            const judge = result.judge;
+
+            const html = this.renderTabbedJudgeEditorForm(judge, false);
+            document.getElementById('configModalBody').innerHTML = html;
+            document.getElementById('configModalTitle').textContent = `编辑 Judge：${judge.display_name}`;
+
+            const saveBtn = document.getElementById('configModalSaveBtn');
+            saveBtn.classList.remove('d-none');
+            saveBtn.onclick = async () => {
+                await this.saveJudge(judgeId);
+            };
+
+            new bootstrap.Modal(document.getElementById('configModal')).show();
+            this.onJudgePromptModeChange(judge.prompt_mode || 'simple');
+        } catch (e) {
+            UI.showError(e.message);
+        }
+    },
+
+    onJudgePromptModeChange(mode) {
+        const hint = document.getElementById('judgePromptModeHint');
+        const tools = document.getElementById('judgeTemplateTools');
+        const isTemplate = mode === 'template';
+
+        if (hint) {
+            hint.textContent = isTemplate
+                ? '模板模式：使用 {chat_text} / {{chat_text}} 插入上下文。系统仍会强制要求 JSON 输出格式。'
+                : '简洁模式会自动注入上下文。系统会强制要求 JSON 输出格式，无需手动指定。';
+        }
+        if (tools) {
+            tools.classList.toggle('d-none', !isTemplate);
+        }
+    },
+
+    insertJudgeTemplateVar(token) {
+        const form = document.getElementById('judgeForm');
+        if (!form || !form.prompt) return;
+
+        const textarea = form.prompt;
+        const start = textarea.selectionStart || 0;
+        const end = textarea.selectionEnd || 0;
+        const before = textarea.value.substring(0, start);
+        const after = textarea.value.substring(end);
+
+        textarea.value = `${before}${token}${after}`;
+        textarea.focus();
+        textarea.selectionStart = textarea.selectionEnd = start + token.length;
+    },
+
+    async saveJudge(judgeId) {
+        try {
+            const form = document.getElementById('judgeForm');
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+
+            const data = {
+                display_name: form.display_name.value,
+                description: form.description.value,
+                prompt_mode: form.prompt_mode.value,
+                prompt: form.prompt.value,
+                trigger_msg_threshold: parseInt(form.trigger_msg_threshold.value || '0', 10),
+                trigger_interval_minutes: parseInt(form.trigger_interval_minutes.value || '0', 10),
+                cooldown_msg_threshold: parseInt(form.cooldown_msg_threshold.value || '0', 10),
+                cooldown_minutes: parseInt(form.cooldown_minutes.value || '0', 10)
+            };
+
+            if (!judgeId) {
+                data.name = form.name.value;
+                await API.judges.create(data);
+            } else {
+                await API.judges.update(judgeId, data);
+            }
+
+            const modal = bootstrap.Modal.getInstance(document.getElementById('configModal'));
+            if (modal) modal.hide();
+            this.loadRoles();
+        } catch (e) {
+            UI.showError('Judge 操作失败：' + e.message);
+        }
+    },
+
+    async deleteJudge(judgeId) {
+        if (!await UI.confirm('确定删除此 Judge 吗？该操作无法撤销。', {
+            title: '删除 Judge',
+            confirmText: '删除',
+            variant: 'danger'
+        })) return;
+        try {
+            await API.judges.delete(judgeId);
+            this.loadRoles();
+        } catch (e) {
+            UI.showError('删除 Judge 失败：' + e.message);
+        }
+    },
+
+    // Logs
+    currentLogType: 'app', // Track current log type
+
+    setupLogControls() {
+        if (this.logControlsReady) return;
+        const debouncedLoad = UI.debounce(() => this.loadLogs(), 350);
+        const debouncedSearch = UI.debounce(() => this.applyLogSearch(), 160);
+        const pluginFilter = document.getElementById('logPluginFilter');
+        const searchInput = document.getElementById('logSearchInput');
+        const linesSelect = document.getElementById('logLinesSelect');
+
+        if (pluginFilter) pluginFilter.addEventListener('change', debouncedLoad);
+        if (linesSelect) linesSelect.addEventListener('change', debouncedLoad);
+        if (searchInput) {
+            searchInput.addEventListener('input', debouncedSearch);
+            searchInput.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    this.navigateLogSearch(event.shiftKey ? -1 : 1);
+                } else if (event.key === 'Escape' && searchInput.value) {
+                    searchInput.value = '';
+                    this.applyLogSearch({ focus: false });
+                }
+            });
+        }
+        this.logControlsReady = true;
+    },
+
+    async loadLogs(logType, isInitialLoad = false) {
+        // If no logType specified, use current or default to 'app'
+        if (!logType) {
+            logType = this.currentLogType || 'app';
+        }
+
+        const logTypeChanged = logType !== this.currentLogType;
+        // Store the current log type
+        this.currentLogType = logType;
+
+        // Get filter values
+        const pluginFilter = document.getElementById('logPluginFilter');
+        const searchInput = document.getElementById('logSearchInput');
+        const linesSelect = document.getElementById('logLinesSelect');
+
+        let plugin = null;
+        let lines = 500;
+        if (linesSelect) lines = parseInt(linesSelect.value) || 500;
+
+        if (pluginFilter) {
+            // Disable plugin filter for non-app logs
+            if (logType !== 'app') {
+                pluginFilter.disabled = true;
+                pluginFilter.value = "";
+            } else {
+                pluginFilter.disabled = false;
+                plugin = pluginFilter.value;
+
+                // Populate if empty (and we are on app log)
+                if (pluginFilter.options.length <= 1) {
+                    try {
+                        const pluginsData = await API.plugins.getAll();
+                        if (pluginsData.plugins) {
+                            // Clear existing (keep first)
+                            while (pluginFilter.options.length > 1) {
+                                pluginFilter.remove(1);
+                            }
+                            // Add new
+                            const pluginsList = Array.isArray(pluginsData.plugins) ? pluginsData.plugins : Object.values(pluginsData.plugins);
+                            pluginsList.sort((a, b) => a.name.localeCompare(b.name));
+
+                            pluginsList.forEach(p => {
+                                const option = document.createElement('option');
+                                option.value = p.name;
+                                option.textContent = p.name;
+                                pluginFilter.appendChild(option);
+                            });
+                            // Restore value if it was set
+                            if (plugin) pluginFilter.value = plugin;
+                        }
+                    } catch (e) {
+                        console.error("Failed to populate plugin filter", e);
+                    }
+                }
+            }
+        }
+
+        // Update status bar
+        const statusInfo = document.getElementById('logStatusInfo');
+        if (statusInfo) statusInfo.textContent = '加载中…';
+
+        try {
+            if (this.logAbortController) this.logAbortController.abort();
+            const controller = new AbortController();
+            this.logAbortController = controller;
+            // Keyword finding is browser-side so the surrounding log lines remain visible.
+            const data = await API.system.getLogs(logType, lines, null, plugin, { signal: controller.signal });
+            if (this.logAbortController !== controller) return;
+            this.logAbortController = null;
+            if (data.content !== undefined) {
+                this.currentLogContent = data.content || '';
+                const activeSearch = String(searchInput?.value || '').trim();
+                const searchChanged = activeSearch !== this.currentLogSearchQuery;
+                await UI.renderLogs(this.currentLogContent, activeSearch);
+
+                // Update active button state
+                document.querySelectorAll('.logs-type-btn').forEach(btn => {
+                    btn.classList.remove('active');
+                });
+                const activeBtn = document.querySelector(`.logs-type-btn[data-log-type="${logType}"]`);
+                if (activeBtn) {
+                    activeBtn.classList.add('active');
+                }
+
+                // Update status bar
+                const lineCount = data.content ? data.content.split('\n').filter(l => l.trim()).length : 0;
+                const totalInfo = data.total_lines ? ` / 共 ${data.total_lines} 行` : '';
+                this.currentLogStatusBase = `${logType} · ${lineCount} 行${totalInfo}`;
+                if (plugin) this.currentLogStatusBase += ` · 插件：${plugin}`;
+                this.syncLogSearchMatches(activeSearch, {
+                    resetIndex: searchChanged || logTypeChanged,
+                    focus: Boolean(activeSearch) && (searchChanged || logTypeChanged || isInitialLoad),
+                });
+
+                // Show latest logs by default; keep following on subsequent refreshes when enabled.
+                if (!activeSearch && (this.logFollowEnabled || isInitialLoad || logTypeChanged)) {
+                    this.scrollLogToBottom(isInitialLoad);
+                }
+            }
+        } catch (e) {
+            if (e.name === 'AbortError') return;
+            await UI.renderLogs('加载日志失败：' + e.message, null);
+            if (statusInfo) statusInfo.textContent = '加载失败';
+        }
+    },
+
+    toggleLogFollow() {
+        this.logFollowEnabled = !this.logFollowEnabled;
+        const btn = document.getElementById('logFollowBtn');
+        if (btn) {
+            if (this.logFollowEnabled) {
+                btn.classList.add('active');
+                btn.innerHTML = '<i class="bi bi-arrow-down-circle-fill"></i> 跟随中';
+                this.scrollLogToBottom();
+            } else {
+                btn.classList.remove('active');
+                btn.innerHTML = '<i class="bi bi-arrow-down-circle"></i> 跟随';
+            }
+        }
+    },
+
+    async applyLogSearch({ focus = true } = {}) {
+        const input = document.getElementById('logSearchInput');
+        const query = String(input?.value || '').trim();
+        const queryChanged = query !== this.currentLogSearchQuery;
+        await UI.renderLogs(this.currentLogContent, query);
+        this.syncLogSearchMatches(query, {
+            resetIndex: queryChanged,
+            focus: focus && Boolean(query),
+        });
+    },
+
+    syncLogSearchMatches(query, { resetIndex = false, focus = false } = {}) {
+        const container = document.getElementById('logContent');
+        this.currentLogSearchQuery = String(query || '').trim();
+        this.currentLogSearchMatches = container
+            ? Array.from(container.querySelectorAll('mark.log-search-match'))
+            : [];
+
+        if (!this.currentLogSearchQuery || this.currentLogSearchMatches.length === 0) {
+            this.currentLogSearchIndex = -1;
+        } else if (resetIndex || this.currentLogSearchIndex < 0) {
+            this.currentLogSearchIndex = 0;
+        } else {
+            this.currentLogSearchIndex = Math.min(
+                this.currentLogSearchIndex,
+                this.currentLogSearchMatches.length - 1
+            );
+        }
+
+        this.updateLogSearchControls();
+        if (focus && this.currentLogSearchIndex >= 0) this.focusCurrentLogSearchMatch();
+    },
+
+    updateLogSearchControls() {
+        const total = this.currentLogSearchMatches.length;
+        const current = this.currentLogSearchIndex >= 0 ? this.currentLogSearchIndex + 1 : 0;
+        this.currentLogSearchMatches.forEach((match, index) => {
+            const active = index === this.currentLogSearchIndex;
+            match.classList.toggle('is-current', active);
+            if (active) match.setAttribute('aria-current', 'true');
+            else match.removeAttribute('aria-current');
+        });
+
+        const position = document.getElementById('logSearchPosition');
+        if (position) position.textContent = `${current}/${total}`;
+        for (const id of ['logSearchPrevious', 'logSearchNext']) {
+            const button = document.getElementById(id);
+            if (button) button.disabled = total === 0;
+        }
+
+        const statusInfo = document.getElementById('logStatusInfo');
+        if (statusInfo) {
+            statusInfo.textContent = this.currentLogSearchQuery
+                ? `${this.currentLogStatusBase} · 查找：“${this.currentLogSearchQuery}” · ${total} 处`
+                : this.currentLogStatusBase;
+        }
+    },
+
+    async navigateLogSearch(direction = 1) {
+        const input = document.getElementById('logSearchInput');
+        const query = String(input?.value || '').trim();
+        if (!query) {
+            input?.focus();
+            return;
+        }
+        if (query !== this.currentLogSearchQuery) {
+            await this.applyLogSearch();
+            return;
+        }
+        const total = this.currentLogSearchMatches.length;
+        if (!total) return;
+        this.currentLogSearchIndex = (
+            this.currentLogSearchIndex + (direction < 0 ? -1 : 1) + total
+        ) % total;
+        this.updateLogSearchControls();
+        this.focusCurrentLogSearchMatch();
+    },
+
+    focusCurrentLogSearchMatch() {
+        const container = document.getElementById('logContent');
+        const match = this.currentLogSearchMatches[this.currentLogSearchIndex];
+        const line = match?.closest('.log-line');
+        if (!container || !line) return;
+        const lineRect = line.getBoundingClientRect();
+        const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        if (window.innerWidth <= 768) {
+            const targetTop = window.scrollY + lineRect.top
+                - Math.max(0, (window.innerHeight - lineRect.height) / 2);
+            window.scrollTo({
+                top: Math.max(0, targetTop),
+                behavior: reducedMotion ? 'auto' : 'smooth',
+            });
+            return;
+        }
+
+        const containerRect = container.getBoundingClientRect();
+        const targetTop = container.scrollTop
+            + lineRect.top - containerRect.top
+            - Math.max(0, (container.clientHeight - lineRect.height) / 2);
+        container.scrollTo({ top: Math.max(0, targetTop), behavior: reducedMotion ? 'auto' : 'smooth' });
+    },
+
+    scrollLogToBottom(resetViewport = false) {
+        const el = document.getElementById('logContent');
+        if (!el) return;
+
+        if (window.innerWidth <= 768) {
+            const scrollPageToLatest = () => {
+                const logsPage = document.getElementById('logs');
+                if (!logsPage || logsPage.classList.contains('d-none')) return;
+                const pageBottom = window.scrollY + logsPage.getBoundingClientRect().bottom;
+                window.scrollTo({ top: Math.max(0, pageBottom - window.innerHeight), behavior: 'auto' });
+            };
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    scrollPageToLatest();
+                    window.setTimeout(scrollPageToLatest, 80);
+                });
+            });
+            return;
+        }
+
+        if (resetViewport) {
+            const mainContent = document.querySelector('.main-content');
+            if (mainContent) mainContent.scrollTop = 0;
+        }
+        requestAnimationFrame(() => {
+            el.scrollTop = el.scrollHeight;
+            requestAnimationFrame(() => {
+                el.scrollTop = el.scrollHeight;
+            });
+        });
+    },
+
+    // Settings
+    async loadSettings() {
+        try {
+            const settings = await API.settings.getConsole();
+            UI.renderSystemSettings(settings);
+        } catch (e) {
+            UI.showError('加载设置失败：' + e.message);
+        }
+    },
+
+    async saveSettings() {
+        try {
+            const inputs = document.querySelectorAll('.system-setting-input');
+            const values = {};
+
+            for (const input of inputs) {
+                if (input.disabled || input.readOnly) continue;
+                const key = input.name;
+                const value = input.value;
+                const original = input.dataset.original;
+                const sensitive = input.dataset.sensitive === 'true';
+                if (sensitive && value === '') continue;
+                if (value !== original) values[key] = value;
+            }
+
+            if (Object.keys(values).length === 0) {
+                UI.showInfo('未检测到更改');
+                return;
+            }
+
+            await API.settings.updateConsole(values);
+            UI.showSuccess('系统设置已原子保存');
+            await this.loadSettings();
+        } catch (e) {
+            UI.showError('保存设置失败：' + e.message);
+        }
+    },
+
+    async reloadSettingsFromEnv() {
+        if (!await UI.confirm('确定从 .env 文件重新加载设置吗？', {
+            title: '重新加载设置',
+            confirmText: '重新加载'
+        })) return;
+        try {
+            await API.settings.reloadFromEnv();
+            UI.showSuccess('设置已重新加载');
+            this.loadSettings();
+        } catch (e) {
+            UI.showError(e.message);
+        }
+    }
+};
+
+window.App = App;
+document.addEventListener('DOMContentLoaded', () => App.init());

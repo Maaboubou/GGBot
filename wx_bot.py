@@ -56,6 +56,7 @@ from app.utils.daily_schedule import BEIJING_TIMEZONE, next_daily_run_at
 from app.utils.inflight_deduplicator import InFlightDeduplicator
 from app.utils.logging_utils import create_rotating_file_handler
 from app.utils.wechat_media import image_file_fingerprint, is_probable_wechat_media_window
+from app.utils.wechat_listener_recovery import open_listener_from_existing_session
 from app.utils.wechat_outbound import send_text_with_retry
 from app.utils.window_health import is_offscreen_sentinel_rect, is_unrecoverable_offscreen_window
 
@@ -126,10 +127,10 @@ LISTENER_ADD_RETRY_DELAY_SEC = 1.0
 LISTENER_ADD_VERIFY_ATTEMPTS = 5
 LISTENER_ADD_VERIFY_DELAY_SEC = 0.3
 LISTENER_ZOMBIE_FAILURE_THRESHOLD = 2
-# 单个监听窗口恢复失败时做退避/升级，避免每 20 秒重复抢 UI 并刷屏。
+# 单个监听窗口恢复失败时只做退避，避免每 20 秒重复抢 UI 并刷屏。
+# 某个聊天的窗口/UIA 异常不代表微信连接失效，不能因此重启全部正常监听。
 LISTENER_RECOVERY_MIN_COOLDOWN_SEC = 60
 LISTENER_RECOVERY_MAX_COOLDOWN_SEC = 300
-LISTENER_RECOVERY_RESTART_FAILURES = 12
 LISTENER_CALLBACK_STALE_SEC = 6 * 60 * 60
 # 主会话列表与监听回调是两条独立数据链。主会话时间明显晚于最近一次
 # 监听成功/回调/主动发送时，说明微信已收到新消息但监听窗口没有上报。
@@ -992,15 +993,16 @@ def _chat_info_name(chat) -> str:
     return ""
 
 
-def _get_actual_listener_names() -> list:
+def _get_actual_listener_names(wechat=None) -> list:
     """读取当前仍存在或已注册的 wxautox 监听名。失败时返回空列表。"""
     global last_listener_actual_snapshot, last_listener_actual_snapshot_at
-    if not wx:
+    client = wechat or wx
+    if not client:
         return []
 
     names = set()
     try:
-        sub_windows = wx.GetAllSubWindow()
+        sub_windows = client.GetAllSubWindow()
     except Exception as e:
         logger.debug(f"获取监听子窗口列表失败: {e}")
         sub_windows = []
@@ -1013,7 +1015,7 @@ def _get_actual_listener_names() -> list:
     # wxautox 的子窗口枚举偶发返回空；wx.listen 是实际监听线程使用的注册表。
     # 两者取并集，避免健康检查/恢复流程误判所有监听丢失。
     try:
-        listen = getattr(wx, "listen", None)
+        listen = getattr(client, "listen", None)
         if isinstance(listen, dict):
             for name, value in listen.items():
                 chat = value[0] if isinstance(value, tuple) and value else value
@@ -1029,13 +1031,14 @@ def _get_actual_listener_names() -> list:
     return snapshot
 
 
-def _get_actual_listener_chat(who: str):
+def _get_actual_listener_chat(who: str, wechat=None):
     """返回已存在的 wxautox 子窗口 Chat 对象；不存在时返回 None。"""
-    if not wx:
+    client = wechat or wx
+    if not client:
         return None
 
     try:
-        sub_windows = wx.GetAllSubWindow()
+        sub_windows = client.GetAllSubWindow()
     except Exception as e:
         logger.debug(f"获取监听子窗口对象失败: {e}")
         return None
@@ -1752,32 +1755,85 @@ def _listener_failure_count(who: str) -> int:
         return int(desired_listeners.get(who, {}).get("failure_count", 0) or 0)
 
 
+def _open_listener_from_main_session(who: str, client):
+    """用当前会话的右键菜单拆出窗口，绕过失效的搜索/双击路径。"""
+    try:
+        chat, route = open_listener_from_existing_session(
+            client,
+            who,
+            get_listener_chat=lambda name: _get_actual_listener_chat(name, client),
+        )
+    except Exception as e:
+        logger.warning(
+            "⚠️ 从当前会话菜单恢复监听失败: who=%s error=%s",
+            who,
+            e,
+        )
+        return None
+
+    if chat is None:
+        logger.info("当前会话菜单恢复未命中: who=%s route=%s", who, route)
+        return None
+
+    logger.info("✅ 已从当前会话菜单打开监听窗口: who=%s route=%s", who, route)
+    return chat
+
+
 def _add_listen_chat_verified(who: str, *, reactivated: bool = False, force_new: bool = False) -> None:
     """添加监听并确认独立监听窗口真的出现在 wxautox 子窗口列表中。"""
+    client = wx
+    if client is None:
+        raise RuntimeError("WeChat not connected")
+
     last_error = None
     for attempt in range(1, LISTENER_ADD_ATTEMPTS + 1):
         _mark_desired_listener_attempt(who)
         try:
-            existing_chat = None if force_new else _get_actual_listener_chat(who)
+            existing_chat = None if force_new else _get_actual_listener_chat(who, client)
             if existing_chat and _bind_existing_listener_chat(who, existing_chat, reason="add_listener_existing_window"):
                 _mark_desired_listener_success(who, reactivated=reactivated)
                 return
 
             _activate_wechat_main_window(f"add_listener:{who}")
-            result = wx.AddListenChat(who, message_callback)
+            native_error = None
+            try:
+                # 正常增加和管理面板恢复始终优先走 wxautox4 原生接口。
+                result = client.AddListenChat(who, message_callback)
+            except Exception as e:
+                native_error = e
+                result = None
+                logger.warning(
+                    "⚠️ 原生 AddListenChat 失败，尝试当前版本会话菜单兼容路径: who=%s error=%s",
+                    who,
+                    e,
+                )
+
             if result and hasattr(result, "ChatInfo"):
                 _bind_existing_listener_chat(who, result, reason="add_listener_new_window")
                 _mark_desired_listener_success(who, reactivated=reactivated)
                 return
 
+            menu_chat = _open_listener_from_main_session(who, client)
+            if menu_chat is not None:
+                # 菜单只负责适配新微信的“独立窗口显示”。窗口建好后再调用
+                # 原生 AddListenChat，由 wxautox4 登记 Chat 和 message_callback。
+                result = client.AddListenChat(who, message_callback)
+                if result and hasattr(result, "ChatInfo"):
+                    _bind_existing_listener_chat(who, result, reason="add_listener_menu_then_native")
+                    _mark_desired_listener_success(who, reactivated=reactivated)
+                    logger.info("✅ 兼容窗口已由原生 AddListenChat 完成回调登记: who=%s", who)
+                    return
+
             actual = []
             for _ in range(LISTENER_ADD_VERIFY_ATTEMPTS):
-                actual = _get_actual_listener_names()
+                actual = _get_actual_listener_names(client)
                 if who in set(actual):
                     _mark_desired_listener_success(who, reactivated=reactivated)
                     return
                 time.sleep(LISTENER_ADD_VERIFY_DELAY_SEC)
 
+            if native_error is not None:
+                raise native_error
             raise RuntimeError(f"监听窗口未出现在实际子窗口列表: expected={who}, actual={actual}")
         except Exception as e:
             last_error = e
@@ -2138,17 +2194,18 @@ def _ensure_listener_watchdog_started() -> None:
                 with desired_listeners_lock:
                     expected = list(desired_listeners.keys())
 
-                if not wx:
-                    continue
-
-                try:
-                    if not wx.IsOnline():
-                        continue
-                except Exception as e:
-                    logger.debug(f"监听窗口看护跳过：微信在线状态检查失败: {e}")
-                    continue
-
                 with wx_ui_lock:
+                    # wx 会在重连时被替换。必须在 UI 锁内检查，
+                    # 避免锁外看到旧对象，进锁后却对 None/新对象操作。
+                    if not wx:
+                        continue
+                    try:
+                        if not wx.IsOnline():
+                            continue
+                    except Exception as e:
+                        logger.debug(f"监听窗口看护跳过：微信在线状态检查失败: {e}")
+                        continue
+
                     if time.time() >= listener_daily_restart_next_at:
                         _run_scheduled_listener_restart(expected)
                         # 本轮只负责关闭；让下一轮 watchdog 通过缺失检测走统一恢复链路。
@@ -2185,27 +2242,13 @@ def _ensure_listener_watchdog_started() -> None:
                         now = time.time()
                         ready_missing = []
                         cooling_missing = []
-                        restart_needed = False
                         for name in missing_retry:
                             failures = _listener_failure_count(name)
-                            if failures >= LISTENER_RECOVERY_RESTART_FAILURES:
-                                restart_needed = True
-                                logger.error(
-                                    "❌ 监听窗口恢复连续失败过多，升级为全量微信连接重启: who=%s failures=%s",
-                                    name,
-                                    failures,
-                                )
-                                break
                             remaining = _listener_recovery_cooldown_remaining(name, now)
                             if remaining > 0:
                                 cooling_missing.append((name, round(remaining, 1), failures))
                             else:
                                 ready_missing.append(name)
-
-                        if restart_needed:
-                            global restart_requested
-                            restart_requested = True
-                            continue
 
                         if cooling_missing:
                             logger.warning(
@@ -2241,7 +2284,8 @@ def _ensure_listener_watchdog_started() -> None:
                             _add_listen_chat_verified(who, reactivated=True)
                             logger.info(f"✅ 已自动恢复监听窗口: {who}")
                         except Exception as e:
-                            _mark_desired_listener_failure(who, e)
+                            # _add_listen_chat_verified 已按真实尝试次数记录失败，
+                            # 这里不再重复累加，否则退避时间会被平白翻倍。
                             logger.error(f"❌ 自动恢复监听窗口失败: {who}, {e}")
 
                     for who in zombies:
@@ -2345,32 +2389,70 @@ MAIN_APP_URL = os.getenv("MAIN_APP_URL") or f"http://127.0.0.1:{os.getenv('WEB_P
 
 
 # --- 微信核心逻辑 ---
+def _reset_listener_recovery_after_connection() -> None:
+    """新连接不继承旧 UI 对象的失败计数，允许所有目标重新尝试一次。"""
+    with desired_listeners_lock:
+        for meta in desired_listeners.values():
+            meta["active"] = False
+            meta["status"] = "connection_ready_pending"
+            meta["last_error"] = None
+            meta["failure_count"] = 0
+            meta["health_failure_count"] = 0
+
+
+def _stop_wechat_client(client, reason: str) -> None:
+    """停止旧 wxautox 监听线程，但保留独立聊天窗口供新对象重绑。"""
+    if client is None:
+        return
+    try:
+        stop_listening = getattr(client, "StopListening", None)
+        if callable(stop_listening):
+            stop_listening(remove=False)
+            logger.info("已停止旧 wxautox 监听线程: reason=%s", reason)
+    except Exception as e:
+        logger.warning("停止旧 wxautox 监听线程失败: reason=%s error=%s", reason, e)
+
+
 def start_wechat_logic():
     """初始化微信并保持运行，支持自动重连"""
     global wx, restart_requested, last_wechat_online, last_wechat_online_checked_at
-    
+
     retry_count = 0
     max_retries = 3
     base_delay = 10  # 基础重连延迟
-    
+
     while True:
+        current_client = None
+        manual_restart = False
+        retry_delay = base_delay
+        disconnect_reason = "connection_cycle_end"
         try:
             # 在新线程中必须初始化COM
             comtypes.CoInitialize()
-            
+
             logger.info(f"Initializing WeChat... (attempt {retry_count + 1})")
-            wx = WeChat(start_listener=True)
+            # 初始化、发布和销毁 wx 对象都与真实 UI 操作共用一把锁。
+            # 这样 API/watchdog 不会在对象切换到 None 的中途继续 AddListenChat。
+            with wx_ui_lock:
+                current_client = WeChat(start_listener=True)
+                wx = current_client
+                _reset_listener_recovery_after_connection()
             logger.info("✅ WeChat connected successfully!")
             _ensure_listener_watchdog_started()
-            
+
             # 重置重试计数
             retry_count = 0
-            
+
             # 启动KeepRunning在单独线程中，然后进入监控循环
             logger.info("Starting KeepRunning in background...")
-            keep_running_thread = threading.Thread(target=lambda: wx.KeepRunning(), daemon=True)
+            # 必须捕获本轮对象；不能让旧线程在重连后读取新的全局 wx。
+            keep_running_thread = threading.Thread(
+                target=current_client.KeepRunning,
+                name="wxautox_keep_running",
+                daemon=True,
+            )
             keep_running_thread.start()
-            
+
             # 进入监控循环，定期检查重启请求和微信状态
             logger.info("Starting monitoring loop...")
             while True:
@@ -2378,62 +2460,69 @@ def start_wechat_logic():
                 if restart_requested:
                     logger.info("🔄 检测到重启请求，退出当前连接...")
                     restart_requested = False
-                    wx = None
+                    manual_restart = True
+                    disconnect_reason = "manual_restart"
                     break
-                
+
                 # 检查微信是否还在线
                 try:
-                    online = bool(wx and wx.IsOnline())
+                    online = bool(current_client.IsOnline())
                     last_wechat_online = online
                     last_wechat_online_checked_at = time.time()
                     if not online:
                         logger.warning("⚠️ 检测到微信掉线，将重新连接...")
-                        wx = None
+                        disconnect_reason = "wechat_offline"
                         break
                 except Exception as check_e:
                     logger.warning(f"⚠️ 检查微信状态时出现异常: {check_e}")
-                    wx = None
+                    disconnect_reason = f"online_check_failed:{check_e}"
                     break
-                
+
                 # 等待5秒后再次检查
                 time.sleep(5)
-            
+
             # 退出监控循环，准备重连
             logger.info("🔄 准备重新连接...")
-            
+
         except Exception as e:
             logger.error(f"❌ WeChat connection failed: {e}", exc_info=True)
-            wx = None
+            disconnect_reason = f"connection_failed:{e}"
             retry_count += 1
-            
+
             if retry_count > max_retries:
                 logger.error(f"❌ WeChat connection failed after {max_retries} attempts, entering continuous retry mode")
                 # 进入持续重试模式，但延长间隔
                 retry_delay = min(300, base_delay * (2 ** min(retry_count - max_retries, 5)))  # 最多5分钟
             else:
                 retry_delay = base_delay * retry_count
-                
+
             logger.info(f"🔄 Will retry WeChat connection in {retry_delay} seconds...")
-            
+
         finally:
+            with wx_ui_lock:
+                if wx is current_client:
+                    wx = None
+                _stop_wechat_client(current_client, disconnect_reason)
+            last_wechat_online = False
+            last_wechat_online_checked_at = time.time()
+
             # 确保COM被正确卸载
             try:
                 comtypes.CoUninitialize()
-            except:
+            except Exception:
                 pass
-        
+
         # 确定重连延迟时间
-        if restart_requested:
+        if manual_restart:
             logger.info("🔄 手动重启，立即尝试重连...")
-            restart_requested = False
             delay = 2  # 手动重启短暂等待
         else:
             # 自动重连：使用计算的延迟或默认值
-            delay = locals().get('retry_delay', 10)
+            delay = retry_delay
             logger.info(f"🔄 等待 {delay} 秒后重连...")
-        
+
         time.sleep(delay)
-        
+
         logger.info("🔄 Attempting to reconnect WeChat...")
 
 
@@ -4017,6 +4106,8 @@ def add_listener():
     try:
         logger.info(f"Adding listener for {who}...")
         with wx_ui_lock:
+            if not wx:
+                return jsonify({"status": "error", "message": "WeChat not connected"}), 503
             _add_listen_chat_verified(who)
         return jsonify({"status": "success", "message": f"Listener added for {who}"})
     except Exception as e:
@@ -4048,6 +4139,11 @@ def remove_listener():
     try:
         logger.info(f"Removing listener for {who}...")
         with wx_ui_lock:
+            if not wx:
+                return jsonify({
+                    "status": "success",
+                    "message": f"Listener removed from desired list for {who}; WeChat not connected"
+                })
             wx.RemoveListenChat(who)
         return jsonify({"status": "success", "message": f"Listener removed for {who}"})
     except Exception as e:

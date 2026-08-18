@@ -15,6 +15,7 @@ class WeChatUser(Base):
     chat_name = Column(String, unique=True, index=True, nullable=False)
     remark = Column(String, nullable=True)
     is_group = Column(Boolean, default=False)
+    listening_enabled = Column(Boolean, default=True, nullable=False)
     sender_blacklist = Column(Text, nullable=True)  # 当前群/私聊内全局 sender 黑名单（JSON array）
     # 群内 @ 名称与微信账号的全局显示名并不总是相同。手动值始终作为
     # 备用别名；自动值只从微信群详情的“我在本群的昵称”字段读取。

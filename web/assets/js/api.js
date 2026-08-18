@@ -200,6 +200,7 @@ const API = {
         getStatus: () => API.get('/api/wechat/status'),
         getMyInfo: () => API.get('/api/wechat/my-info'),
         getListeners: () => API.get('/api/wechat/listened-chats'),
+        addListener: (chatName) => API.post('/api/wechat/add-listen-chat', { chat_name: chatName }),
         removeListener: (chatName) => API.post(`/api/wechat/remove-listen-chat/${chatName}`),
     },
 

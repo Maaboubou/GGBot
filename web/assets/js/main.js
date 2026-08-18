@@ -1462,9 +1462,19 @@ const App = {
             variant: 'warning'
         })) return;
         try {
-            await API.wechat.removeListener(chatName);
-            // Refresh
-            this.loadUsers();
+            const result = await API.wechat.removeListener(chatName);
+            UI.showSuccess(result.message || '已停止监听');
+            await this.loadUsers();
+        } catch (e) {
+            UI.showError(e.message);
+        }
+    },
+
+    async addListener(chatName) {
+        try {
+            const result = await API.wechat.addListener(chatName);
+            UI.showSuccess(result.message || '已启用监听');
+            await this.loadUsers();
         } catch (e) {
             UI.showError(e.message);
         }

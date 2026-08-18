@@ -175,13 +175,17 @@ def create_wechat_user(
     """
     db_user = db.query(models_permission.WeChatUser).filter(models_permission.WeChatUser.chat_name == user.chat_name).first()
     if db_user:
-        # 用户已存在，确保其正在被监听
+        # “添加”已有聊天等同于显式恢复监听，并允许后续断线自动恢复。
+        db_user.listening_enabled = True
+        db.commit()
+        db.refresh(db_user)
         if wechat_manager and wechat_manager.is_connected():
             wechat_manager.add_listen_chat(db_user.chat_name)
         return db_user
     
     # 用户不存在，创建新用户
     new_user = models_permission.WeChatUser(**user.dict())
+    new_user.listening_enabled = True
     new_user.sender_blacklist = _normalize_sender_blacklist(user.sender_blacklist)
     db.add(new_user)
     db.commit()

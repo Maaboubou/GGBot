@@ -281,9 +281,6 @@ class WeChatManager:
             data = response.json()
 
             if data.get("status") == "success":
-                if chat_name in self._listened_chats:
-                    del self._listened_chats[chat_name]
-                    self._stats['listened_chats_count'] = len(self._listened_chats)
                 self.logger.debug(f"✅ Successfully removed listen chat via API: {chat_name}")
                 return True
             else:
@@ -292,6 +289,10 @@ class WeChatManager:
         except requests.RequestException as e:
             self.logger.error(f"❌ Failed to call remove_listener API: {e}")
             return False
+        finally:
+            # 本地视图立即服从用户的停止意图；桥接残留会在重连同步时再次清理。
+            self._listened_chats.pop(chat_name, None)
+            self._stats['listened_chats_count'] = len(self._listened_chats)
     
     def send_message(self, chat_name: str, message: str, at_users: List[str] = None) -> bool:
         """发送消息 - 通过API"""

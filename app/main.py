@@ -119,6 +119,7 @@ def ensure_initial_settings(db: SessionLocal):
     _ensure_user_permission_extension_columns(db)
     _ensure_wechat_user_sender_blacklist_column(db)
     _ensure_wechat_user_bot_nickname_columns(db)
+    _ensure_wechat_user_listener_preference_column(db)
     
     # 创建默认的ChatBot角色
     _ensure_default_chatbot_roles(db)
@@ -260,6 +261,30 @@ def _ensure_wechat_user_bot_nickname_columns(db: SessionLocal):
         db.commit()
     except Exception as e:
         logger.error(f"补齐群内机器人昵称字段失败: {e}")
+        db.rollback()
+
+
+def _ensure_wechat_user_listener_preference_column(db: SessionLocal):
+    """为历史 SQLite 数据库补齐持久化的监听启用状态。"""
+    try:
+        if "sqlite" not in str(db.bind.url):
+            return
+
+        existing = {
+            row[1]
+            for row in db.execute(text("PRAGMA table_info(wechat_users)")).fetchall()
+        }
+        if "listening_enabled" not in existing:
+            db.execute(
+                text(
+                    "ALTER TABLE wechat_users "
+                    "ADD COLUMN listening_enabled BOOLEAN NOT NULL DEFAULT 1"
+                )
+            )
+            logger.info("已为 wechat_users 添加字段: listening_enabled")
+        db.commit()
+    except Exception as e:
+        logger.error(f"补齐聊天监听启用状态字段失败: {e}")
         db.rollback()
 
 
@@ -420,6 +445,12 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
         return
 
     active_listeners = stable_active_listeners(listener_status)
+    registered_listeners = {
+        str(name)
+        for key in ("desired", "actual")
+        for name in (listener_status.get(key) or [])
+        if name
+    }
     
     logger.debug("Syncing all listeners from database...")
     users = db.query(models_permission.WeChatUser).all()
@@ -430,8 +461,16 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
     all_plugins = plugin_manager.get_all_plugin_names()
     success_count = 0
     for user in users:
-        # 同步监听
-        if user.chat_name in active_listeners:
+        # 手动暂停是持久化意图，启动和重连时都不能被自动恢复覆盖。
+        if not bool(user.listening_enabled):
+            if user.chat_name in registered_listeners:
+                if wechat_manager.remove_listen_chat(user.chat_name):
+                    logger.info("Removed stale listener registration for paused chat '%s'.", user.chat_name)
+                else:
+                    logger.warning("Failed to remove stale listener registration for paused chat '%s'.", user.chat_name)
+            else:
+                logger.debug("Listener explicitly paused for '%s'; skipping auto recovery.", user.chat_name)
+        elif user.chat_name in active_listeners:
             success_count += 1
             logger.debug("Listener already active for '%s'; skipping UI rebind.", user.chat_name)
         elif wechat_manager.add_listen_chat(user.chat_name):

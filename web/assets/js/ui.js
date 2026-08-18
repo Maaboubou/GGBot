@@ -1198,6 +1198,7 @@ const UI = {
         list.innerHTML = users.map(u => {
             const userId = Number(u.id) || null;
             const isActive = u.is_listening;
+            const listeningEnabled = u.listening_enabled !== false;
             const isConfigured = u.has_permission_config;
             const isSelected = window.App.currentThreadName === u.chat_name;
             const activeClass = isSelected ? 'active' : '';
@@ -1229,7 +1230,11 @@ const UI = {
                                 <div class="fw-bold text-break">${displayName}</div>
                                 ${u.remark ? `<div class="small text-muted text-break">${safeChatName}</div>` : ''}
                                 <div class="mt-1">
-                                    ${isActive ? '<span class="badge bg-success-subtle text-success border border-success-subtle rounded-pill" style="font-size: 0.7em;">监听中</span>' : '<span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle rounded-pill" style="font-size: 0.7em;">已暂停</span>'}
+                                    ${isActive
+                                        ? '<span class="badge bg-success-subtle text-success border border-success-subtle rounded-pill" style="font-size: 0.7em;">监听中</span>'
+                                        : listeningEnabled
+                                            ? '<span class="badge bg-warning-subtle text-warning border border-warning-subtle rounded-pill" style="font-size: 0.7em;">等待恢复</span>'
+                                            : '<span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle rounded-pill" style="font-size: 0.7em;">已暂停</span>'}
                                     ${isConfigured ? '<span class="badge bg-primary-subtle text-primary border border-primary-subtle rounded-pill" style="font-size: 0.7em;">已管理</span>' : ''}
                                     ${blacklistCount > 0 ? `<span class="badge bg-danger-subtle text-danger border border-danger-subtle rounded-pill" style="font-size: 0.7em;">已屏蔽 ${blacklistCount} 人</span>` : ''}
                                 </div>
@@ -1255,6 +1260,13 @@ const UI = {
                                     data-chatname="${safeChatName}"
                                     title="停止监听">
                                     <i class="bi bi-stop-circle"></i>
+                                </button>
+                            ` : userId ? `
+                                <button class="btn btn-link text-success p-0"
+                                    onclick="event.stopPropagation(); App.addListener(this.getAttribute('data-chatname'))"
+                                    data-chatname="${safeChatName}"
+                                    title="恢复监听">
+                                    <i class="bi bi-play-circle"></i>
                                 </button>
                             ` : ''}
                             ${userId ? `

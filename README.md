@@ -229,10 +229,13 @@ Install.bat
 | `WX_BOT_PORT` | `5555`，微信桥接端口 |
 | `WECHAT_BOT_NAME` | 机器人在微信中的显示名称 |
 | `WEB_CORS_ORIGINS` | 前后端分离时允许的明确来源，默认留空 |
+| `OPENAI_API_KEY` 等 | 可选的模型环境变量凭据；完整供应商字段见 `.env.example` |
 | `CODEX_PROXY_*` | 周报及本机 Codex 集成参数 |
 | `QQEMAIL_ADDR` / `QQEMAIL_CODE` | 可选的微信掉线或登录失败邮件通知 |
 | `TIKHUB_API_TOKEN` | 可选，部分抖音/TikTok/小红书媒体解析使用 |
 | `WECHAT_AUTOLOGIN_*` | Windows 登录后自动确认微信登录的等待与重试参数 |
+
+`.env.example` 会随 Git 更新，但安装脚本不会覆盖已有的 `.env`。更新后如果新增了需要使用的功能，请对照新版 `.env.example`，把对应字段手动补入自己的 `.env`；不使用的字段无需复制或填写。
 
 ## 内置插件
 

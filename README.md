@@ -1,106 +1,479 @@
 # GGBot
 
-GGBot 是运行在 Windows 上的本地微信自动化助手。它通过 Web 管理面板统一管理微信聊天、AI 模型、任务路由、角色、主动回复和插件，不要求把聊天数据或模型密钥交给第三方控制台。
+GGBot 是一个运行在 Windows 上的本地微信自动化助手。它把微信桌面端接入、消息监听、AI 对话、聊天记录和实用插件集中到一个 Web 管理面板中，模型与聊天数据默认保存在用户自己的电脑上。
 
-项目自带以下能力：
+> 管理面板面向可信本机环境，默认没有登录认证。请保持 `WEB_HOST=127.0.0.1`，不要把端口直接暴露到公网。详细边界见[安全策略](SECURITY.md)。
 
-- 聊天记录：按联系人或群聊保存并检索本地消息。
-- AI 助手：支持自定义模型、独立 API Key、任务路由、角色、Judge 主动回复和长期记忆。
-- 翻译助手：在聊天中完成文本翻译。
-- 汇率查询：查询常用货币汇率。
-- 周报助手：调用本机 Codex 整理周报。
-- 磁链检查：检查磁力链接内容。
-- 菜单翻译：识别菜单图片并生成双语结果。
+## 主要能力
 
-首次启动不会预置模型、API Key 或聊天绑定。AI 长期记忆默认关闭，由用户自行决定是否启用。内置的“默认助手”和“刘局-和联胜”角色可直接选用，也可以在管理面板中自行创建角色和 Judge。
+- 微信接入：监听指定私聊或群聊，发送文本、图片和文件，并监控微信与监听窗口状态。
+- AI 助手：支持多个模型供应商、独立 API Key、任务路由、角色、Judge 主动回复、图片理解和连续对话。
+- 聊天记录：按聊天保存文本、图片、链接和引用消息，供检索、周报及 AI 上下文使用。
+- 聊天级权限：每个联系人或群聊可以分别选择允许使用的插件，群聊还可设置是否必须 `@机器人`。
+- 插件系统：内置翻译、汇率、周报、磁链检查和菜单翻译，并支持按 Manifest v2 规范继续扩展。
+- 本地管理：通过 GGbot 管理面板维护聊天、插件、模型、任务路由、角色、Judge 和记忆设置。
+- 运行恢复：提供 GUI 启动器、日志查看、微信在线检查、监听恢复和 Windows 登录后自动启动脚本。
+
+首次启动不会预置模型、API Key 或聊天绑定。AI 长期记忆默认关闭，需要时再由用户开启。项目内置“默认助手”“刘局-和联胜”角色以及“默认 Judge”“刘局-和联胜 Judge”。
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    U[微信用户] --> W[Windows 微信客户端]
+    W <--> B[wx_bot.py<br/>微信桥接 :5555]
+    B -->|消息事件| A[start.py / FastAPI<br/>主应用 :8888]
+    A --> E[EventBus]
+    E --> P[Manifest v2 插件]
+    P --> L[AI 模型 / 外部服务]
+    P -->|回复| M[WeChatManager]
+    M --> B
+    C[GGbot 管理面板] <--> A
+    A <--> D[(SQLite / 本地配置)]
+```
+
+| 组件 | 入口 | 主要职责 |
+|---|---|---|
+| 微信桥接 | `wx_bot.py`，默认端口 `5555` | 操作微信窗口、接收消息、发送内容、维护监听对象 |
+| 主应用 | `start.py`，默认端口 `8888` | API、事件总线、插件、模型路由、后台任务和状态监控 |
+| Web 管理面板 | `web/` | 聊天授权、AI 助手、插件、模型和运行日志管理 |
+| 数据层 | `data/database.db` 等 | 系统设置、模型连接、权限、角色、Judge、聊天记录和记忆 |
+| GUI 启动器 | `launcher.py` | 在 Windows 中启动、停止和重启两个服务并查看输出 |
+
+消息主链路：
+
+```text
+微信消息
+  -> wx_bot.py
+  -> POST /api/internal/wechat_message
+  -> EventBus 检查聊天权限与群聊 @ 条件
+  -> 按全局顺序执行插件监听器
+  -> 插件处理 / 调用任务路由中的 AI 模型
+  -> WeChatManager
+  -> wx_bot.py
+  -> 微信回复
+```
+
+微信窗口操作和主应用分为两个进程。即使某个 AI 调用或插件出现异常，也可以单独重启主应用或微信桥接，减少对微信桌面端的影响。
 
 ## 运行要求
 
-- Windows 10/11，且有可交互的桌面会话。
+- Windows 10/11，且当前用户拥有可交互的桌面会话。
 - 微信 4.1 客户端已经安装并登录。
 - 64 位 Python 3.11 或 3.12；安装 Python 时勾选 `Add Python to PATH`。
-- `wxautox4` 可能需要单独购买并激活授权。
-- 菜单翻译需要本机安装 Chrome。Selenium 会为自动化会话创建 Profile，无需手工准备；首次使用可能需要联网获取匹配的驱动。
-- 周报助手需要另行安装、登录并配置 Codex CLI；不使用周报时可以暂不安装。
+- 使用 Git 获取和更新项目时，需要安装 [Git for Windows](https://git-scm.com/download/win)。
+- `wxautox4` 可能需要单独购买并激活授权；依赖包会由安装脚本自动安装。
+- 菜单翻译需要本机安装 Chrome。首次使用时 Selenium 可能需要联网获取匹配的浏览器驱动。
+- 周报助手需要另行安装、登录并配置 Codex CLI；不使用周报时无需安装 Codex。
 
-## 一键安装与启动
+## 获取、安装与启动
 
-下载并解压后，直接双击：
+### 方法一：使用 Git（推荐）
+
+在 PowerShell 或 Windows Terminal 中运行：
+
+```powershell
+cd C:\Users\你的用户名
+git clone https://github.com/Seren-dipity/GGBot.git
+cd GGBot
+.\一键启动.bat
+```
+
+`git clone` 只在第一次使用时执行。建议把项目放在当前 Windows 用户有完整读写权限的目录中，例如 `C:\Users\你的用户名\GGBot`，不要放到 `Program Files`。
+
+### 方法二：下载 ZIP
+
+在 GitHub 项目页面选择 `Code -> Download ZIP`，完整解压后双击项目根目录中的：
 
 ```text
 一键启动.bat
 ```
 
-首次运行会自动：
+不要只把 BAT 文件复制到桌面。如果需要桌面入口，请为原文件创建快捷方式。
 
-1. 查找 Python 3.11/3.12。
-2. 创建项目内的 `.venv`。
-3. 安装 `requirements.txt`，包括项目所需的 `wxautox4`。
-4. 从 `.env.example` 创建本地 `.env`。
-5. 启动微信桥接和 Web 服务，并打开 <http://127.0.0.1:8888/>。
+### 一键启动会做什么
 
-以后再次双击会复用现有环境；只有依赖文件改变时才重新安装。如果只想安装而不启动，可以运行 `Install.bat`。
+首次运行 `一键启动.bat` 时，安装脚本会自动：
+
+1. 查找 64 位 Python 3.11/3.12。
+2. 在项目目录创建独立虚拟环境 `.venv`。
+3. 更新 `pip`、`setuptools` 和 `wheel`。
+4. 安装 `requirements.txt` 中的全部依赖，包括 `wxautox4`。
+5. 检查 `fastapi`、`flask` 和 `wxautox4` 能否正常导入。
+6. 从 `.env.example` 创建本地 `.env`，但不会覆盖已经存在的配置。
+7. 创建 `data/`、`logs/` 和 `tmp/` 运行目录。
+8. 打开 GUI 启动器，由启动器管理微信桥接和主应用。
+
+以后再次运行会复用 `.venv`；只有 `requirements.txt` 变化或环境不完整时才重新安装依赖。
+
+如果只想安装或强制重装依赖，运行：
+
+```text
+Install.bat
+```
+
+环境准备好后，也可以直接运行 `Start-GUI.bat`。日常使用继续运行 `一键启动.bat` 更省心，它会先检查依赖是否仍然完整。
 
 ## 首次配置
 
 ### 1. 激活 wxautox4
 
-如果你的授权需要激活，请按照供应商提供的方式执行。常见形式为：
+如果所使用的授权需要激活，请按 wxautox4 供应商的说明操作。常见命令为：
 
 ```powershell
 .\.venv\Scripts\wxautox4.exe -a <你的激活码>
 ```
 
-不要把激活码提交到 Git。
+激活码只应保留在本机，不要写入 README、`.env` 或提交到 Git。
 
-### 2. 添加模型并配置任务路由
+### 2. 启动服务并打开管理面板
 
-启动后打开“模型与调用 → 模型连接”，添加自己的模型。添加时只需填写一个 API Key；同一模型供应商可以建立多个模型连接并分别使用不同 Key。凭据保存在本机数据库中，管理页面不会回显原始密钥。
+确认微信已经登录，在 GUI 启动器中启动全部服务。浏览器没有自动打开时，手动访问：
 
-然后在“任务路由”中为需要的任务选择模型，例如：
+- GGbot 管理面板：<http://127.0.0.1:8888/>
+- API 文档：<http://127.0.0.1:8888/docs>
+- 主应用健康检查：<http://127.0.0.1:8888/health>
+- 微信桥接健康检查：<http://127.0.0.1:5555/health>
 
-- `builtin_chatbot.chat`：聊天回复
-- `builtin_chatbot.judge`：主动回复判断
-- `builtin_chatbot.ocr`：图片理解
-- `builtin_translation.translate`：翻译
-- `menu_translator.vision`：菜单识别
+### 3. 添加模型连接
 
-没有模型时，微信桥接、聊天记录、汇率和磁链检查等非 AI 功能仍可使用。
+进入“模型与调用 -> 模型连接”，创建要使用的模型：
 
-### 3. 分配聊天权限与角色
+1. 选择供应商或 OpenAI 兼容接口。
+2. 填写一个便于识别且不重复的连接名称。
+3. 填写模型 ID、API 地址和 API Key。
+4. 保存后点击“测试”。
 
-在 Web 控制台“聊天”页面添加需要监听的群聊或联系人，并为其启用对应插件。使用 AI 助手时，再为聊天选择角色和 Judge。AI 长期记忆全局默认关闭；需要时到“AI 助手”中手动开启。
+同一供应商可以创建多个模型连接，每个连接分别保存自己的 Key、API 地址和参数。例如可以同时创建“DeepSeek-个人”和“DeepSeek-团队”，互不覆盖。管理页面不会回显已经保存的原始密钥。
 
-## Windows 重启后自动登录
+模型配置不是项目自带内容，首次安装时列表为空。没有添加模型并保存成功前，任务路由不会出现可选模型。
 
-项目提供 `Start-WeChat-AutoLogin.bat`。它会等待 Windows 桌面和微信启动，尝试确认微信登录；确认在线后再启动 GGBot。如果出现二维码，仍需人工扫码。
+### 4. 配置任务路由
 
-该脚本不会自行注册为开机任务。可以把它的快捷方式放入 Windows“启动”目录，或在任务计划程序中设置为用户登录后运行。由于微信和窗口自动化依赖交互桌面，不要把任务设置为“无论用户是否登录都运行”。
+进入“模型与调用 -> 任务路由”，为插件声明的 AI 任务选择模型连接。常见任务包括：
 
-建议先正常运行一次 `一键启动.bat` 完成环境安装，再双击 `Start-WeChat-AutoLogin.bat` 验证。相关等待时间可在 `.env` 中通过 `WECHAT_AUTOLOGIN_*` 调整；失败日志位于 `logs/wechat_auto_login.log`。如填写 `QQEMAIL_ADDR` 和 `QQEMAIL_CODE`，二维码或登录失败时还可以发送邮件提醒。
-
-## 环境变量
-
-安装器首次运行会把 `.env.example` 复制为 `.env`，以后不会覆盖你的修改。AI 供应商的 API Key 推荐直接在“模型连接”页面填写。
-
-常用字段：
-
-| 字段 | 用途 |
+| 任务 | 用途 |
 |---|---|
-| `WECHAT_BOT_NAME` | 机器人在聊天中的显示名称 |
-| `WEB_PORT` | Web 管理面板端口，默认 8888 |
-| `WX_BOT_PORT` | 微信桥接端口，默认 5555 |
-| `*_API_KEY` | 对应 AI 供应商的本地凭据 |
-| `CODEX_PROXY_USE_WSL` | Codex 位于 WSL 时为 `true`，原生 Windows 时为 `false` |
-| `QQEMAIL_ADDR` / `QQEMAIL_CODE` | 可选的掉线和自动登录失败通知 |
-| `WECHAT_AUTOLOGIN_*` | 自动登录流程的等待和重试参数 |
+| `builtin_chatbot.chat` | 普通聊天回复 |
+| `builtin_chatbot.judge` | 群聊主动回复判断 |
+| `builtin_translation.translate` | 文本翻译 |
+| `menu_translator.vision` | 菜单图片识别与翻译 |
 
-## 数据、浏览器与安全
+图片回复还会使用 Chatbot 的视觉调用能力，最终显示的任务列表以当前插件声明和管理面板为准。
 
-管理面板默认只监听 `127.0.0.1`，不要直接暴露到公网。SQLite 数据库默认位于 `data/database.db`；聊天记录、模型配置、角色绑定和任务路由也保存在本机。日志位于 `logs/`，插件生成内容保存在各插件运行目录，这些路径都已被 Git 忽略。
+如果任务路由中没有模型选项，先确认“模型连接”页面已有保存成功的连接并通过测试，然后刷新任务路由页面。微信桥接、聊天记录、汇率和磁链检查等非 AI 功能不依赖模型。
 
-Chrome 自动化 Profile 由 Selenium 在运行时创建和管理。它与日常使用的 Chrome Profile 分离，通常不需要配置或迁移；若清理系统临时文件，下次使用时会自动重新创建。
+### 5. 添加聊天并分配能力
 
-如果需要重置为全新状态，请先退出 GGBot，备份并移走 `data/`，再重新启动。不要在程序运行时直接删除数据库。
+进入“聊天”页面：
 
-更多说明见 [模型配置](docs/MODEL_CONFIGURATION.md)、[记忆管理](docs/MEMORY_LIBRARY.md) 和 [安全策略](SECURITY.md)。
+1. 添加需要监听的联系人或群聊，名称应与微信窗口中显示的名称一致。
+2. 为该聊天勾选允许使用的插件。
+3. 群聊按需要设置是否必须 `@机器人`。
+4. 启动该聊天的监听。
+
+手动停止某个聊天后，健康检查不会自动把它恢复；需要再次使用时，在管理面板中手动启动监听。
+
+### 6. 设置角色、Judge 和记忆
+
+进入“AI 助手”页面，为启用 Chatbot 的聊天选择：
+
+- 角色：决定回答身份、语气和行为。
+- Judge：决定群聊中没有明确 `@` 时是否主动参与。
+- 主动回复：按聊天独立开启。
+- 长期记忆：首次安装默认关闭，可全局或按聊天开启。
+
+不需要主动插话时保持主动回复关闭。Judge 不替代任务路由；`builtin_chatbot.judge` 仍需要配置可用模型。
+
+## Web 管理面板
+
+| 工作区 | 路径 | 用途 |
+|---|---|---|
+| 概览 | `/` | 查看服务、微信、模型调用和近期活动 |
+| 聊天 | `/chats` | 管理监听对象、插件权限、`@` 条件和聊天覆盖 |
+| AI 助手 | `/assistant` | 管理聊天角色、Judge、主动回复和长期记忆 |
+| 插件 | `/plugins` | 修改插件全局配置、定时任务和消息执行顺序 |
+| 模型连接 | `/ai/models` | 添加模型、独立凭据和默认参数 |
+| 任务路由 | `/ai/mappings` | 为各插件 AI 任务选择主模型和备用模型 |
+| 用量统计 | `/ai/usage` | 查看模型调用统计 |
+| 调用记录 | `/ai/calls` | 排查模型请求、响应和错误 |
+| 运行与日志 | `/operations/logs` | 查看主应用和微信桥接日志 |
+| 系统 | `/system` | 查看运行环境、微信身份和高级设置 |
+
+敏感字段只显示是否已配置，不会在页面中回显原始值。
+
+## 配置分层
+
+| 层级 | 管理位置 | 内容 |
+|---|---|---|
+| 启动环境 | `.env` | 数据库地址、服务地址、端口、Codex 和可选通知参数 |
+| 模型连接 | 管理面板、本机数据库 | 供应商、模型 ID、API 地址、API Key 和模型参数 |
+| 任务路由 | 管理面板、本机配置 | 每项 AI 任务使用的主模型、备用模型和参数覆盖 |
+| 插件配置 | “插件”页面、`config.json` | 触发词、超时、提示词、定时任务和能力默认值 |
+| 聊天配置 | “聊天”“AI 助手”页面 | 插件权限、`@` 条件、角色、Judge、主动回复和记忆 |
+
+`.env.example` 是可以提交的模板，`.env` 是本机实际配置并已被 Git 忽略。AI Key 推荐在管理面板中按模型连接填写，不需要把所有供应商密钥都写进 `.env`。
+
+常用环境变量：
+
+| 字段 | 默认值或用途 |
+|---|---|
+| `DATABASE_URL` | `sqlite:///data/database.db` |
+| `WEB_HOST` | `127.0.0.1`，管理面板监听地址 |
+| `WEB_PORT` | `8888`，管理面板与主应用端口 |
+| `WX_BOT_PORT` | `5555`，微信桥接端口 |
+| `WECHAT_BOT_NAME` | 机器人在微信中的显示名称 |
+| `WEB_CORS_ORIGINS` | 前后端分离时允许的明确来源，默认留空 |
+| `CODEX_PROXY_*` | 周报及本机 Codex 集成参数 |
+| `QQEMAIL_ADDR` / `QQEMAIL_CODE` | 可选的微信掉线或登录失败邮件通知 |
+| `WECHAT_AUTOLOGIN_*` | Windows 登录后自动确认微信登录的等待与重试参数 |
+
+## 内置插件
+
+| 插件 | 功能 | 典型触发 |
+|---|---|---|
+| `builtin_chat_logger` | 保存文本、图片、链接和引用消息 | 已授权聊天中的消息 |
+| `builtin_chatbot` | AI 对话、角色、Judge、图片理解、搜索和本地记忆 | 私聊、群聊 `@`、Judge 或回复续接 |
+| `builtin_translation` | 文本和引用消息翻译 | 已授权聊天中的非空文本 |
+| `boc_rate` | 中国银行牌价、历史走势和汇率异动提醒 | “汇率”、币种关键词；定时任务 |
+| `Weekly` | 根据聊天记录生成并推送周报 | 定时任务；管理员私聊命令 |
+| `magnet_check` | 检查 InfoHash 或完整磁力链接并生成报告 | `验车 <InfoHash>` 或有效 magnet 链接 |
+| `menu_translator` | 收集菜单图片并生成双语结果 | 菜单翻译关键词及后续图片会话 |
+
+插件的最终触发词、聊天范围和定时条件以各自 `manifest.json` 及“插件”页面显示为准。
+
+## 权限与消息执行顺序
+
+每个聊天对每个插件都有独立权限。`require_mention` 只约束群聊：
+
+| 配置 | 私聊 | 群聊未 @ | 群聊已 @ |
+|---|---|---|---|
+| `require_mention = false` | 执行 | 执行 | 执行 |
+| `require_mention = true` | 执行 | 跳过 | 执行 |
+
+插件监听器按 `app/plugins/routing_order.json` 中的全局顺序执行，可在管理面板调整。Manifest v2 支持三种消息传播方式：
+
+- `observe`：只观察和记录，不阻止后续插件。
+- `continue`：处理完成后继续执行后续插件。
+- `stop_on_consumed`：真正命中并消费消息时停止后续处理。
+
+插件开发约束见 [Manifest v2 插件开发指南](app/plugins/README.md)。
+
+## 手动启动与状态检查
+
+通常只需使用 GUI 启动器。需要排错或开发时，可以在两个 PowerShell 窗口中分别运行：
+
+```powershell
+# 窗口 1：微信桥接
+.\.venv\Scripts\python.exe wx_bot.py
+```
+
+```powershell
+# 窗口 2：主应用
+.\.venv\Scripts\python.exe start.py --host 127.0.0.1 --port 8888
+```
+
+常用检查命令：
+
+```powershell
+curl.exe http://127.0.0.1:8888/health
+curl.exe http://127.0.0.1:8888/api/system/status
+curl.exe http://127.0.0.1:8888/api/wechat/status
+curl.exe http://127.0.0.1:5555/health
+curl.exe http://127.0.0.1:5555/api/listeners/status
+```
+
+日志默认位于：
+
+- `logs/app.log`：主应用、插件和后台任务。
+- `logs/wx_bot.log`：微信桥接、窗口操作和监听器。
+- `logs/gui_launcher.log`：GUI 启动器。
+- `logs/wechat_auto_login.log`：自动登录流程。
+
+## Windows 登录后自动启动
+
+项目提供 `Start-WeChat-AutoLogin.bat`。它会等待 Windows 桌面和微信启动，尝试确认微信登录；微信在线后再启动 GGBot。如果出现二维码，仍需人工扫码。
+
+首次使用前先运行一次 `一键启动.bat`，完成虚拟环境安装和 wxautox4 激活，再双击 `Start-WeChat-AutoLogin.bat` 验证。
+
+脚本不会自行创建开机任务。确认运行正常后，可以：
+
+1. 按 `Win + R`，输入 `shell:startup`。
+2. 为项目中的 `Start-WeChat-AutoLogin.bat` 创建快捷方式。
+3. 把快捷方式放入打开的“启动”目录。
+
+也可以使用 Windows 任务计划程序，但必须设置为“仅当用户登录时运行”，因为微信和窗口自动化需要可交互桌面。
+
+## 数据、Chrome 与备份
+
+### 本地数据
+
+默认运行数据包括：
+
+| 路径 | 内容 |
+|---|---|
+| `data/database.db` | 系统设置、聊天、权限、角色、Judge 和模型凭据 |
+| `data/chat_logs/` | 按聊天保存的消息记录和媒体索引 |
+| `data/llm_models.json` 等 | 模型、路由及运行配置 |
+| `logs/` | 应用、桥接、启动器和自动登录日志 |
+| `tmp/` | 可删除的临时文件 |
+| 插件运行目录 | 汇率缓存、菜单图片/PDF、磁链报告等 |
+
+`data/`、`logs/`、`tmp/`、`.env` 及插件生成内容均已被 Git 忽略，不会随 `git pull` 被覆盖，也不会提交到 GitHub。
+
+这些目录可能包含聊天内容、密钥状态和个人信息，请按敏感数据处理。重要升级前，先在 GUI 中停止全部服务，再复制备份 `data/` 和 `.env`。不要在服务运行时直接删除或替换 SQLite 数据库。
+
+### Chrome Profile
+
+菜单翻译使用 Selenium 控制 Chrome。自动化 Profile 会在运行时创建并与日常 Chrome 用户资料分开，通常不需要手动配置或迁移。Profile 或临时缓存被清理后，下次使用会重新创建。
+
+如果首次启动浏览器失败，请确认 Chrome 已安装、网络可以获取匹配驱动，并查看 `logs/app.log`。
+
+## 更新项目
+
+### Git 安装
+
+先在 GUI 中停止全部服务，然后在项目目录运行：
+
+```powershell
+cd C:\原来的\GGBot
+git status
+git pull origin main
+.\一键启动.bat
+```
+
+`一键启动.bat` 会在依赖文件改变时自动更新虚拟环境。`data/` 和 `.env` 不会被 Git 覆盖。
+
+如果 `git status` 显示你修改了项目代码或插件自带的 `config.json`，先保存或提交这些改动，再执行 `git pull`，避免把本地改动直接覆盖。仅通过管理面板产生的数据库和运行数据不需要提交。
+
+### ZIP 安装
+
+下载新的 ZIP 并解压到新目录。停止旧服务后，把旧目录中的 `data/` 和 `.env` 复制到新目录，再运行 `一键启动.bat`。迁移前请保留旧目录作为备份，确认新版本运行正常后再删除。
+
+## 常见问题
+
+### 双击后提示找不到 Python
+
+安装 64 位 Python 3.11 或 3.12，并在安装界面勾选 `Add Python to PATH`。安装完成后重新打开终端或重启电脑，再运行 `一键启动.bat`。
+
+### 依赖安装失败
+
+检查网络、代理和上方的 pip 错误。修复后运行 `Install.bat` 强制重新检查并安装依赖。不要把另一个项目的 `venv` 复制过来。
+
+### wxautox4 无法使用或提示授权错误
+
+确认使用项目 `.venv` 中的 wxautox4，并按供应商说明完成激活。运行 `.\.venv\Scripts\wxautox4.exe` 可以确认实际使用的程序路径。
+
+### 管理面板打不开
+
+确认 GUI 中“微信桥接”和“主应用”均已启动，再检查：
+
+```powershell
+curl.exe http://127.0.0.1:8888/health
+curl.exe http://127.0.0.1:5555/health
+```
+
+仍失败时查看 `logs/gui_launcher.log`、`logs/app.log` 和 `logs/wx_bot.log`。如果端口被占用，可在 `.env` 中修改 `WEB_PORT` 和 `WX_BOT_PORT`，保存后重启全部服务。
+
+### 任务路由没有可选模型
+
+先到“模型连接”创建并保存模型，点击“测试”确认连接可用，再刷新“任务路由”。同一供应商的不同 Key 应创建成不同连接，而不是反复修改同一个连接。
+
+### 已添加聊天但机器人不回复
+
+依次检查：
+
+1. 微信客户端是否在线，聊天名称是否完全一致。
+2. 对应聊天的监听是否已经启动。
+3. 聊天是否已获得目标插件权限。
+4. 群聊是否要求 `@机器人`。
+5. AI 任务是否配置了可用模型路由。
+6. “运行与日志”中是否有模型、权限或窗口错误。
+
+### 手动停止监听后又不想让它自动恢复
+
+手动停止状态会持久保存，健康检查不会自动恢复该聊天。需要重新监听时，在“聊天”页面手动点击启动。
+
+### 菜单翻译没有打开 Chrome 或一直等待图片
+
+确认 Chrome 已安装，聊天已获得 `menu_translator` 权限，并先发送插件配置中的菜单翻译触发词，再在会话时限内发送图片。查看 `logs/app.log` 可确认浏览器和模型调用错误。
+
+### 周报助手无法运行
+
+周报依赖本机 Codex CLI。确认 Codex 已安装并登录，然后根据实际安装位置设置 `CODEX_PROXY_USE_WSL`、`CODEX_PROXY_WSL_BIN` 或 `CODEX_PROXY_BIN`。不使用周报时可停用 `Weekly` 插件。
+
+## 项目结构
+
+```text
+GGBot/
+├── app/
+│   ├── api/                    # FastAPI 路由与管理 API
+│   ├── core/                   # 事件总线、插件管理、消息顺序、微信管理
+│   ├── models/                 # SQLAlchemy 数据模型
+│   ├── plugins/                # 7 个内置插件及 Manifest
+│   ├── services/               # AI、配置、记忆、监控和后台服务
+│   └── utils/                  # 微信媒体、发送、配置等通用工具
+├── data/                       # SQLite、聊天记录和本地运行数据
+├── docs/                       # 模型与记忆专项文档
+├── scripts/
+│   └── install.ps1             # Windows 环境与依赖安装器
+├── tests/                      # 监听状态与微信媒体回归测试
+├── web/                        # GGbot 单页管理面板
+├── .env.example                # 可公开的环境变量模板
+├── requirements.txt            # Python 运行依赖
+├── launcher.py                 # Windows GUI 服务启动器
+├── start.py                    # FastAPI 主应用入口
+├── wx_bot.py                   # 微信桥接进程
+├── wechat_auto_login.py        # 微信自动登录与启动协调
+├── 一键启动.bat                # 安装检查并打开 GUI
+├── Install.bat                 # 强制安装依赖
+├── Start-GUI.bat               # 直接打开 GUI
+└── Start-WeChat-AutoLogin.bat  # Windows 登录后自动启动入口
+```
+
+## 插件开发与测试
+
+每个插件至少包含：
+
+```text
+app/plugins/my_plugin/
+├── config.json       # 插件元数据、配置说明和默认值
+├── manifest.json     # 监听器、触发条件、范围、传播方式和定时任务
+└── main.py           # register / unregister 与处理逻辑
+```
+
+监听顺序只有 `app/plugins/routing_order.json` 一个事实来源。Manifest 声明应与插件实际注册的事件保持一致，不要在单个插件中另建一套优先级。
+
+开发环境可以手动安装 pytest 并运行现有测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pytest
+.\.venv\Scripts\python.exe -m pytest
+```
+
+更多字段、事件和会话型插件约束见 [Manifest v2 插件开发指南](app/plugins/README.md)。
+
+## 相关文档
+
+- [模型连接与任务路由](docs/MODEL_CONFIGURATION.md)
+- [AI 助手记忆库](docs/MEMORY_LIBRARY.md)
+- [Manifest v2 插件开发指南](app/plugins/README.md)
+- [中国银行汇率插件](app/plugins/boc_rate/README.md)
+- [磁链检查插件](app/plugins/magnet_check/README.md)
+- [安全策略](SECURITY.md)
+- [wxautox 官方文档](https://docs.wxauto.org/docs/install.html)
+
+## 安全与部署
+
+- 默认仅监听 `127.0.0.1`，不要直接改为公网地址。
+- 如确需局域网访问，先确认 Windows 防火墙、可信设备范围和数据泄露风险。
+- 公网部署必须放在带身份认证和 TLS 的反向代理之后。
+- 不要提交 `.env`、`data/`、聊天日志、下载媒体、数据库或任何真实凭据。
+- 分享日志前先检查其中是否包含聊天内容、联系人名称、API 地址或异常响应。
+- 升级和迁移前停止服务并备份 `data/` 与 `.env`。
+
+## 许可证
+
+项目使用 [MIT License](LICENSE)。
+
+问题与改进建议请提交到 [GitHub Issues](https://github.com/Seren-dipity/GGBot/issues)。

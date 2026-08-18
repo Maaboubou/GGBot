@@ -75,7 +75,7 @@ if (-not $EnvironmentReady) {
         Stop-Install "pip 基础工具更新失败，请检查网络或代理。"
     }
 
-    Write-Step "安装公开版依赖（首次运行可能需要数分钟）"
+    Write-Step "安装项目依赖（首次运行可能需要数分钟）"
     & $VenvPython -m pip install -r $Requirements
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "依赖安装失败，请检查网络、Python 版本和上方 pip 错误。"

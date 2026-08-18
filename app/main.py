@@ -44,6 +44,7 @@ from .services.feishu_bitable_service import FeishuBitableService
 from .services.wechat_monitor_service import get_monitor_service
 from .utils.plugin_config import get_plugin_setting
 from .utils.health_state import stable_active_listeners
+from .chatbot_presets import BUILTIN_CHATBOT_JUDGES, BUILTIN_CHATBOT_ROLES
 
 # 配置日志
 os.makedirs("logs", exist_ok=True)
@@ -263,36 +264,35 @@ def _ensure_wechat_user_bot_nickname_columns(db: SessionLocal):
 
 
 def _ensure_default_chatbot_roles(db: SessionLocal):
-    """确保默认的ChatBot角色存在"""
+    """确保系统内置的 ChatBot 角色存在，不覆盖用户已有配置。"""
     try:
         from app.models.chatbot_role import ChatBotRole
-        
-        # 检查是否已有角色
-        existing_roles = db.query(ChatBotRole).count()
-        if existing_roles > 0:
-            logger.debug("ChatBot角色已存在，跳过创建")
-            return
-        
-        # 创建默认角色
-        default_roles = [
+
+        desired_roles = [
             {
                 "name": "default",
                 "display_name": "默认助手",
                 "description": "友好、专业的AI助手",
                 "prompt": "你是一个有用的AI助手，能够回答各种问题并提供帮助。请用简洁明了的语言回复。",
                 "is_builtin": "true"
-            }
+            },
+            *BUILTIN_CHATBOT_ROLES,
         ]
-        
-        for role_data in default_roles:
-            role = ChatBotRole(**role_data)
-            db.add(role)
-        
+
+        created_count = 0
+        for role_data in desired_roles:
+            existing = db.query(ChatBotRole).filter(ChatBotRole.name == role_data["name"]).first()
+            if existing:
+                continue
+            db.add(ChatBotRole(**role_data))
+            created_count += 1
+
         db.commit()
-        logger.info(f"成功创建 {len(default_roles)} 个默认ChatBot角色")
-        
+        if created_count:
+            logger.info("成功创建 %s 个内置 ChatBot 角色", created_count)
+
     except Exception as e:
-        logger.error(f"创建默认ChatBot角色失败: {e}")
+        logger.error(f"创建内置 ChatBot 角色失败: {e}")
         db.rollback()
 
 
@@ -329,37 +329,45 @@ def _get_system_default_judge_prompt() -> str:
 
 
 def _ensure_default_chatbot_judges(db: SessionLocal):
-    """确保默认 Judge 存在，并从旧配置迁移 prompt（幂等）"""
+    """确保内置 Judge 存在，并从旧配置迁移默认 prompt（幂等）。"""
     try:
         from app.models.chatbot_judge import ChatBotJudge
 
         default_judge = db.query(ChatBotJudge).filter(ChatBotJudge.name == "default_judge").first()
-        if default_judge:
-            logger.debug("ChatBot默认 Judge 已存在，跳过创建")
-            return default_judge
+        created_count = 0
+        if not default_judge:
+            legacy_prompt = get_plugin_setting("builtin_chatbot", "proactive_judge_prompt", None)
+            prompt_text = legacy_prompt if isinstance(legacy_prompt, str) and legacy_prompt.strip() else _get_system_default_judge_prompt()
 
-        legacy_prompt = get_plugin_setting("builtin_chatbot", "proactive_judge_prompt", None)
-        prompt_text = legacy_prompt if isinstance(legacy_prompt, str) and legacy_prompt.strip() else _get_system_default_judge_prompt()
+            default_judge = ChatBotJudge(
+                name="default_judge",
+                display_name="默认 Judge",
+                description="默认主动回复判断器（由旧 proactive_judge_prompt 迁移）",
+                prompt=prompt_text,
+                prompt_mode="template",
+                trigger_msg_threshold=int(get_plugin_setting("builtin_chatbot", "proactive_msg_threshold", 5) or 0),
+                trigger_interval_minutes=int(get_plugin_setting("builtin_chatbot", "proactive_interval_minutes", 1) or 1),
+                cooldown_msg_threshold=int(get_plugin_setting("builtin_chatbot", "proactive_msg_threshold", 5) or 0),
+                cooldown_minutes=int(get_plugin_setting("builtin_chatbot", "proactive_interval_minutes", 1) or 1),
+                is_builtin="true",
+            )
+            db.add(default_judge)
+            created_count += 1
 
-        default_judge = ChatBotJudge(
-            name="default_judge",
-            display_name="默认 Judge",
-            description="默认主动回复判断器（由旧 proactive_judge_prompt 迁移）",
-            prompt=prompt_text,
-            prompt_mode="template",
-            trigger_msg_threshold=int(get_plugin_setting("builtin_chatbot", "proactive_msg_threshold", 5) or 0),
-            trigger_interval_minutes=int(get_plugin_setting("builtin_chatbot", "proactive_interval_minutes", 1) or 1),
-            cooldown_msg_threshold=int(get_plugin_setting("builtin_chatbot", "proactive_msg_threshold", 5) or 0),
-            cooldown_minutes=int(get_plugin_setting("builtin_chatbot", "proactive_interval_minutes", 1) or 1),
-            is_builtin="true",
-        )
-        db.add(default_judge)
+        for judge_data in BUILTIN_CHATBOT_JUDGES:
+            existing = db.query(ChatBotJudge).filter(ChatBotJudge.name == judge_data["name"]).first()
+            if existing:
+                continue
+            db.add(ChatBotJudge(**judge_data))
+            created_count += 1
+
         db.commit()
         db.refresh(default_judge)
-        logger.info("成功创建默认 ChatBot Judge: default_judge")
+        if created_count:
+            logger.info("成功创建 %s 个内置 ChatBot Judge", created_count)
         return default_judge
     except Exception as e:
-        logger.error(f"创建默认 ChatBot Judge 失败: {e}")
+        logger.error(f"创建内置 ChatBot Judge 失败: {e}")
         db.rollback()
         return None
 

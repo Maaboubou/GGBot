@@ -27,7 +27,7 @@ class EmailService:
     """邮件服务类"""
     
     def __init__(self):
-        # 邮箱地址与授权码都由用户在本机配置，公开版不提供默认账号。
+        # 邮箱地址与授权码都由用户在本机配置，不提供默认账号。
         qq_email: Optional[str] = None
         if _get_setting_from_db is not None:
             try:

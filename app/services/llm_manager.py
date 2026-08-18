@@ -219,7 +219,7 @@ class LLMManager:
             except Exception as e:
                 logger.error(f"❌ 迁移旧版配置失败: {e}")
 
-        # 4. 公开版首次启动保持空模型列表，由用户在 Web 控制台自行添加。
+        # 4. 首次启动保持空模型列表，由用户在 Web 控制台自行添加。
         if not self.config.get("models") and not self.config.get("plugin_mappings"):
             logger.info("📄 未找到模型配置，初始化为空配置")
             self.config["models"] = {}

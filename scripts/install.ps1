@@ -30,7 +30,7 @@ $EnvironmentReady = $false
 if (-not $Force -and (Test-Path $VenvPython) -and (Test-Path $HashMarker)) {
     $SavedHash = (Get-Content $HashMarker -Raw).Trim()
     if ($SavedHash -eq $RequirementHash) {
-        & $VenvPython -c "import fastapi, flask, wxautox4, playwright, yt_dlp, youtube_transcript_api, json_repair" 2>$null
+        & $VenvPython -c "import fastapi, flask, wxautox4, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair" 2>$null
         $EnvironmentReady = ($LASTEXITCODE -eq 0)
         if ($EnvironmentReady) {
             & $VenvPython -c "from pathlib import Path; from playwright.sync_api import sync_playwright; p = sync_playwright().start(); path = p.chromium.executable_path; p.stop(); raise SystemExit(0 if Path(path).is_file() else 1)" 2>$null
@@ -86,7 +86,7 @@ if (-not $EnvironmentReady) {
         Stop-Install "依赖安装失败，请检查网络、Python 版本和上方 pip 错误。"
     }
 
-    & $VenvPython -c "import fastapi, flask, wxautox4, playwright, yt_dlp, youtube_transcript_api, json_repair"
+    & $VenvPython -c "import fastapi, flask, wxautox4, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair"
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "依赖安装完成，但关键模块导入检查失败。"
     }
@@ -108,6 +108,12 @@ if (-not $PlaywrightReady) {
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "Playwright 已执行安装，但 Chromium 运行时检查失败。"
     }
+}
+
+Write-Step "准备链接摘要所需的 FFmpeg/FFprobe（首次运行需要下载）"
+& $VenvPython -c "import subprocess; from static_ffmpeg import run; ffmpeg, ffprobe = run.get_or_fetch_platform_executables_else_raise(); subprocess.run([ffmpeg, '-version'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); subprocess.run([ffprobe, '-version'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); print(f'FFmpeg: {ffmpeg}'); print(f'FFprobe: {ffprobe}')"
+if ($LASTEXITCODE -ne 0) {
+    Stop-Install "FFmpeg/FFprobe 自动安装或运行检查失败，请检查网络、代理或安全软件后重试。"
 }
 
 $EnvFile = Join-Path $ProjectRoot ".env"

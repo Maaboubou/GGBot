@@ -100,7 +100,7 @@ cd GGBot
 2. 在项目目录创建独立虚拟环境 `.venv`。
 3. 更新 `pip`、`setuptools` 和 `wheel`。
 4. 安装 `requirements.txt` 中的全部依赖，包括 `wxautox4`。
-5. 安装链接摘要脑图所需的 Playwright Chromium，并检查关键模块与浏览器运行时。
+5. 安装并验证链接摘要所需的 FFmpeg/FFprobe 与 Playwright Chromium。
 6. 从 `.env.example` 创建本地 `.env`，但不会覆盖已经存在的配置。
 7. 创建 `data/`、`logs/` 和 `tmp/` 运行目录。
 8. 打开 GUI 启动器，由启动器管理微信桥接和主应用。
@@ -252,7 +252,7 @@ Install.bat
 
 插件的最终触发词、聊天范围和定时条件以各自 `manifest.json` 及“插件”页面显示为准。
 
-链接摘要需要先为目标聊天授权 `summary_plus`，并在“任务路由”配置对应模型。普通网页和公众号链接使用独立的自动化 Chrome Profile；首次运行会创建 `tmp/chrome_data`。抖音、TikTok 和部分小红书媒体解析需要在 `.env` 填写可选的 `TIKHUB_API_TOKEN`。B站登录态会尝试从该 Profile 自动获取，生成的 `cookies.txt` 已被 Git 忽略，不会上传。视频合并、转码或弹幕压制还需要本机可用的 FFmpeg；只使用普通网页摘要时无需配置这些可选项。
+链接摘要需要先为目标聊天授权 `summary_plus`，并在“任务路由”配置对应模型。普通网页和公众号链接使用独立的自动化 Chrome Profile；首次运行会创建 `tmp/chrome_data`。抖音、TikTok 和部分小红书媒体解析需要在 `.env` 填写可选的 `TIKHUB_API_TOKEN`。B站登录态会尝试从该 Profile 自动获取，生成的 `cookies.txt` 已被 Git 忽略，不会上传。视频合并、转码和弹幕压制所需的 FFmpeg/FFprobe 由安装器放入 `.venv` 并自动使用，无需手动填路径。
 
 ## 权限与消息执行顺序
 
@@ -414,7 +414,7 @@ curl.exe http://127.0.0.1:5555/health
 
 ### 链接没有生成摘要或脑图
 
-确认聊天已获得 `summary_plus` 权限，并已为 `summary_plus.summary` 及需要的脑图任务配置模型路由。普通链接还要确认 Chrome 能正常启动；脑图失败时可重新运行 `Install.bat` 检查 Playwright Chromium。B站、YouTube 或媒体下载问题通常还与登录态、字幕可用性、网络和 FFmpeg 有关，具体原因可在 `logs/app.log` 查看。
+确认聊天已获得 `summary_plus` 权限，并已为 `summary_plus.summary` 及需要的脑图任务配置模型路由。普通链接还要确认 Chrome 能正常启动；脑图或媒体处理失败时可重新运行 `Install.bat` 检查 Playwright Chromium 与 FFmpeg。B站、YouTube 或媒体下载问题通常还与登录态、字幕可用性和网络有关，具体原因可在 `logs/app.log` 查看。
 
 ### 周报助手无法运行
 

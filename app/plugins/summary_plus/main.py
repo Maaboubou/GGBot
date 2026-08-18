@@ -1826,6 +1826,18 @@ class SummaryService:
         if os.path.exists(project_candidate):
             return project_candidate
 
+        try:
+            from static_ffmpeg import run as static_ffmpeg_run
+
+            ffmpeg_path, ffprobe_path = (
+                static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
+            )
+            bundled_path = ffmpeg_path if tool_name == "ffmpeg" else ffprobe_path
+            if os.path.exists(bundled_path):
+                return bundled_path
+        except Exception as exc:
+            self.logger.warning(f"⚠️ 自动准备 {tool_name} 失败，将尝试直接调用系统命令: {exc}")
+
         if os.name == "nt":
             for tool_dir in (
                 "C:\\msys64\\ucrt64\\bin",
@@ -1836,7 +1848,10 @@ class SummaryService:
                     return candidate
 
         resolved_path = shutil.which(tool_name)
-        return resolved_path or tool_name
+        if resolved_path:
+            return resolved_path
+
+        return tool_name
 
     def _resolve_ytdlp_tool(self) -> str:
         """优先使用当前 Python/虚拟环境中由 pip 安装的 yt-dlp 命令。"""

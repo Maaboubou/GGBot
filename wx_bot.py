@@ -55,6 +55,7 @@ from app.models.user_permission import WeChatUser
 from app.utils.daily_schedule import BEIJING_TIMEZONE, next_daily_run_at
 from app.utils.inflight_deduplicator import InFlightDeduplicator
 from app.utils.logging_utils import create_rotating_file_handler
+from app.utils.wechat_media import image_file_fingerprint, is_probable_wechat_media_window
 from app.utils.wechat_outbound import send_text_with_retry
 from app.utils.window_health import is_offscreen_sentinel_rect, is_unrecoverable_offscreen_window
 
@@ -2768,6 +2769,13 @@ def _control_handle(control) -> int:
         return 0
 
 
+def _control_process_id(control) -> int:
+    try:
+        return int(getattr(control, "ProcessId", 0) or 0)
+    except Exception:
+        return 0
+
+
 def _top_control_for(control):
     try:
         top = control.GetTopLevelControl() if control else None
@@ -2793,6 +2801,175 @@ def _focus_control(control, description: str) -> bool:
     if point:
         return _click_point(point, f"{description}(聚焦)")
     return False
+
+
+def _wechat_top_level_snapshot() -> dict[int, dict]:
+    """Capture WeChat-looking top-level controls for media UI diagnostics."""
+    snapshot: dict[int, dict] = {}
+    try:
+        controls = uia.GetRootControl().GetChildren() or []
+    except Exception as e:
+        logger.debug("读取顶层窗口失败: %s", e)
+        return snapshot
+
+    for control in controls:
+        try:
+            class_name = str(getattr(control, "ClassName", "") or "")
+            if not (class_name.startswith("mmui::") or class_name == "Chrome_WidgetWin_0"):
+                continue
+            handle = _control_handle(control)
+            if not handle:
+                continue
+            snapshot[handle] = {
+                "control": control,
+                "handle": handle,
+                "process_id": _control_process_id(control),
+                "class_name": class_name,
+                "name": str(getattr(control, "Name", "") or ""),
+            }
+        except Exception:
+            continue
+    return snapshot
+
+
+def _format_top_level_snapshot(snapshot: dict[int, dict]) -> list[str]:
+    return [
+        (
+            f"handle={item.get('handle')} pid={item.get('process_id')} "
+            f"class={item.get('class_name')} name={item.get('name')!r}"
+        )
+        for item in snapshot.values()
+    ]
+
+
+def _close_probable_media_windows(
+    snapshot: dict[int, dict],
+    *,
+    expected_process_id: int,
+    baseline_handles: set[int],
+    trace_id: str,
+    stage: str,
+) -> list[int]:
+    """Close only top-level controls classified as WeChat media previews."""
+    with desired_listeners_lock:
+        listener_names = set(desired_listeners.keys())
+
+    closed_handles = []
+    for item in snapshot.values():
+        if not is_probable_wechat_media_window(
+            class_name=item.get("class_name", ""),
+            name=item.get("name", ""),
+            handle=item.get("handle", 0),
+            process_id=item.get("process_id", 0),
+            expected_process_id=expected_process_id,
+            baseline_handles=baseline_handles,
+            listener_names=listener_names,
+        ):
+            continue
+
+        control = item.get("control")
+        handle = int(item.get("handle") or 0)
+        logger.warning(
+            "🧹 收尾微信图片预览窗口: trace=%s stage=%s %s",
+            trace_id,
+            stage,
+            _describe_control(control),
+        )
+        focused = _focus_control(control, f"图片预览窗口[{trace_id}]")
+        current_handle = _control_handle(_current_top_control())
+        if not focused and current_handle != handle:
+            logger.warning(
+                "⚠️ 图片预览窗口无法聚焦，跳过 Esc: trace=%s handle=%s current=%s",
+                trace_id,
+                handle,
+                current_handle,
+            )
+            continue
+        try:
+            uia.SendKeys("{Esc}", waitTime=0.2)
+            time.sleep(0.2)
+            closed_handles.append(handle)
+        except Exception as e:
+            logger.warning(
+                "⚠️ 关闭图片预览窗口失败: trace=%s handle=%s error=%s",
+                trace_id,
+                handle,
+                e,
+            )
+    return closed_handles
+
+
+def _run_media_download_with_preview_guard(msg, operation, *, trace_id: str):
+    """Run one wxautox media download and close only its preview popups."""
+    message_control = getattr(msg, "control", None)
+    message_top = _top_control_for(message_control)
+    expected_process_id = _control_process_id(message_top)
+    if not expected_process_id:
+        current_top = _current_top_control()
+        if _control_class_name(current_top).startswith("mmui::"):
+            expected_process_id = _control_process_id(current_top)
+
+    before = _wechat_top_level_snapshot()
+    logger.info(
+        "🔎 媒体下载窗口快照[before]: trace=%s message_top=%s windows=%s",
+        trace_id,
+        _describe_control(message_top),
+        _format_top_level_snapshot(before),
+    )
+
+    # Before an operation, close only explicitly recognizable media windows.
+    # Passing every existing handle as baseline disables the generic-new-window
+    # rule, so unrelated pre-existing WeChat windows are left untouched.
+    _close_probable_media_windows(
+        before,
+        expected_process_id=expected_process_id,
+        baseline_handles=set(before),
+        trace_id=trace_id,
+        stage="before",
+    )
+    baseline = _wechat_top_level_snapshot()
+
+    try:
+        return operation()
+    finally:
+        after = _wechat_top_level_snapshot()
+        logger.info(
+            "🔎 媒体下载窗口快照[after]: trace=%s windows=%s",
+            trace_id,
+            _format_top_level_snapshot(after),
+        )
+        closed = _close_probable_media_windows(
+            after,
+            expected_process_id=expected_process_id,
+            baseline_handles=set(baseline),
+            trace_id=trace_id,
+            stage="after",
+        )
+        final_snapshot = _wechat_top_level_snapshot()
+        logger.info(
+            "🧹 媒体下载窗口收尾完成: trace=%s closed=%s windows=%s",
+            trace_id,
+            closed,
+            _format_top_level_snapshot(final_snapshot),
+        )
+
+
+def _log_image_download_audit(kind: str, chat_name: str, message_id: str, file_path: str) -> dict:
+    audit = image_file_fingerprint(file_path)
+    logger.info(
+        "🧷 图片下载绑定审计: kind=%s chat=%r message_id=%s "
+        "path=%r bytes=%s sha256=%s dimensions=%sx%s format=%s",
+        kind,
+        chat_name,
+        message_id,
+        audit.get("path"),
+        audit.get("bytes"),
+        audit.get("sha256"),
+        audit.get("width"),
+        audit.get("height"),
+        audit.get("format"),
+    )
+    return audit
 
 
 def _control_is_foreground(control) -> bool:
@@ -3386,7 +3563,7 @@ def resolve_link_url_from_browser(msg, timeout: int = 30, source_chat_name: str 
 
 
 
-def download_quote_image_with_fallback(msg):
+def download_quote_image(msg):
     """
     下载引用图片
     
@@ -3397,7 +3574,7 @@ def download_quote_image_with_fallback(msg):
         下载的文件路径或None
     """
     
-    # 直接下载
+    # 只允许从当前引用消息对象直接下载，不做最近图片回退。
     try:
         logger.debug("🔄 尝试下载引用图片")
         file_path = msg.download_quote_image()
@@ -4057,7 +4234,11 @@ def download_image_message():
     def _download_once() -> str:
         logger.info("Downloading image message once: %s:%s type=%s", chat_name, message_id, type(msg))
         with wx_ui_lock:
-            file_path = msg.download()
+            file_path = _run_media_download_with_preview_guard(
+                msg,
+                msg.download,
+                trace_id=f"image:{chat_name}:{message_id}",
+            )
         logger.info("Download completed, result: %s", file_path)
         if isinstance(file_path, dict):
             raise RuntimeError(str(file_path.get("message") or file_path))
@@ -4066,6 +4247,7 @@ def download_image_message():
             raise RuntimeError("Download returned no file path")
         if not os.path.exists(normalized_path):
             raise FileNotFoundError(f"Downloaded file does not exist: {normalized_path}")
+        _log_image_download_audit("image", chat_name, message_id, normalized_path)
         return normalized_path
 
     try:
@@ -4370,12 +4552,17 @@ def download_quote_image_on_demand():
     def _download_quote_once() -> str:
         logger.info("🖼️ 按需下载引用图片（单次）: %s:%s", chat_name, message_id)
         with wx_ui_lock:
-            image_path = download_quote_image_with_fallback(msg)
+            image_path = _run_media_download_with_preview_guard(
+                msg,
+                lambda: download_quote_image(msg),
+                trace_id=f"quote_image:{chat_name}:{message_id}",
+            )
         normalized_path = str(image_path or "")
         if not normalized_path:
             raise RuntimeError("Failed to download quote image")
         if not os.path.exists(normalized_path):
             raise FileNotFoundError(f"Downloaded quote image does not exist: {normalized_path}")
+        _log_image_download_audit("quote_image", chat_name, message_id, normalized_path)
         return normalized_path
 
     try:

@@ -360,9 +360,6 @@ class ChatBotPlugin:
         # Judge cooldown tracking - prevents excessive API calls after rejections
         self._judge_cooldowns = {}  # {chat::judge: {'time': timestamp, 'msg_count': int, 'total_count': int}}
 
-        # Cache for last successful image download per chat {chat_name: {'path': str, 'time': float}}
-        self._last_images = {}
-
         # Anchored append context cache: keep the exact dynamic message prefix
         # sent to the LLM so later calls can append to it and reuse prefix caches.
         self._anchored_contexts: Dict[str, Dict[str, Any]] = {}
@@ -3050,17 +3047,17 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
                     image_path = None
 
 
-            # Fallback: 如果上述方法都失败了，且我们有缓存的最近图片，尝试使用它
-            if (not image_path or not Path(image_path).exists()) and chat_name in self._last_images:
-                cached = self._last_images[chat_name]
-                if time.time() - cached['time'] < 300: # 5分钟有效期
-                        cached_path = cached['path']
-                        if Path(cached_path).exists():
-                            image_path = cached_path
-                            logger.info(f"🤖 使用最近缓存的图片作为引用图片 fallback (Retry): {image_path}")
-
             if not image_path or not Path(image_path).exists():
-                logger.error("🤖 图片路径不存在或下载失败")
+                # 引用图片必须精确来自当前引用消息。绝不能用“最近一张图”
+                # 猜测，否则异步 OCR 下载的前一张/后一张图都可能串入。
+                logger.error(
+                    "🤖 引用图片精确路径不存在或下载失败，已拒绝使用最近图片: "
+                    "chat=%s message_id=%s requested_path=%s downloaded_path=%s",
+                    chat_name,
+                    message_id,
+                    quote_image_path,
+                    image_path,
+                )
                 return None
 
             # 读取并编码为base64
@@ -3856,13 +3853,6 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
                 logger.info(f"🤖 Ignored blacklisted image sender: chat={chat_name}, sender={sender}")
                 return False
 
-            if file_path and os.path.exists(file_path):
-                # 先把已知图片路径同步缓存，供随后引用图片消息 fallback 使用。
-                self._last_images[chat_name] = {
-                    'path': str(file_path),
-                    'time': time.time()
-                }
-
             wx_manager = event.context.get("wx")
             message_id = data.get("message_id")
             logger.info(f"🤖 OCR queued async: chat={chat_name}, sender={sender}, msg={message_id}, file={file_path or 'missing'}")
@@ -3897,10 +3887,6 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
                         file_path = wx_manager.download_image_message(chat_name, message_id)
                         if file_path:
                             logger.info(f"🤖 OCR async download success: {file_path}")
-                            self._last_images[chat_name] = {
-                                'path': str(file_path),
-                                'time': time.time()
-                            }
                         else:
                             logger.warning("🤖 OCR async download returned None")
                     except Exception as e:
@@ -3913,11 +3899,6 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             if not os.path.exists(file_path):
                 logger.warning(f"🤖 OCR async skipped: File not found at {file_path}")
                 return
-
-            self._last_images[chat_name] = {
-                'path': str(file_path),
-                'time': time.time()
-            }
 
             try:
                 with open(file_path, "rb") as f:

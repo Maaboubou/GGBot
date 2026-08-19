@@ -9,6 +9,7 @@ cookies.txt
 *.session
 .pytest_cache/
 .ruff_cache/
+/tests/
 .vscode/
 .idea/
 Thumbs.db

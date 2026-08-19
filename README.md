@@ -232,7 +232,7 @@ Install.bat
 | `OPENAI_API_KEY` 等 | 可选的模型环境变量凭据；完整供应商字段见 `.env.example` |
 | `CODEX_PROXY_*` | 周报及本机 Codex 集成参数 |
 | `QQEMAIL_ADDR` / `QQEMAIL_CODE` | 可选的微信掉线或登录失败邮件通知 |
-| `TIKHUB_API_TOKEN` | 可选，部分抖音/TikTok/小红书媒体解析使用 |
+| `TIKHUB_API_TOKEN` | 可选；TikTok 解析及抖音/小红书 yt-dlp 失败后的回退使用 |
 | `WECHAT_AUTOLOGIN_*` | Windows 登录后自动确认微信登录的等待与重试参数 |
 
 `.env.example` 会随 Git 更新，但安装脚本不会覆盖已有的 `.env`。更新后如果新增了需要使用的功能，请对照新版 `.env.example`，把对应字段手动补入自己的 `.env`；不使用的字段无需复制或填写。
@@ -248,11 +248,11 @@ Install.bat
 | `Weekly` | 根据聊天记录生成并推送周报 | 定时任务；管理员私聊命令 |
 | `magnet_check` | 检查 InfoHash 或完整磁力链接并生成报告 | `验车 <InfoHash>` 或有效 magnet 链接 |
 | `menu_translator` | 收集菜单图片并生成双语结果 | 菜单翻译关键词及后续图片会话 |
-| `summary_plus` | 网页/公众号摘要、视频平台解析、字幕脑图 | 网页分享卡片或链接消息 |
+| `summary_plus` | 网页/公众号摘要、yt-dlp 平台媒体下载、字幕脑图 | 网页分享卡片或链接消息 |
 
 插件的最终触发词、聊天范围和定时条件以各自 `manifest.json` 及“插件”页面显示为准。
 
-链接摘要需要先为目标聊天授权 `summary_plus`，并在“任务路由”配置对应模型。普通网页和公众号链接使用独立的自动化 Chrome Profile；首次运行会创建 `tmp/chrome_data`。抖音、TikTok 和部分小红书媒体解析需要在 `.env` 填写可选的 `TIKHUB_API_TOKEN`。B站登录态会尝试从该 Profile 自动获取，生成的 `cookies.txt` 已被 Git 忽略，不会上传。视频合并、转码和弹幕压制所需的 FFmpeg/FFprobe 由安装器放入 `.venv` 并自动使用，无需手动填路径。
+链接摘要需要先为目标聊天授权 `summary_plus`，并在“任务路由”配置对应模型。普通网页和公众号链接使用独立的自动化 Chrome Profile；首次运行会创建 `tmp/chrome_data`。抖音和小红书优先使用 yt-dlp，并自动复用该调试 Chrome 中的登录态，无需手工维护 Cookie 文件；抖音失败后回退 TikHub，小红书失败后回退 TikHub/H5。小红书图文笔记保持单图输出 JPG、多图按配置合并成长图的效果。TikTok 解析及上述回退能力需要在 `.env` 填写可选的 `TIKHUB_API_TOKEN`。B站登录态也会尝试从该 Profile 自动获取，生成的 `cookies.txt` 已被 Git 忽略，不会上传。视频合并、转码和弹幕压制所需的 FFmpeg/FFprobe 由安装器放入 `.venv` 并自动使用，无需手动填路径。
 
 ## 权限与消息执行顺序
 
@@ -341,6 +341,8 @@ curl.exe http://127.0.0.1:5555/api/listeners/status
 
 菜单翻译和链接摘要使用 Selenium 控制 Chrome。链接摘要的自动化 Profile 默认位于 `tmp/chrome_data`，会在运行时创建并与日常 Chrome 用户资料分开，通常不需要手动配置或迁移。Profile 或临时缓存被清理后，下次使用会重新创建，但网站登录态也会随之清除。
 
+抖音和小红书下载会自动从该 Profile 的实时调试会话读取目标网站 Cookie，临时文件在每次调用后自动删除。如果登录态过期，`logs/app.log` 会记录 yt-dlp 的鉴权错误和 TikHub/H5 回退过程；在项目调试 Chrome 中重新登录对应网站即可，无需导出 `cookies.txt`。
+
 如果首次启动浏览器失败，请确认 Chrome 已安装、网络可以获取匹配驱动，并查看 `logs/app.log`。
 
 ## 更新项目
@@ -414,7 +416,7 @@ curl.exe http://127.0.0.1:5555/health
 
 ### 链接没有生成摘要或脑图
 
-确认聊天已获得 `summary_plus` 权限，并已为 `summary_plus.summary` 及需要的脑图任务配置模型路由。普通链接还要确认 Chrome 能正常启动；脑图或媒体处理失败时可重新运行 `Install.bat` 检查 Playwright Chromium 与 FFmpeg。B站、YouTube 或媒体下载问题通常还与登录态、字幕可用性和网络有关，具体原因可在 `logs/app.log` 查看。
+确认聊天已获得 `summary_plus` 权限，并已为 `summary_plus.summary` 及需要的脑图任务配置模型路由。普通链接还要确认 Chrome 能正常启动；脑图或媒体处理失败时可重新运行 `Install.bat` 检查 Playwright Chromium、yt-dlp 与 FFmpeg。抖音或小红书日志出现 Cookie/登录态错误时，请在项目调试 Chrome 中重新登录；yt-dlp 失败后会自动记录并回退 TikHub/H5。B站、YouTube 或其他媒体下载问题通常还与登录态、字幕可用性和网络有关，具体原因可在 `logs/app.log` 查看。
 
 ### 周报助手无法运行
 
@@ -435,7 +437,6 @@ GGBot/
 ├── docs/                       # 模型与记忆专项文档
 ├── scripts/
 │   └── install.ps1             # Windows 环境与依赖安装器
-├── tests/                      # 监听状态与微信媒体回归测试
 ├── web/                        # GGbot 单页管理面板
 ├── .env.example                # 可公开的环境变量模板
 ├── requirements.txt            # Python 运行依赖
@@ -449,7 +450,7 @@ GGBot/
 └── Start-WeChat-AutoLogin.bat  # Windows 登录后自动启动入口
 ```
 
-## 插件开发与测试
+## 插件开发
 
 每个插件至少包含：
 
@@ -461,13 +462,6 @@ app/plugins/my_plugin/
 ```
 
 监听顺序只有 `app/plugins/routing_order.json` 一个事实来源。Manifest 声明应与插件实际注册的事件保持一致，不要在单个插件中另建一套优先级。
-
-开发环境可以手动安装 pytest 并运行现有测试：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install pytest
-.\.venv\Scripts\python.exe -m pytest
-```
 
 更多字段、事件和会话型插件约束见 [Manifest v2 插件开发指南](app/plugins/README.md)。
 

@@ -45,6 +45,76 @@ _RETRIABLE_CONTENT_FAILURE_MARKERS: tuple[str, ...] = (
     "please try again shortly or pick a different model",
 )
 
+# Gemini 3.x reasoning is tuned for the provider defaults. Google recommends
+# removing these sampling controls from every Gemini 3.x request; newer models
+# ignore them today and may reject them in future API versions.
+GEMINI_3_SAMPLING_PARAMETERS: frozenset[str] = frozenset(
+    {"temperature", "top_p", "top_k"}
+)
+_GEMINI_3_SAMPLING_ALIASES: frozenset[str] = frozenset(
+    {"temperature", "top_p", "top_k", "topP", "topK"}
+)
+
+
+def is_gemini_3_model_config(model_cfg: Dict[str, Any]) -> bool:
+    """Return whether a config calls Gemini 3.x through Google's adapters."""
+    model = str(model_cfg.get("model") or "").strip().lower()
+    provider = str(
+        model_cfg.get("custom_llm_provider") or model_cfg.get("provider") or ""
+    ).strip().lower()
+    api_base = str(model_cfg.get("api_base") or "").strip().lower()
+
+    if not provider:
+        if model.startswith("gemini/"):
+            provider = "gemini"
+        elif model.startswith("vertex_ai/"):
+            provider = "vertex_ai"
+        elif "generativelanguage.googleapis.com" in api_base:
+            provider = "gemini"
+        elif "aiplatform.googleapis.com" in api_base:
+            provider = "vertex_ai"
+
+    return provider in {"gemini", "vertex_ai"} and "gemini-3" in model
+
+
+def _strip_gemini_3_sampling_parameters_inplace(payload: Dict[str, Any]) -> set[str]:
+    """Remove Gemini 3.x sampling controls from a config/request dictionary."""
+    removed: set[str] = set()
+    for key in _GEMINI_3_SAMPLING_ALIASES:
+        if key in payload:
+            payload.pop(key, None)
+            removed.add(key)
+
+    extra_body = payload.get("extra_body")
+    if isinstance(extra_body, dict):
+        for key in _GEMINI_3_SAMPLING_ALIASES:
+            if key in extra_body:
+                extra_body.pop(key, None)
+                removed.add(f"extra_body.{key}")
+        for container_key in ("generation_config", "generationConfig"):
+            generation_config = extra_body.get(container_key)
+            if not isinstance(generation_config, dict):
+                continue
+            for key in _GEMINI_3_SAMPLING_ALIASES:
+                if key in generation_config:
+                    generation_config.pop(key, None)
+                    removed.add(f"extra_body.{container_key}.{key}")
+            if not generation_config:
+                extra_body.pop(container_key, None)
+        if not extra_body:
+            payload.pop("extra_body", None)
+    return removed
+
+
+def sanitize_gemini_3_model_config(
+    model_cfg: Dict[str, Any],
+) -> tuple[Dict[str, Any], set[str]]:
+    """Copy a model config and remove deprecated Gemini 3.x sampling values."""
+    sanitized = copy.deepcopy(model_cfg)
+    if not is_gemini_3_model_config(sanitized):
+        return sanitized, set()
+    return sanitized, _strip_gemini_3_sampling_parameters_inplace(sanitized)
+
 
 def _is_google_only_tool(tool: dict) -> bool:
     """判断一个 tool dict 是否是 Google 专属工具。"""
@@ -226,9 +296,45 @@ class LLMManager:
             self.config["plugin_mappings"] = {}
             migration_needed = True
 
+        # 自动清理 Gemini 3.x 已弃用采样参数。旧配置在首次加载新版
+        # 代码时会被修正并写回，避免仅靠调用时过滤而长期保留脏数据。
+        modified = False
+        for model_id, model_cfg in list(self.config.get("models", {}).items()):
+            if not isinstance(model_cfg, dict):
+                continue
+            sanitized, removed = sanitize_gemini_3_model_config(model_cfg)
+            if removed:
+                self.config["models"][model_id] = sanitized
+                modified = True
+                logger.info(
+                    "🧹 已清理 Gemini 3+ 模型 %s 的弃用采样参数: %s",
+                    model_id,
+                    ", ".join(sorted(removed)),
+                )
+        for plugin_name, plugin_mappings in self.config.get("plugin_mappings", {}).items():
+            if not isinstance(plugin_mappings, dict):
+                continue
+            for call_type, mapping in plugin_mappings.items():
+                if not isinstance(mapping, dict):
+                    continue
+                primary_id = str(mapping.get("primary") or "").strip()
+                primary_cfg = self.config.get("models", {}).get(primary_id, {})
+                overrides = mapping.get("override_params")
+                if not is_gemini_3_model_config(primary_cfg) or not isinstance(overrides, dict):
+                    continue
+                removed = _strip_gemini_3_sampling_parameters_inplace(overrides)
+                if removed:
+                    modified = True
+                    logger.info(
+                        "🧹 已清理 Gemini 3+ 路由 %s.%s 的弃用采样参数: %s",
+                        plugin_name,
+                        call_type,
+                        ", ".join(sorted(removed)),
+                    )
+
         # 没有模型时不写入任何预设模型 ID 或任务映射，避免制造无效配置。
         if not self.config.get("models"):
-            if migration_needed:
+            if migration_needed or modified:
                 self.save_config()
             logger.info(
                 "📄 配置加载完成: models=0, mappings=%s",
@@ -240,6 +346,8 @@ class LLMManager:
             os.getenv("LLM_ENABLE_LEGACY_DEFAULT_MAPPINGS", "false")
         ).strip().lower() in {"1", "true", "yes", "on"}
         if not legacy_defaults_enabled:
+            if migration_needed or modified:
+                self.save_config()
             logger.info(
                 "📄 配置加载完成: models=%s, mappings=%s（未注入预设映射）",
                 len(self.config.get("models", {})),
@@ -248,7 +356,6 @@ class LLMManager:
             return
 
         # 自动补全可能缺失的配置项。
-        modified = False
         chatbot_mappings = self.config.setdefault("plugin_mappings", {}).setdefault(
             "builtin_chatbot",
             {},
@@ -694,6 +801,11 @@ class LLMManager:
             if not api_base or "deepseek.com" in api_base:
                 logger.warning(f"🛡️ 已从 deepseek-reasoner (官方) 移除 response_format 参数以避免空响应错误。建议在 Prompt 中明确 JSON 要求。")
                 params.pop("response_format", None)
+
+        # 最后一层防御：mapping.override_params、插件透传或历史配置都不能
+        # 再把采样参数带回 Gemini 3.x 请求。
+        if is_gemini_3_model_config(model_cfg):
+            _strip_gemini_3_sampling_parameters_inplace(params)
 
         return params
 
@@ -2622,8 +2734,15 @@ class LLMManager:
         with self._config_lock:
             if "models" not in self.config:
                 self.config["models"] = {}
-            self.config["models"][model_id] = config
+            sanitized, removed = sanitize_gemini_3_model_config(config)
+            self.config["models"][model_id] = sanitized
             self.save_config()
+        if removed:
+            logger.info(
+                "🧹 保存时已移除 Gemini 3+ 模型 %s 的弃用采样参数: %s",
+                model_id,
+                ", ".join(sorted(removed)),
+            )
         logger.info(f"✅ 模型配置已更新: {model_id}")
 
     def rename_model(self, old_id: str, new_id: str):
@@ -2707,6 +2826,13 @@ class LLMManager:
                 self.config["plugin_mappings"] = {}
             if plugin_name not in self.config["plugin_mappings"]:
                 self.config["plugin_mappings"][plugin_name] = {}
+            primary_id = str(mapping.get("primary") or "").strip()
+            primary_cfg = self.config.get("models", {}).get(primary_id, {})
+            if is_gemini_3_model_config(primary_cfg):
+                mapping = copy.deepcopy(mapping)
+                overrides = mapping.get("override_params")
+                if isinstance(overrides, dict):
+                    _strip_gemini_3_sampling_parameters_inplace(overrides)
             self.config["plugin_mappings"][plugin_name][call_type] = mapping
             self.save_config()
         logger.info(f"✅ 插件映射已更新: {plugin_name}.{call_type}")

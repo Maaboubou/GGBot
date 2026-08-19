@@ -22,7 +22,12 @@ from sqlalchemy.orm import Session
 
 from app.models.base import get_db
 from app.models.setting import Setting
-from app.services.llm_manager import get_llm_manager, reload_llm_config
+from app.services.llm_manager import (
+    GEMINI_3_SAMPLING_PARAMETERS,
+    get_llm_manager,
+    is_gemini_3_model_config,
+    reload_llm_config,
+)
 from app.services.config_service import get_setting, update_setting
 
 logger = logging.getLogger(__name__)
@@ -253,6 +258,11 @@ def model_management_metadata(
         "has_custom_endpoint": bool(str(config.get("api_base") or "").strip()),
         "mapped_by": references,
         "mapping_count": len(references),
+        "disabled_parameters": (
+            sorted(GEMINI_3_SAMPLING_PARAMETERS)
+            if is_gemini_3_model_config(config)
+            else []
+        ),
     }
 
 
@@ -464,7 +474,7 @@ class ModelConfig(BaseModel):
     api_base: Optional[str] = None
     custom_llm_provider: Optional[str] = None
     provider: Optional[str] = None
-    temperature: Optional[float] = 0.7
+    temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     context_window_tokens: Optional[int] = None
     max_input_tokens: Optional[int] = None

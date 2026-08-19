@@ -315,6 +315,7 @@ const LLMManager = {
     async init() {
         this.setupSubTabHandlers();
         this.setupModelEditor();
+        this.setupMappingEditor();
         this.loadModelCatalogProviders();
 
         // Add event listener to clean up modal when closed
@@ -441,6 +442,15 @@ const LLMManager = {
         });
     },
 
+    setupMappingEditor() {
+        const primary = document.getElementById('mappingPrimary');
+        const fallback = document.getElementById('mappingFallback');
+        if (!primary || primary.dataset.samplingBound) return;
+        primary.dataset.samplingBound = 'true';
+        primary.addEventListener('change', () => this.updateMappingSamplingControls());
+        fallback?.addEventListener('change', () => this.updateMappingSamplingControls());
+    },
+
     async loadModelCatalogProviders() {
         try {
             const response = await fetch('/api/llm/models/catalog');
@@ -496,6 +506,79 @@ const LLMManager = {
             if (model.startsWith(`${provider}/`)) return provider;
         }
         return apiBase ? 'compatible' : 'openai';
+    },
+
+    isGemini3ModelConfig(config = {}) {
+        const disabled = this.getModelManagementMeta(config).disabled_parameters || [];
+        if (disabled.includes('temperature')) return true;
+        const provider = this.inferProviderKey(config);
+        const model = String(config.model || '').toLowerCase();
+        return ['gemini', 'vertex_ai'].includes(provider) && model.includes('gemini-3');
+    },
+
+    isGemini3FormSelection(provider, modelName) {
+        const providerId = String(
+            provider?.key === 'other'
+                ? provider.catalogProvider
+                : (provider?.providerValue || provider?.key || '')
+        ).toLowerCase();
+        return ['gemini', 'vertex_ai'].includes(providerId)
+            && String(modelName || '').toLowerCase().includes('gemini-3');
+    },
+
+    stripGeminiSamplingParameters(value) {
+        if (!value || typeof value !== 'object') return value;
+        const cleaned = JSON.parse(JSON.stringify(value));
+        const stripKnownContainers = object => {
+            if (!object || typeof object !== 'object' || Array.isArray(object)) return;
+            for (const key of ['temperature', 'top_p', 'top_k', 'topP', 'topK']) delete object[key];
+            for (const key of ['extra_body', 'generation_config', 'generationConfig']) {
+                stripKnownContainers(object[key]);
+                if (object[key] && typeof object[key] === 'object' && !Object.keys(object[key]).length) {
+                    delete object[key];
+                }
+            }
+        };
+        stripKnownContainers(cleaned);
+        return cleaned;
+    },
+
+    updateModelSamplingControls(provider = null, modelName = null) {
+        provider ||= this.getActiveProviderPreset();
+        modelName ??= this.normalizePastedText(document.getElementById('modelName')?.value || '').trim();
+        const disabled = this.isGemini3FormSelection(provider, modelName);
+        const group = document.getElementById('modelTemperatureGroup');
+        const input = document.getElementById('modelTemp');
+        const notice = document.getElementById('modelSamplingNotice');
+        group?.classList.toggle('d-none', disabled);
+        notice?.classList.toggle('d-none', !disabled);
+        if (input) {
+            input.disabled = disabled;
+            if (disabled) input.value = '';
+        }
+        return disabled;
+    },
+
+    updateMappingSamplingControls() {
+        const primaryId = document.getElementById('mappingPrimary')?.value || '';
+        const fallbackId = document.getElementById('mappingFallback')?.value || '';
+        const primaryIsGemini3 = this.isGemini3ModelConfig(this.currentModels[primaryId] || {});
+        const fallbackIsGemini3 = this.isGemini3ModelConfig(this.currentModels[fallbackId] || {});
+        const group = document.getElementById('mappingOverrideTemperatureGroup');
+        const input = document.getElementById('mappingOverrideTemp');
+        const notice = document.getElementById('mappingSamplingNotice');
+        group?.classList.toggle('d-none', primaryIsGemini3);
+        if (input) {
+            input.disabled = primaryIsGemini3;
+            if (primaryIsGemini3) input.value = '';
+        }
+        if (notice) {
+            notice.classList.toggle('d-none', !(primaryIsGemini3 || fallbackIsGemini3));
+            notice.textContent = primaryIsGemini3
+                ? 'Gemini 3+ 使用模型默认采样设置；路由中的 temperature、top_p 和 top_k 不会保存或发送。'
+                : 'Gemini 3+ 备用模型使用默认采样设置；此处参数只会应用到支持它们的模型。';
+        }
+        return primaryIsGemini3;
     },
 
     getProviderLabel(providerKey) {
@@ -872,6 +955,7 @@ const LLMManager = {
         const envVar = this.sanitizeCredentialName(document.getElementById('modelApiKeyEnv')?.value || '');
         const envValue = document.getElementById('modelApiKeyEnvValue')?.value.trim() || '';
         const isEdit = document.getElementById('modelEditMode')?.value === 'true';
+        this.updateModelSamplingControls(provider, modelName);
         const mode = this.getEffectiveCredentialMode(provider, isEdit, envVar, envValue);
         const checks = [
             { ok: provider.key !== 'other' || Boolean(provider.catalogProvider), label: provider.label || '选择供应商' },
@@ -1051,7 +1135,9 @@ const LLMManager = {
                                 </div>
                                 ${config.api_base ? `<div class="llm-model-endpoint" title="${this.escapeHtml(config.api_base)}"><i class="bi bi-link-45deg"></i>${this.escapeHtml(config.api_base)}</div>` : ''}
                                 <div class="llm-model-capabilities">
-                                    <span title="温度"><i class="bi bi-thermometer-half"></i>${this.formatTemperature(config.temperature, '默认')}</span>
+                                    ${this.isGemini3ModelConfig(config)
+                                        ? '<span title="Gemini 3+ 使用模型默认采样设置"><i class="bi bi-stars"></i>默认采样</span>'
+                                        : `<span title="温度"><i class="bi bi-thermometer-half"></i>${this.formatTemperature(config.temperature, '默认')}</span>`}
                                     ${tokenPills.join('')}
                                 </div>
                                 <div id="modelTestResult_${domModelId}" class="llm-model-test-result" style="display:none;"></div>
@@ -1943,7 +2029,10 @@ const LLMManager = {
             if (values.credentialMode === 'none' && provider.requiresCredential) {
                 throw new Error(`${provider.label} 需要 API Key，请填写后再保存。`);
             }
-            values.temperature = this.parseOptionalNumber('modelTemp', '温度', 0, 2);
+            values.samplingDisabled = this.isGemini3FormSelection(provider, values.modelName);
+            values.temperature = values.samplingDisabled
+                ? { value: null, empty: true }
+                : this.parseOptionalNumber('modelTemp', '温度', 0, 2);
             values.maxTokens = this.parseOptionalNumber('modelMaxTokens', '最大输出 Token', 1);
             values.contextWindow = this.parseOptionalNumber('modelContextWindow', '上下文窗口', 1);
             values.timeout = this.parseOptionalNumber('modelTimeout', '超时', 1, 3600);
@@ -1952,6 +2041,9 @@ const LLMManager = {
             values.extraBody = extraBody ? JSON.parse(extraBody) : {};
             if (!values.extraBody || Array.isArray(values.extraBody) || typeof values.extraBody !== 'object') {
                 throw new Error('附加请求体必须是 JSON 对象。');
+            }
+            if (values.samplingDisabled) {
+                values.extraBody = this.stripGeminiSamplingParameters(values.extraBody);
             }
             this.showModelFormError('');
             return values;
@@ -2246,6 +2338,7 @@ const LLMManager = {
             delete overrideParams.max_tokens;
             delete overrideParams.timeout;
             document.getElementById('mappingOverrideExtra').value = Object.keys(overrideParams).length > 0 ? JSON.stringify(overrideParams, null, 2) : '';
+            this.updateMappingSamplingControls();
 
             bootstrap.Modal.getOrCreateInstance(document.getElementById('editMappingModal')).show();
         } catch (error) {
@@ -2300,6 +2393,9 @@ const LLMManager = {
                     UI.showError('附加参数中的 JSON 无效：' + e.message);
                     return;
                 }
+            }
+            if (this.isGemini3ModelConfig(this.currentModels[primary] || {})) {
+                mapping.override_params = this.stripGeminiSamplingParameters(mapping.override_params);
             }
 
             // Save via API

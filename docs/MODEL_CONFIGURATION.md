@@ -11,6 +11,12 @@ Web 控制台的 `/ai/models` 用于管理“模型连接”。一个连接由�
 
 自定义 OpenAI 兼容服务选择“自定义接口”，填写服务端返回的模型名和完整 API 地址。接口无需认证时，API Key 留空即可。
 
+## Gemini 3+ 采样参数
+
+Google 已要求 Gemini 3.x 使用模型默认采样设置，并建议从请求中移除 `temperature`、`top_p` 和 `top_k`。模型管理页识别到 Google Gemini 或 Vertex AI 的 Gemini 3.x 后，会隐藏温度输入并在保存、历史配置迁移和实际调用前清理这三个参数；任务路由中的同名覆盖也不会传给 Gemini 3.x。需要控制确定性、格式或表达风格时，应把规则写入系统指令。
+
+该规则只针对 Google 官方适配器。OpenRouter 或自定义兼容网关可能有自己的参数转换规则，不会仅因模型名中包含 Gemini 而被自动清理。参考 [Gemini 3.x 参数更新说明](https://ai.google.dev/gemini-api/docs/generate-content/whats-new-gemini-3.5)。
+
 ## 模型目录不是白名单
 
 目录来自当前运行进程中的 LiteLLM `models_by_provider` 和模型成本/能力表，只负责辅助填写，不限制可保存的模型：

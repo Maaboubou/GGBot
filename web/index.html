@@ -1169,10 +1169,15 @@
                                     <summary><i class="bi bi-sliders me-2"></i>高级参数 <span>大多数模型保持默认即可</span></summary>
                                     <div class="model-advanced-body">
                                         <div class="row g-3">
-                                            <div class="col-sm-6 col-lg-4">
+                                            <div class="col-sm-6 col-lg-4" id="modelTemperatureGroup">
                                                 <label class="form-label" for="modelTemp">温度</label>
                                                 <input type="number" class="form-control" id="modelTemp" value="0.7"
                                                     step="0.1" min="0" max="2">
+                                            </div>
+                                            <div class="col-12 d-none" id="modelSamplingNotice">
+                                                <div class="alert alert-info py-2 mb-0 small">
+                                                    Gemini 3+ 使用模型默认采样设置；temperature、top_p 和 top_k 不会保存或发送。需要约束输出时请写入系统指令。
+                                                </div>
                                             </div>
                                             <div class="col-sm-6 col-lg-4">
                                                 <label class="form-label" for="modelMaxTokens">最大输出 Token</label>
@@ -1311,10 +1316,13 @@
 
                         <div class="mb-3">
                             <label class="form-label">覆盖参数（可选）</label>
-                            <div class="mb-2">
+                            <div class="mb-2" id="mappingOverrideTemperatureGroup">
                                 <label class="form-label small">温度</label>
                                 <input type="number" class="form-control form-control-sm" id="mappingOverrideTemp"
                                     step="0.1" min="0" max="2" placeholder="留空则使用模型配置">
+                            </div>
+                            <div class="alert alert-info py-2 small d-none" id="mappingSamplingNotice">
+                                Gemini 3+ 使用模型默认采样设置；路由采样参数不会发送给该模型。
                             </div>
                             <div class="mb-2">
                                 <label class="form-label small">最大 Token 数</label>
@@ -1349,7 +1357,7 @@
     <!-- App Scripts -->
     <script src="/static/assets/js/api.js?v=3.4.1"></script>
     <script src="/static/assets/js/ui.js?v=3.3.10"></script>
-    <script src="/static/assets/js/llm_manager.js?v=3.2.6"></script>
+    <script src="/static/assets/js/llm_manager.js?v=3.2.7"></script>
     <script src="/static/assets/js/main.js?v=3.5.6"></script>
     <script src="/static/assets/js/memory_console.js?v=1.0.1"></script>
 

@@ -74,6 +74,7 @@
   "requires": [
     "selenium",
     "requests",
+    "websocket-client",
     "yt-dlp",
     "yt-dlp-danmaku",
     "youtube-transcript-api",

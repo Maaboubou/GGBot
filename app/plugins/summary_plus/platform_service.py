@@ -87,8 +87,18 @@ def _resolve_pending_link_url(event: Event, wx: Any, chat_name: str, logger: log
 
 def _handle_douyin_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
     try:
+        if not wx:
+            logger.info("ℹ️ 未找到 wx 上下文，跳过抖音视频下载")
+            return
+
+        video_path = svc._download_douyin_with_ytdlp(share_url, timeout_sec=180)
+        if video_path:
+            _send_files(wx, chat_name, video_path, logger)
+            return
+
+        logger.info("🔄 抖音 yt-dlp 下载失败，回退 TikHub")
         video_url_list = svc.parse_douyin_video(share_url)
-        if video_url_list and wx:
+        if video_url_list:
             video_path = svc._download_video(video_url_list)
             if video_path:
                 _send_files(wx, chat_name, video_path, logger)

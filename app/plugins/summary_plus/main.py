@@ -13,6 +13,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -42,6 +43,7 @@ from .mindmap_service import (
 from .platform_service import handle_link_message as route_link_message
 from .subtitle_service import bili_get_subtitles
 from .yt_transcript import get_best_transcript_text
+from .ytdlp_cookie_service import ytdlp_browser_cookie_args
 
 logger = logging.getLogger(__name__)
 # start.py 将 app.plugins 默认压到 WARNING；summary_plus 是长链路插件，
@@ -1115,6 +1117,67 @@ class SummaryService:
             score -= 5
         return score
 
+    def _download_douyin_with_ytdlp(
+        self,
+        share_url: str,
+        timeout_sec: int = 180,
+    ) -> Optional[str]:
+        """Download Douyin with yt-dlp before the paid TikHub fallback."""
+        share_url = self._extract_douyin_share_url(share_url or "") or ""
+        if not share_url:
+            return None
+
+        tmp_dir = os.path.join(os.getcwd(), "tmp", "videos")
+        os.makedirs(tmp_dir, exist_ok=True)
+        output_template = os.path.join(
+            tmp_dir,
+            f"douyin_ytdlp_{int(time.time())}_{uuid.uuid4().hex[:8]}.%(ext)s",
+        )
+        self.logger.info("📥 抖音优先使用 yt-dlp 下载: %s", share_url)
+        try:
+            result = self._run_platform_ytdlp(
+                "douyin",
+                [
+                    "--ffmpeg-location",
+                    self.ffmpeg_bin,
+                    "--format",
+                    "b[format_id^=h264_]/b[vcodec=h264]/b[vcodec^=avc]/b[ext=mp4]/b",
+                    "--merge-output-format",
+                    "mp4",
+                    "--remux-video",
+                    "mp4",
+                    "--no-write-thumbnail",
+                    "--no-progress",
+                    "-o",
+                    output_template,
+                    share_url,
+                ],
+                timeout_sec=timeout_sec,
+            )
+            if result.returncode != 0:
+                self._log_ytdlp_failure("抖音", result)
+                return None
+            video_path = self._find_ytdlp_output(output_template)
+            if not video_path:
+                self.logger.warning("⚠️ 抖音 yt-dlp 未生成视频文件")
+                return None
+
+            codec = self._probe_video_codec(video_path)
+            if codec and codec not in {"h264", "avc1"}:
+                self.logger.info("🔄 抖音 yt-dlp 输出编码为 %s，转换为微信兼容 H.264", codec)
+                video_path = self._convert_to_wechat_compatible(video_path) or video_path
+            self.logger.info("✅ 抖音 yt-dlp 下载成功: %s", video_path)
+            return video_path
+        except subprocess.TimeoutExpired:
+            self.logger.warning("⚠️ 抖音 yt-dlp 下载超时（>%ss）", timeout_sec)
+            return None
+        except FileNotFoundError:
+            self.logger.warning("⚠️ 未找到 yt-dlp，抖音将回退 TikHub")
+            return None
+        except Exception as exc:
+            self.logger.warning("⚠️ 抖音 yt-dlp 下载异常，将回退 TikHub: %s", exc)
+            return None
+
     def _download_video(self, url_list: List[str]) -> Optional[str]:
         """下载视频到临时文件，支持 fallback 机制遍历 url_list"""
         if not url_list:
@@ -1721,6 +1784,29 @@ class SummaryService:
             return None
         return None
 
+    def _probe_video_codec(self, video_path: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                [
+                    self.ffprobe_bin, "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    video_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode == 0:
+                codec = (result.stdout or "").strip().casefold()
+                return codec or None
+        except Exception:
+            return None
+        return None
+
     def _probe_video_duration_seconds(self, video_path: str) -> Optional[float]:
         try:
             result = subprocess.run(
@@ -1865,6 +1951,81 @@ class SummaryService:
 
         resolved_path = shutil.which("yt-dlp")
         return resolved_path or "yt-dlp"
+
+    def _run_platform_ytdlp(
+        self,
+        platform: str,
+        arguments: List[str],
+        *,
+        timeout_sec: int,
+        cookie_args: Optional[List[str]] = None,
+    ) -> subprocess.CompletedProcess:
+        """Run yt-dlp with cookies from the project's dedicated Chrome profile."""
+        if cookie_args is not None:
+            return subprocess.run(
+                [
+                    self.yt_dlp_bin,
+                    "--ignore-config",
+                    "--no-playlist",
+                    *cookie_args,
+                    *arguments,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                encoding="utf-8",
+                errors="replace",
+            )
+        with ytdlp_browser_cookie_args(
+            platform=platform,
+            debug_port=self.chrome_debug_port,
+            user_data_dir=self.chrome_user_data_dir,
+            profile_dir=self.chrome_profile_dir,
+            logger=self.logger,
+        ) as cookie_args:
+            return subprocess.run(
+                [
+                    self.yt_dlp_bin,
+                    "--ignore-config",
+                    "--no-playlist",
+                    *cookie_args,
+                    *arguments,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+    def _find_ytdlp_output(self, output_template: str) -> Optional[str]:
+        prefix = output_template.replace("%(ext)s", "")
+        directory = os.path.dirname(output_template)
+        candidates = [
+            os.path.join(directory, filename)
+            for filename in os.listdir(directory)
+            if os.path.isfile(os.path.join(directory, filename))
+            and os.path.join(directory, filename).startswith(prefix)
+            and not filename.endswith((".part", ".temp", ".ytdl", ".json"))
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=os.path.getmtime, reverse=True)
+        return candidates[0]
+
+    def _log_ytdlp_failure(self, platform: str, result: subprocess.CompletedProcess) -> None:
+        self.logger.warning(
+            "⚠️ %s yt-dlp 失败，返回码 %s",
+            platform,
+            result.returncode,
+        )
+        err_lines = (result.stderr or "").strip().splitlines()
+        if err_lines:
+            self.logger.warning(
+                "⚠️ %s yt-dlp 错误输出(尾部): %s",
+                platform,
+                chr(10).join(err_lines[-5:]),
+            )
 
     def _escape_ffmpeg_filter_path(self, path: str) -> str:
         return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
@@ -2595,6 +2756,233 @@ class SummaryService:
             sender=sender,
         )
 
+    def _xhs_ytdlp_info(
+        self,
+        share_url: str,
+        timeout_sec: int = 60,
+        cookie_args: Optional[List[str]] = None,
+    ) -> Optional[dict]:
+        try:
+            result = self._run_platform_ytdlp(
+                "xiaohongshu",
+                [
+                    "--ignore-no-formats-error",
+                    "--dump-single-json",
+                    share_url,
+                ],
+                timeout_sec=timeout_sec,
+                cookie_args=cookie_args,
+            )
+            if result.returncode != 0:
+                self._log_ytdlp_failure("小红书元数据", result)
+                return None
+            payload = json.loads((result.stdout or "").strip())
+            return payload if isinstance(payload, dict) else None
+        except (json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+            self.logger.warning("⚠️ 小红书 yt-dlp 元数据解析失败: %s", exc)
+            return None
+        except Exception as exc:
+            self.logger.warning("⚠️ 小红书 yt-dlp 元数据获取异常: %s", exc)
+            return None
+
+    def _xhs_ytdlp_image_urls(self, info: Any) -> List[str]:
+        """Deduplicate urlDefault/urlPre thumbnail pairs while preserving note order."""
+        if not isinstance(info, dict):
+            return []
+        selected: Dict[str, Tuple[int, str]] = {}
+        for thumbnail in info.get("thumbnails") or []:
+            if not isinstance(thumbnail, dict):
+                continue
+            url = str(thumbnail.get("url") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            parsed = urlparse(url)
+            variant = re.search(r"^(.*)!nd_(dft|prv)_", parsed.path, re.IGNORECASE)
+            if variant:
+                key = f"{parsed.netloc.casefold()}{variant.group(1)}"
+                score = 2 if variant.group(2).casefold() == "dft" else 1
+            else:
+                key = url
+                score = 0
+            current = selected.get(key)
+            if current is None or score > current[0]:
+                selected[key] = (score, url)
+        return [url for _score, url in selected.values()]
+
+    def _process_xhs_image_urls(self, image_urls: List[str], uid: str) -> Optional[str]:
+        image_urls = image_urls[:self.xhs_max_images]
+        if not image_urls:
+            return None
+
+        tmp_dir = os.path.join(os.getcwd(), "tmp", "images")
+        os.makedirs(tmp_dir, exist_ok=True)
+        if len(image_urls) == 1:
+            raw_path = os.path.join(tmp_dir, f"temp_{uid}_ytdlp_raw")
+            output_path = os.path.join(tmp_dir, f"xhs_img_{uid}.jpg")
+            try:
+                self._xhs_download_file(image_urls[0], raw_path)
+                self._xhs_convert_to_jpg(raw_path, output_path)
+                return output_path
+            finally:
+                self._remove_path_quietly(raw_path)
+
+        self.logger.info(
+            "检测到 yt-dlp 小红书多图（%s 张），准备合并为长图",
+            len(image_urls),
+        )
+        temp_files: List[str] = []
+        converted_images: List[str] = []
+        try:
+            for index, image_url in enumerate(image_urls):
+                raw_path = os.path.join(tmp_dir, f"temp_{uid}_ytdlp_{index}_raw")
+                jpg_path = os.path.join(tmp_dir, f"temp_{uid}_ytdlp_{index}.jpg")
+                self._xhs_download_file(image_url, raw_path)
+                temp_files.append(raw_path)
+                self._xhs_convert_to_jpg(raw_path, jpg_path)
+                temp_files.append(jpg_path)
+                converted_images.append(jpg_path)
+            if not converted_images:
+                return None
+            output_path = os.path.join(tmp_dir, f"xhs_long_img_{uid}.jpg")
+            self._merge_images_vertically(converted_images, output_path)
+            return output_path
+        except Exception as exc:
+            self.logger.warning("⚠️ yt-dlp 小红书图片处理失败，将回退 TikHub: %s", exc)
+            return None
+        finally:
+            for temp_path in temp_files:
+                self._remove_path_quietly(temp_path)
+
+    def _download_xhs_video_with_ytdlp(
+        self,
+        share_url: str,
+        uid: str,
+        info: Optional[dict] = None,
+        timeout_sec: int = 240,
+        cookie_args: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        tmp_dir = os.path.join(os.getcwd(), "tmp", "videos")
+        os.makedirs(tmp_dir, exist_ok=True)
+        output_template = os.path.join(tmp_dir, f"xhs_ytdlp_{uid}_{uuid.uuid4().hex[:8]}.%(ext)s")
+        info_path = ""
+        try:
+            input_args: List[str]
+            if info:
+                handle, info_path = tempfile.mkstemp(
+                    prefix="summary_plus_xhs_",
+                    suffix=".info.json",
+                )
+                os.close(handle)
+                with open(info_path, "w", encoding="utf-8") as info_file:
+                    json.dump(info, info_file, ensure_ascii=False)
+                try:
+                    os.chmod(info_path, 0o600)
+                except OSError:
+                    pass
+                input_args = ["--load-info-json", info_path]
+            else:
+                input_args = [share_url]
+            result = self._run_platform_ytdlp(
+                "xiaohongshu",
+                [
+                    "--ffmpeg-location",
+                    self.ffmpeg_bin,
+                    "--format",
+                    "b[vcodec=EF4]/b[vcodec=h264]/b[vcodec^=avc]/b[ext=mp4]/b",
+                    "--merge-output-format",
+                    "mp4",
+                    "--remux-video",
+                    "mp4",
+                    "--no-write-thumbnail",
+                    "--no-progress",
+                    "-o",
+                    output_template,
+                    *input_args,
+                ],
+                timeout_sec=timeout_sec,
+                cookie_args=cookie_args,
+            )
+            if result.returncode != 0:
+                self._log_ytdlp_failure("小红书视频", result)
+                return None
+            video_path = self._find_ytdlp_output(output_template)
+            if not video_path:
+                return None
+            codec = self._probe_video_codec(video_path)
+            if codec and codec not in {"h264", "avc1"}:
+                self.logger.info("🔄 小红书 yt-dlp 输出编码为 %s，转换为微信兼容 H.264", codec)
+                video_path = self._convert_to_wechat_compatible(video_path) or video_path
+            return video_path
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            self.logger.warning("⚠️ 小红书 yt-dlp 视频下载失败: %s", exc)
+            return None
+        except Exception as exc:
+            self.logger.warning("⚠️ 小红书 yt-dlp 视频下载异常: %s", exc)
+            return None
+        finally:
+            if info_path:
+                self._remove_path_quietly(info_path)
+
+    def _process_xhs_note_with_ytdlp(self, share_url: str) -> Tuple[bool, Optional[str]]:
+        self.logger.info("📥 小红书优先使用 yt-dlp 处理: %s", share_url)
+        try:
+            with ytdlp_browser_cookie_args(
+                platform="xiaohongshu",
+                debug_port=self.chrome_debug_port,
+                user_data_dir=self.chrome_user_data_dir,
+                profile_dir=self.chrome_profile_dir,
+                logger=self.logger,
+            ) as cookie_args:
+                info = self._xhs_ytdlp_info(share_url, cookie_args=cookie_args)
+                if not info:
+                    return False, None
+
+                uid = str(
+                    info.get("id")
+                    or self._extract_xhs_note_id(share_url)
+                    or uuid.uuid4().hex[:8]
+                )
+                formats = info.get("formats") or []
+                if isinstance(formats, list) and formats:
+                    duration = self._xhs_video_duration_seconds(info)
+                    if not duration:
+                        duration = max(
+                            (self._xhs_video_duration_seconds(item) for item in formats),
+                            default=0,
+                        )
+                    if duration > self.xhs_max_download_duration:
+                        self.logger.info(
+                            "跳过处理(yt-dlp): 视频时长为 %ss，超过 %ss",
+                            duration,
+                            self.xhs_max_download_duration,
+                        )
+                        return True, None
+                    video_path = self._download_xhs_video_with_ytdlp(
+                        share_url,
+                        uid,
+                        info=info,
+                        cookie_args=cookie_args,
+                    )
+                    if video_path:
+                        self.logger.info("✅ 小红书 yt-dlp 视频下载成功: %s", video_path)
+                        return True, video_path
+                    return False, None
+
+                image_urls = self._xhs_ytdlp_image_urls(info)
+                if image_urls:
+                    self.logger.info(
+                        "🖼️ 小红书 yt-dlp 识别到 %s 张去重后的正文图片",
+                        len(image_urls),
+                    )
+                    image_path = self._process_xhs_image_urls(image_urls, uid)
+                    if image_path:
+                        self.logger.info("✅ 小红书 yt-dlp 图片处理成功: %s", image_path)
+                        return True, image_path
+                return False, None
+        except Exception as exc:
+            self.logger.warning("⚠️ 小红书 yt-dlp 处理异常: %s", exc)
+            return False, None
+
     def _xhs_download_file(self, url: str, save_path: str):
         """下载文件并保存 (带 Headers 以防止 405)"""
         self.logger.info(f"正在下载: {url}")
@@ -3162,9 +3550,13 @@ class SummaryService:
     def process_xhs_note(self, share_url: str) -> Optional[str]:
         """获取小红书笔记并根据规则处理，返回文件路径。
 
-        图片：始终走 TikHub API；单张 live 图返回动态视频，多图只用静态图合成长图。
-        视频：先走 TikHub API；如果拿不到有效 MP4 链接，则兜底直连小红书 H5 页面提取。
+        优先使用 yt-dlp；失败后回退 TikHub，并保留原有 H5 视频兜底。
         """
+        handled, ytdlp_path = self._process_xhs_note_with_ytdlp(share_url)
+        if handled:
+            return ytdlp_path
+        self.logger.info("🔄 小红书 yt-dlp 处理失败，回退 TikHub/H5")
+
         token = (os.getenv("TIKHUB_API_TOKEN") or "").strip()
         target_note_id = self._xhs_target_note_id(share_url)
 

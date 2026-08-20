@@ -1,5 +1,9 @@
 {
   "schema_version": 2,
+  "plugin_api_version": 2,
+  "storage": {"cache_retention_days": 30, "cache_limit_mb": 256},
+  "backup": {"schema_version": 1, "include_persistent_storage": true, "include_generated_files": false, "supports_restore_migration": true, "sensitive": true},
+  "health": {"critical": true, "timeout_seconds": 5},
   "listeners": [
     {"event": "text_message_received", "handler": "handle_text_message", "title": "记录文本", "trigger": {"kind": "always", "summary": "记录所有已分配聊天的文本消息", "config_keys": [], "conditions": []}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "observe"},
     {"event": "image_message_received", "handler": "handle_image_message", "title": "记录图片", "trigger": {"kind": "always", "summary": "记录所有已分配聊天的图片消息", "config_keys": [], "conditions": []}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "observe"},

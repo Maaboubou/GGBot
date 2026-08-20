@@ -226,35 +226,80 @@ const App = {
     // --- Tab Actions ---
 
     async refreshDashboard() {
-        try {
-            // Fetch all dashboard data in parallel
-            const [dashStats, recentActivities, topUsers, systemStatus, wxStatus, wxInfo, llmStats, codexStatus] = await Promise.all([
+        // Each panel owns its failure state. One slow integration must not
+        // prevent otherwise healthy dashboard sections from refreshing.
+        const requests = [
                 API.request('/api/dashboard/stats'),
                 API.request('/api/dashboard/recent-activities?limit=14'),
                 API.request('/api/dashboard/top-users?limit=5'),
                 API.system.getStatus(),
                 API.wechat.getStatus(),
-                API.wechat.getMyInfo().catch(() => ({})),
+                API.wechat.getMyInfo(),
                 API.plugins.getStats(),
-                API.request('/api/dashboard/codex-status').catch((e) => ({ status: 'error', quota_message: e.message }))
-            ]);
+                API.request('/api/dashboard/codex-status'),
+                API.system.getHealthDetails()
+        ];
+        const labels = ['统计', '动态', '聊天', '资源', '微信', '微信资料', '插件', 'Codex', '运行状态'];
+        const settled = await Promise.allSettled(requests);
+        const value = (index, fallback) => settled[index].status === 'fulfilled' ? settled[index].value : fallback;
+        const failed = settled
+            .map((item, index) => item.status === 'rejected' ? labels[index] : null)
+            .filter(Boolean);
 
-            // Render all dashboard components
-            this.renderDashboardStats(dashStats);
-            this.renderRecentActivities(recentActivities.activities);
-            this.renderTopUsers(topUsers.users);
-            this.renderSystemResources(systemStatus);
-            this.renderWeChatStatus(wxStatus, wxInfo);
-            this.renderLLMStats(llmStats.stats || llmStats);
+        const dashStats = value(0, null);
+        const recentActivities = value(1, null);
+        const topUsers = value(2, null);
+        const systemStatus = value(3, null);
+        const wxStatus = value(4, null);
+        const wxInfo = value(5, {});
+        const llmStats = value(6, null);
+        const codexStatus = value(7, {
+            status: 'error',
+            quota_message: settled[7].reason?.message || 'Codex 状态暂不可用'
+        });
+        const runtimeHealth = value(8, null);
+
+        try {
+            if (dashStats) this.renderDashboardStats(dashStats);
+            else this.markDashboardPanelStale(['statTodayMessages', 'statAiReplies', 'statTokenUsage']);
+            if (recentActivities) this.renderRecentActivities(recentActivities.activities);
+            else this.markDashboardPanelStale(['recentActivities']);
+            if (topUsers) this.renderTopUsers(topUsers.users);
+            else this.markDashboardPanelStale(['topUsers']);
+            if (systemStatus) this.renderSystemResources(systemStatus);
+            else this.markDashboardPanelStale(['systemResources']);
+            if (wxStatus) this.renderWeChatStatus(wxStatus, wxInfo);
+            else this.markDashboardPanelStale(['dashboardWechatStatus']);
+            if (llmStats) this.renderLLMStats(llmStats.stats || llmStats);
+            else this.markDashboardPanelStale(['dashboardPluginHealth', 'dashboardModelCalls', 'dashboardErrors']);
             this.renderCodexStatus(codexStatus);
-            this.renderDashboardSummary(systemStatus, llmStats.stats || llmStats);
+            if (systemStatus && llmStats) this.renderDashboardSummary(systemStatus, llmStats.stats || llmStats);
+            if (runtimeHealth) this.renderRuntimeHealth(runtimeHealth);
+            else this.markDashboardPanelStale(['dashboardSystemHealth', 'dashboardActiveOperations']);
 
-            // Update last update time
             const now = new Date();
-            document.getElementById('lastUpdateTime').textContent = `更新 ${now.toLocaleTimeString('zh-CN')}`;
+            const updated = document.getElementById('lastUpdateTime');
+            if (updated) {
+                updated.textContent = failed.length
+                    ? `更新 ${now.toLocaleTimeString('zh-CN')} · ${failed.length} 项暂不可用`
+                    : `更新 ${now.toLocaleTimeString('zh-CN')}`;
+                updated.title = failed.length ? `暂不可用：${failed.join('、')}` : '全部数据已刷新';
+            }
         } catch (e) {
-            console.error('Failed to refresh dashboard:', e);
+            console.error('Failed to render dashboard:', e);
         }
+    },
+
+    markDashboardPanelStale(elementIds) {
+        elementIds.forEach(id => {
+            const element = document.getElementById(id);
+            if (!element) return;
+            element.dataset.stale = 'true';
+            element.title = '本区域本次刷新失败，当前内容可能不是最新状态';
+            if (!element.textContent.trim() || element.textContent.trim() === '-') {
+                element.textContent = '暂不可用';
+            }
+        });
     },
 
     openDashboardErrors() {
@@ -472,10 +517,35 @@ const App = {
         if (systemUptime) systemUptime.textContent = this.systemResourceSnapshot?.systemUptime || systemStatus?.system_uptime || '未知';
     },
 
+    renderRuntimeHealth(health) {
+        const healthElement = document.getElementById('dashboardSystemHealth');
+        const operationsElement = document.getElementById('dashboardActiveOperations');
+        const checks = health?.checks || {};
+        const names = { database: '数据库', event_bus: '事件总线', plugin_manager: '插件', wechat: '微信' };
+        const failedChecks = Object.entries(checks)
+            .filter(([, ready]) => !ready)
+            .map(([name]) => names[name] || name);
+        const status = health?.status || (health?.ready ? 'ready' : 'not_ready');
+        const statusText = status === 'ready' ? '正常' : status === 'degraded' ? '可用' : '异常';
+        const tone = status === 'ready' ? 'online' : status === 'degraded' ? 'warning' : 'offline';
+        if (healthElement) {
+            healthElement.innerHTML = `<span class="dashboard-inline-state ${tone}"><i class="bi bi-circle-fill"></i>${statusText}</span>`;
+            healthElement.title = failedChecks.length ? `未就绪：${failedChecks.join('、')}` : '核心组件运行正常';
+            healthElement.removeAttribute('data-stale');
+        }
+        if (operationsElement) {
+            const activeCount = Number(health?.operations?.active_count || 0);
+            operationsElement.textContent = activeCount ? `${activeCount} 项` : '空闲';
+            operationsElement.classList.toggle('text-primary', activeCount > 0);
+            operationsElement.title = activeCount ? `${activeCount} 个平台托管任务正在执行` : '当前没有平台托管任务';
+            operationsElement.removeAttribute('data-stale');
+        }
+    },
+
     localizeCodexQuotaMessage(message) {
         const text = String(message || '');
         const exactLabels = {
-            'Codex app-server did not return account rate limits': 'Codex app-server 未返回账户限额',
+            'Codex runtime did not return account rate limits': 'Codex 运行时未返回账户限额',
             'Latest rollout file does not contain rate_limits yet': '最新 rollout 文件尚未包含 rate_limits',
             'Read from latest Codex rollout rate_limits': '已从最新 Codex rollout 文件读取 rate_limits',
             'Live refresh failed; showing last successful live usage': '实时刷新失败，正在显示最近一次成功获取的实时用量',
@@ -2948,6 +3018,9 @@ const App = {
         try {
             const settings = await API.settings.getConsole();
             UI.renderSystemSettings(settings);
+            const activeGroup = document.getElementById('settings')?.dataset.activeSystemGroup;
+            if (activeGroup === 'operations') await window.SystemOperations?.loadRuntime();
+            if (activeGroup === 'backups') await window.SystemOperations?.loadBackups();
         } catch (e) {
             UI.showError('加载设置失败：' + e.message);
         }

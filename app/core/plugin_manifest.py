@@ -10,6 +10,7 @@ from .event_bus import EventType
 
 
 PLUGIN_MANIFEST_VERSION = 2
+PLUGIN_RUNTIME_API_VERSION = 2
 TRIGGER_KINDS = {
     "always",
     "keyword",
@@ -33,6 +34,24 @@ def _require_text(value: Any, label: str) -> str:
     if not text:
         raise PluginManifestError(f"{label} 不能为空")
     return text
+
+
+def _bounded_int(value: Any, *, label: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(default if value in (None, "") else value)
+    except (TypeError, ValueError) as exc:
+        raise PluginManifestError(f"{label} 必须是整数") from exc
+    if parsed < minimum or parsed > maximum:
+        raise PluginManifestError(f"{label} 必须在 {minimum}–{maximum} 之间")
+    return parsed
+
+
+def _boolean(value: Any, *, label: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise PluginManifestError(f"{label} 必须是布尔值")
+    return value
 
 
 def _validate_trigger(
@@ -106,6 +125,59 @@ def load_plugin_manifest(plugin_path: Path, config: Mapping[str, Any]) -> Dict[s
     if payload.get("schema_version") != PLUGIN_MANIFEST_VERSION:
         raise PluginManifestError(f"schema_version 必须为 {PLUGIN_MANIFEST_VERSION}")
 
+    try:
+        plugin_api_version = int(payload.get("plugin_api_version") or 0)
+    except (TypeError, ValueError) as exc:
+        raise PluginManifestError("plugin_api_version 必须是整数") from exc
+    if plugin_api_version != PLUGIN_RUNTIME_API_VERSION:
+        raise PluginManifestError(
+            f"plugin_api_version 必须为 {PLUGIN_RUNTIME_API_VERSION}；旧版插件不再允许加载"
+        )
+
+    raw_storage = payload.get("storage") or {}
+    if not isinstance(raw_storage, dict):
+        raise PluginManifestError("storage 必须是对象")
+    raw_backup = payload.get("backup") or {}
+    if not isinstance(raw_backup, dict):
+        raise PluginManifestError("backup 必须是对象")
+    raw_health = payload.get("health") or {}
+    if not isinstance(raw_health, dict):
+        raise PluginManifestError("health 必须是对象")
+
+    storage = {
+        "cache_retention_days": _bounded_int(
+            raw_storage.get("cache_retention_days"), label="storage.cache_retention_days",
+            default=0, minimum=0, maximum=3650,
+        ),
+        "cache_limit_mb": _bounded_int(
+            raw_storage.get("cache_limit_mb"), label="storage.cache_limit_mb",
+            default=0, minimum=0, maximum=1048576,
+        ),
+    }
+    backup = {
+        "schema_version": _bounded_int(
+            raw_backup.get("schema_version"), label="backup.schema_version",
+            default=1, minimum=1, maximum=100,
+        ),
+        "include_persistent_storage": _boolean(
+            raw_backup.get("include_persistent_storage"), label="backup.include_persistent_storage", default=True
+        ),
+        "include_generated_files": _boolean(
+            raw_backup.get("include_generated_files"), label="backup.include_generated_files", default=False
+        ),
+        "supports_restore_migration": _boolean(
+            raw_backup.get("supports_restore_migration"), label="backup.supports_restore_migration", default=False
+        ),
+        "sensitive": _boolean(raw_backup.get("sensitive"), label="backup.sensitive", default=False),
+    }
+    health = {
+        "critical": _boolean(raw_health.get("critical"), label="health.critical", default=False),
+        "timeout_seconds": _bounded_int(
+            raw_health.get("timeout_seconds"), label="health.timeout_seconds",
+            default=5, minimum=1, maximum=60,
+        ),
+    }
+
     config_schema = config.get("config_schema") or {}
     if not isinstance(config_schema, dict):
         raise PluginManifestError("config_schema 必须是对象")
@@ -172,7 +244,15 @@ def load_plugin_manifest(plugin_path: Path, config: Mapping[str, Any]) -> Dict[s
                 ),
             }
         )
-    return {"schema_version": PLUGIN_MANIFEST_VERSION, "listeners": listeners, "jobs": jobs}
+    return {
+        "schema_version": PLUGIN_MANIFEST_VERSION,
+        "plugin_api_version": plugin_api_version,
+        "listeners": listeners,
+        "jobs": jobs,
+        "storage": storage,
+        "backup": backup,
+        "health": health,
+    }
 
 
 def listener_manifest_map(manifest: Mapping[str, Any]) -> Dict[tuple[str, str], Dict[str, Any]]:
@@ -211,7 +291,7 @@ def describe_listener_trigger(spec: Mapping[str, Any], config: Mapping[str, Any]
         )
     return {
         "kind": trigger.get("kind", "dynamic"),
-        "summary": str(trigger.get("summary") or "由插件运行时判断"),
+        "summary": str(trigger.get("summary") or "由插件规则判断"),
         "conditions": list(trigger.get("conditions") or []),
         "editable": editable,
         "editable_count": len(editable),

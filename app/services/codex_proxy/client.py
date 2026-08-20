@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -33,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 _RUNNING_REQUESTS_LOCK = threading.Lock()
 _RUNNING_REQUESTS: Dict[str, Dict[str, Any]] = {}
+_ARTIFACT_CLEANUP_LOCK = threading.Lock()
+_ARTIFACT_CLEANUP_LAST_RUN = 0.0
 
 
 def get_running_codex_requests() -> List[Dict[str, Any]]:
@@ -285,6 +289,14 @@ def _attachment_type_for_suffix(suffix: str) -> str:
     return "file"
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _default_text_for_attachments(attachments: List[Dict[str, Any]]) -> str:
     if attachments and all(item.get("type") == "image" for item in attachments):
         return "已生成图片"
@@ -306,6 +318,7 @@ def _collect_artifact_attachments(output_dir: Path) -> List[Dict[str, Any]]:
             continue
         try:
             stat = path.stat()
+            sha256 = _sha256_file(path)
         except OSError:
             continue
         if stat.st_size <= 0:
@@ -319,9 +332,87 @@ def _collect_artifact_attachments(output_dir: Path) -> List[Dict[str, Any]]:
                 "path": str(path.resolve()),
                 "name": path.name,
                 "size": stat.st_size,
+                "sha256": sha256,
             }
         )
     return attachments
+
+
+def _write_artifact_manifest(
+    request_dir: Path,
+    *,
+    request_id: str,
+    backend: str,
+    model: str,
+    attachments: List[Dict[str, Any]],
+) -> Optional[Path]:
+    if not attachments:
+        return None
+    retention_days = max(1, int(os.getenv("CODEX_ARTIFACT_RETENTION_DAYS", "30")))
+    created_at = datetime.now()
+    manifest = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "backend": backend,
+        "model": model,
+        "created_at": created_at.isoformat(timespec="seconds"),
+        "expires_at": (created_at + timedelta(days=retention_days)).isoformat(timespec="seconds"),
+        "files": attachments,
+    }
+    path = request_dir / "manifest.json"
+    temp_path = request_dir / f"manifest.{uuid.uuid4().hex}.tmp"
+    try:
+        temp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, path)
+        return path
+    except OSError as exc:
+        logger.warning("Failed to write Codex artifact manifest %s: %s", path, exc)
+        return None
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _cleanup_expired_artifacts(
+    artifact_root: Path,
+    *,
+    now: Optional[datetime] = None,
+    force: bool = False,
+) -> int:
+    """Remove only immediate request directories with a valid expired manifest."""
+    global _ARTIFACT_CLEANUP_LAST_RUN
+
+    try:
+        interval = max(0, int(os.getenv("CODEX_ARTIFACT_CLEANUP_INTERVAL_SECONDS", "3600")))
+    except ValueError:
+        interval = 3600
+    monotonic_now = time.monotonic()
+    with _ARTIFACT_CLEANUP_LOCK:
+        if not force and monotonic_now - _ARTIFACT_CLEANUP_LAST_RUN < interval:
+            return 0
+        _ARTIFACT_CLEANUP_LAST_RUN = monotonic_now
+
+        root = artifact_root.resolve()
+        if not root.exists() or not root.is_dir():
+            return 0
+        current = now or datetime.now()
+        removed = 0
+        for manifest_path in root.glob("*/manifest.json"):
+            request_dir = manifest_path.parent
+            try:
+                if request_dir.parent.resolve() != root:
+                    continue
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                request_id = str(payload.get("request_id") or "")
+                expires_at = datetime.fromisoformat(str(payload.get("expires_at") or ""))
+                if request_id != request_dir.name or expires_at > current:
+                    continue
+                shutil.rmtree(request_dir)
+                removed += 1
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        if removed:
+            logger.info("Removed %s expired Codex artifact request directories", removed)
+        return removed
 
 
 def render_chat_prompt(
@@ -897,6 +988,7 @@ class CodexCliClient:
         artifact_root = Path(os.getenv("CODEX_PROXY_ARTIFACT_ROOT") or "tmp/images/codex")
         if not artifact_root.is_absolute():
             artifact_root = Path(self.workdir) / artifact_root
+        _cleanup_expired_artifacts(artifact_root)
         request_dir = artifact_root / request_id
         output_dir = request_dir / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -978,8 +1070,16 @@ class CodexCliClient:
             sandbox_mode,
             "--skip-git-repo-check",
             "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
+        ])
+        config_policy = str(
+            request.get("codex_config_policy")
+            or extra_body.get("codex_config_policy")
+            or os.getenv("CODEX_CONFIG_POLICY")
+            or "inherit"
+        ).strip().lower()
+        if config_policy in {"isolated", "managed"}:
+            args.extend(["--ignore-user-config", "--ignore-rules"])
+        args.extend([
             "-C",
             runtime_workdir,
             "--json",
@@ -1014,6 +1114,11 @@ class CodexCliClient:
                 "image_count": len(image_urls),
                 "started_at": started_at,
             },
+        )
+        codex_job_manager.record_event(
+            request_id,
+            "queued",
+            {"backend": "codex_exec"},
         )
         logger.info(
             "Codex request %s starting: model=%s timeout=%ss search=%s messages=%s prompt_chars=%s images=%s output_dir=%s",
@@ -1050,6 +1155,12 @@ class CodexCliClient:
                     use_wsl=self.use_wsl,
                     proc_args_preview=" ".join(shlex.quote(str(arg)) for arg in proc_args[:8]),
                 )
+                codex_job_manager.record_event(
+                    request_id,
+                    "process_started",
+                    {"pid": getattr(proc, "pid", None)},
+                    status="running",
+                )
             except FileNotFoundError as exc:
                 raise CodexProxyError(
                     "Codex CLI was not found. Install Codex or set CODEX_PROXY_BIN "
@@ -1073,6 +1184,13 @@ class CodexCliClient:
                 stdout_tail=_tail_text(stdout, 1200),
                 stderr_tail=_tail_text(stderr, 1200),
             )
+            codex_job_manager.record_event(
+                request_id,
+                "process_completed",
+                {"returncode": proc.returncode},
+                current_item_type=None,
+                current_item_status="completed",
+            )
             text = ""
             try:
                 if output_path.exists():
@@ -1092,6 +1210,13 @@ class CodexCliClient:
                 detail = (stderr or stdout).strip()
                 raise CodexProxyError(f"Codex CLI exited with {proc.returncode}: {detail[:1000]}")
             attachments = _collect_artifact_attachments(output_dir)
+            _write_artifact_manifest(
+                request_dir,
+                request_id=request_id,
+                backend="codex_exec",
+                model=model,
+                attachments=attachments,
+            )
             if attachments:
                 logger.info("Codex proxy collected %s attachment(s) from %s", len(attachments), output_dir)
             if not text and attachments:
@@ -1112,6 +1237,22 @@ class CodexCliClient:
                 text_chars=len(text or ""),
                 attachment_count=len(attachments or []),
             )
+            codex_job_manager.record_event(
+                request_id,
+                "response_ready",
+                {
+                    "text_chars": len(text or ""),
+                    "attachment_count": len(attachments or []),
+                },
+            )
+        except Exception as exc:
+            codex_job_manager.update(request_id, error=str(exc))
+            codex_job_manager.record_event(
+                request_id,
+                "error",
+                {"message": str(exc)[:1000]},
+            )
+            raise
         finally:
             try:
                 output_path.unlink(missing_ok=True)
@@ -1153,7 +1294,15 @@ class CodexCliClient:
                     final_updates = {"error": f"Codex CLI timed out after {timeout}s"}
                 else:
                     final_status = "failed"
-                    final_updates = {"error": f"Codex job ended before completion (status={current_status or 'unknown'})"}
+                    final_updates = {
+                        "error": str(active_job.get("error") or "")
+                        or f"Codex job ended before completion (status={current_status or 'unknown'})"
+                    }
+                codex_job_manager.record_event(
+                    request_id,
+                    "job_finished",
+                    {"status": final_status, "error": final_updates.get("error")},
+                )
                 codex_job_manager.finish(request_id, status=final_status, **final_updates)
 
         now = int(time.time())
@@ -1174,6 +1323,7 @@ class CodexCliClient:
             "object": "chat.completion",
             "created": now,
             "model": model,
+            "backend": "codex_exec",
             "choices": [
                 {
                     "index": 0,

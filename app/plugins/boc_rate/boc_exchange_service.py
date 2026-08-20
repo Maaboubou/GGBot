@@ -58,8 +58,9 @@ class BOCExchangeService:
         "巴基斯坦卢比": ["巴基斯坦卢比", "PKR"], "塞尔维亚第纳尔": ["塞尔维亚第纳尔", "RSD"]
     }
     
-    def __init__(self, config):
+    def __init__(self, config, cache_dir, workers):
         self.config = config
+        self.workers = workers
         self.logger = logging.getLogger(__name__)
         
         # 中行在 2026 年 7 月下线了旧的 JSP 历史查询接口，并将历史查询
@@ -78,7 +79,7 @@ class BOCExchangeService:
         
         # 缓存配置：改为插件私有目录 app/plugins/boc_rate/exchange_rate_cache
         # 使用文件所在目录作为基准，便于统一管理与清理
-        self.cache_dir = os.path.join(os.path.dirname(__file__), "exchange_rate_cache")
+        self.cache_dir = str(cache_dir or os.path.join(os.path.dirname(__file__), "exchange_rate_cache"))
         self.cache_index_file = os.path.join(self.cache_dir, "cache_index.json")
         self.memory_cache = {}
         self.cache_duration = timedelta(minutes=30)
@@ -542,12 +543,11 @@ class BOCExchangeService:
             text_reply = f"💰 {normalized_currency}中行牌价(现汇卖出价)\n📈 {latest_rate}\n🕐 {latest_time}\n💡 (文件缓存)"
             
             # 异步生成图表
-            chart_thread = threading.Thread(
-                target=self._generate_chart_from_cache,
+            self.workers.start(
+                f"chart-cache-{normalized_currency}-{time.time_ns()}",
+                self._generate_chart_from_cache,
                 args=(all_contents, normalized_currency, chat_name),
-                daemon=True
             )
-            chart_thread.start()
             return text_reply, None
 
         # 3. 快速响应优化：先获取第一页最新汇率，后台完成完整数据获取
@@ -584,12 +584,11 @@ class BOCExchangeService:
                     self._is_querying = False
                 
                 # 🔄 后台完成完整数据更新并生成完整走势图
-                update_thread = threading.Thread(
-                    target=self._background_complete_update_and_chart,
+                self.workers.start(
+                    f"update-chart-{normalized_currency}-{time.time_ns()}",
+                    self._background_complete_update_and_chart,
                     args=(normalized_currency, missing_ranges, all_contents, need_update_today, today_str, cached_dates, chat_name, latest_data),
-                    daemon=True
                 )
-                update_thread.start()
                 
                 return text_reply, None
             else:
@@ -605,12 +604,11 @@ class BOCExchangeService:
                 text_reply = f"💰 {normalized_currency}中行牌价(现汇卖出价)\n📈 {latest_data['latest_rate']}\n🕐 {latest_data['latest_time']}"
                 
                 # 启动后台完整数据获取
-                chart_thread = threading.Thread(
-                    target=self._generate_full_chart_background,
+                self.workers.start(
+                    f"full-chart-{normalized_currency}-{time.time_ns()}",
+                    self._generate_full_chart_background,
                     args=(normalized_currency, latest_data, chat_name),
-                    daemon=True
                 )
-                chart_thread.start()
                 
                 return text_reply, None
             
@@ -630,12 +628,11 @@ class BOCExchangeService:
             self.memory_cache[f"exchange_rate_{normalized_currency}"] = {'data': cache_data, 'timestamp': self._get_beijing_now()}
             
             # 异步生成图表
-            chart_thread = threading.Thread(
-                target=self._generate_chart_from_cache,
+            self.workers.start(
+                f"chart-{normalized_currency}-{time.time_ns()}",
+                self._generate_chart_from_cache,
                 args=(all_contents, normalized_currency, chat_name),
-                daemon=True
             )
-            chart_thread.start()
             
             return text_reply, None
             

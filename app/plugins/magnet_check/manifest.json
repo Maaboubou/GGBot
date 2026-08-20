@@ -1,5 +1,9 @@
 {
   "schema_version": 2,
+  "plugin_api_version": 2,
+  "storage": {"cache_retention_days": 7, "cache_limit_mb": 1024},
+  "backup": {"schema_version": 1, "include_persistent_storage": false, "include_generated_files": true, "supports_restore_migration": false, "sensitive": false},
+  "health": {"critical": false, "timeout_seconds": 5},
   "listeners": [
     {"event": "text_message_received", "handler": "handle_text", "title": "磁链验车", "trigger": {"kind": "keyword", "summary": "消息以验车触发词开头并紧跟有效 InfoHash", "config_keys": ["trigger_word", "enable_full_magnet_match"], "conditions": ["InfoHash 必须是 40 位十六进制或 32 位 Base32"]}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "stop_on_consumed"},
     {"event": "link_message_received", "handler": "handle_text", "title": "完整磁链验车", "trigger": {"kind": "link", "summary": "开启完整磁链匹配后，收到有效 magnet 链接", "config_keys": ["enable_full_magnet_match"], "conditions": ["必须包含有效 xt=urn:btih"]}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "stop_on_consumed"}

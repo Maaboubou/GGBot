@@ -14,8 +14,19 @@ from app.utils.network_env import configure_startup_network_environment
 from app.utils.logging_utils import create_rotating_file_handler
 
 
-# 必须在读取 WEB_HOST/WEB_PORT 以及启动子服务前加载本地配置。
+# 先读取当前环境以定位备份目录；待恢复计划必须在 uvicorn 导入
+# app.main 之前应用，才能安全替换代码、数据库与 .env。
 load_dotenv()
+try:
+    from app.services.backup_service import apply_pending_restore
+
+    restored = apply_pending_restore(Path.cwd())
+    if restored:
+        print(f"已应用恢复计划：{restored.get('archive')} ({restored.get('files')} files)")
+        load_dotenv(override=True)
+except Exception as exc:
+    print(f"恢复计划执行失败，已阻止应用启动：{exc}", file=sys.stderr)
+    raise
 
 # 必须早于 uvicorn 导入 app.main；否则 LiteLLM 和插件初始化会先读取代理环境。
 configure_startup_network_environment()
@@ -76,7 +87,9 @@ def check_environment():
 def main():
     """主函数"""
     print("=" * 60)
-    print("WeChat Automation Assistant v2.0")
+    from app.version import APP_VERSION
+
+    print(f"WeChat Automation Assistant v{APP_VERSION}")
     print("基于FastAPI + 事件总线 + 插件化架构")
     print("=" * 60)
     
@@ -103,10 +116,26 @@ def main():
     )
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
     parser.add_argument("--workers", type=int, default=1, help="Number of worker processes")
+    parser.add_argument(
+        "--restore",
+        metavar="ARCHIVE",
+        help="离线恢复指定 .ggbot-backup.zip 后退出（项目必须处于停止状态）",
+    )
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"], 
                        help="Log level")
     
     args = parser.parse_args()
+
+    if args.restore:
+        from app.services.backup_service import BackupService
+
+        result = BackupService(Path.cwd()).restore_archive(Path(args.restore))
+        logger.info(
+            "Restore completed from %s (%s files); restart normally to validate the restored system",
+            result.get("archive"),
+            result.get("files"),
+        )
+        return
     
     logger.info(f"Starting server on {args.host}:{args.port}")
     logger.info(f"Log level: {args.log_level}")

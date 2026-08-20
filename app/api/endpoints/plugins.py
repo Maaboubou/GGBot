@@ -222,6 +222,19 @@ async def toggle_plugin(
             action = "disabled"
         
         if success:
+            try:
+                from app.services.runtime_operations import get_runtime_operation_service
+
+                get_runtime_operation_service().record_audit(
+                    category="plugin_lifecycle",
+                    action="toggle_plugin",
+                    target=plugin_name,
+                    summary=f"插件已{action}",
+                    before={"enabled": not toggle_request.enabled},
+                    after={"enabled": toggle_request.enabled},
+                )
+            except Exception:
+                pass
             return {
                 "message": f"Plugin '{plugin_name}' {action} successfully",
                 "plugin_name": plugin_name,
@@ -246,6 +259,17 @@ async def reload_plugin(
         success = plugin_manager.reload_plugin(plugin_name)
         
         if success:
+            try:
+                from app.services.runtime_operations import get_runtime_operation_service
+
+                get_runtime_operation_service().record_audit(
+                    category="plugin_lifecycle",
+                    action="reload_plugin",
+                    target=plugin_name,
+                    summary="插件已重新加载",
+                )
+            except Exception:
+                pass
             return {
                 "message": f"Plugin '{plugin_name}' reloaded successfully",
                 "plugin_name": plugin_name

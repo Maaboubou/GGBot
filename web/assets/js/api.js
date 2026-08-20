@@ -49,6 +49,7 @@ const API = {
     system: {
         getInfo: () => API.get('/api/system/info'),
         getStatus: () => API.get('/api/system/status'),
+        getHealthDetails: () => API.get('/api/system/health/details'),
         getLogs: (type, lines, search, plugin, options = {}) => {
             const params = new URLSearchParams({
                 lines: lines || 100,
@@ -61,6 +62,43 @@ const API = {
         restart: (serviceName) => API.post(`/api/system/restart/${serviceName}`),
         getRestartCapabilities: () => API.get('/api/system/restart-capabilities'),
         checkHealth: () => API.get('/health')
+    },
+
+    backups: {
+        getOverview: () => API.get('/api/backups/'),
+        create: options => API.post('/api/backups/', options),
+        validate: name => API.post(`/api/backups/${encodeURIComponent(name)}/validate`, {}),
+        prepareRestore: (name, confirmation) => API.post(
+            `/api/backups/${encodeURIComponent(name)}/prepare-restore`,
+            { confirmation }
+        ),
+        downloadUrl: name => `/api/backups/${encodeURIComponent(name)}/download`,
+        importFile: async file => {
+            const response = await fetch(
+                `/api/backups/import?filename=${encodeURIComponent(file.name)}`,
+                { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file }
+            );
+            if (!response.ok) {
+                const error = await response.json().catch(() => ({}));
+                throw new Error(error.detail || error.message || `HTTP ${response.status}`);
+            }
+            return response.json();
+        }
+    },
+
+    operations: {
+        getAll: (limit = 100, owner = '') => API.get(
+            `/api/operations/?limit=${encodeURIComponent(limit)}${owner ? `&owner=${encodeURIComponent(owner)}` : ''}`
+        ),
+        get: id => API.get(`/api/operations/${encodeURIComponent(id)}`),
+        cancel: id => API.post(`/api/operations/${encodeURIComponent(id)}/cancel`, {}),
+        getRuntime: () => API.get('/api/operations/runtime'),
+        getIncidents: (limit = 40) => API.get(`/api/operations/incidents?limit=${encodeURIComponent(limit)}`),
+        getAudit: (limit = 50) => API.get(`/api/operations/audit?limit=${encodeURIComponent(limit)}`),
+        getStorage: () => API.get('/api/operations/storage'),
+        scanStorage: () => API.post('/api/operations/storage/scan', {}),
+        getCleanupPreview: (days = 7) => API.get(`/api/operations/storage/cleanup-preview?retention_days=${encodeURIComponent(days)}`),
+        cleanupStorage: (days, confirmation) => API.post('/api/operations/storage/cleanup', { retention_days: days, confirmation })
     },
 
     // Plugins
@@ -336,7 +374,14 @@ const API = {
 
     codexJobs: {
         list: () => API.get('/api/codex/jobs'),
-        cancel: (requestId) => API.post(`/api/codex/jobs/${encodeURIComponent(requestId)}/cancel`, {})
+        refreshRuntime: () => API.post('/api/codex/jobs/runtime/refresh', {}),
+        cancel: (requestId) => API.post(`/api/codex/jobs/${encodeURIComponent(requestId)}/cancel`, {}),
+        events: (requestId) => API.get(`/api/codex/jobs/events/${encodeURIComponent(requestId)}`),
+        checkUpdate: () => API.post('/api/codex/jobs/upgrade/check', {}),
+        startUpdate: () => API.post('/api/codex/jobs/upgrade/start', {}),
+        rollback: () => API.post('/api/codex/jobs/upgrade/rollback', {}),
+        resetSession: (chatId) => API.post('/api/codex/jobs/sessions/reset', { chat_id: chatId }),
+        interruptSession: (chatId) => API.post('/api/codex/jobs/sessions/interrupt', { chat_id: chatId })
     },
 
     // Settings

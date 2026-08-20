@@ -1553,12 +1553,29 @@ def handle_text(event: Event) -> bool:
     return plugin.handle_text(event)
 
 
-def register(event_bus: Any, subscribe: Any) -> None:
+def register(event_bus: Any, subscribe: Any, context: Any) -> None:
     """Register the plugin with wxautox's event bus."""
 
     del event_bus  # Reserved for future shared services.
     global plugin
     plugin = MagnetCheckPlugin()
+    migration_notes = context.storage.migrate_legacy_directory(
+        plugin.output_dir, storage_class="generated", relative="reports"
+    )
+    plugin.output_dir = context.storage.generated_root / "reports"
+    plugin.output_dir.mkdir(parents=True, exist_ok=True)
+    if migration_notes:
+        context.audit.record(
+            "storage_migration",
+            summary="磁链检查报告已迁移到插件标准存储目录",
+            details={"moved_files": len(migration_notes)},
+        )
+    context.health.register(lambda: {
+        "status": "degraded" if plugin is not None and plugin._detector_error else "healthy" if plugin is not None else "unhealthy",
+        "message": plugin._detector_error if plugin is not None and plugin._detector_error else "磁链检查服务已就绪" if plugin is not None else "磁链检查服务未初始化",
+        "detector_loaded": bool(plugin and plugin._detector is not None),
+    })
+    context.register_cleanup(unregister)
     subscribe(
         event_type=EventType.TEXT_MESSAGE_RECEIVED,
         handler=handle_text,

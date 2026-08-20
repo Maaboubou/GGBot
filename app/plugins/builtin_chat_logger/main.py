@@ -4,7 +4,6 @@
 """
 
 import logging
-import threading
 import time
 from app.core.event_bus import Event, EventType
 from app.plugins.builtin_chatbot.chat_log import ChatLogManager
@@ -16,7 +15,8 @@ logger = logging.getLogger(__name__)
 class ChatLoggerPlugin:
     """聊天记录插件主类"""
     
-    def __init__(self):
+    def __init__(self, context):
+        self.context = context
         self.chat_log_manager = ChatLogManager()
         
         # 从插件配置读取设置
@@ -61,8 +61,7 @@ class ChatLoggerPlugin:
 
         if not self._cleanup_thread_started:
             self._cleanup_thread_started = True
-            self._cleanup_thread = threading.Thread(target=_cleanup_runner, daemon=True)
-            self._cleanup_thread.start()
+            self._cleanup_thread = self.context.workers.start("log-cleanup", _cleanup_runner)
             logger.info("📝 ChatLogger 清理线程已启动")
 
     def stop_cleanup_scheduler(self):
@@ -257,17 +256,23 @@ def handle_quote_message(event: Event):
     return False
 
 
-def register(event_bus, subscribe):
+def register(event_bus, subscribe, context):
     """插件注册函数"""
     global chat_logger_plugin
     
     logger.info("📝 Registering ChatLogger plugin...")
     
     # 初始化聊天记录插件
-    chat_logger_plugin = ChatLoggerPlugin()
+    chat_logger_plugin = ChatLoggerPlugin(context)
     
     # 启动清理任务
     chat_logger_plugin.start_cleanup_scheduler()
+    context.health.register(lambda: {
+        "status": "healthy" if chat_logger_plugin is not None and chat_logger_plugin._cleanup_thread_started else "degraded",
+        "message": "消息记录与清理调度器运行正常" if chat_logger_plugin is not None and chat_logger_plugin._cleanup_thread_started else "消息记录清理调度器未运行",
+        "cleanup_scheduler_alive": bool(chat_logger_plugin and chat_logger_plugin._cleanup_thread and chat_logger_plugin._cleanup_thread.is_alive()),
+    })
+    context.register_cleanup(unregister)
     
     # 订阅所有消息事件，使用高优先级确保最先处理
     subscribe(

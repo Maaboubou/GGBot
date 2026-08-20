@@ -44,7 +44,7 @@ const LLMManager = {
             apiBase: 'https://openrouter.ai/api/v1', apiBaseRequired: false,
         },
         local_codex: {
-            label: '本地 Codex', catalogProvider: 'local_codex', providerValue: 'local_codex_cli',
+            label: '本地 Codex', catalogProvider: 'local_codex', providerValue: 'local_codex',
             envVar: '', requiresCredential: false,
             modelPlaceholder: '例如 gpt-5.6-sol', apiBase: '', apiBaseRequired: false,
         },
@@ -498,7 +498,7 @@ const LLMManager = {
         const explicit = String(config.custom_llm_provider || config.provider || '').toLowerCase();
         const model = String(config.model || '').toLowerCase();
         const apiBase = String(config.api_base || '').toLowerCase();
-        if (explicit === 'local_codex_cli' || apiBase.includes('/api/codex/')) return 'local_codex';
+        if (['local_codex', 'local_codex_cli'].includes(explicit) || apiBase.includes('/api/codex/')) return 'local_codex';
         if (explicit === 'custom_openai') return 'compatible';
         if (explicit) return explicit;
         if (model.startsWith('openrouter/') || apiBase.includes('openrouter.ai')) return 'openrouter';
@@ -2922,11 +2922,16 @@ const LLMManager = {
         return `<span class="badge ${cls}">${this.escapeHtml(label)}</span>`;
     },
 
-    async loadCodexJobs() {
+    async loadCodexJobs(options = {}) {
         const container = document.getElementById('codexJobsList');
         if (!container) return;
+        const quiet = Boolean(options.quiet);
+        if (quiet && this.codexJobsLoading) return;
+        this.codexJobsLoading = true;
         try {
-            container.innerHTML = `<div class="text-center text-muted py-4"><div class="spinner-border spinner-border-sm me-2"></div>正在加载 Codex 任务…</div>`;
+            if (!quiet) {
+                container.innerHTML = `<div class="text-center text-muted py-4"><div class="spinner-border spinner-border-sm me-2"></div>正在加载 Codex 运行状态…</div>`;
+            }
             const result = await API.codexJobs.list();
             const data = result.data || {};
             this.renderCodexJobs(
@@ -2935,375 +2940,277 @@ const LLMManager = {
                 data.stats || {},
                 data.sessions || [],
                 data.session_stats || {},
-                data.app_server || {},
+                data.runtime || {},
+                data.upgrade || {},
+            );
+            this.scheduleCodexJobsPoll(
+                (data.active || []).length,
+                Boolean(data.upgrade?.operation_running),
             );
         } catch (e) {
             console.error('Failed to load Codex jobs:', e);
-            container.innerHTML = `<div class="alert alert-danger">加载 Codex 任务失败：${this.escapeHtml(e.message)}</div>`;
+            if (!quiet) {
+                container.innerHTML = `<div class="alert alert-danger">加载 Codex 运行状态失败：${this.escapeHtml(e.message)}</div>`;
+            }
+        } finally {
+            this.codexJobsLoading = false;
         }
     },
 
-    renderCodexJobs(active, recent, stats, sessions = [], sessionStats = {}, appServer = {}) {
+    scheduleCodexJobsPoll(activeCount = 0, operationRunning = false) {
+        clearTimeout(this.codexJobsPollTimer);
+        const pane = document.getElementById('llm-codex-jobs');
+        if (!pane?.classList.contains('active')) return;
+        const delay = operationRunning ? 1000 : activeCount > 0 ? 2000 : 10000;
+        this.codexJobsPollTimer = setTimeout(
+            () => this.loadCodexJobs({ quiet: true }),
+            delay,
+        );
+    },
+
+    renderCodexJobs(active, recent, stats, sessions = [], sessionStats = {}, runtime = {}, upgrade = {}) {
         const container = document.getElementById('codexJobsList');
         if (!container) return;
+        this.codexExpandedSessions ||= new Set();
 
-        const premiumStyles = `
-            <style>
-                .codex-dashboard { font-family: 'Inter', system-ui, sans-serif; }
-                .codex-stat-card {
-                    border: 1px solid var(--border-color);
-                    border-radius: 12px;
-                    background: var(--bg-card);
-                    box-shadow: var(--shadow-sm);
-                    transition: border-color 0.2s;
-                }
-                .codex-stat-icon-sm {
-                    width: 40px;
-                    height: 40px;
-                    border-radius: 10px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    font-size: 1.25rem;
-                    flex-shrink: 0;
-                }
-                .bg-icon-primary { background: var(--accent-soft); color: var(--primary); }
-                .bg-icon-success { background: var(--success-soft); color: var(--success); }
-                .bg-icon-info { background: var(--info-soft); color: var(--info); }
-                .bg-icon-warning { background: var(--warning-soft); color: var(--warning); }
-                .bg-icon-secondary { background: var(--bg-subtle); color: var(--text-secondary); }
-
-                .codex-table-card {
-                    border: 1px solid var(--border-color);
-                    border-radius: 12px;
-                    background: var(--bg-card);
-                    margin-bottom: 1.5rem;
-                    box-shadow: var(--shadow-sm);
-                    overflow: hidden;
-                }
-                .codex-table-header {
-                    padding: 1rem 1.25rem;
-                    background: var(--bg-card);
-                    border-bottom: 1px solid var(--border-color);
-                    display: flex;
-                    align-items: center;
-                    justify-content: space-between;
-                }
-                .codex-table {
-                    margin-bottom: 0;
-                    font-size: 0.85rem;
-                }
-                .codex-table thead th {
-                    background: var(--bg-soft);
-                    color: var(--text-secondary);
-                    font-weight: 500;
-                    padding: 0.75rem 1.25rem;
-                    border-bottom: 1px solid var(--border-color);
-                    white-space: nowrap;
-                }
-                .codex-table tbody td {
-                    padding: 0.85rem 1.25rem;
-                    vertical-align: middle;
-                    border-bottom: 1px solid var(--border-soft);
-                }
-                .codex-table tbody tr:last-child td { border-bottom: none; }
-                .codex-table tbody tr:hover { background-color: var(--bg-soft); }
-
-                .badge-custom {
-                    padding: 0.35em 0.6em;
-                    font-weight: 500;
-                    border-radius: 6px;
-                }
-                .progress-slim {
-                    height: 4px;
-                    border-radius: 2px;
-                    background-color: var(--bg-strong);
-                    overflow: hidden;
-                }
-                .text-subtext {
-                    font-size: 0.75rem;
-                    color: var(--text-secondary);
-                }
-                .data-value {
-                    font-size: 0.875rem;
-                    font-weight: 500;
-                    color: var(--text-main);
-                }
-                .mono-text {
-                    font-family: 'JetBrains Mono', Consolas, monospace;
-                    font-size: 0.825rem;
-                }
-                .w-max-120 { max-width: 120px; }
-                .w-max-150 { max-width: 150px; }
-                .w-max-200 { max-width: 200px; }
-            </style>
-        `;
-
-        const formatK = (num) => {
-            if (num === null || num === undefined) return '-';
-            const val = Number(num);
-            if (val >= 1000000) return (val / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
-            if (val >= 1000) return (val / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
-            return val.toLocaleString();
+        const formatK = value => {
+            const number = Number(value || 0);
+            if (number >= 1000000) return `${(number / 1000000).toFixed(1).replace(/\.0$/, '')}M`;
+            if (number >= 1000) return `${(number / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+            return number.toLocaleString();
+        };
+        const statusMeta = status => {
+            const key = String(status || 'idle');
+            const labels = {
+                queued: '等待中', starting: '准备中', running: '运行中', completed: '已完成', failed: '失败',
+                timeout: '已超时', cancelling: '正在中断', cancelled: '已取消', idle: '空闲',
+            };
+            const classes = {
+                queued: 'busy', starting: 'busy', running: 'busy', completed: 'ready', failed: 'failed',
+                timeout: 'warning', cancelling: 'warning', cancelled: '', idle: '',
+            };
+            return { label: labels[key] || key, className: classes[key] || '' };
+        };
+        const activityLabel = job => {
+            const item = String(job?.current_item_type || '');
+            const event = String(job?.progress_event || '');
+            const labels = {
+                reasoning: '分析中', agentMessage: '生成回复', commandExecution: '执行命令',
+                webSearch: '搜索中', mcpToolCall: '调用工具', fileChange: '处理文件',
+                imageGeneration: '生成图片', dynamicToolCall: '调用工具',
+            };
+            if (labels[item]) return labels[item];
+            return {
+                queued: '等待执行', turn_started: '开始处理', item_started: '处理中',
+                token_usage: '整理结果', process_started: '进程运行中', process_completed: '读取结果',
+                response_ready: '结果就绪', error: '执行失败',
+            }[event] || statusMeta(job?.status).label;
         };
 
+        const pools = runtime.pools || {};
+        const poolValues = Object.values(pools);
+        const workerCount = poolValues.reduce((sum, pool) => sum + Number(pool.size || 0), 0);
+        const queueCount = poolValues.reduce((sum, pool) => sum + Number(pool.waiting || 0), 0);
         const activeCount = Number(stats.active_count ?? active.length ?? 0);
-        const serverRunning = Boolean(appServer.running);
-        const currentThreadTokens = Number(sessionStats.current_thread_total_tokens || 0);
+        const sessionCount = Number(sessionStats.session_count ?? sessions.length ?? 0);
+        const operation = upgrade.operation || null;
+        const operationRunning = Boolean(upgrade.operation_running);
+        const serverRunning = Boolean(runtime.running);
+        const maintenance = Boolean(runtime.maintenance || operationRunning);
+        const dotClass = maintenance ? 'busy' : serverRunning ? 'ready' : 'failed';
+        const installedVersion = String(upgrade.installed_version || runtime.active_version || '-');
+        const schemaShort = String(runtime.schema_hash || '').slice(0, 10) || '-';
+        const checkedCurrent = Boolean(upgrade.available_version && !upgrade.update_available);
 
-        const summary = `
-            <div class="row g-3 mb-4 codex-dashboard">
-                <div class="col-md-6 col-xl">
-                    <div class="codex-stat-card p-3 d-flex align-items-center gap-3 h-100">
-                        <div class="codex-stat-icon-sm ${serverRunning ? 'bg-icon-success' : 'bg-icon-secondary'}">
-                            <i class="bi bi-server"></i>
-                        </div>
-                        <div>
-                            <div class="text-subtext mb-1 text-uppercase">应用服务器</div>
-                            <div class="data-value ${serverRunning ? 'text-success' : 'text-danger'}">${serverRunning ? '运行中' : '未运行'}</div>
-                            <div class="text-subtext mt-1">PID ${this.escapeHtml(appServer.pid || '-')} · 已加载 ${Number(appServer.loaded_threads || 0)}</div>
-                        </div>
+        const updateButton = operationRunning
+            ? `<button class="btn btn-outline-secondary" disabled><span class="spinner-border spinner-border-sm me-1"></span>处理中</button>`
+            : checkedCurrent
+                ? `<button class="btn btn-outline-secondary" disabled><i class="bi bi-check2 me-1"></i>已是最新</button>`
+                : `<button class="btn btn-primary codex-update-start"><i class="bi bi-arrow-up-circle me-1"></i>更新</button>`;
+        const rollbackButton = upgrade.rollback_available && !operationRunning
+            ? `<button class="btn btn-outline-secondary codex-update-rollback" title="恢复 ${this.escapeHtml(upgrade.rollback_version || '')}"><i class="bi bi-arrow-counterclockwise"></i></button>`
+            : '';
+
+        const operationFinishedAt = operation?.finished_at ? Date.parse(operation.finished_at) : NaN;
+        const showOperation = Boolean(operation && (
+            operationRunning
+            || operation.status === 'failed'
+            || !Number.isFinite(operationFinishedAt)
+            || Date.now() - operationFinishedAt < 10 * 60 * 1000
+        ));
+        const operationHtml = showOperation ? (() => {
+            const opStatus = statusMeta(operation.status === 'succeeded' || operation.status === 'rolled_back' ? 'completed' : operation.status);
+            const logs = (operation.logs || []).map(log => `
+                <div>${this.escapeHtml(log.at || '')} · ${this.escapeHtml(log.message || '')}</div>`).join('');
+            return `
+                <div class="codex-operation">
+                    <span class="codex-inline-badge ${opStatus.className}">${this.escapeHtml(opStatus.label)}</span>
+                    <div>
+                        <div class="codex-operation-message" title="${this.escapeHtml(operation.message || '')}">${this.escapeHtml(operation.message || '')}</div>
+                        <div class="progress mt-1"><div class="progress-bar" style="width:${Math.max(0, Math.min(Number(operation.progress || 0), 100))}%"></div></div>
                     </div>
-                </div>
-                <div class="col-md-6 col-xl">
-                    <div class="codex-stat-card p-3 d-flex align-items-center gap-3 h-100">
-                        <div class="codex-stat-icon-sm bg-icon-primary">
-                            <i class="bi bi-chat-square-dots"></i>
-                        </div>
-                        <div>
-                            <div class="text-subtext mb-1 text-uppercase">持久会话</div>
-                            <div class="fs-5 fw-semibold text-dark">${Number(sessionStats.session_count ?? sessions.length ?? 0).toLocaleString()}</div>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-4 col-xl">
-                    <div class="codex-stat-card p-3 d-flex align-items-center gap-3 h-100">
-                        <div class="codex-stat-icon-sm bg-icon-info">
-                            <i class="bi bi-activity"></i>
-                        </div>
-                        <div>
-                            <div class="text-subtext mb-1 text-uppercase">运行中任务</div>
-                            <div class="fs-5 fw-semibold text-dark">${activeCount.toLocaleString()}</div>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-4 col-xl">
-                    <div class="codex-stat-card p-3 d-flex align-items-center gap-3 h-100">
-                        <div class="codex-stat-icon-sm bg-icon-warning">
-                            <i class="bi bi-arrow-repeat"></i>
-                        </div>
-                        <div>
-                            <div class="text-subtext mb-1 text-uppercase">累计回复轮数</div>
-                            <div class="fs-5 fw-semibold text-dark">${Number(sessionStats.total_turn_count || 0).toLocaleString()}</div>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-4 col-xl">
-                    <div class="codex-stat-card p-3 d-flex align-items-center gap-3 h-100">
-                        <div class="codex-stat-icon-sm bg-icon-secondary">
-                            <i class="bi bi-coin"></i>
-                        </div>
-                        <div>
-                            <div class="text-subtext mb-1 text-uppercase">当前线程 Token</div>
-                            <div class="fs-5 fw-semibold text-dark">${formatK(currentThreadTokens)}</div>
-                            <div class="text-subtext mt-1">非历史总消费</div>
-                        </div>
-                    </div>
-                </div>
-            </div>`;
+                    ${logs ? `<details><summary>过程</summary><div class="codex-operation-log">${logs}</div></details>` : '<span></span>'}
+                </div>`;
+        })() : '';
+
+        const activeByChat = new Map(
+            active.filter(job => job.chat_id).map(job => [String(job.chat_id), job]),
+        );
 
         const renderSessions = () => {
-            if (!sessions || sessions.length === 0) {
-                return `<div class="text-center text-muted py-5"><i class="bi bi-inbox fs-2 d-block mb-2 opacity-50"></i>暂无持久会话</div>`;
-            }
+            if (!sessions.length) return '<div class="codex-empty">暂无持久会话</div>';
             const rows = sessions.map(session => {
-                const threadId = String(session.thread_id || '');
-                const shortThread = threadId ? `${threadId.slice(0, 8)}…${threadId.slice(-6)}` : '-';
-                const turnId = String(session.turn_id || '');
-                const shortTurnId = turnId ? `${turnId.slice(0, 8)}…` : '-';
-
+                const chatId = String(session.chat_id || '');
+                const activeJob = activeByChat.get(chatId);
+                const status = statusMeta(activeJob?.status || session.status);
                 const input = Number(session.last_input_tokens || 0);
                 const cached = Number(session.last_cached_input_tokens || 0);
                 const completion = Number(session.last_completion_tokens || 0);
                 const total = Number(session.last_total_tokens || 0);
-                const cacheRate = session.cache_hit_rate === null || session.cache_hit_rate === undefined
-                    ? null
-                    : Number(session.cache_hit_rate) * 100;
                 const contextWindow = Number(session.model_context_window || 0);
                 const contextPercent = session.context_usage_percent === null || session.context_usage_percent === undefined
-                    ? null
-                    : Number(session.context_usage_percent);
-                const safePercent = contextPercent === null ? 0 : Math.max(0, Math.min(contextPercent, 100));
+                    ? null : Number(session.context_usage_percent);
+                const safePercent = Math.max(0, Math.min(contextPercent || 0, 100));
+                const cacheRate = input > 0 ? cached / input * 100 : null;
+                const roleName = !session.role_name || session.role_name === 'default' ? '默认' : session.role_name;
+                const expanded = this.codexExpandedSessions.has(chatId);
                 const sessionTotal = session.session_total || {};
-                const roleName = !session.role_name || session.role_name === 'default'
-                    ? '默认'
-                    : session.role_name;
-                const hasUsage = input > 0 || completion > 0 || total > 0;
-
-                const exactBadge = !hasUsage
-                    ? '<span class="badge bg-light text-muted border badge-custom">等待统计</span>'
-                    : session.usage_estimated
-                        ? '<span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle badge-custom">估算</span>'
-                        : '<span class="badge bg-success-subtle text-success-emphasis border badge-custom"><i class="bi bi-check-circle me-1"></i>精确</span>';
-
-                const searchMode = session.web_search_mode
-                    ? `<span class="badge bg-light text-secondary border badge-custom ms-1"><i class="bi bi-search"></i></span>`
-                    : '';
-
-                const contextCell = contextWindow
-                    ? `<div class="d-flex justify-content-between text-subtext mb-1">
-                           <span class="mono-text">${formatK(input)}</span>
-                           <span class="mono-text">${formatK(contextWindow)}</span>
-                       </div>
-                       <div class="progress progress-slim">
-                           <div class="progress-bar ${safePercent >= 90 ? 'bg-danger' : safePercent >= 75 ? 'bg-warning' : 'bg-primary'}" style="width:${safePercent}%"></div>
-                       </div>
-                       <div class="text-end text-subtext mt-1">${contextPercent.toFixed(1)}%</div>`
-                    : '<span class="text-muted">-</span>';
-
+                const contextClass = safePercent >= 90 ? 'danger' : safePercent >= 75 ? 'warning' : '';
+                const contextHtml = contextWindow ? `
+                    <div class="codex-context">
+                        <div class="codex-context-label"><span>${formatK(input)}</span><span>${contextPercent.toFixed(1)}%</span></div>
+                        <div class="codex-context-track ${contextClass}"><i style="width:${safePercent}%"></i></div>
+                    </div>` : '<span class="codex-cell-sub">尚无数据</span>';
+                const detailHtml = expanded ? `
+                    <tr class="codex-detail-row"><td colspan="7">
+                        <div class="codex-detail-grid">
+                            <div><small>Thread ID</small><span title="${this.escapeHtml(session.thread_id || '')}">${this.escapeHtml(session.thread_id || '-')}</span></div>
+                            <div><small>最近 Turn</small><span title="${this.escapeHtml(session.turn_id || '')}">${this.escapeHtml(session.turn_id || '-')}</span></div>
+                            <div><small>最近一轮</small><span>输入 ${formatK(input)} · 输出 ${formatK(completion)} · 缓存 ${formatK(cached)}</span></div>
+                            <div><small>线程累计</small><span>${formatK(sessionTotal.total_tokens || 0)} Token</span></div>
+                            <div><small>推理 / 搜索</small><span>${this.escapeHtml(this.reasoningEffortLabel(session.reasoning_effort))} · ${session.web_search_mode ? this.escapeHtml(session.web_search_mode) : '关闭'}</span></div>
+                            <div><small>统计来源</small><span>${this.escapeHtml(session.usage_source || '-')}</span></div>
+                            <div><small>Schema</small><span>${this.escapeHtml(session.schema_hash || runtime.schema_hash || '-')}</span></div>
+                            <div><small>最近活动</small><span>${this.formatJobTime(session.updated_at)}</span></div>
+                        </div>
+                    </td></tr>` : '';
                 return `
                     <tr>
-                        <td class="w-max-150">
-                            <div class="data-value text-truncate" title="${this.escapeHtml(session.chat_id || '')}">${this.escapeHtml(session.chat_id || '-')}</div>
-                            <div class="text-subtext text-truncate mt-1" title="${this.escapeHtml(session.role_name || '')}"><i class="bi bi-tag me-1"></i>${this.escapeHtml(roleName)}</div>
-                        </td>
-                        <td class="text-center">${this.jobStatusBadge(session.status)}</td>
                         <td>
-                            <div class="mono-text text-muted" title="${this.escapeHtml(threadId)}"><i class="bi bi-hash"></i>${this.escapeHtml(shortThread)}</div>
-                            <div class="text-subtext mt-1 text-truncate w-max-120" title="${this.escapeHtml(turnId)}">轮次：<span class="mono-text">${this.escapeHtml(shortTurnId)}</span></div>
+                            <div class="codex-cell-main" title="${this.escapeHtml(chatId)}">${this.escapeHtml(chatId || '-')}</div>
+                            <div class="codex-cell-sub">${this.escapeHtml(roleName)}</div>
                         </td>
                         <td>
-                            <div class="data-value">${this.escapeHtml(session.model || '-')}</div>
-                            <div class="text-subtext mt-1">${this.escapeHtml(this.reasoningEffortLabel(session.reasoning_effort))} ${searchMode}</div>
-                        </td>
-                        <td class="text-center">
-                            <span class="badge bg-light text-dark border badge-custom">${Number(session.turn_count || 0).toLocaleString()}</span>
+                            <span class="codex-inline-badge ${status.className}">${this.escapeHtml(status.label)}</span>
+                            <div class="codex-cell-sub">${activeJob ? this.escapeHtml(activityLabel(activeJob)) : '等待消息'}</div>
                         </td>
                         <td>
-                            <div class="d-flex align-items-center gap-3 mb-1">
-                                <div><span class="text-subtext me-1">输入</span><span class="mono-text">${formatK(input)}</span></div>
-                                <div><span class="text-subtext me-1">输出</span><span class="mono-text">${formatK(completion)}</span></div>
-                            </div>
-                            <div class="d-flex align-items-center gap-3 text-subtext">
-                                <div><span class="me-1">缓存</span><span class="mono-text">${formatK(cached)}</span></div>
-                                <div><span class="me-1">总计</span><span class="mono-text">${formatK(total)}</span></div>
-                                <div>${exactBadge}</div>
+                            <div class="codex-cell-main">${this.escapeHtml(session.model || '-')}</div>
+                            <div class="codex-cell-sub">${Number(session.turn_count || 0).toLocaleString()} 轮</div>
+                        </td>
+                        <td>${contextHtml}</td>
+                        <td>
+                            <div class="codex-cell-main codex-mono">${formatK(total)} Token</div>
+                            <div class="codex-cell-sub">缓存 ${cacheRate === null ? '-' : `${cacheRate.toFixed(1)}%`}</div>
+                        </td>
+                        <td><span class="codex-mono">${this.formatJobTime(session.updated_at)}</span></td>
+                        <td>
+                            <div class="codex-row-actions">
+                                <button class="btn codex-session-toggle" data-chat-id="${this.escapeHtml(chatId)}" title="${expanded ? '收起详情' : '查看详情'}"><i class="bi bi-${expanded ? 'chevron-up' : 'chevron-down'}"></i></button>
+                                ${activeJob ? `<button class="btn text-danger codex-session-interrupt" data-chat-id="${this.escapeHtml(chatId)}" title="中断当前任务"><i class="bi bi-stop-circle"></i></button>` : ''}
+                                <button class="btn codex-session-reset" data-chat-id="${this.escapeHtml(chatId)}" title="开启新上下文"><i class="bi bi-arrow-repeat"></i></button>
                             </div>
                         </td>
-                        <td>
-                            <div class="data-value mono-text">${cacheRate === null ? '-' : `${cacheRate.toFixed(1)}%`}</div>
-                            <div class="text-subtext mt-1">未命中 <span class="mono-text">${formatK(Number(session.last_cache_miss_input_tokens || 0))}</span></div>
-                        </td>
-                        <td style="min-width: 140px; max-width: 180px;">${contextCell}</td>
-                        <td>
-                            <div class="data-value mono-text">${formatK(Number(sessionTotal.total_tokens || 0))}</div>
-                            <div class="text-subtext mt-1">缓存 <span class="mono-text">${formatK(Number(sessionTotal.cached_input_tokens || 0))}</span></div>
-                        </td>
-                        <td style="max-width: 160px;">
-                            <div class="data-value text-nowrap">${this.formatJobTime(session.updated_at)}</div>
-                            <div class="text-subtext text-truncate mt-1" title="${this.escapeHtml(session.usage_source || '')}">${this.escapeHtml(session.usage_source || '')}</div>
-                        </td>
-                    </tr>`;
+                    </tr>${detailHtml}`;
             }).join('');
-
             return `
                 <div class="table-responsive">
-                    <table class="table codex-table align-middle">
-                        <thead>
-                            <tr>
-                                <th>聊天 / 角色</th>
-                                <th class="text-center">状态</th>
-                                <th>线程 / 轮次</th>
-                                <th>模型</th>
-                                <th class="text-center">轮数</th>
-                                <th>Token（最近一轮）</th>
-                                <th>缓存命中</th>
-                                <th>上下文占用</th>
-                                <th>Token（累计）</th>
-                                <th>更新时间</th>
-                            </tr>
-                        </thead>
+                    <table class="codex-compact-table" style="min-width:860px">
+                        <thead><tr><th>会话</th><th>状态</th><th>模型</th><th>上下文</th><th>最近 Token</th><th>活动时间</th><th></th></tr></thead>
                         <tbody>${rows}</tbody>
                     </table>
                 </div>`;
         };
 
-        const renderTable = (jobs, activeTable = false) => {
-            if (!jobs || jobs.length === 0) {
-                return `<div class="text-center text-muted py-4"><i class="bi bi-hdd-network fs-3 d-block mb-2 opacity-50"></i>${activeTable ? '当前没有运行中的 Codex 任务' : '暂无最近任务记录'}</div>`;
-            }
+        const renderJobs = (jobs, running = false) => {
+            if (!jobs.length) return `<div class="codex-empty">${running ? '当前没有运行中的任务' : '暂无任务历史'}</div>`;
             const rows = jobs.map(job => {
                 const requestId = String(job.request_id || '');
-                const shortId = requestId ? `${requestId.slice(0, 8)}…${requestId.slice(-6)}` : '-';
-                const error = job.error ? `<div class="text-danger mt-1 text-subtext text-truncate w-max-200" title="${this.escapeHtml(job.error)}"><i class="bi bi-exclamation-triangle me-1"></i>${this.escapeHtml(job.error)}</div>` : '';
-                const cancelBtn = activeTable ? `<button class="btn btn-sm btn-outline-danger rounded-pill px-3 codex-job-cancel" data-request-id="${this.escapeHtml(requestId)}"><i class="bi bi-stop-circle me-1"></i>取消</button>` : '';
-
+                const status = statusMeta(job.status);
+                const identity = job.chat_id || job.profile || job.backend || '-';
+                const error = job.error ? `<div class="codex-cell-sub text-danger" title="${this.escapeHtml(job.error)}">${this.escapeHtml(job.error)}</div>` : '';
                 return `
                     <tr>
-                        <td><code class="bg-light text-dark px-2 py-1 rounded mono-text" title="${this.escapeHtml(requestId)}">${this.escapeHtml(shortId)}</code></td>
-                        <td>${this.jobStatusBadge(job.status)}</td>
-                        <td><span class="data-value">${this.escapeHtml(job.model || '-')}</span></td>
-                        <td>${job.web_search ? '<span class="badge bg-info-subtle text-info-emphasis badge-custom"><i class="bi bi-search me-1"></i>搜索</span>' : '<span class="badge bg-light text-secondary border badge-custom">无</span>'}</td>
-                        <td class="mono-text">${this.escapeHtml(job.image_count ?? 0)}</td>
-                        <td class="mono-text">${this.escapeHtml(job.prompt_chars ?? 0)}</td>
-                        <td class="mono-text">${this.formatJobDuration(job)}</td>
-                        <td>
-                            <div class="data-value">${this.formatJobTime(job.started_at)}</div>
-                            ${error}
-                        </td>
-                        <td class="text-end">${cancelBtn}</td>
+                        <td><div class="codex-cell-main">${this.escapeHtml(identity)}</div><div class="codex-cell-sub codex-mono" title="${this.escapeHtml(requestId)}">${this.escapeHtml(requestId.slice(0, 12))}</div></td>
+                        <td><span class="codex-inline-badge ${status.className}">${this.escapeHtml(status.label)}</span><div class="codex-cell-sub">${this.escapeHtml(activityLabel(job))}</div></td>
+                        <td><div class="codex-cell-main">${this.escapeHtml(job.model || '-')}</div><div class="codex-cell-sub">${this.escapeHtml(job.pool_worker || job.backend || '')}</div></td>
+                        <td><span class="codex-mono">${formatK(job.total_tokens || 0)}</span></td>
+                        <td><span class="codex-mono">${this.formatJobDuration(job)}</span>${error}</td>
+                        <td><span class="codex-mono">${this.formatJobTime(job.started_at)}</span></td>
+                        <td><div class="codex-row-actions"><button class="btn codex-job-details" data-request-id="${this.escapeHtml(requestId)}" title="查看过程"><i class="bi bi-list-ul"></i></button>${running ? `<button class="btn text-danger codex-job-cancel" data-request-id="${this.escapeHtml(requestId)}" title="取消任务"><i class="bi bi-stop-circle"></i></button>` : ''}</div></td>
                     </tr>`;
             }).join('');
-
             return `
-                <div class="table-responsive">
-                    <table class="table codex-table align-middle">
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>状态</th>
-                                <th>模型</th>
-                                <th>搜索</th>
-                                <th>图片数</th>
-                                <th>提示词</th>
-                                <th>耗时</th>
-                                <th>开始时间 / 错误</th>
-                                <th></th>
-                            </tr>
-                        </thead>
-                        <tbody>${rows}</tbody>
-                    </table>
-                </div>`;
+                <div class="table-responsive"><table class="codex-compact-table" style="min-width:760px">
+                    <thead><tr><th>来源</th><th>进度</th><th>模型 / Worker</th><th>Token</th><th>耗时</th><th>开始时间</th><th></th></tr></thead>
+                    <tbody>${rows}</tbody>
+                </table></div>`;
         };
 
         container.innerHTML = `
-            ${premiumStyles}
-            ${summary}
-
-            <div class="codex-table-card">
-                <div class="codex-table-header">
-                    <h6 class="mb-0 fw-semibold text-dark"><i class="bi bi-chat-square-text me-2 text-primary"></i>持久会话</h6>
-                    <span class="badge bg-light text-secondary border fw-normal">一个聊天对象对应一个当前线程</span>
+            <div class="codex-center">
+                <div class="codex-runtime-strip">
+                    <div class="codex-runtime-identity">
+                        <span class="codex-runtime-dot ${dotClass}"></span>
+                        <div><strong>${maintenance ? '运行环境维护中' : serverRunning ? 'Codex 正常运行' : 'Codex 未就绪'}</strong><small>${this.escapeHtml(installedVersion)}</small></div>
+                    </div>
+                    <div class="codex-runtime-facts">
+                        <span>进程<strong>${workerCount}</strong></span><span>队列<strong>${queueCount}</strong></span><span>会话<strong>${sessionCount}</strong></span><span>任务<strong>${activeCount}</strong></span><span>线程 Token<strong>${formatK(sessionStats.current_thread_total_tokens || 0)}</strong></span><span>Schema<strong class="codex-mono">${this.escapeHtml(schemaShort)}</strong></span><span>安装<strong>${this.escapeHtml(upgrade.installation?.method_label || '-')}</strong></span>
+                        ${upgrade.update_available ? `<span class="codex-inline-badge warning">可用 ${this.escapeHtml(upgrade.available_version || '')}</span>` : ''}
+                    </div>
+                    <div class="codex-runtime-actions">
+                        <button class="btn btn-outline-secondary codex-update-check" ${operationRunning ? 'disabled' : ''} title="检查最新版本"><i class="bi bi-arrow-clockwise"></i></button>
+                        ${updateButton}${rollbackButton}
+                    </div>
                 </div>
-                ${renderSessions()}
-            </div>
-
-            <div class="codex-table-card">
-                <div class="codex-table-header">
-                    <h6 class="mb-0 fw-semibold text-dark"><i class="bi bi-play-circle me-2 text-info"></i>运行中的任务</h6>
-                </div>
-                ${renderTable(active, true)}
-            </div>
-
-            <div class="codex-table-card mb-0">
-                <div class="codex-table-header">
-                    <h6 class="mb-0 fw-semibold text-dark"><i class="bi bi-clock-history me-2 text-secondary"></i>最近任务</h6>
-                </div>
-                ${renderTable(recent, false)}
+                ${operationHtml}
+                <section class="codex-section">
+                    <div class="codex-section-head"><h6>会话</h6><small>${sessionCount} 个持久上下文 · ${Number(sessionStats.total_turn_count || 0).toLocaleString()} 轮</small></div>
+                    ${renderSessions()}
+                </section>
+                ${active.length ? `<section class="codex-section"><div class="codex-section-head"><h6>正在执行</h6><small>${active.length} 个任务</small></div>${renderJobs(active, true)}</section>` : ''}
+                <details class="codex-section codex-history" ${this.codexHistoryOpen ? 'open' : ''}>
+                    <summary>任务历史 <span>${recent.length} 条 · 点击展开</span></summary>
+                    ${renderJobs(recent, false)}
+                </details>
             </div>`;
+
+        container.querySelectorAll('.codex-session-toggle').forEach(button => {
+            button.addEventListener('click', () => {
+                const chatId = button.dataset.chatId;
+                if (this.codexExpandedSessions.has(chatId)) this.codexExpandedSessions.delete(chatId);
+                else this.codexExpandedSessions.add(chatId);
+                this.renderCodexJobs(active, recent, stats, sessions, sessionStats, runtime, upgrade);
+            });
+        });
+        container.querySelector('.codex-history')?.addEventListener('toggle', event => {
+            this.codexHistoryOpen = event.currentTarget.open;
+        });
         container.querySelectorAll('.codex-job-cancel').forEach(button => {
             button.addEventListener('click', () => this.cancelCodexJob(button.dataset.requestId));
         });
+        container.querySelectorAll('.codex-job-details').forEach(button => {
+            button.addEventListener('click', () => this.showCodexJobDetails(button.dataset.requestId));
+        });
+        container.querySelectorAll('.codex-session-reset').forEach(button => {
+            button.addEventListener('click', () => this.resetCodexSession(button.dataset.chatId));
+        });
+        container.querySelectorAll('.codex-session-interrupt').forEach(button => {
+            button.addEventListener('click', () => this.interruptCodexSession(button.dataset.chatId));
+        });
+        container.querySelector('.codex-update-check')?.addEventListener('click', () => this.checkCodexUpdate());
+        container.querySelector('.codex-update-start')?.addEventListener('click', () => this.startCodexUpdate(upgrade));
+        container.querySelector('.codex-update-rollback')?.addEventListener('click', () => this.rollbackCodex(upgrade));
     },
 
     async cancelCodexJob(requestId) {
@@ -3320,6 +3227,139 @@ const LLMManager = {
         } catch (e) {
             UI.showError('取消失败：' + e.message);
             await this.loadCodexJobs();
+        }
+    },
+
+    async showCodexJobDetails(requestId) {
+        if (!requestId) return;
+        try {
+            const response = await API.codexJobs.events(requestId);
+            const job = response.data?.job || {};
+            const events = response.data?.events || [];
+            const labels = {
+                queued: '进入队列', turn_started: '开始处理', item_started: '开始步骤',
+                item_completed: '完成步骤', token_usage: '更新 Token', process_started: '进程启动',
+                process_completed: '进程结束', response_ready: '结果就绪', error: '发生错误',
+                cancel_requested: '请求中断', turn_completed: 'Turn 完成', job_finished: '任务结束',
+            };
+            const itemLabels = {
+                userMessage: '提交输入', reasoning: '分析', agentMessage: '生成回复', commandExecution: '执行命令',
+                webSearch: '网页搜索', mcpToolCall: '调用工具', fileChange: '处理文件',
+                imageGeneration: '生成图片', dynamicToolCall: '调用工具',
+            };
+            const eventRows = events.length ? events.map(event => {
+                const item = itemLabels[event.item_type] || event.item_type || '';
+                const detail = event.message || item || event.status || '';
+                return `<div class="codex-event"><strong>${this.escapeHtml(labels[event.type] || event.type || '-')}</strong><small>${this.formatJobTime(event.created_at)}${detail ? ` · ${this.escapeHtml(detail)}` : ''}</small></div>`;
+            }).join('') : '<div class="text-muted small">暂无过程记录</div>';
+
+            let modal = document.getElementById('codexJobEventModal');
+            if (!modal) {
+                modal = document.createElement('div');
+                modal.id = 'codexJobEventModal';
+                modal.className = 'modal fade';
+                modal.tabIndex = -1;
+                modal.innerHTML = `
+                    <div class="modal-dialog modal-dialog-scrollable">
+                        <div class="modal-content">
+                            <div class="modal-header py-2"><h6 class="modal-title">任务过程</h6><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                            <div class="modal-body" id="codexJobEventBody"></div>
+                        </div>
+                    </div>`;
+                document.body.appendChild(modal);
+            }
+            modal.querySelector('#codexJobEventBody').innerHTML = `
+                <div class="d-flex flex-wrap gap-3 pb-3 mb-3 border-bottom small text-muted">
+                    <span>状态 <strong class="text-body">${this.escapeHtml(job.status || '-')}</strong></span>
+                    <span>模型 <strong class="text-body">${this.escapeHtml(job.model || '-')}</strong></span>
+                    <span>耗时 <strong class="text-body">${this.formatJobDuration(job)}</strong></span>
+                    <span>Token <strong class="text-body">${Number(job.total_tokens || 0).toLocaleString()}</strong></span>
+                </div>
+                ${job.error ? `<div class="alert alert-danger py-2 small">${this.escapeHtml(job.error)}</div>` : ''}
+                <div class="codex-event-list">${eventRows}</div>`;
+            bootstrap.Modal.getOrCreateInstance(modal).show();
+        } catch (error) {
+            UI.showError(`读取任务过程失败：${error.message}`);
+        }
+    },
+
+    async checkCodexUpdate() {
+        try {
+            const response = await API.codexJobs.checkUpdate();
+            const data = response.data || {};
+            if (data.update_available) {
+                UI.showSuccess(`可更新到 Codex ${data.available_version}`);
+            } else {
+                UI.showSuccess('当前已是最新版本');
+            }
+            await this.loadCodexJobs({ quiet: true });
+        } catch (error) {
+            UI.showError(`检查版本失败：${error.message}`);
+        }
+    },
+
+    async startCodexUpdate(upgrade = {}) {
+        const target = upgrade.available_version ? ` ${upgrade.available_version}` : '最新版';
+        if (!await UI.confirm(`确定将 Codex 更新到${target}吗？现有任务会继续运行，验证通过后自动切换。`, {
+            title: '更新 Codex',
+            confirmText: '开始更新',
+            variant: 'primary',
+        })) return;
+        try {
+            await API.codexJobs.startUpdate();
+            UI.showSuccess('Codex 更新任务已开始');
+            await this.loadCodexJobs({ quiet: true });
+        } catch (error) {
+            UI.showError(`启动更新失败：${error.message}`);
+        }
+    },
+
+    async rollbackCodex(upgrade = {}) {
+        const version = upgrade.rollback_version || '上一版本';
+        if (!await UI.confirm(`确定恢复 Codex ${version} 吗？运行时会在验证通过后自动切换。`, {
+            title: '恢复 Codex',
+            confirmText: '开始恢复',
+            variant: 'warning',
+        })) return;
+        try {
+            await API.codexJobs.rollback();
+            UI.showSuccess('Codex 恢复任务已开始');
+            await this.loadCodexJobs({ quiet: true });
+        } catch (error) {
+            UI.showError(`启动恢复失败：${error.message}`);
+        }
+    },
+
+    async resetCodexSession(chatId) {
+        if (!chatId) return;
+        if (!await UI.confirm(`确定让“${chatId}”在下一条消息时开启新上下文吗？`, {
+            title: '开启新上下文',
+            confirmText: '确认',
+            variant: 'warning',
+        })) return;
+        try {
+            await API.codexJobs.resetSession(chatId);
+            this.codexExpandedSessions?.delete(chatId);
+            UI.showSuccess('下一条消息将使用新上下文');
+            await this.loadCodexJobs({ quiet: true });
+        } catch (error) {
+            UI.showError(`操作失败：${error.message}`);
+        }
+    },
+
+    async interruptCodexSession(chatId) {
+        if (!chatId) return;
+        if (!await UI.confirm(`确定中断“${chatId}”当前正在运行的任务吗？`, {
+            title: '中断任务',
+            confirmText: '中断',
+            variant: 'danger',
+        })) return;
+        try {
+            await API.codexJobs.interruptSession(chatId);
+            UI.showSuccess('已发送中断请求');
+            await this.loadCodexJobs({ quiet: true });
+        } catch (error) {
+            UI.showError(`中断失败：${error.message}`);
         }
     },
 

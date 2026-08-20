@@ -58,9 +58,22 @@ class MenuData(BaseModel):
 class MenuTranslatorPlugin:
     """菜单翻译插件主类"""
 
-    def __init__(self):
+    def __init__(self, context=None):
+        self.context = context
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        self.output_dir = os.path.join(self.plugin_dir, "images")
+        if context is not None:
+            migration_notes = context.storage.migrate_legacy_directory(
+                Path(self.plugin_dir) / "images", storage_class="generated", relative="menus"
+            )
+            self.output_dir = str(context.storage.generated_root / "menus")
+            if migration_notes:
+                context.audit.record(
+                    "storage_migration",
+                    summary="菜单翻译结果已迁移到插件标准存储目录",
+                    details={"moved_files": len(migration_notes)},
+                )
+        else:
+            self.output_dir = os.path.join(self.plugin_dir, "images")
         os.makedirs(self.output_dir, exist_ok=True)
 
         # 从 config.json 读取配置
@@ -158,13 +171,12 @@ class MenuTranslatorPlugin:
                 )
 
             # 启动最长等待定时器
-            max_timer = threading.Timer(
+            max_timer = self.context.workers.start_timer(
+                f"max-timeout-{chat_name}-{time.time_ns()}",
                 self.image_window_minutes * 60,
                 self._on_max_timeout,
-                args=(chat_name,)
+                args=(chat_name,),
             )
-            max_timer.daemon = True
-            max_timer.start()
 
             with self._lock:
                 if chat_name in self._sessions:
@@ -231,21 +243,20 @@ class MenuTranslatorPlugin:
                 # 如果已达上限，立即触发
                 if count >= self.max_images:
                     logger.info(f"🍽️ [{chat_name}] 已收集 {self.max_images} 张图片，立即开始翻译")
-                    threading.Thread(
-                        target=self._process_session,
+                    self.context.workers.start(
+                        f"translate-{chat_name}-{time.time_ns()}",
+                        self._process_session,
                         args=(chat_name,),
-                        daemon=True
-                    ).start()
+                    )
                     return True
 
                 # 设置新的空闲超时定时器
-                idle_timer = threading.Timer(
+                idle_timer = self.context.workers.start_timer(
+                    f"idle-timeout-{chat_name}-{time.time_ns()}",
                     self.idle_timeout_seconds,
                     self._on_idle_timeout,
-                    args=(chat_name,)
+                    args=(chat_name,),
                 )
-                idle_timer.daemon = True
-                idle_timer.start()
                 session["timer"] = idle_timer
 
             return True
@@ -584,12 +595,18 @@ def handle_image(event: Event) -> bool:
     return False
 
 
-def register(event_bus, subscribe):
+def register(event_bus, subscribe, context):
     """注册插件"""
     global plugin
     logger.info("🍽️ 注册 menu_translator 插件...")
     try:
-        plugin = MenuTranslatorPlugin()
+        plugin = MenuTranslatorPlugin(context)
+        context.health.register(lambda: {
+            "status": "healthy" if plugin is not None else "unhealthy",
+            "message": "菜单翻译会话服务已就绪" if plugin is not None else "菜单翻译服务未初始化",
+            "active_sessions": len(plugin._sessions) if plugin is not None else 0,
+        })
+        context.register_cleanup(unregister)
 
         subscribe(
             event_type=EventType.TEXT_MESSAGE_RECEIVED,

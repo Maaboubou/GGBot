@@ -1,6 +1,6 @@
 # WxAutoX 插件规范（Manifest v2）
 
-本目录中的每个运行时插件必须同时提供 `config.json`、`manifest.json` 和 `main.py`。Manifest v2 是插件的运行契约：插件管理器会在加载时校验声明与实际订阅是否完全一致；声明缺失、字段无效或代码额外注册监听器都会导致插件拒绝加载。
+本目录中的每个可加载插件必须同时提供 `config.json`、`manifest.json` 和 `main.py`。Manifest v2 是插件的运行契约：插件管理器会在加载时校验声明与实际订阅是否完全一致；声明缺失、字段无效或代码额外注册监听器都会导致插件拒绝加载。
 
 ## 1. 标准目录
 
@@ -86,6 +86,21 @@ app/plugins/my_plugin/
 ```json
 {
   "schema_version": 2,
+  "plugin_api_version": 2,
+  "storage": {
+    "cache_retention_days": 7,
+    "cache_limit_mb": 500
+  },
+  "backup": {
+    "schema_version": 1,
+    "include_persistent_storage": true,
+    "include_generated_files": false,
+    "supports_restore_migration": true
+  },
+  "health": {
+    "critical": false,
+    "timeout_seconds": 5
+  },
   "listeners": [
     {
       "event": "text_message_received",
@@ -152,7 +167,44 @@ app/plugins/my_plugin/
 
 `jobs` 用于能力说明和设置导航，不进入消息执行顺序。
 
-## 4. main.py
+## 4. 统一插件管理接口（Plugin Runtime API v2）
+
+所有插件必须声明 `plugin_api_version: 2`，并让 `register()` 接收第三个 `PluginContext`。平台不再提供 Runtime API v1 的兼容加载路径；缺少版本声明或仍使用双参数注册的插件会被直接拒绝加载。
+
+```python
+def register(event_bus, subscribe, context):
+    path = context.storage.persistent_path("state.json")
+    cache = context.storage.cache_path("lookup.json")
+    browser_profile = context.storage.machine_bound_path("browser/Default")
+    temporary = context.storage.temp_path("download.bin")
+
+    context.health.register(lambda: {"status": "healthy", "message": "连接正常"})
+    context.register_cleanup(close_browser_and_http_clients)
+
+    context.tasks.submit(
+        "refresh_index",
+        "刷新索引",
+        lambda operation: rebuild_index(operation, path),
+    )
+    context.workers.start("scheduler", run_scheduler_loop)
+```
+
+运行时约束：
+
+- 正式数据只能写入 `context.storage.persistent_path()`；它会自动进入状态备份和完整迁移。
+- 浏览器配置、硬件索引等机器绑定数据写入 `context.storage.machine_bound_path()`；默认不进入备份，只有管理员显式勾选“包含机器绑定数据”时才打包。
+- 可重建缓存写入 `cache_path()`，临时下载写入 `temp_path()`；默认不备份，卸载时清理临时目录。
+- 后台工作通过 `context.tasks.submit()` 提交，自动获得进度、取消、历史和插件所有权。
+- 长任务通过 `context.tasks.submit()` 运行；长期调度循环通过 `context.workers.start()` 启动，并在循环中检查 `context.workers.stop_event`。
+- 浏览器、HTTP session、线程池等其他资源必须通过 `register_cleanup()` 登记。
+- 插件应注册轻量健康检查；异常会统一出现在“系统 → 运行状态”。
+- 需要恢复数据结构升级的插件声明 `supports_restore_migration`，后续格式版本通过插件恢复钩子迁移。
+
+插件不得直接创建 `threading.Thread`、`threading.Timer`、长期 `ClientSession`，也不得随意写入公共 `data/`/`tmp/`。Runtime API v2 不提供旧实现的兼容加载路径。
+
+`summary_plus` 是 Runtime API v2 的完整参考实现：`runtime_support.py` 展示有界任务准入、URL 去重、分池并发与托管产物；`browser_runtime.py` 展示单例浏览器生命周期；`media_pipeline.py` 和 `xhs_service.py` 展示如何把平台能力从入口类拆开。新插件应复用这些运行模式，不要复制具体平台业务代码。
+
+## 5. main.py
 
 ```python
 import logging
@@ -185,9 +237,10 @@ def handle_text(event: Event) -> bool:
     return plugin.handle_text(event) if plugin else False
 
 
-def register(event_bus, subscribe):
+def register(event_bus, subscribe, context):
     global plugin
     plugin = MyPlugin()
+    context.health.register(lambda: {"status": "healthy", "message": "插件已就绪"})
     subscribe(EventType.TEXT_MESSAGE_RECEIVED, handle_text)
 
 
@@ -198,7 +251,7 @@ def unregister():
 
 不要向 `subscribe()` 传顺序数值或阻断参数。它只接收事件、处理器，以及少数确需消除同名处理器歧义时使用的 `listener_key`；顺序和传播行为分别由中央顺序表与 Manifest 决定。
 
-## 5. 会话型插件
+## 6. 会话型插件
 
 多轮图片收集、向导等插件应为“开始命令”和“会话续接”分别声明监听器触发语义。若需要在会话期临时豁免群聊 @ 条件，可使用：
 
@@ -209,7 +262,7 @@ event_bus.release_session_permission(chat_name, "my_plugin")
 
 必须设置有限时长，并在完成、取消和异常清理时主动释放。插件仍需维护自己的会话状态；临时权限不等于自动消费消息。
 
-## 6. 质量要求与升级清单
+## 7. 质量要求与升级清单
 
 - 处理器未命中时返回 `False`，成功消费时才返回 `True`。
 - 网络、浏览器和模型异常不得错误返回已消费。
@@ -218,5 +271,7 @@ event_bus.release_session_permission(chat_name, "my_plugin")
 - 配置项使用明确标题、说明、类型和默认值；触发字段归入 `trigger` 组。
 - 使用统一 LLM 路由的每个 `call_type` 都在 `ui.llm_tasks` 声明用户可读名称和用途。
 - Manifest 中每个监听器与 `register()` 逐一对应，定时任务放入 `jobs`。
+- 新插件声明 `plugin_api_version: 2`，并通过 `PluginContext` 管理任务、存储、健康和清理。
+- 插件停止或重载后不得残留线程、HTTP session、浏览器进程、计划任务或临时文件。
 - 不写 `priority`、`routing_overrides`、`block_after_handling`，也不假设目录扫描顺序。
 - 修改后至少运行插件管理、路由服务、Web 契约和插件自身测试；再重启 Web 进程确认所有插件加载成功。

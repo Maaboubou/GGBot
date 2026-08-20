@@ -211,7 +211,7 @@ def _infer_model_provider(config: Dict[str, Any]) -> str:
     explicit = str(config.get("custom_llm_provider") or config.get("provider") or "").strip().lower()
     model = str(config.get("model") or "").strip().lower()
     api_base = str(config.get("api_base") or "").strip().lower()
-    if explicit == "local_codex_cli" or "/api/codex/" in api_base:
+    if explicit in {"local_codex", "local_codex_cli"} or "/api/codex/" in api_base:
         return "local_codex"
     if explicit:
         return "compatible" if explicit == "custom_openai" else explicit
@@ -836,14 +836,14 @@ async def test_model_connectivity(model_id: str):
         try:
             if llm_manager._is_local_codex_model(model_cfg):
                 response, response_time, response_text = await asyncio.to_thread(
-                    llm_manager._call_local_codex_cli,
+                    llm_manager._call_local_codex,
                     model_cfg,
                     [{"role": "user", "content": "请只回复 OK，不要解释。"}],
                     params,
                     False,
                 )
                 latency_ms = int(response_time * 1000)
-                actual_model = f"local_codex_cli/{model_cfg.get('model', model_id)}"
+                actual_model = f"local_codex/{model_cfg.get('model', model_id)}"
                 return {
                     "status": "success",
                     "data": {

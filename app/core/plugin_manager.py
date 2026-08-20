@@ -5,6 +5,7 @@
 import json
 import importlib
 import importlib.util
+import inspect
 import logging
 import os
 import sys
@@ -24,6 +25,7 @@ from .plugin_manifest import (
     validate_registered_listeners,
 )
 from .routing_order import RoutingOrderStore
+from app.services.plugin_runtime import PluginContext, get_plugin_runtime_registry
 
 
 @dataclass
@@ -40,6 +42,11 @@ class PluginInfo:
     config: Dict[str, Any] = None
     listener_ids: List[str] = None
     manifest: Dict[str, Any] = None
+    runtime_context: Optional[PluginContext] = None
+    last_error: str = ""
+    last_loaded_at: Optional[float] = None
+    last_failed_at: Optional[float] = None
+    last_unloaded_at: Optional[float] = None
     
     def __post_init__(self):
         if self.config is None:
@@ -151,6 +158,7 @@ class PluginManager:
         self.plugins: Dict[str, PluginInfo] = {}
         self._lock = threading.RLock()
         self.routing_order = RoutingOrderStore(self.plugins_dir / "routing_order.json")
+        self.runtime_registry = get_plugin_runtime_registry()
         
         # 文件监控
         self._observer = Observer()
@@ -270,7 +278,6 @@ class PluginManager:
                 # 计算模块名：plugins.<相对路径用点分隔>.main
                 rel_path = plugin_path.relative_to(self.plugins_dir)
                 rel_module_path = str(rel_path).replace('\\', '.').replace('/', '.')
-                rel_module_path = str(rel_path).replace('\\', '.').replace('/', '.')
                 # 使用完整的包路径 app.plugins... 以匹配API中的导入
                 module_name = "app.plugins." + rel_module_path + ".main"
                 spec = importlib.util.spec_from_file_location(
@@ -316,6 +323,9 @@ class PluginManager:
                 plugin_info.module = module
                 plugin_info.loaded = True
                 plugin_info.manifest = manifest
+                plugin_info.runtime_context = self.runtime_registry.register(
+                    plugin_name, manifest, plugin_path
+                )
 
                 
                 # 注册插件
@@ -364,10 +374,38 @@ class PluginManager:
                     listener_ids.append(listener_id)
                     return listener_id
                 
-                # 调用插件注册函数
-                module.register(self.event_bus, subscribe_wrapper)
+                # Every plugin is a Runtime API v2 plugin and must receive its
+                # owned PluginContext. There is deliberately no legacy branch.
+                register_signature = inspect.signature(module.register)
+                positional = [
+                    parameter
+                    for parameter in register_signature.parameters.values()
+                    if parameter.kind in {
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    }
+                ]
+                accepts_context = (
+                    len(positional) >= 3
+                    or "context" in register_signature.parameters
+                    or any(
+                        parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                        for parameter in register_signature.parameters.values()
+                    )
+                )
+                if not accepts_context:
+                    raise PluginManifestError(
+                        "plugin_api_version=2 的 register 必须接收第三个 PluginContext 参数"
+                    )
+                module.register(
+                    self.event_bus,
+                    subscribe_wrapper,
+                    plugin_info.runtime_context,
+                )
                 validate_registered_listeners(manifest, registered_identities)
                 plugin_info.listener_ids = listener_ids
+                plugin_info.last_error = ""
+                plugin_info.last_loaded_at = time.time()
                 if not plugin_info.enabled:
                     for listener_id in listener_ids:
                         self.event_bus.disable_listener(listener_id)
@@ -399,6 +437,10 @@ class PluginManager:
                     plugin_info.listener_ids = []
                     plugin_info.loaded = False
                     plugin_info.module = None
+                    plugin_info.runtime_context = None
+                    plugin_info.last_error = str(e)
+                    plugin_info.last_failed_at = time.time()
+                self.runtime_registry.unregister(plugin_name)
                 self.logger.error(f"Failed to load plugin '{plugin_name}': {e}")
                 return False
     
@@ -416,9 +458,18 @@ class PluginManager:
                 for listener_id in plugin_info.listener_ids:
                     self.event_bus.unsubscribe(listener_id)
                 
-                # 调用插件的卸载函数（如果存在）
-                if plugin_info.module and hasattr(plugin_info.module, 'unregister'):
-                    plugin_info.module.unregister()
+                # Runtime API v2 requires plugins to register cleanup through
+                # PluginContext. Closing the context is the single teardown
+                # path, so resources are not released twice.
+                cleanup_errors = self.runtime_registry.unregister(plugin_name)
+                if cleanup_errors:
+                    self.logger.warning(
+                        "Plugin '%s' runtime cleanup completed with errors: %s",
+                        plugin_name,
+                        "; ".join(cleanup_errors),
+                    )
+                plugin_info.runtime_context = None
+                plugin_info.last_unloaded_at = time.time()
                 
                 # 从sys.modules中移除整个插件包。只移除 main.py 会让
                 # getmagnet.py 等子模块在热重载后继续使用旧代码。
@@ -600,6 +651,15 @@ class PluginManager:
                 if "DAILY_PUSH_TIME" in plugin.config or "ENABLE_DAILY_PUSH" in plugin.config:
                     features.append("push")
 
+            health = (
+                plugin.runtime_context.health_snapshot()
+                if plugin.runtime_context is not None
+                else {
+                    "status": "stopped" if not plugin.enabled else "unhealthy",
+                    "message": plugin.last_error or ("插件已停用" if not plugin.enabled else "插件未加载"),
+                }
+            )
+
             result[name] = {
                 "name": plugin.name,
                 "display_name": plugin.config.get("display_name", plugin.name),
@@ -612,6 +672,11 @@ class PluginManager:
                 "listener_count": len(plugin.listener_ids),
                 "features": features,
                 "manifest_version": plugin.manifest.get("schema_version"),
+                "plugin_api_version": plugin.manifest.get("plugin_api_version"),
+                "last_error": plugin.last_error or None,
+                "last_loaded_at": plugin.last_loaded_at,
+                "last_failed_at": plugin.last_failed_at,
+                "health": health,
                 "jobs": list(plugin.manifest.get("jobs", [])),
             }
         return result

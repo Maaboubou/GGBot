@@ -195,7 +195,7 @@ def handle_text_message(event: Event):
         return False
 
 
-def register(event_bus, subscribe):
+def register(event_bus, subscribe, context):
     """注册插件"""
     global translation_service
     
@@ -203,6 +203,11 @@ def register(event_bus, subscribe):
     
     # 初始化翻译服务
     translation_service = TranslationService()
+    context.health.register(lambda: {
+        "status": "healthy" if translation_service is not None else "unhealthy",
+        "message": "翻译服务已就绪" if translation_service is not None else "翻译服务未初始化",
+    })
+    context.register_cleanup(unregister)
     
     # 订阅文本消息事件
     subscribe(

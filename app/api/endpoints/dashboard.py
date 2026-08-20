@@ -12,7 +12,6 @@ import json
 import os
 import re
 import logging
-import shutil
 from pathlib import Path
 
 from app.models.base import get_db
@@ -246,112 +245,6 @@ def _get_top_users_today(limit: int = 5) -> List[Dict[str, Any]]:
         return []
 
 
-async def _read_codex_app_server_response(
-    proc: asyncio.subprocess.Process,
-    request_id: int,
-) -> Dict[str, Any]:
-    """Read JSONL messages until the response for ``request_id`` arrives."""
-    if proc.stdout is None:
-        raise RuntimeError("Codex app-server stdout is unavailable")
-
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            stderr = ""
-            if proc.stderr is not None:
-                stderr = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()
-            raise RuntimeError(stderr or "Codex app-server exited before returning usage data")
-
-        try:
-            message = json.loads(line.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError:
-            continue
-        if message.get("id") != request_id:
-            continue
-        if isinstance(message.get("error"), dict):
-            error = message["error"]
-            raise RuntimeError(error.get("message") or str(error))
-        result = message.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError("Codex app-server returned an invalid response")
-        return result
-
-
-async def _query_codex_rate_limits_with_command(
-    command: List[str],
-) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    proc = await asyncio.create_subprocess_exec(
-        *command,
-        "app-server",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    async def send(message: Dict[str, Any]) -> None:
-        if proc.stdin is None:
-            raise RuntimeError("Codex app-server stdin is unavailable")
-        proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
-        await proc.stdin.drain()
-
-    async def exchange() -> tuple[Dict[str, Any], Dict[str, Any]]:
-        await send({
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "wxautox4-dashboard",
-                    "title": "wxautox4 Dashboard",
-                    "version": "1.0.0",
-                },
-                "capabilities": {"experimentalApi": True},
-            },
-        })
-        initialize_result = await _read_codex_app_server_response(proc, 1)
-        await send({"method": "initialized", "params": {}})
-        await send({"id": 2, "method": "account/rateLimits/read"})
-        rate_limits_result = await _read_codex_app_server_response(proc, 2)
-        return rate_limits_result, initialize_result
-
-    timeout = int(os.getenv("CODEX_USAGE_REFRESH_TIMEOUT", "30"))
-    try:
-        return await asyncio.wait_for(exchange(), timeout=timeout)
-    finally:
-        if proc.stdin is not None and not proc.stdin.is_closing():
-            proc.stdin.close()
-        if proc.returncode is None:
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=2)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-
-
-async def _query_codex_rate_limits() -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Query live limits with the WSL Codex used by the Windows deployment."""
-    if os.name == "nt":
-        wsl_bin = shutil.which("wsl.exe") or shutil.which("wsl")
-        if not wsl_bin:
-            raise RuntimeError("wsl.exe is unavailable; cannot query WSL Codex usage")
-        # Interactive bash loads the nvm-managed Codex installation used in WSL.
-        command = [
-            wsl_bin,
-            "-e",
-            "bash",
-            "-ic",
-            'exec codex "$@"',
-            "codex",
-        ]
-    else:
-        command = [shutil.which("codex") or "codex"]
-
-    return await _query_codex_rate_limits_with_command(command)
-
-
 def _get_codex_sessions_dir() -> Path:
     codex_home = os.getenv("CODEX_HOME")
     if codex_home:
@@ -446,13 +339,13 @@ def _format_codex_quota(rate_limits: Dict[str, Any]) -> str:
     return " | ".join(parts) if parts else "Codex rate limit data found"
 
 
-def _usage_info_from_app_server(response: Dict[str, Any]) -> Dict[str, Any]:
+def _usage_info_from_runtime(response: Dict[str, Any]) -> Dict[str, Any]:
     snapshot = response.get("rateLimits")
     if not isinstance(snapshot, dict):
         return {
             "quota_available": False,
             "quota": None,
-            "quota_message": "Codex app-server did not return account rate limits",
+            "quota_message": "Codex runtime did not return account rate limits",
             "rate_limits": None,
             "rate_limits_by_limit_id": None,
             "rate_limit_updated_at": None,
@@ -478,7 +371,7 @@ def _usage_info_from_app_server(response: Dict[str, Any]) -> Dict[str, Any]:
         "quota_available": quota_available,
         "quota": _format_codex_quota(normalized) if quota_available else None,
         "quota_message": (
-            "Read live account limits from Codex app-server"
+            "Read live account limits from Codex runtime"
             if quota_available
             else "Codex account has no percentage-based rate limit"
         ),
@@ -494,7 +387,7 @@ def _usage_info_from_app_server(response: Dict[str, Any]) -> Dict[str, Any]:
 def _read_codex_live_status_snapshot(
     snapshot_file: Optional[Path] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Read the last successful app-server result used by the dashboard."""
+    """Read the last successful Codex runtime result used by the dashboard."""
     path = snapshot_file or _codex_live_status_snapshot_file
     try:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
@@ -644,8 +537,18 @@ async def _get_codex_status_payload(refresh: bool = False) -> Dict[str, Any]:
     if refresh:
         async with _codex_refresh_lock:
             try:
-                response, initialize_result = await _query_codex_rate_limits()
-                usage_info = _usage_info_from_app_server(response)
+                from app.services.agent_runtime import get_agent_runtime
+
+                timeout = int(os.getenv("CODEX_USAGE_REFRESH_TIMEOUT", "30"))
+                response, runtime_worker = await asyncio.to_thread(
+                    get_agent_runtime().read_rate_limits,
+                    timeout,
+                )
+                initialize_result = {
+                    "userAgent": runtime_worker.get("user_agent"),
+                    "codexVersion": runtime_worker.get("codex_version"),
+                }
+                usage_info = _usage_info_from_runtime(response)
                 refresh_succeeded = bool(usage_info.get("quota_available"))
             except Exception as exc:
                 errors.append(f"Codex live usage refresh failed: {exc}")
@@ -671,7 +574,11 @@ async def _get_codex_status_payload(refresh: bool = False) -> Dict[str, Any]:
     logged_in = bool(usage_info.get("quota_available"))
     user_agent = initialize_result.get("userAgent") or ""
     version_match = re.match(r"[^/]+/([^\s]+)", user_agent)
-    version = session.get("cli_version") or (version_match.group(1) if version_match else "")
+    version = (
+        session.get("cli_version")
+        or initialize_result.get("codexVersion")
+        or (version_match.group(1) if version_match else "")
+    )
     model = session.get("model") or os.getenv("CODEX_PROXY_MODEL", "gpt-5.6-sol")
     rate_limits = usage_info.get("rate_limits") or {}
     plan_type = rate_limits.get("plan_type")
@@ -802,7 +709,7 @@ async def get_codex_status():
 
 @router.post("/codex-status/refresh")
 async def refresh_codex_status():
-    """通过 Codex app-server 直接读取实时账户额度，不启动模型会话。"""
+    """通过 Codex 运行时读取实时账户额度，不启动模型会话。"""
     try:
         return await _get_codex_status_payload(refresh=True)
     except Exception as exc:

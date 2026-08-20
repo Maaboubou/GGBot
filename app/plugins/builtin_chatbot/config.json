@@ -99,7 +99,7 @@
       },
       "model": {
         "title": "Codex 回复行为",
-        "description": "仅影响使用本地 Codex 应用服务器的对话路由",
+        "description": "仅影响使用本地 Codex 的对话路由",
         "order": 30
       },
       "tools": {
@@ -122,7 +122,7 @@
     },
     "codex_persistent_session_enabled": {
       "type": "boolean",
-      "description": "Codex 回复是否按聊天对象复用应用服务器线程；普通模型不受影响",
+      "description": "Codex 回复是否按聊天对象复用持久会话；普通模型不受影响",
       "default": true
     },
     "codex_reasoning_effort": {
@@ -200,7 +200,7 @@
     },
     "codex_exec_fallback_enabled": {
       "type": "boolean",
-      "description": "应用服务器失败时是否先降级为独立 codex exec，再尝试 LLM 映射的备用模型",
+      "description": "Codex 运行时不可用时是否允许使用独立执行后端",
       "default": true
     },
     "context_limit": {
@@ -215,7 +215,7 @@
     },
     "context_window_auto_detect": {
       "type": "boolean",
-      "description": "优先读取 Codex 应用服务器或 LLM 模型配置中的真实上下文窗口",
+      "description": "优先读取 Codex 运行时或 LLM 模型配置中的真实上下文窗口",
       "default": true
     },
     "context_safety_margin_tokens": {

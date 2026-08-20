@@ -105,6 +105,7 @@ class EventBus:
         self._listeners: Dict[EventType, List[EventListener]] = {}
         self._event_queue = asyncio.Queue()
         self._running = False
+        self._processor_task: Optional[asyncio.Task] = None
         self._lock = threading.RLock()
         self.db_session_factory = db_session_factory
         # 全局上下文字典：用于共享跨插件/系统的服务实例（例如 feishu_service）
@@ -704,7 +705,9 @@ class EventBus:
             return
         
         self._running = True
-        asyncio.create_task(self._process_events())
+        self._processor_task = asyncio.create_task(
+            self._process_events(), name="event-bus-processor"
+        )
         self.logger.info("Event bus started")
         
         # 发布系统启动事件
@@ -743,9 +746,17 @@ class EventBus:
             except Exception as e:
                 self.logger.error(f"Error waiting for user queue '{chat_name}': {e}")
 
-        # 标记停止，后台处理协程在下一次循环检查时退出
+        # 标记停止并等待拥有的协程退出，避免进程关闭时留下 pending task。
         self._running = False
-        
+        processor_task = self._processor_task
+        self._processor_task = None
+        if processor_task is not None:
+            try:
+                await asyncio.wait_for(processor_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                processor_task.cancel()
+                await asyncio.gather(processor_task, return_exceptions=True)
+
         # Cleanup all user workers
         with self._lock:
             remaining_users = list(self._user_workers.keys())

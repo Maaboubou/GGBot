@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import json
+import platform
 from functools import partial
 from typing import Dict, Any
 from pathlib import Path
@@ -17,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.utils.logging_utils import read_log_lines
 from app.utils.system_temperature import get_temperature_status
+from app.version import APP_VERSION
 
 
 
@@ -150,13 +152,83 @@ async def get_system_status() -> Dict[str, Any]:
 
 
 @router.get("/health")
+@router.get("/health/live")
 async def health_check() -> Dict[str, Any]:
-    """健康检查"""
+    """Liveness probe: the Web process can answer requests."""
     return {
-        "status": "healthy",
+        "status": "live",
         "timestamp": time.time(),
-        "version": "2.0.0"
+        "version": APP_VERSION,
     }
+
+
+@router.get("/health/ready")
+async def readiness_check(request: Request) -> Dict[str, Any]:
+    """Readiness is separate from liveness and exposes degraded components."""
+    components = get_app_components(request)
+    event_bus = components.get("event_bus")
+    plugin_manager = components.get("plugin_manager")
+    wechat_manager = components.get("wechat_manager")
+    checks = {
+        "event_bus": bool(event_bus and getattr(event_bus, "_running", False)),
+        "plugin_manager": bool(plugin_manager),
+        "wechat": bool(wechat_manager and wechat_manager.is_connected_cached()),
+    }
+    try:
+        from app.models.base import engine
+
+        with engine.connect() as connection:
+            connection.execute(__import__("sqlalchemy").text("SELECT 1"))
+        checks["database"] = True
+    except Exception:
+        checks["database"] = False
+
+    critical_ready = checks["event_bus"] and checks["plugin_manager"] and checks["database"]
+    return {
+        "status": "ready" if critical_ready and checks["wechat"] else ("degraded" if critical_ready else "not_ready"),
+        "ready": critical_ready,
+        "checks": checks,
+        "optional": ["wechat"],
+        "timestamp": time.time(),
+        "version": APP_VERSION,
+    }
+
+
+@router.get("/health/details")
+async def health_details(request: Request) -> Dict[str, Any]:
+    readiness = await readiness_check(request)
+    from app.services.backup_service import get_backup_service
+    from app.services.plugin_runtime import get_plugin_runtime_registry
+    from app.services.runtime_operations import get_runtime_operation_service
+
+    runtime_plugins = get_plugin_runtime_registry().snapshot()
+    try:
+        from app.services.llm_manager import get_llm_manager
+
+        model_health = get_llm_manager().get_model_health()
+    except Exception:
+        model_health = []
+    readiness.update(
+        {
+            "plugin_runtime": {
+                "plugins": runtime_plugins,
+                "unhealthy": sum(
+                    (item.get("health") or {}).get("status") in {"unhealthy", "failed"}
+                    for item in runtime_plugins
+                ),
+            },
+            "operations": get_runtime_operation_service().stats(),
+            "models": {
+                "health": model_health,
+                "open_circuits": sum(item.get("status") == "open" for item in model_health),
+                "degraded": sum(item.get("status") in {"degraded", "half_open"} for item in model_health),
+            },
+            "backup": {
+                "pending_restore": bool(get_backup_service().overview().get("pending_restore")),
+            },
+        }
+    )
+    return readiness
 
 
 @router.get("/wechat-monitor")
@@ -252,7 +324,7 @@ async def get_system_info() -> Dict[str, Any]:
         return {
             "application": {
                 "name": "GGBot",
-                "version": "2.0.0",
+                "version": APP_VERSION,
                 "bot_name": bot_name,
                 "pid": process.pid,
                 "memory_usage": process.memory_info().rss,
@@ -261,12 +333,12 @@ async def get_system_info() -> Dict[str, Any]:
                 "threads": process.num_threads()
             },
             "python": {
-                "version": f"{psutil.version_info[0]}.{psutil.version_info[1]}.{psutil.version_info[2]}",
-                "platform": psutil.WINDOWS if hasattr(psutil, 'WINDOWS') else "unknown"
+                "version": platform.python_version(),
+                "platform": platform.python_implementation(),
             },
             "system": {
-                "platform": psutil.WINDOWS if hasattr(psutil, 'WINDOWS') else "unix",
-                "architecture": "x64" if psutil.cpu_count() else "unknown"
+                "platform": platform.system(),
+                "architecture": platform.machine() or "unknown",
             }
         }
     except Exception as e:

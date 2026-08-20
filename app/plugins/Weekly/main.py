@@ -23,7 +23,7 @@ import pytz
 from PIL import Image, JpegImagePlugin  # noqa: F401 - registers JPEG PDF encoder
 
 from app.core.event_bus import Event, EventType
-from app.services.codex_proxy.client import CodexCliClient
+from app.services.agent_runtime import get_agent_runtime
 from app.utils.plugin_config import get_config
 
 logger = logging.getLogger(__name__)
@@ -35,12 +35,26 @@ class WeeklyGenerationError(RuntimeError):
 
 
 class WeeklyPlugin:
-    def __init__(self):
+    def __init__(self, context):
+        self.context = context
         self.log_dir = Path("data/chat_logs")
-        self.output_root = Path("data/weekly_reports")
-        self.state_path = self.output_root / "weekly_state.json"
-        self.task_lock_path = self.output_root / "weekly_task.lock"
+        migration_notes = context.storage.migrate_legacy_directory(
+            Path("data/weekly_reports"), storage_class="generated", relative="reports"
+        )
+        self.output_root = context.storage.generated_root / "reports"
+        self.state_path = context.storage.persistent_path("weekly_state.json")
+        migrated_state = self.output_root / "weekly_state.json"
+        if migrated_state.exists() and not self.state_path.exists():
+            os.replace(migrated_state, self.state_path)
+            migration_notes.append(f"{migrated_state} -> {self.state_path}")
+        self.task_lock_path = context.storage.temp_path("weekly_task.lock")
         self.output_root.mkdir(parents=True, exist_ok=True)
+        if migration_notes:
+            context.audit.record(
+                "storage_migration",
+                summary="Weekly 已迁移到插件标准存储目录",
+                details={"moved_files": len(migration_notes)},
+            )
         logger.info("🗞️ Weekly 插件初始化完成")
 
     def handle_text(self, event: Event):
@@ -546,8 +560,8 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 async def _codex_chat_async(prompt: str, *, timeout: int, model: str) -> dict[str, Any]:
-    client = CodexCliClient(timeout_seconds=timeout)
-    return await client.chat(
+    return await asyncio.to_thread(
+        get_agent_runtime().run,
         {
             "model": model,
             "timeout": timeout,
@@ -556,12 +570,24 @@ async def _codex_chat_async(prompt: str, *, timeout: int, model: str) -> dict[st
                 "reasoning_effort": "high",
                 "web_search": True,
             },
-        }
+        },
+        profile_name="weekly",
     )
 
 
 def _codex_chat(prompt: str, *, timeout: int, model: str) -> dict[str, Any]:
-    return asyncio.run(_codex_chat_async(prompt, timeout=timeout, model=model))
+    return get_agent_runtime().run(
+        {
+            "model": model,
+            "timeout": timeout,
+            "messages": [{"role": "user", "content": prompt}],
+            "extra_body": {
+                "reasoning_effort": "high",
+                "web_search": True,
+            },
+        },
+        profile_name="weekly",
+    )
 
 
 def _create_weekly_plan(
@@ -1098,28 +1124,35 @@ def _parse_admin_command(message: str) -> tuple[str, str | None] | None:
 
 
 def _start_admin_retry(chat_name: str, wx: Any, active_plugin: WeeklyPlugin) -> bool:
-    if not _execution_lock.acquire(blocking=False):
+    if _execution_lock.locked():
         _send_text(wx, _admin_chat_name(), "当前已有 Weekly 任务在执行，稍后再试。")
         logger.warning("🗞️ Weekly: 管理员重试被拒绝，已有任务执行 chat=%s", chat_name)
         return False
 
     task_lock_path = active_plugin.task_lock_path
 
-    def _runner() -> None:
+    def _runner(operation) -> Dict[str, Any]:
+        if not _execution_lock.acquire(blocking=False):
+            raise WeeklyGenerationError("当前已有 Weekly 任务在执行")
         lock_acquired = False
         try:
+            operation.progress(5, f"准备重试 {chat_name}")
             lock_acquired = _acquire_task_file_lock(task_lock_path)
             if not lock_acquired:
                 _send_text(wx, _admin_chat_name(), "当前已有 Weekly 任务锁，无法开始重试。")
                 return
             _send_text(wx, _admin_chat_name(), f"已开始重试 Weekly：{chat_name}")
-            _execute_one_chat_task(
+            succeeded = _execute_one_chat_task(
                 chat_name,
                 wx,
                 active_plugin,
                 triggered_by="admin_retry",
                 notify_admin=True,
             )
+            if not succeeded:
+                raise WeeklyGenerationError(f"{chat_name} 周报重试失败")
+            operation.progress(100, "周报重试完成")
+            return {"chat_name": chat_name, "succeeded": bool(succeeded)}
         finally:
             if lock_acquired:
                 _release_task_file_lock(task_lock_path)
@@ -1128,13 +1161,13 @@ def _start_admin_retry(chat_name: str, wx: Any, active_plugin: WeeklyPlugin) -> 
             except Exception:
                 pass
 
-    thread = threading.Thread(
-        target=_runner,
-        name=f"Weekly-AdminRetry-{_safe_filename(chat_name)}",
-        daemon=True,
+    active_plugin.context.tasks.submit(
+        "weekly_retry",
+        f"Weekly · 重试 {chat_name}",
+        _runner,
+        details={"chat_name": chat_name, "triggered_by": "admin_retry"},
     )
-    thread.start()
-    logger.info("🗞️ Weekly: 管理员重试线程已启动 chat=%s", chat_name)
+    logger.info("🗞️ Weekly: 管理员重试托管任务已提交 chat=%s", chat_name)
     return True
 
 
@@ -1217,9 +1250,9 @@ def _execute_weekly_task(event_bus) -> None:
         _release_task_file_lock(task_lock_path)
 
 
-def _start_weekly_scheduler(event_bus) -> None:
+def _start_weekly_scheduler(event_bus, context) -> None:
     def _runner():
-        while _scheduler_started:
+        while _scheduler_started and not context.workers.stop_event.is_set():
             try:
                 weekday = _parse_weekday(_cfg_str("WEEKLY_PUSH_WEEKDAY", "MON"))
                 hh, mm = _parse_hhmm(_cfg_str("WEEKLY_PUSH_TIME", "09:00"))
@@ -1275,18 +1308,28 @@ def _start_weekly_scheduler(event_bus) -> None:
                 if new_schedule != schedule:
                     continue
                 execution_run_key = (target.strftime("%Y-%m-%d"), weekday, hh, mm)
-                if not _execution_lock.acquire(blocking=False):
-                    logger.warning("🗞️ Weekly: 检测到任务并发，跳过本次执行")
+                active_plugin = plugin
+                if active_plugin is None:
                     continue
-                try:
-                    _execute_weekly_task(event_bus)
-                finally:
-                    if plugin is not None:
-                        _mark_scheduler_run(plugin.state_path, execution_run_key)
+
+                def _managed_push(operation):
+                    if not _execution_lock.acquire(blocking=False):
+                        raise WeeklyGenerationError("已有 Weekly 任务正在执行")
                     try:
+                        operation.progress(5, "读取周报推送范围")
+                        _execute_weekly_task(event_bus)
+                        operation.progress(100, "每周周报推送完成")
+                        return {"run_key": execution_run_key[0]}
+                    finally:
+                        _mark_scheduler_run(active_plugin.state_path, execution_run_key)
                         _execution_lock.release()
-                    except Exception:
-                        pass
+
+                active_plugin.context.tasks.submit(
+                    "weekly_push",
+                    "Weekly · 每周周报推送",
+                    _managed_push,
+                    details={"run_key": execution_run_key[0]},
+                )
             except Exception as e:
                 logger.warning("🗞️ Weekly: 定时任务循环异常: %s", e, exc_info=True)
 
@@ -1295,20 +1338,25 @@ def _start_weekly_scheduler(event_bus) -> None:
         with _scheduler_lock:
             if not _scheduler_started:
                 _scheduler_started = True
-                _scheduler_thread = threading.Thread(target=_runner, daemon=True)
-                _scheduler_thread.start()
+                _scheduler_thread = context.workers.start("weekly-scheduler", _runner)
                 logger.info("🗞️ Weekly: scheduler thread started")
 
 
-def register(event_bus, subscribe):
+def register(event_bus, subscribe, context):
     global plugin
     logger.info("🗞️ 注册 Weekly 插件...")
-    plugin = WeeklyPlugin()
+    plugin = WeeklyPlugin(context)
     subscribe(
         event_type=EventType.TEXT_MESSAGE_RECEIVED,
         handler=plugin.handle_text,
     )
-    _start_weekly_scheduler(event_bus)
+    _start_weekly_scheduler(event_bus, context)
+    context.health.register(lambda: {
+        "status": "healthy" if plugin is not None and _scheduler_thread is not None and _scheduler_thread.is_alive() else "degraded",
+        "message": "周报调度器运行正常" if plugin is not None and _scheduler_thread is not None and _scheduler_thread.is_alive() else "周报调度器未运行",
+        "scheduler_alive": bool(_scheduler_thread and _scheduler_thread.is_alive()),
+    })
+    context.register_cleanup(unregister)
     logger.info("✅ Weekly 插件注册成功")
 
 

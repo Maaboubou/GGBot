@@ -27,6 +27,8 @@ const UI = {
         '/system/integrations': 'settings',
         '/system/runtime': 'settings',
         '/system/developer': 'settings',
+        '/system/operations': 'settings',
+        '/system/backups': 'settings',
         '/assistant/roles': 'roles',
         '/assistant/chats': 'roles',
         '/assistant/memory': 'roles',
@@ -813,7 +815,7 @@ const UI = {
                                     <span><i class="bi bi-lightning-charge"></i>触发条件</span>
                                     ${editable.length ? `<button type="button" class="automation-trigger-button"><i class="bi bi-pencil-square"></i>编辑全局触发</button>` : '<small><i class="bi bi-lock"></i>插件固定</small>'}
                                 </div>
-                                <p>${this.escapeHtml(trigger.summary || '由插件运行时判断')}</p>
+                                <p>${this.escapeHtml(trigger.summary || '由插件规则判断')}</p>
                                 ${triggerValues ? `<div class="automation-trigger-values">${triggerValues}</div>` : ''}
                                 ${conditions ? `<ul>${conditions}</ul>` : ''}
                             </div>
@@ -841,7 +843,7 @@ const UI = {
             const eligible = Boolean(item.eligible);
             const stateClass = !eligible ? 'is-skipped' : '';
             const trigger = item.trigger || {};
-            const triggerSummary = trigger.summary || '由插件运行时判断';
+            const triggerSummary = trigger.summary || '由插件规则判断';
             const previewLabel = isChatPreview
                 ? (eligible ? '该聊天已启用' : (item.reason || '该聊天不会经过'))
                 : (item.status === 'running' ? '运行中' : '需检查');
@@ -1341,7 +1343,9 @@ const UI = {
             '/system/providers': 'integrations',
             '/system/integrations': 'integrations',
             '/system/runtime': 'runtime',
-            '/system/developer': 'developer'
+            '/system/developer': 'developer',
+            '/system/operations': 'operations',
+            '/system/backups': 'backups'
         }[path] || 'identity';
     },
 
@@ -1349,10 +1353,24 @@ const UI = {
         const container = document.getElementById('settings');
         if (!container) return;
         const groups = consoleData.groups || [];
+        const primaryGroups = groups.filter(group => group.id !== 'developer');
+        const extensionGroups = groups.filter(group => group.id === 'developer');
+        const platformGroups = [
+            ...primaryGroups,
+            {
+                id: 'operations', title: '运行状态', icon: 'bi-heart-pulse',
+                description: '统一任务、插件状态和组件健康'
+            },
+            {
+                id: 'backups', title: '备份与迁移', icon: 'bi-shield-check',
+                description: '状态备份、完整迁移和安全恢复'
+            },
+            ...extensionGroups
+        ];
         const identity = consoleData.identity || {};
         const requested = this.getSystemSettingsGroupFromPath();
-        const activeId = groups.some(group => group.id === requested) ? requested : groups[0]?.id;
-        const navigation = groups.map(group => `
+        const activeId = platformGroups.some(group => group.id === requested) ? requested : groups[0]?.id;
+        const navigation = platformGroups.map(group => `
             <button type="button" class="system-settings-nav-item ${group.id === activeId ? 'active' : ''}" data-system-group="${this.escapeHtml(group.id)}">
                 <i class="bi ${this.escapeHtml(group.icon)}"></i>
                 <span><strong>${this.escapeHtml(group.title)}</strong></span>
@@ -1412,7 +1430,7 @@ const UI = {
             const editable = (group.fields || []).some(field => field.editable);
             const developerActions = group.id === 'developer' ? `
                 <div class="system-developer-actions">
-                    <div><strong>扩展工具</strong><small>根据应用或插件文档添加、导入自定义键。</small></div>
+                    <div><strong>自定义配置</strong><small>仅在扩展文档明确要求时添加或导入。</small></div>
                     <button class="btn btn-sm btn-light border" onclick="UI.showAddSettingModal()"><i class="bi bi-plus-lg me-1"></i>添加自定义键</button>
                     <button class="btn btn-sm btn-light border" onclick="App.reloadSettingsFromEnv()"><i class="bi bi-arrow-clockwise me-1"></i>导入 .env 到数据库</button>
                 </div>` : '';
@@ -1429,11 +1447,18 @@ const UI = {
                     ${developerActions}
                 </section>`;
         }).join('');
+        const platformSections = `
+            <section class="system-settings-section ${activeId === 'operations' ? '' : 'd-none'}" data-system-section="operations">
+                <div id="systemOperationsConsole" class="system-platform-console"><div class="loading-wrapper">正在读取运行状态…</div></div>
+            </section>
+            <section class="system-settings-section ${activeId === 'backups' ? '' : 'd-none'}" data-system-section="backups">
+                <div id="systemBackupsConsole" class="system-platform-console"><div class="loading-wrapper">正在读取备份…</div></div>
+            </section>`;
 
         container.innerHTML = `
             <div class="system-settings-shell">
                 <aside class="system-settings-nav">${navigation}</aside>
-                <main class="system-settings-main">${sections}</main>
+                <main class="system-settings-main">${sections}${platformSections}</main>
             </div>`;
         container.dataset.activeSystemGroup = activeId || '';
         container.querySelectorAll('[data-system-group]').forEach(button => button.addEventListener('click', () => {
@@ -1461,13 +1486,16 @@ const UI = {
         if (options.history !== false) {
             const paths = {
                 identity: '/system', integrations: '/system/integrations',
-                runtime: '/system/runtime', developer: '/system/developer'
+                runtime: '/system/runtime', developer: '/system/developer',
+                operations: '/system/operations', backups: '/system/backups'
             };
             const path = paths[groupId] || '/system';
             if (this.normalizePath(window.location.pathname) !== path) {
                 window.history.pushState({ tab: 'settings', section: groupId }, '', path);
             }
         }
+        if (groupId === 'operations') window.SystemOperations?.loadRuntime();
+        if (groupId === 'backups') window.SystemOperations?.loadBackups();
     },
 
     togglePassword(id) {

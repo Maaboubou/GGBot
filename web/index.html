@@ -40,8 +40,8 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
 
     <!-- App CSS -->
-    <link href="/static/assets/css/style.css?v=3.6.2" rel="stylesheet">
-    <link href="/static/assets/css/dashboard.css?v=3.5.2" rel="stylesheet">
+    <link href="/static/assets/css/style.css?v=3.6.5" rel="stylesheet">
+    <link href="/static/assets/css/dashboard.css?v=3.5.3" rel="stylesheet">
 </head>
 
 <body>
@@ -110,7 +110,7 @@
             </div>
 
             <div class="sidebar-footer p-3 border-top border-secondary border-opacity-25">
-                <small class="text-muted d-block mb-1">版本：2.0.1</small>
+                <small class="text-muted d-block mb-1">版本：2.2.0</small>
                 <div class="d-flex align-items-center text-muted gap-2">
                     <button id="themeToggle" type="button" class="sidebar-theme-toggle"
                         aria-label="切换到暗色模式" aria-pressed="false" title="切换到暗色模式">
@@ -166,8 +166,10 @@
                     <section class="modern-card dashboard-overview fade-in">
                         <div class="dashboard-status-row">
                             <div class="dashboard-health-metrics">
+                                <a href="/system/operations" onclick="event.preventDefault(); window.history.pushState({ tab: 'settings', section: 'operations' }, '', '/system/operations'); UI.switchTab('settings', { history: false })" title="查看完整运行状态"><span>系统</span><strong id="dashboardSystemHealth">检测中</strong></a>
                                 <div><span>微信</span><strong id="dashboardWechatStatus">检测中</strong></div>
                                 <div><span>插件</span><strong id="dashboardPluginHealth">-</strong></div>
+                                <div><span>后台任务</span><strong id="dashboardActiveOperations">-</strong></div>
                                 <div title="当前 GGBot 进程的连续运行时长"><span>GGBot 已运行</span><strong id="dashboardUptime">-</strong></div>
                                 <div title="电脑自最近一次开机以来的时长"><span>本机已开机</span><strong id="dashboardSystemUptime">-</strong></div>
                             </div>
@@ -625,13 +627,12 @@
 
                     <!-- Codex Sessions Section -->
                     <div class="tab-pane fade d-none workspace-section" id="llm-codex-jobs">
-                        <div class="d-flex justify-content-between align-items-center mb-3">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
                             <div>
-                                <h5 class="fw-bold text-secondary mb-0"><i class="bi bi-chat-square-dots me-2"></i>Codex 会话监控</h5>
-                                <div class="small text-muted">查看每个聊天对象对应的持久线程、轮数、上下文占用、缓存命中和精确 Token；下方保留运行任务及取消功能。</div>
+                                <h5 class="fw-bold text-secondary mb-0"><i class="bi bi-chat-square-dots me-2"></i>Codex 运行中心</h5>
                             </div>
-                            <button class="btn btn-outline-secondary btn-sm" onclick="LLMManager.loadCodexJobs()">
-                                <i class="bi bi-arrow-clockwise me-1"></i> 刷新
+                            <button class="btn btn-outline-secondary btn-sm" onclick="LLMManager.loadCodexJobs()" title="刷新" aria-label="刷新">
+                                <i class="bi bi-arrow-clockwise"></i>
                             </button>
                         </div>
                         <div id="codexJobsList">
@@ -1355,10 +1356,11 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
     <!-- App Scripts -->
-    <script src="/static/assets/js/api.js?v=3.4.1"></script>
-    <script src="/static/assets/js/ui.js?v=3.3.10"></script>
-    <script src="/static/assets/js/llm_manager.js?v=3.2.7"></script>
-    <script src="/static/assets/js/main.js?v=3.5.6"></script>
+    <script src="/static/assets/js/api.js?v=3.5.1"></script>
+    <script src="/static/assets/js/ui.js?v=3.4.2"></script>
+    <script src="/static/assets/js/system_operations.js?v=1.2.1"></script>
+    <script src="/static/assets/js/llm_manager.js?v=3.2.8"></script>
+    <script src="/static/assets/js/main.js?v=3.6.1"></script>
     <script src="/static/assets/js/memory_console.js?v=1.0.1"></script>
 
     <!-- ==================== Judge History Modal ==================== -->

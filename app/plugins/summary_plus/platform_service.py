@@ -3,11 +3,13 @@
 import asyncio
 import logging
 import re
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from app.core.event_bus import Event
+from app.services.runtime_operations import OperationContext
+
+from .runtime_support import DispatchDecision, ProcessingResult
 
 __all__ = [
     "handle_link_message",
@@ -21,7 +23,16 @@ class PlatformRoute:
     async_handler: Callable[[Any, Any, str, str, logging.Logger], None]
 
 
-def _send_files(wx: Any, chat_name: str, file_path: str, logger: logging.Logger) -> None:
+def _send_files(
+    wx: Any,
+    chat_name: str,
+    file_path: str,
+    logger: logging.Logger,
+    svc: Any = None,
+) -> None:
+    artifacts = getattr(svc, "artifacts", None)
+    if artifacts is not None:
+        artifacts.validate_file(file_path)
     if hasattr(wx, "send_files"):
         wx.send_files(chat_name, [file_path])
         return
@@ -93,7 +104,7 @@ def _handle_douyin_async(svc: Any, wx: Any, chat_name: str, share_url: str, logg
 
         video_path = svc._download_douyin_with_ytdlp(share_url, timeout_sec=180)
         if video_path:
-            _send_files(wx, chat_name, video_path, logger)
+            _send_files(wx, chat_name, video_path, logger, svc)
             return
 
         logger.info("🔄 抖音 yt-dlp 下载失败，回退 TikHub")
@@ -101,11 +112,12 @@ def _handle_douyin_async(svc: Any, wx: Any, chat_name: str, share_url: str, logg
         if video_url_list:
             video_path = svc._download_video(video_url_list)
             if video_path:
-                _send_files(wx, chat_name, video_path, logger)
+                _send_files(wx, chat_name, video_path, logger, svc)
                 return
             logger.info("❌ 视频下载失败")
     except Exception as e:
         logger.error(f"❌ 异步处理抖音视频失败: {e}", exc_info=True)
+        raise
 
 
 def _handle_tiktok_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
@@ -114,11 +126,12 @@ def _handle_tiktok_async(svc: Any, wx: Any, chat_name: str, share_url: str, logg
         if video_url_list and wx:
             video_path = svc._download_video(video_url_list)
             if video_path:
-                _send_files(wx, chat_name, video_path, logger)
+                _send_files(wx, chat_name, video_path, logger, svc)
                 return
             logger.error(f"❌ TikTok 视频下载失败: {share_url}")
     except Exception as e:
         logger.error(f"❌ 异步处理 TikTok 视频失败: {e}", exc_info=True)
+        raise
 
 
 def _handle_weibo_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
@@ -130,12 +143,13 @@ def _handle_weibo_async(svc: Any, wx: Any, chat_name: str, share_url: str, logge
 
         video_path = svc._download_weibo_video(share_url, timeout_sec=180)
         if video_path:
-            _send_files(wx, chat_name, video_path, logger)
+            _send_files(wx, chat_name, video_path, logger, svc)
             logger.info(f"✅ 微博视频发送完成: {share_url}")
             return
         logger.error(f"❌ 微博视频下载失败: {share_url}")
     except Exception as e:
         logger.error(f"❌ 异步处理微博视频失败: {e}", exc_info=True)
+        raise
 
 
 def _handle_bilibili_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
@@ -157,7 +171,7 @@ def _handle_bilibili_async(svc: Any, wx: Any, chat_name: str, share_url: str, lo
                 video_path = svc._download_bilibili_video(share_url, max_720p=False)
                 if video_path:
                     video_path = svc._process_bilibili_video(video_path, source_url=share_url)
-                    _send_files(wx, chat_name, video_path, logger)
+                    _send_files(wx, chat_name, video_path, logger, svc)
                 else:
                     logger.error(f"❌ Bilibili 视频下载失败: {share_url}")
             return
@@ -169,7 +183,7 @@ def _handle_bilibili_async(svc: Any, wx: Any, chat_name: str, share_url: str, lo
                 video_path = svc._download_bilibili_video(share_url, max_720p=True)
                 if video_path:
                     video_path = svc._process_bilibili_video(video_path, source_url=share_url)
-                    _send_files(wx, chat_name, video_path, logger)
+                    _send_files(wx, chat_name, video_path, logger, svc)
                 else:
                     logger.error(f"❌ Bilibili 视频下载失败: {share_url}")
             return
@@ -221,17 +235,19 @@ def _handle_bilibili_async(svc: Any, wx: Any, chat_name: str, share_url: str, lo
             )
     except Exception as e:
         logger.error(f"❌ 异步处理 Bilibili 视频失败: {e}", exc_info=True)
+        raise
 
 
 def _handle_xhs_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
     try:
         file_path = svc.process_xhs_note(share_url)
         if file_path and wx:
-            _send_files(wx, chat_name, file_path, logger)
+            _send_files(wx, chat_name, file_path, logger, svc)
         elif not file_path:
             logger.info(f"ℹ️ 小红书笔记 {share_url} 处理完成，但未生成待发送文件（可能时长超限或非单图）")
     except Exception as e:
         logger.error(f"❌ 异步处理小红书视频/图片失败: {e}", exc_info=True)
+        raise
 
 
 def _handle_youtube_async(svc: Any, wx: Any, chat_name: str, youtube_url: str, logger: logging.Logger) -> None:
@@ -243,6 +259,7 @@ def _handle_youtube_async(svc: Any, wx: Any, chat_name: str, youtube_url: str, l
         loop.run_until_complete(svc._generate_youtube_mindmap_async(youtube_url, wx, chat_name))
     except Exception as e:
         logger.error(f"❌ YouTube 异步处理线程报错: {e}", exc_info=True)
+        raise
     finally:
         if loop is not None:
             loop.close()
@@ -289,12 +306,98 @@ def _dispatch_platform_route(
     chat_name: str,
     share_url: str,
     logger: logging.Logger,
-) -> None:
-    threading.Thread(
-        target=route.async_handler,
-        args=(svc, wx, chat_name, share_url, logger),
-        daemon=True,
-    ).start()
+) -> DispatchDecision:
+    """Submit a platform route to Runtime API v2's bounded dispatcher."""
+
+    def worker(operation: OperationContext) -> ProcessingResult:
+        operation.progress(10, f"正在处理 {route.name}")
+        route.async_handler(svc, wx, chat_name, share_url, logger)
+        return ProcessingResult.completed(f"{route.name} 处理完成")
+
+    dispatch = getattr(svc, "dispatch_operation", None)
+    if not callable(dispatch):
+        # Compatibility path for isolated unit tests and Runtime API v1.
+        route.async_handler(svc, wx, chat_name, share_url, logger)
+        return DispatchDecision(True, "compatibility")
+    decision = dispatch(
+        route.name,
+        chat_name,
+        share_url,
+        worker,
+        title=f"Summary Plus · {route.name}",
+    )
+    if not decision.accepted:
+        logger.info("ℹ️ %s 任务未重复提交: %s", route.name, decision.reason)
+    return decision
+
+
+def _dispatch_hupu(
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    sender: str,
+    share_url: str,
+    message_id: Optional[str],
+    logger: logging.Logger,
+) -> DispatchDecision:
+    def worker(operation: OperationContext) -> ProcessingResult:
+        operation.progress(10, "正在下载虎扑视频")
+        video_path = svc._download_hupu_video(share_url, timeout_sec=60)
+        if video_path:
+            _send_files(wx, chat_name, video_path, logger, svc)
+            logger.info("✅ 虎扑视频发送完成: %s", share_url)
+            return ProcessingResult.completed("虎扑视频发送完成", video_path)
+        logger.info("ℹ️ 虎扑视频下载失败，回退常规摘要流程: %s", share_url)
+        return _run_browser_summary(
+            svc,
+            wx,
+            chat_name,
+            sender,
+            share_url,
+            message_id,
+            False,
+            logger,
+        )
+
+    dispatch = getattr(svc, "dispatch_operation", None)
+    if not callable(dispatch):
+        worker(_CompatibilityOperation())
+        return DispatchDecision(True, "compatibility")
+    return dispatch("hupu", chat_name, share_url, worker, title="Summary Plus · 虎扑")
+
+
+class _CompatibilityOperation:
+    def progress(self, _percent: int, _message: str, **_details: Any) -> None:
+        return None
+
+
+def _run_browser_summary(
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    sender: str,
+    url: str,
+    message_id: Optional[str],
+    is_link_message: bool,
+    logger: logging.Logger,
+) -> ProcessingResult:
+    summary = svc.summarize_url(
+        url,
+        is_link_message=is_link_message,
+        chat_name=chat_name,
+        sender=sender,
+    )
+    logger.info("🧾 常规网页摘要流程返回: has_summary=%s", bool(summary))
+    if not wx:
+        return ProcessingResult.completed("摘要处理完成" if summary else "页面无可用摘要")
+    if not summary:
+        return ProcessingResult.skipped("页面无可用摘要")
+    _send_summary_reply(wx, chat_name, message_id, summary, logger)
+    if chat_name in svc.special_translation_groups:
+        translated = svc.translate_text_for_special_group(summary)
+        if translated:
+            wx.send_message(chat_name, translated)
+    return ProcessingResult.completed("网页摘要已发送")
 
 
 def handle_link_message(event: Event, svc: Any, logger: logging.Logger) -> bool:
@@ -325,12 +428,18 @@ def handle_link_message(event: Event, svc: Any, logger: logging.Logger) -> bool:
             if hupu_url:
                 logger.info(f"🏀 检测到虎扑链接，优先尝试直返视频: {hupu_url}")
                 if wx:
-                    video_path = svc._download_hupu_video(hupu_url, timeout_sec=60)
-                    if video_path:
-                        _send_files(wx, chat_name, video_path, logger)
-                        logger.info(f"✅ 虎扑视频发送完成: {hupu_url}")
-                        return True
-                    logger.info(f"ℹ️ 虎扑视频下载失败，回退常规摘要流程: {hupu_url}")
+                    decision = _dispatch_hupu(
+                        svc,
+                        wx,
+                        chat_name,
+                        sender,
+                        hupu_url,
+                        event.data.get("message_id"),
+                        logger,
+                    )
+                    if not decision.accepted:
+                        logger.info("ℹ️ 虎扑任务未重复提交: %s", decision.reason)
+                    return True
                 else:
                     logger.info("ℹ️ 未找到 wx 上下文，跳过虎扑视频直返并继续摘要流程")
 
@@ -349,31 +458,41 @@ def handle_link_message(event: Event, svc: Any, logger: logging.Logger) -> bool:
             "🧭 进入常规网页摘要流程: "
             f"is_link_message={is_link_message}"
         )
-        summary = svc.summarize_url(
-            url,
-            is_link_message=is_link_message,
-            chat_name=chat_name,
-            sender=sender,
-        )
-        logger.info(f"🧾 常规网页摘要流程返回: has_summary={bool(summary)}")
-
-        if not wx:
-            return bool(summary)
-
-        if not summary:
+        dispatch = getattr(svc, "dispatch_operation", None)
+        if callable(dispatch):
+            decision = dispatch(
+                "browser",
+                chat_name,
+                url,
+                lambda operation: (
+                    operation.progress(10, "正在提取网页内容"),
+                    _run_browser_summary(
+                        svc,
+                        wx,
+                        chat_name,
+                        sender,
+                        url,
+                        event.data.get("message_id"),
+                        is_link_message,
+                        logger,
+                    ),
+                )[1],
+                title="Summary Plus · 网页摘要",
+            )
+            if not decision.accepted:
+                logger.info("ℹ️ 网页摘要任务未重复提交: %s", decision.reason)
             return True
 
-        _send_summary_reply(
+        _run_browser_summary(
+            svc,
             wx,
             chat_name,
+            sender,
+            url,
             event.data.get("message_id"),
-            summary,
+            is_link_message,
             logger,
         )
-        if chat_name in svc.special_translation_groups:
-            translated = svc.translate_text_for_special_group(summary)
-            if translated:
-                wx.send_message(chat_name, translated)
         return True
     except Exception as e:
         logger.error(f"❌ Error handling link message: {e}", exc_info=True)

@@ -31,7 +31,7 @@ from .core.event_bus import get_event_bus, EventType
 from .core.plugin_manager import PluginManager
 from .core.wechat_manager import WeChatManager
 from .models.base import create_tables, SessionLocal
-from .api.endpoints import assistant, automation, capabilities, system, settings, plugins, wechat, permissions, chatbot_roles, chatbot_judges, dashboard
+from .api.endpoints import assistant, automation, backups, capabilities, operations, system, settings, plugins, wechat, permissions, chatbot_roles, chatbot_judges, dashboard
 from .api import internal as internal_api
 from .api import codex_proxy
 from .api import codex_jobs
@@ -45,6 +45,7 @@ from .services.wechat_monitor_service import get_monitor_service
 from .utils.plugin_config import get_plugin_setting
 from .utils.health_state import stable_active_listeners
 from .chatbot_presets import BUILTIN_CHATBOT_JUDGES, BUILTIN_CHATBOT_ROLES
+from .version import APP_VERSION
 
 # 配置日志
 os.makedirs("logs", exist_ok=True)
@@ -72,7 +73,7 @@ event_bus = None
 plugin_manager: Optional[PluginManager] = None
 wechat_manager = None
 monitor_service = None
-codex_app_server_manager = None
+agent_runtime = None
 
 
 def ensure_initial_settings(db: SessionLocal):
@@ -498,7 +499,7 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global event_bus, plugin_manager, wechat_manager, monitor_service, codex_app_server_manager
+    global event_bus, plugin_manager, wechat_manager, monitor_service, agent_runtime
     
     logger.info("Starting WeChat Automation Assistant...")
     
@@ -526,21 +527,18 @@ async def lifespan(app: FastAPI):
             ensure_initial_settings(db)
         logger.debug("Initial settings checked/migrated.")
 
-        # Codex App Server follows the Web application's lifecycle. Failure to
-        # start it is non-fatal because LLMManager automatically falls back to
-        # the existing one-process-per-reply `codex exec` adapter.
         try:
-            from .services.codex_app_server import get_codex_app_server_manager
+            from .services.agent_runtime import get_agent_runtime
 
-            codex_app_server_manager = get_codex_app_server_manager()
+            agent_runtime = get_agent_runtime()
             loop = asyncio.get_running_loop()
-            started = await loop.run_in_executor(None, codex_app_server_manager.start)
+            started = await loop.run_in_executor(None, agent_runtime.start)
             if started:
-                logger.info("Codex App Server started with wxautox")
+                logger.info("Codex runtime started")
             else:
-                logger.info("Codex App Server disabled; using stateless Codex CLI calls")
+                logger.warning("Codex runtime is using its fallback backend")
         except Exception as e:
-            logger.warning("Codex App Server startup failed; stateless fallback remains active: %s", e)
+            logger.warning("Codex runtime startup failed: %s", e)
 
         # 3. 初始化事件总线
         event_bus = get_event_bus(db_session_factory=SessionLocal)
@@ -613,7 +611,7 @@ async def lifespan(app: FastAPI):
         app.state.plugin_manager = plugin_manager
         app.state.wechat_manager = wechat_manager
         app.state.monitor_service = monitor_service
-        app.state.codex_app_server = codex_app_server_manager
+        app.state.codex_runtime = agent_runtime
         
         logger.info("Application startup completed")
         
@@ -641,12 +639,12 @@ async def lifespan(app: FastAPI):
                 len(unload_results),
             )
 
-        if codex_app_server_manager:
+        if agent_runtime:
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, codex_app_server_manager.stop)
+                await loop.run_in_executor(None, agent_runtime.stop)
             except Exception as e:
-                logger.warning("Codex App Server shutdown failed: %s", e)
+                logger.warning("Codex runtime shutdown failed: %s", e)
 
         if wechat_manager:
             wechat_manager.stop()
@@ -663,7 +661,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="WeChat Automation Assistant",
     description="基于事件驱动的微信自动化助手",
-    version="2.0.0",
+    version=APP_VERSION,
     lifespan=lifespan
 )
 
@@ -686,6 +684,8 @@ if cors_origins:
 
 # 注册路由
 app.include_router(system.router, prefix="/api/system", tags=["system"])
+app.include_router(backups.router, prefix="/api/backups", tags=["backups"])
+app.include_router(operations.router, prefix="/api/operations", tags=["operations"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])  
 app.include_router(plugins.router, prefix="/api/plugins", tags=["plugins"])
 app.include_router(capabilities.router, prefix="/api/capabilities", tags=["capabilities"])
@@ -748,8 +748,8 @@ async def health_check():
     """健康检查端点；只读缓存，绝不在探针路径同步请求 wx_bot。"""
     manager = getattr(app.state, 'wechat_manager', None)
     return {
-        "status": "healthy",
-        "version": "2.0.0",
+        "status": "live",
+        "version": APP_VERSION,
         "components": {
             "event_bus": hasattr(app.state, 'event_bus') and app.state.event_bus is not None,
             "plugin_manager": hasattr(app.state, 'plugin_manager') and app.state.plugin_manager is not None,

@@ -655,6 +655,8 @@ class CapabilityService:
             raise CapabilityConfigError("插件配置文件不是有效 JSON") from exc
 
         validated = validate_settings_patch(config, values)
+        source_values = config.get("config") if isinstance(config.get("config"), dict) else config
+        previous_values = {key: source_values.get(key) for key in validated}
         if isinstance(config.get("config"), dict):
             config["config"].update(validated)
         else:
@@ -668,7 +670,7 @@ class CapabilityService:
                     raise RuntimeError("插件重新加载失败")
             else:
                 plugin.config = config
-        except Exception:
+        except Exception as exc:
             rollback_payload = json.loads(original_bytes.decode("utf-8-sig"))
             _atomic_write_json(config_path, rollback_payload)
             # reload_plugin may remove the registry entry before failing.
@@ -680,7 +682,37 @@ class CapabilityService:
                     self.plugin_manager.reload_plugin(plugin_id)
             elif restored is not None:
                 restored.config = rollback_payload
+            try:
+                from app.services.runtime_operations import get_runtime_operation_service
+
+                get_runtime_operation_service().record_audit(
+                    category="plugin_settings",
+                    action="update_plugin_settings",
+                    target=plugin_id,
+                    status="failed",
+                    summary="插件设置更新失败，已恢复原配置",
+                    before=previous_values,
+                    after=validated,
+                    details={"keys": sorted(validated), "error": str(exc)},
+                )
+            except Exception:
+                pass
             raise
+
+        try:
+            from app.services.runtime_operations import get_runtime_operation_service
+
+            get_runtime_operation_service().record_audit(
+                category="plugin_settings",
+                action="update_plugin_settings",
+                target=plugin_id,
+                summary=f"更新 {len(validated)} 个插件设置",
+                before=previous_values,
+                after=validated,
+                details={"keys": sorted(validated), "reloaded": should_reload},
+            )
+        except Exception:
+            pass
 
         return self.get_settings(plugin_id)
 

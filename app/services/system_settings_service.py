@@ -54,9 +54,9 @@ GROUPS = OrderedDict(
         (
             "developer",
             {
-                "title": "高级设置",
-                "description": "插件扩展键与维护工具",
-                "icon": "bi-code-square",
+                "title": "扩展设置",
+                "description": "仅管理尚未归属的自定义键与导入工具",
+                "icon": "bi-sliders",
             },
         ),
     ]
@@ -108,6 +108,26 @@ FIELD_SPECS: Dict[str, Dict[str, Any]] = {
     "CODEX_PROXY_KEY": {
         "group": "integrations", "section": "本地服务", "title": "Codex 代理访问密钥",
         "description": "保护本地 Codex 代理接口；修改后新的请求立即使用。", "source": "本机数据库优先", "editable": True,
+    },
+    "CODEX_BINARY_POLICY": {
+        "group": "runtime", "section": "Codex", "title": "Codex 二进制策略",
+        "description": "运行时使用全局 Codex 命令并自动识别当前版本。",
+        "source": ".env / 启动环境", "editable": False, "environment_only": True,
+    },
+    "CODEX_CONFIG_POLICY": {
+        "group": "runtime", "section": "Codex", "title": "Codex 配置策略",
+        "description": "控制任务是否继承全局 Codex 配置、Rules 与 Skills。",
+        "source": ".env / 启动环境", "editable": False, "environment_only": True,
+    },
+    "CODEX_INTERACTIVE_POOL_SIZE": {
+        "group": "runtime", "section": "Codex", "title": "交互进程数",
+        "description": "承载聊天与持久会话的 Codex 进程数量。",
+        "source": ".env / 启动环境", "editable": False, "environment_only": True,
+    },
+    "CODEX_BATCH_POOL_SIZE": {
+        "group": "runtime", "section": "Codex", "title": "批处理进程数",
+        "description": "承载周报、记忆和代理请求的 Codex 进程数量。",
+        "source": ".env / 启动环境", "editable": False, "environment_only": True,
     },
     # These integrations currently read the process environment directly.
     # Present their state, but do not offer a database input that cannot work.
@@ -336,6 +356,10 @@ class SystemSettingsConsoleService:
             setting.key: setting
             for setting in self.db.query(Setting).filter(Setting.key.in_(values)).all()
         }
+        before_values = {
+            key: (existing[key].value if key in existing else None)
+            for key in values
+        }
 
         for key, raw_value in values.items():
             spec = FIELD_SPECS.get(key)
@@ -369,4 +393,20 @@ class SystemSettingsConsoleService:
             self.db.rollback()
             raise
         _clear_setting_caches()
+        try:
+            from app.services.runtime_operations import get_runtime_operation_service
+
+            get_runtime_operation_service().record_audit(
+                category="settings",
+                action="update_system_settings",
+                target="system_console",
+                summary=f"更新 {len(values)} 个系统设置",
+                before=before_values,
+                after={key: existing[key].value for key in values if key in existing},
+                details={"keys": sorted(values)},
+            )
+        except Exception:
+            # Audit persistence must not turn an already committed settings
+            # update into a misleading API failure.
+            pass
         return self.get_console()

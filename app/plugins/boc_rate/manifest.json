@@ -1,5 +1,9 @@
 {
   "schema_version": 2,
+  "plugin_api_version": 2,
+  "storage": {"cache_retention_days": 30, "cache_limit_mb": 256},
+  "backup": {"schema_version": 1, "include_persistent_storage": true, "include_generated_files": true, "supports_restore_migration": true, "sensitive": false},
+  "health": {"critical": false, "timeout_seconds": 5},
   "listeners": [
     {
       "event": "text_message_received",

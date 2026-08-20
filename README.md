@@ -115,6 +115,12 @@ Install.bat
 
 环境准备好后，也可以直接运行 `Start-GUI.bat`。日常使用继续运行 `一键启动.bat` 更省心，它会先检查依赖是否仍然完整。
 
+## 升级与更新记录
+
+面向使用者的版本公告发布在 [GitHub Releases](https://github.com/Seren-dipity/GGBot/releases)，仓库内的长期变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+升级前建议先在“系统 → 备份与迁移”中创建并校验备份，然后停止正在执行的长任务、更新代码与依赖并重启 GGBot。涉及插件接入方式或数据结构的版本会在 Release 公告中单独列出迁移提醒。
+
 ## 首次配置
 
 ### 1. 激活 wxautox4

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
 from typing import Any, Dict
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
-from app.services.codex_proxy.client import CodexCliClient, CodexProxyError, get_running_codex_requests
+from app.services.agent_runtime import get_agent_runtime
+from app.services.codex_job_manager import codex_job_manager
+from app.services.codex_proxy.client import CodexProxyError
 from app.services.config_service import get_setting
 
 logger = logging.getLogger(__name__)
@@ -33,18 +36,21 @@ def _verify_proxy_auth(authorization: str | None) -> None:
 
 @router.get("/health")
 async def health():
+    runtime = get_agent_runtime().status()
     return {
         "status": "ok",
         "auth_configured": bool(_configured_proxy_key()),
-        "backend": "codex-cli",
-        "running_requests": len(get_running_codex_requests()),
+        "backend": "codex-runtime",
+        "running": runtime.get("running", False),
+        "version": runtime.get("active_version"),
+        "running_requests": len(codex_job_manager.list_active()),
     }
 
 
 @router.get("/running")
 async def running(authorization: str | None = Header(default=None)):
     _verify_proxy_auth(authorization)
-    return {"data": get_running_codex_requests()}
+    return {"data": codex_job_manager.list_active()}
 
 
 @router.get("/models")
@@ -78,9 +84,13 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail="stream=true is not supported by Codex proxy yet")
 
     timeout = int(payload.get("timeout") or os.getenv("CODEX_PROXY_TIMEOUT", "600"))
-    client = CodexCliClient(timeout_seconds=timeout)
+    payload["timeout"] = timeout
     try:
-        return await client.chat(payload)
+        return await asyncio.to_thread(
+            get_agent_runtime().run,
+            payload,
+            profile_name="proxy",
+        )
     except CodexProxyError as exc:
         logger.warning("Codex proxy request failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc

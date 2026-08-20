@@ -5,6 +5,7 @@
 
 import asyncio
 import copy
+import hashlib
 import litellm
 import json
 import logging
@@ -153,6 +154,8 @@ class LLMManager:
         self._call_history_lock = threading.RLock()
         self._stats_lock = threading.RLock()
         self._config_lock = threading.RLock()
+        self._model_health_lock = threading.RLock()
+        self._model_health: Dict[str, Dict[str, Any]] = {}
         self._last_models_mtime = None
         self._last_mappings_mtime = None
         self.last_used_model: Optional[str] = None  # 最近一次成功调用实际使用的模型名
@@ -163,6 +166,7 @@ class LLMManager:
         self.load_stats()
         self.load_daily_stats()
         self.load_call_history()
+        self._compact_cache_diagnostics()
 
         litellm.set_verbose = False
         # fallback 到不支持某些参数的模型时，自动丢弃不支持的参数
@@ -173,6 +177,85 @@ class LLMManager:
 
         logger.info("✅ LLM Manager 初始化成功")
         self.apply_proxy_env_vars()
+
+    # ─────────────────────── 模型健康与熔断 ───────────────────────
+
+    @staticmethod
+    def _circuit_failure_threshold() -> int:
+        try:
+            return max(2, min(int(os.getenv("LLM_CIRCUIT_FAILURE_THRESHOLD", "3")), 20))
+        except (TypeError, ValueError):
+            return 3
+
+    @staticmethod
+    def _circuit_cooldown_seconds() -> int:
+        try:
+            return max(15, min(int(os.getenv("LLM_CIRCUIT_COOLDOWN_SECONDS", "120")), 3600))
+        except (TypeError, ValueError):
+            return 120
+
+    def _record_model_success(self, model: str, duration: Optional[float] = None) -> None:
+        key = str(model or "unknown")
+        now = time.time()
+        with self._model_health_lock:
+            item = self._model_health.setdefault(key, {})
+            item.update(
+                {
+                    "model": key,
+                    "status": "healthy",
+                    "consecutive_failures": 0,
+                    "opened_until": 0,
+                    "last_success_at": now,
+                    "last_latency_seconds": round(float(duration), 3) if duration is not None else None,
+                }
+            )
+
+    def _record_model_failure(self, model: str, error: Any = None) -> None:
+        key = str(model or "unknown")
+        now = time.time()
+        threshold = self._circuit_failure_threshold()
+        with self._model_health_lock:
+            item = self._model_health.setdefault(key, {"model": key, "consecutive_failures": 0})
+            failures = int(item.get("consecutive_failures") or 0) + 1
+            item.update(
+                {
+                    "model": key,
+                    "consecutive_failures": failures,
+                    "last_failure_at": now,
+                    "last_error": str(error or "model call failed")[:500],
+                }
+            )
+            if failures >= threshold:
+                item["status"] = "open"
+                item["opened_until"] = now + self._circuit_cooldown_seconds()
+            else:
+                item["status"] = "degraded"
+
+    def _model_circuit_open(self, model: str) -> bool:
+        key = str(model or "unknown")
+        now = time.time()
+        with self._model_health_lock:
+            item = self._model_health.get(key)
+            if not item:
+                return False
+            opened_until = float(item.get("opened_until") or 0)
+            if opened_until > now:
+                return True
+            if item.get("status") == "open":
+                item["status"] = "half_open"
+            return False
+
+    def get_model_health(self) -> List[Dict[str, Any]]:
+        now = time.time()
+        with self._model_health_lock:
+            rows = [dict(item) for item in self._model_health.values()]
+        for item in rows:
+            opened_until = float(item.get("opened_until") or 0)
+            if item.get("status") == "open" and opened_until <= now:
+                item["status"] = "half_open"
+            item["retry_after_seconds"] = max(0, round(opened_until - now, 1))
+        rows.sort(key=lambda item: (item.get("status") != "open", -(item.get("last_failure_at") or 0)))
+        return rows
 
     # ─────────────────────────── 代理管理 ───────────────────────────
 
@@ -1011,10 +1094,25 @@ class LLMManager:
                     caller_tools=caller_tools,
                     extra_kwargs=extra_kwargs,
                 )
+                if self._model_circuit_open(str(fb_params.get("model") or fb_id)):
+                    logger.warning("⚡ 跳过熔断中的备用模型: %s", fb_params.get("model") or fb_id)
+                    continue
                 fallback_list.append(fb_params)
 
             if fallback_list:
-                primary_params["fallbacks"] = fallback_list
+                if (
+                    not self._is_local_codex_model(model_config)
+                    and self._model_circuit_open(str(primary_params.get("model") or primary_model_id))
+                ):
+                    skipped_model = primary_params.get("model") or primary_model_id
+                    primary_params = copy.deepcopy(fallback_list.pop(0))
+                    logger.warning(
+                        "⚡ 主模型 %s 处于熔断期，直接切换到 %s",
+                        skipped_model,
+                        primary_params.get("model"),
+                    )
+                if fallback_list:
+                    primary_params["fallbacks"] = fallback_list
 
         # ── 6. 代理检查（缓存机制：无变化时为 no-op）──
         self.apply_proxy_env_vars()
@@ -1148,7 +1246,7 @@ class LLMManager:
 
         if self._is_local_codex_model(model_config):
             try:
-                response, response_time, result = self._call_local_codex_cli(
+                response, response_time, result = self._call_local_codex(
                     model_config=model_config,
                     messages=messages,
                     params=primary_params,
@@ -1172,7 +1270,7 @@ class LLMManager:
                     if isinstance(response, dict)
                     else ""
                 )
-                backend_label = "local_codex_app_server" if codex_backend == "codex_app_server" else "local_codex_cli"
+                backend_label = f"local_codex_{codex_backend or 'runtime'}"
                 self.last_used_model = f"{backend_label}/{model_config.get('model', primary_model_id)}"
                 response_attachments = self._extract_attachments_from_response(response)
                 if isinstance(attachment_capture, list):
@@ -1225,7 +1323,7 @@ class LLMManager:
                     messages,
                     "",
                     0,
-                    f"local_codex_cli/{model_config.get('model', primary_model_id)}",
+                    f"local_codex/{model_config.get('model', primary_model_id)}",
                     0,
                     success=False,
                     error=str(local_exc),
@@ -1759,9 +1857,9 @@ class LLMManager:
     def _is_local_codex_model(model_config: dict) -> bool:
         provider = str(model_config.get("provider") or model_config.get("custom_llm_provider") or "").lower()
         api_base = str(model_config.get("api_base") or "").lower()
-        return provider == "local_codex_cli" or "/api/codex/" in api_base or api_base.endswith("/api/codex/v1")
+        return provider in {"local_codex", "local_codex_cli"} or "/api/codex/" in api_base or api_base.endswith("/api/codex/v1")
 
-    def _call_local_codex_cli(
+    def _call_local_codex(
         self,
         model_config: dict,
         messages: List[Dict],
@@ -1778,8 +1876,8 @@ class LLMManager:
         codex_exec_fallback: bool = True,
         codex_output_schema: Optional[dict] = None,
     ) -> tuple:
-        """Call persistent App Server for chatbot chats, with codex exec fallback."""
-        from app.services.codex_proxy.client import CodexCliClient
+        """Call the shared Codex runtime using the appropriate workload profile."""
+        from app.services.agent_runtime import get_agent_runtime
 
         extra_body = copy.deepcopy(params.get("extra_body") or {})
         timeout = int(params.get("timeout") or model_config.get("timeout") or 600)
@@ -1825,28 +1923,23 @@ class LLMManager:
             payload.setdefault("extra_body", {})["wxautox_allow_image_input"] = True
 
         t0 = time.time()
-        response = None
+        runtime = get_agent_runtime()
         if chat_id:
-            try:
-                from app.services.codex_app_server import get_codex_app_server_manager
-
-                response = get_codex_app_server_manager().chat(
-                    payload,
-                    chat_id=chat_id,
-                    role_name=role_name or None,
-                    retry=retry,
-                    max_turns=codex_max_turns,
-                )
-            except Exception as app_server_exc:
-                if not codex_exec_fallback:
-                    raise
-                logger.warning(
-                    "⚠️ Codex App Server 调用失败，自动降级为独立 codex exec: %s",
-                    app_server_exc,
-                    exc_info=True,
-                )
-        if response is None:
-            response = self._run_coroutine_sync(CodexCliClient(timeout_seconds=timeout).chat(payload))
+            response = runtime.chat(
+                payload,
+                chat_id=chat_id,
+                role_name=role_name or None,
+                retry=retry,
+                max_turns=codex_max_turns,
+                allow_exec_fallback=codex_exec_fallback,
+            )
+        else:
+            profile_name = "memory" if codex_output_schema else "batch"
+            response = runtime.run(
+                payload,
+                profile_name=profile_name,
+                allow_exec_fallback=codex_exec_fallback,
+            )
         response_time = time.time() - t0
         choices = response.get("choices") or [] if isinstance(response, dict) else []
         message = (choices[0].get("message") if choices else {}) or {}
@@ -2054,6 +2147,7 @@ class LLMManager:
                         continue
 
                     entry.pop("key", None)
+                    entry = self._sanitize_history_entry(entry)
                     loaded.setdefault(key, []).append(entry)
                     if len(loaded[key]) > max_history_per_key:
                         loaded[key] = loaded[key][-max_history_per_key:]
@@ -2061,6 +2155,12 @@ class LLMManager:
             with self._call_history_lock:
                 self.call_history = loaded
             logger.info(f"✅ 已加载 LLM 调用历史: {sum(len(v) for v in loaded.values())} 条")
+            # Older builds persisted embedded image/base64 payloads and could
+            # grow a few hundred records to hundreds of MB. Rewrite once after
+            # sanitizing so future saves remain bounded.
+            if self.call_history_path.stat().st_size > 20 * 1024 * 1024:
+                with self._call_history_lock:
+                    self._save_call_history()
         except Exception as e:
             logger.warning(f"⚠️ 加载 LLM 调用历史失败: {e}")
 
@@ -2101,7 +2201,7 @@ class LLMManager:
         if history_mode not in {"full", "summary", "none"}:
             history_mode = "full"
 
-        entry = {
+        entry = self._sanitize_history_entry({
             "timestamp": datetime.now().isoformat(),
             "plugin_name": plugin_name,
             "call_type": call_type,
@@ -2123,7 +2223,7 @@ class LLMManager:
                 if isinstance(safe_metadata.get("memory_trace"), dict)
                 else None
             ),
-        }
+        })
         if isinstance(usage_capture, list):
             usage_capture.append(
                 {
@@ -2161,6 +2261,48 @@ class LLMManager:
             return max(10, int(get_setting("LLM_CALL_HISTORY_PER_KEY", "") or 50))
         except Exception:
             return 50
+
+    @staticmethod
+    def _history_text_limit() -> int:
+        try:
+            return max(2000, min(int(os.getenv("LLM_HISTORY_MAX_TEXT_CHARS", "50000")), 500000))
+        except (TypeError, ValueError):
+            return 50000
+
+    @classmethod
+    def _sanitize_history_value(cls, value: Any, *, depth: int = 0) -> Any:
+        if depth > 12:
+            return "[nested payload omitted]"
+        if isinstance(value, str):
+            limit = cls._history_text_limit()
+            lowered = value[:64].lower()
+            looks_binary = lowered.startswith("data:image/") or lowered.startswith("data:audio/") or lowered.startswith("data:video/")
+            if looks_binary:
+                digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+                return f"[embedded binary omitted: chars={len(value)} sha256={digest}]"
+            if len(value) > limit:
+                digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+                return value[:limit] + f"\n[…truncated chars={len(value)} sha256={digest}]"
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): cls._sanitize_history_value(item, depth=depth + 1)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            if len(items) > 300:
+                items = items[:20] + [{"_omitted_items": len(items) - 300}] + items[-280:]
+            return [cls._sanitize_history_value(item, depth=depth + 1) for item in items]
+        return value
+
+    @classmethod
+    def _sanitize_history_entry(cls, entry: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized = dict(entry)
+        for key in ("messages", "response_text", "reasoning_text", "memory_trace", "error"):
+            if key in sanitized:
+                sanitized[key] = cls._sanitize_history_value(sanitized[key])
+        return sanitized
 
     @staticmethod
     def _cache_diagnostics_limit() -> int:
@@ -2222,8 +2364,11 @@ class LLMManager:
             cache_denominator = prompt_tokens
             cache_miss_tokens = max(prompt_tokens - cached_tokens, 0)
 
+        raw_messages = list(messages or [])
         message_summaries = []
-        for idx, message in enumerate(messages or []):
+        retained_messages = raw_messages[-120:]
+        start_index = max(0, len(raw_messages) - len(retained_messages))
+        for idx, message in enumerate(retained_messages, start=start_index):
             text = self._message_text_for_diagnostics(message.get("content") if isinstance(message, dict) else message)
             message_summaries.append({
                 "index": idx,
@@ -2281,6 +2426,35 @@ class LLMManager:
             os.replace(tmp_path, self.cache_diagnostics_path)
         except Exception as exc:
             logger.warning(f"⚠️ 保存 LLM cache 诊断记录失败: {exc}")
+
+    def _compact_cache_diagnostics(self) -> None:
+        """Bound legacy cache diagnostics without retaining giant message arrays."""
+        try:
+            if not self.cache_diagnostics_path.exists() or self.cache_diagnostics_path.stat().st_size <= 10 * 1024 * 1024:
+                return
+            compacted = []
+            with self.cache_diagnostics_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    summaries = record.get("message_summaries")
+                    if isinstance(summaries, list) and len(summaries) > 120:
+                        record["message_summaries"] = summaries[-120:]
+                    if isinstance(record.get("error"), str):
+                        record["error"] = record["error"][:2000]
+                    compacted.append(json.dumps(record, ensure_ascii=False, default=str))
+            compacted = compacted[-self._cache_diagnostics_limit():]
+            temporary = self.cache_diagnostics_path.with_suffix(".jsonl.tmp")
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write("\n".join(compacted))
+                if compacted:
+                    handle.write("\n")
+            os.replace(temporary, self.cache_diagnostics_path)
+            logger.info("🧹 已压缩 LLM cache 诊断记录: %s 条", len(compacted))
+        except Exception as exc:
+            logger.warning("⚠️ 压缩 LLM cache 诊断记录失败: %s", exc)
 
     def get_call_history(self, plugin_name: str = None, call_type: str = None) -> dict:
         """获取调用历史记录，可按插件/类型筛选"""
@@ -2668,11 +2842,13 @@ class LLMManager:
         """LiteLLM 成功回调"""
         duration = end_time - start_time
         model = kwargs.get("model", "unknown")
+        self._record_model_success(model, duration)
         logger.debug(f"✅ LLM Success: {model} - {duration:.2f}s")
 
     def _log_failure(self, kwargs, response_obj, start_time, end_time):
         """LiteLLM 失败回调"""
         model = kwargs.get("model", "unknown")
+        self._record_model_failure(model, response_obj)
         logger.error(f"❌ LLM Failure: {model}")
 
     # ─────────────────────── 持久化统计 ───────────────────────
@@ -2721,6 +2897,7 @@ class LLMManager:
             "today": self.daily_stats.get(self._today_key(), {}),
             "session": self.session_stats,
             "total": self.total_stats,
+            "model_health": self.get_model_health(),
         }
 
     # ─────────────────────── 配置 CRUD ────────────────────────

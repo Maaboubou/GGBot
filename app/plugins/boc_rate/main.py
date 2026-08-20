@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Set
 
 from app.core.event_bus import Event, EventType
@@ -20,9 +21,24 @@ logger = logging.getLogger(__name__)
 
 
 class BOCExchangePlugin:
-    def __init__(self):
+    def __init__(self, context):
+        self.context = context
         # 与 legacy 一致的初始化（无需特殊配置时传入空dict）
-        self.service = BOCExchangeService(config={})
+        migration_notes = context.storage.migrate_legacy_directory(
+            Path(__file__).parent / "exchange_rate_cache",
+            storage_class="cache",
+            relative="exchange_rates",
+        )
+        cache_dir = context.storage.cache_root / "exchange_rates"
+        self.service = BOCExchangeService(
+            config={}, cache_dir=cache_dir, workers=context.workers
+        )
+        if migration_notes:
+            context.audit.record(
+                "storage_migration",
+                summary="中行汇率缓存已迁移到插件标准存储目录",
+                details={"moved_files": len(migration_notes)},
+            )
         self.trigger_keywords = get_config(
             "trigger_keywords", ["汇率", "中行", "牌价"], plugin_name="boc_rate"
         ) or []
@@ -382,9 +398,9 @@ def _execute_daily_task(event_bus):
         logger.warning("boc_rate: 每日任务执行出错: %s", e)
 
 
-def _start_daily_scheduler(event_bus):
+def _start_daily_scheduler(event_bus, context):
     def _runner():
-        while _scheduler_started:
+        while _scheduler_started and not context.workers.stop_event.is_set():
             try:
                 daily_push_time = get_config("DAILY_PUSH_TIME", plugin_name="boc_rate") or "10:00"
                 hh, mm = _parse_hhmm(daily_push_time)
@@ -403,16 +419,27 @@ def _start_daily_scheduler(event_bus):
                 if not _scheduler_started:
                     break
 
-                if not _execution_lock.acquire(blocking=False):
-                    logger.warning("boc_rate: 检测到任务并发，跳过本次执行")
+                active_plugin = plugin
+                if active_plugin is None:
                     continue
-                try:
-                    _execute_daily_task(event_bus)
-                finally:
+
+                def _managed_push(operation):
+                    if not _execution_lock.acquire(blocking=False):
+                        raise RuntimeError("上次汇率推送仍在执行")
                     try:
+                        operation.progress(10, "正在读取汇率数据")
+                        _execute_daily_task(event_bus)
+                        operation.progress(100, "每日汇率推送完成")
+                        return {"scheduled": True}
+                    finally:
                         _execution_lock.release()
-                    except Exception:
-                        pass
+
+                active_plugin.context.tasks.submit(
+                    "daily_rate_alert",
+                    "中行汇率 · 每日推送",
+                    _managed_push,
+                    details={"scheduled": True},
+                )
             except Exception as e:
                 logger.warning("boc_rate: 定时任务循环异常: %s", e)
 
@@ -421,19 +448,24 @@ def _start_daily_scheduler(event_bus):
         with _scheduler_lock:
             if not _scheduler_started:
                 _scheduler_started = True
-                _scheduler_thread = threading.Thread(target=_runner, daemon=True)
-                _scheduler_thread.start()
+                _scheduler_thread = context.workers.start("daily-scheduler", _runner)
                 logger.info("boc_rate: daily scheduler SINGLETON started")
 
-def register(event_bus, subscribe):
+def register(event_bus, subscribe, context):
     global plugin
     logger.info("📈 注册 boc_rate 插件...")
-    plugin = BOCExchangePlugin()
+    plugin = BOCExchangePlugin(context)
     subscribe(
         event_type=EventType.TEXT_MESSAGE_RECEIVED,
         handler=handle_text
     )
-    _start_daily_scheduler(event_bus)
+    _start_daily_scheduler(event_bus, context)
+    context.health.register(lambda: {
+        "status": "healthy" if plugin is not None and _scheduler_thread is not None and _scheduler_thread.is_alive() else "degraded",
+        "message": "汇率调度器运行正常" if plugin is not None and _scheduler_thread is not None and _scheduler_thread.is_alive() else "汇率调度器未运行",
+        "scheduler_alive": bool(_scheduler_thread and _scheduler_thread.is_alive()),
+    })
+    context.register_cleanup(unregister)
     logger.info("✅ boc_rate 插件注册成功")
 
 

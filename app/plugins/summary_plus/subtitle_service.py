@@ -55,7 +55,12 @@ def srt_to_txt(srt_path: str, logger=None) -> Optional[str]:
             os.remove(srt_path)
 
 
-def bili_get_subtitles(url: str, cookies_path: str, logger=None) -> Optional[str]:
+def bili_get_subtitles(
+    url: str,
+    cookies_path: str,
+    logger=None,
+    temp_dir: Optional[str] = None,
+) -> Optional[str]:
     """尝试获取 B 站字幕 (优先使用 yt-dlp 获取手动/AI 字幕，失败则回退到 API)"""
     match = re.search(r"BV[a-zA-Z0-9]+", url)
     if not match:
@@ -90,7 +95,7 @@ def bili_get_subtitles(url: str, cookies_path: str, logger=None) -> Optional[str
                 langs_to_download = ["ai-zh", "zh-Hans", "zh-CN", "zh"]
                 write_auto = True
 
-        tmp_sub_dir = os.path.join(os.getcwd(), "tmp", "subtitles")
+        tmp_sub_dir = temp_dir or os.path.join(os.getcwd(), "tmp", "subtitles")
         os.makedirs(tmp_sub_dir, exist_ok=True)
         uid = uuid.uuid4().hex[:6]
         outtmpl = os.path.join(tmp_sub_dir, f"sub_{uid}_%(title)s.%(ext)s")

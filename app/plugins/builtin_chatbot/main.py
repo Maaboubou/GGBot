@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 class ChatBotPlugin:
     """ChatBot 插件主类"""
 
-    def __init__(self):
+    def __init__(self, context=None):
+        self.runtime_context = context
         # 从插件配置中读取参数
         self.bot_name = get_setting("WECHAT_BOT_NAME", "微信助手")  # 保留全局配置
         self.chat_log_manager = ChatLogManager()
@@ -363,7 +364,21 @@ class ChatBotPlugin:
         # Anchored append context cache: keep the exact dynamic message prefix
         # sent to the LLM so later calls can append to it and reuse prefix caches.
         self._anchored_contexts: Dict[str, Dict[str, Any]] = {}
-        self._anchored_context_dir = Path("data/chatbot_anchor_contexts")
+        if context is not None:
+            migration_notes = context.storage.migrate_legacy_directory(
+                Path("data/chatbot_anchor_contexts"),
+                storage_class="persistent",
+                relative="anchor_contexts",
+            )
+            self._anchored_context_dir = context.storage.persistent_root / "anchor_contexts"
+            if migration_notes:
+                context.audit.record(
+                    "storage_migration",
+                    summary="聊天锚点上下文已迁移到插件标准存储目录",
+                    details={"moved_files": len(migration_notes)},
+                )
+        else:
+            self._anchored_context_dir = Path("data/chatbot_anchor_contexts")
         self._anchored_context_dir.mkdir(parents=True, exist_ok=True)
 
         # 注意：enabled_chats 权限检查已移至 EventBus 统一管理
@@ -472,6 +487,10 @@ class ChatBotPlugin:
 
     def handle_text_message(self, event: Event):
         """处理文本消息事件"""
+        # Must exist before every early-return branch because the outer finally
+        # always inspects it. Duplicate-event exits previously raised an
+        # UnboundLocalError after successfully deciding to ignore the message.
+        proactive_processing_acquired = False
         try:
             logger.info(f"🤖 ChatBot plugin received text message event")
 
@@ -522,7 +541,6 @@ class ChatBotPlugin:
 
             # 初始化变量，防止在finally块中访问未定义变量
             is_mention = False
-            proactive_processing_acquired = False
 
             # ✨ 检测是否为误识别的引用图片消息
             quote_detection = self._detect_misidentified_quote_image(content)
@@ -1065,14 +1083,13 @@ class ChatBotPlugin:
         delay = max(0.05, due_at - now)
         generation = int(session.get("generation") or 0)
         anchor_id = str(session.get("anchor_id") or "")
-        timer = threading.Timer(
+        timer = self.runtime_context.workers.start_timer(
+            f"followup-{chat_name}-{generation}-{time.time_ns()}",
             delay,
             self._submit_followup_judge,
             args=(chat_name, anchor_id, generation),
         )
-        timer.daemon = True
         session["timer"] = timer
-        timer.start()
 
     def _submit_followup_judge(
         self,
@@ -1314,9 +1331,9 @@ class ChatBotPlugin:
             logger.warning("🔗 Failed to remove stale anchor for %s: %s", chat_name, exc)
         if invalidate_provider and self.codex_persistent_session_enabled:
             try:
-                from app.services.codex_app_server import get_codex_app_server_manager
+                from app.services.agent_runtime import get_agent_runtime
 
-                get_codex_app_server_manager().invalidate_chat(chat_name)
+                get_agent_runtime().invalidate_chat(chat_name)
             except Exception as exc:
                 logger.warning(
                     "🔗 Failed to invalidate stale Codex thread for %s: %s",
@@ -1859,9 +1876,9 @@ class ChatBotPlugin:
         """Prefer authoritative App Server telemetry, then model metadata."""
         if self.context_window_auto_detect:
             try:
-                from app.services.codex_app_server import get_codex_app_server_manager
+                from app.services.agent_runtime import get_agent_runtime
 
-                state = get_codex_app_server_manager().state_store.get(chat_name) or {}
+                state = get_agent_runtime().state_store.get(chat_name) or {}
                 context_window = int(state.get("model_context_window") or 0)
                 if context_window > 0:
                     return context_window
@@ -3856,12 +3873,11 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             wx_manager = event.context.get("wx")
             message_id = data.get("message_id")
             logger.info(f"🤖 OCR queued async: chat={chat_name}, sender={sender}, msg={message_id}, file={file_path or 'missing'}")
-            threading.Thread(
-                target=self._process_image_ocr_async,
+            self.runtime_context.workers.start(
+                f"ocr-{chat_name}-{message_id or time.time_ns()}",
+                self._process_image_ocr_async,
                 args=(data, wx_manager),
-                name=f"ChatBot-OCR-{chat_name}-{message_id or 'noid'}",
-                daemon=True,
-            ).start()
+            )
 
             # 只是后台记录上下文，不消费/阻断该图片消息事件。
             return False
@@ -3962,15 +3978,21 @@ def handle_followup_approved(event: Event):
     return False
 
 
-def register(event_bus, subscribe):
+def register(event_bus, subscribe, context):
     """插件注册函数"""
     global chatbot_plugin
 
     logger.info("🤖 Registering ChatBot plugin...")
 
     # 初始化ChatBot插件
-    chatbot_plugin = ChatBotPlugin()
+    chatbot_plugin = ChatBotPlugin(context)
     chatbot_plugin.event_bus = event_bus
+    context.health.register(lambda: {
+        "status": "healthy" if chatbot_plugin is not None and not chatbot_plugin._followup_closed else "degraded",
+        "message": "聊天、记忆与后续回复服务运行正常" if chatbot_plugin is not None and not chatbot_plugin._followup_closed else "聊天服务正在关闭",
+        "pending_followups": len(chatbot_plugin._followup_sessions) if chatbot_plugin is not None else 0,
+    })
+    context.register_cleanup(unregister)
 
     # 订阅文本消息事件
     subscribe(

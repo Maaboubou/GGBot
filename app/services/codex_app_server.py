@@ -15,10 +15,12 @@ import os
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -30,9 +32,11 @@ from app.services.codex_proxy.client import (
     _as_bool,
     _as_runtime_path,
     _collect_artifact_attachments,
+    _cleanup_expired_artifacts,
     _content_to_text,
     _default_text_for_attachments,
     _write_image_url_to_file,
+    _write_artifact_manifest,
     estimate_codex_usage,
     extract_image_urls,
     normalize_codex_web_search_mode,
@@ -62,11 +66,16 @@ class _PendingRequest:
 class _TurnTracker:
     completed: threading.Event = field(default_factory=threading.Event)
     usage_ready: threading.Event = field(default_factory=threading.Event)
-    agent_messages: List[str] = field(default_factory=list)
+    final_messages: List[str] = field(default_factory=list)
+    unclassified_messages: List[str] = field(default_factory=list)
+    commentary_messages: List[str] = field(default_factory=list)
     reasoning: List[str] = field(default_factory=list)
     usage: Dict[str, Any] = field(default_factory=dict)
     status: str = "running"
     error: Optional[str] = None
+    request_id: str = ""
+    thread_id: str = ""
+    started_recorded: bool = False
 
 
 @dataclass
@@ -214,77 +223,148 @@ def _normalize_app_server_usage(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class CodexThreadStateStore:
-    """Small atomic JSON store for WeChat chat -> Codex thread mappings."""
+    """SQLite-backed chat-to-thread state shared by every runtime worker."""
 
     def __init__(self, path: Optional[Path] = None) -> None:
-        self.path = Path(
-            path
-            or os.getenv("CODEX_APP_SERVER_THREAD_STATE")
+        configured_path = path or os.getenv("CODEX_RUNTIME_STATE_DB") or "data/codex_runtime.db"
+        self.path = Path(configured_path)
+        self.legacy_path = Path(
+            os.getenv("CODEX_APP_SERVER_THREAD_STATE")
             or "data/codex_app_server_threads.json"
         )
         self._lock = threading.RLock()
-        self._states: Dict[str, Dict[str, Any]] = {}
-        self._load()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+        self._migrate_legacy_json()
 
-    def _load(self) -> None:
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self.path), timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    def _initialize(self) -> None:
         with self._lock:
-            if not self.path.exists():
-                self._states = {}
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS codex_thread_state (
+                        chat_id TEXT PRIMARY KEY,
+                        state_json TEXT NOT NULL,
+                        codex_version TEXT,
+                        schema_hash TEXT,
+                        config_signature TEXT,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_codex_thread_state_updated "
+                    "ON codex_thread_state(updated_at)"
+                )
+
+    def _migrate_legacy_json(self) -> None:
+        if not self.legacy_path.exists() or self.legacy_path.resolve() == self.path.resolve():
+            return
+        try:
+            payload = json.loads(self.legacy_path.read_text(encoding="utf-8"))
+            states = payload.get("threads") if isinstance(payload, dict) else None
+            if not isinstance(states, dict) or not states:
                 return
-            try:
-                payload = json.loads(self.path.read_text(encoding="utf-8"))
-                states = payload.get("threads") if isinstance(payload, dict) else None
-                self._states = states if isinstance(states, dict) else {}
-            except Exception as exc:
-                logger.warning("Failed to load Codex App Server thread state %s: %s", self.path, exc)
-                self._states = {}
+            with self._lock, closing(self._connect()) as connection, connection:
+                existing = connection.execute(
+                    "SELECT COUNT(*) AS count FROM codex_thread_state"
+                ).fetchone()
+                if existing and int(existing["count"] or 0) > 0:
+                    return
+                now = datetime.now().isoformat()
+                for chat_id, state in states.items():
+                    if not isinstance(state, dict):
+                        continue
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO codex_thread_state
+                        (chat_id, state_json, codex_version, schema_hash, config_signature, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(chat_id),
+                            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                            str(state.get("codex_version") or ""),
+                            str(state.get("schema_hash") or ""),
+                            str(state.get("config_signature") or ""),
+                            str(state.get("updated_at") or now),
+                        ),
+                    )
+            logger.info("Imported %s Codex thread states into %s", len(states), self.path)
+        except Exception as exc:
+            logger.warning("Failed to import Codex thread state %s: %s", self.legacy_path, exc)
 
     def get(self, chat_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            state = self._states.get(chat_id)
-            return dict(state) if isinstance(state, dict) else None
+        with self._lock, closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT state_json FROM codex_thread_state WHERE chat_id = ?",
+                (str(chat_id),),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            state = json.loads(row["state_json"])
+            return state if isinstance(state, dict) else None
+        except Exception:
+            logger.warning("Invalid Codex thread state for chat %s", chat_id)
+            return None
 
     def list_all(self) -> Dict[str, Dict[str, Any]]:
         """Return a detached snapshot for read-only monitoring APIs."""
-        with self._lock:
-            return {
-                str(chat_id): dict(state)
-                for chat_id, state in self._states.items()
-                if isinstance(state, dict)
-            }
+        with self._lock, closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                "SELECT chat_id, state_json FROM codex_thread_state ORDER BY updated_at DESC"
+            ).fetchall()
+        result: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            try:
+                state = json.loads(row["state_json"])
+            except Exception:
+                continue
+            if isinstance(state, dict):
+                result[str(row["chat_id"])] = state
+        return result
 
     def put(self, chat_id: str, state: Dict[str, Any]) -> None:
-        with self._lock:
-            self._states[chat_id] = dict(state)
-            self._save_locked()
+        payload = dict(state)
+        updated_at = str(payload.get("updated_at") or datetime.now().isoformat())
+        payload["updated_at"] = updated_at
+        with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO codex_thread_state
+                (chat_id, state_json, codex_version, schema_hash, config_signature, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    codex_version = excluded.codex_version,
+                    schema_hash = excluded.schema_hash,
+                    config_signature = excluded.config_signature,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(chat_id),
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    str(payload.get("codex_version") or ""),
+                    str(payload.get("schema_hash") or ""),
+                    str(payload.get("config_signature") or ""),
+                    updated_at,
+                ),
+            )
 
     def delete(self, chat_id: str) -> None:
-        with self._lock:
-            if chat_id not in self._states:
-                return
-            self._states.pop(chat_id, None)
-            self._save_locked()
-
-    def _save_locked(self) -> None:
-        with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.tmp")
-            payload = {
-                "version": 1,
-                "updated_at": datetime.now().isoformat(),
-                "threads": self._states,
-            }
-            try:
-                temp_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                os.replace(str(temp_path), str(self.path))
-            finally:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                "DELETE FROM codex_thread_state WHERE chat_id = ?",
+                (str(chat_id),),
+            )
 
 
 class CodexAppServerManager:
@@ -296,6 +376,11 @@ class CodexAppServerManager:
         codex_bin: Optional[str] = None,
         workdir: Optional[str] = None,
         state_path: Optional[Path] = None,
+        state_store: Optional[CodexThreadStateStore] = None,
+        instance_name: str = "interactive-1",
+        codex_version: str = "",
+        schema_hash: str = "",
+        experimental_api: bool = False,
     ) -> None:
         configured_bin = codex_bin or os.getenv("CODEX_PROXY_BIN")
         self.codex_bin = configured_bin or shutil.which("codex") or "codex"
@@ -307,7 +392,11 @@ class CodexAppServerManager:
             os.getenv("CODEX_APP_SERVER_ROTATE_TOKENS", "220000"),
             220000,
         )
-        self.state_store = CodexThreadStateStore(state_path)
+        self.state_store = state_store or CodexThreadStateStore(state_path)
+        self.instance_name = str(instance_name or "codex")
+        self.codex_version = str(codex_version or "")
+        self.schema_hash = str(schema_hash or "")
+        self.experimental_api = bool(experimental_api)
 
         self._lifecycle_lock = threading.RLock()
         self._write_lock = threading.Lock()
@@ -325,6 +414,8 @@ class CodexAppServerManager:
         self._stderr_thread: Optional[threading.Thread] = None
         self._stopping = False
         self._initialize_result: Dict[str, Any] = {}
+        self._stderr_tail: List[str] = []
+        self._last_error = ""
 
     def _command(self) -> List[str]:
         executable = os.getenv("CODEX_PROXY_WSL_BIN", "codex") if self.use_wsl else self.codex_bin
@@ -340,6 +431,7 @@ class CodexAppServerManager:
     def status(self) -> Dict[str, Any]:
         proc = self._proc
         return {
+            "name": self.instance_name,
             "enabled": self.enabled,
             "running": self.is_running(),
             "pid": getattr(proc, "pid", None),
@@ -347,6 +439,11 @@ class CodexAppServerManager:
             "loaded_threads": len(self._loaded_threads),
             "user_agent": self._initialize_result.get("userAgent"),
             "codex_home": self._initialize_result.get("codexHome"),
+            "codex_version": self.codex_version,
+            "schema_hash": self.schema_hash,
+            "api_surface": "experimental" if self.experimental_api else "stable",
+            "last_error": self._last_error or None,
+            "last_diagnostic": self._stderr_tail[-1] if self._stderr_tail else None,
         }
 
     def invalidate_chat(self, chat_id: str) -> None:
@@ -462,6 +559,8 @@ class CodexAppServerManager:
             if self.is_running():
                 return True
             self._stopping = False
+            self._stderr_tail.clear()
+            self._last_error = ""
             self._fail_all("Codex App Server restarting")
             command = self._command()
             popen_kwargs: Dict[str, Any] = {
@@ -502,21 +601,24 @@ class CodexAppServerManager:
             self._stdout_thread.start()
             self._stderr_thread.start()
             try:
+                initialize_params: Dict[str, Any] = {
+                    "clientInfo": {
+                        "name": "wxautox4",
+                        "title": "wxautox4",
+                        "version": "2.0.0",
+                    },
+                }
+                if self.experimental_api:
+                    initialize_params["capabilities"] = {"experimentalApi": True}
                 self._initialize_result = self._request(
                     "initialize",
-                    {
-                        "clientInfo": {
-                            "name": "wxautox4-chatbot",
-                            "title": "wxautox4 ChatBot",
-                            "version": "1.0.0",
-                        },
-                        "capabilities": {"experimentalApi": True},
-                    },
+                    initialize_params,
                     timeout=timeout or self.startup_timeout,
                     ensure_started=False,
                 )
                 self._notify("initialized", {})
-            except Exception:
+            except Exception as exc:
+                self._last_error = str(exc)
                 self._stop_process(proc)
                 if self._proc is proc:
                     self._proc = None
@@ -595,7 +697,12 @@ class CodexAppServerManager:
                 self._proc = None
                 if not self._stopping:
                     logger.warning("Codex App Server exited unexpectedly with code %s", proc.poll())
-                    self._fail_all("Codex App Server exited unexpectedly")
+                    detail = self._stderr_tail[-1] if self._stderr_tail else ""
+                    self._last_error = (
+                        "Codex App Server exited unexpectedly"
+                        + (f": {detail}" if detail else "")
+                    )
+                    self._fail_all(self._last_error)
 
     def _stderr_loop(self, proc: subprocess.Popen) -> None:
         stream = proc.stderr
@@ -605,6 +712,9 @@ class CodexAppServerManager:
             for raw_line in stream:
                 line = raw_line.strip()
                 if line:
+                    self._stderr_tail.append(line[:2000])
+                    if len(self._stderr_tail) > 20:
+                        self._stderr_tail = self._stderr_tail[-20:]
                     logger.debug("Codex App Server stderr: %s", line[:2000])
         except Exception:
             if not self._stopping:
@@ -661,7 +771,13 @@ class CodexAppServerManager:
     def _read_completed_item(self, tracker: _TurnTracker, item: Dict[str, Any]) -> None:
         item_type = str(item.get("type") or "")
         if item_type == "agentMessage":
-            self._append_unique(tracker.agent_messages, item.get("text"))
+            phase = str(item.get("phase") or "").strip().lower()
+            if phase == "final_answer":
+                self._append_unique(tracker.final_messages, item.get("text"))
+            elif phase == "commentary":
+                self._append_unique(tracker.commentary_messages, item.get("text"))
+            else:
+                self._append_unique(tracker.unclassified_messages, item.get("text"))
         elif item_type == "reasoning":
             summary = item.get("summary")
             content = item.get("content")
@@ -677,6 +793,31 @@ class CodexAppServerManager:
                     else:
                         self._append_unique(tracker.reasoning, part)
 
+    @staticmethod
+    def _public_item_event(item: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "item_id": str(item.get("id") or ""),
+            "item_type": str(item.get("type") or "unknown"),
+            "status": str(item.get("status") or ""),
+        }
+
+    def _record_turn_event(
+        self,
+        tracker: _TurnTracker,
+        event_type: str,
+        details: Optional[Dict[str, Any]] = None,
+        **updates: Any,
+    ) -> bool:
+        if not tracker.request_id:
+            return False
+        codex_job_manager.record_event(
+            tracker.request_id,
+            event_type,
+            details or {},
+            **updates,
+        )
+        return True
+
     def _handle_notification(self, method: str, params: Dict[str, Any]) -> None:
         turn_id = str(params.get("turnId") or "")
         turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
@@ -685,16 +826,64 @@ class CodexAppServerManager:
         if not turn_id:
             return
         tracker = self._tracker(turn_id)
-        if method == "item/completed":
+        if method == "turn/started":
+            if not tracker.started_recorded:
+                tracker.started_recorded = self._record_turn_event(
+                    tracker,
+                    "turn_started",
+                    {"turn_id": turn_id, "thread_id": tracker.thread_id},
+                    status="running",
+                    current_item_type=None,
+                )
+        elif method == "item/started":
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            public_item = self._public_item_event(item)
+            self._record_turn_event(
+                tracker,
+                "item_started",
+                public_item,
+                current_item_type=public_item["item_type"],
+                current_item_status="in_progress",
+            )
+        elif method == "item/completed":
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
             self._read_completed_item(tracker, item)
+            public_item = self._public_item_event(item)
+            self._record_turn_event(
+                tracker,
+                "item_completed",
+                public_item,
+                current_item_type=public_item["item_type"],
+                current_item_status=public_item.get("status") or "completed",
+            )
         elif method == "thread/tokenUsage/updated":
             tracker.usage = params.get("tokenUsage") if isinstance(params.get("tokenUsage"), dict) else {}
             tracker.usage_ready.set()
+            normalized = _normalize_app_server_usage(tracker.usage)
+            self._record_turn_event(
+                tracker,
+                "token_usage",
+                {
+                    "prompt_tokens": normalized.get("prompt_tokens", 0),
+                    "completion_tokens": normalized.get("completion_tokens", 0),
+                    "total_tokens": normalized.get("total_tokens", 0),
+                },
+                prompt_tokens=normalized.get("prompt_tokens", 0),
+                completion_tokens=normalized.get("completion_tokens", 0),
+                total_tokens=normalized.get("total_tokens", 0),
+            )
         elif method == "error":
             error = params.get("error") if isinstance(params.get("error"), dict) else {}
             if not params.get("willRetry"):
                 tracker.error = str(error.get("message") or error or "Codex turn failed")
+            self._record_turn_event(
+                tracker,
+                "error",
+                {
+                    "message": str(error.get("message") or error or "Codex turn failed")[:1000],
+                    "will_retry": bool(params.get("willRetry")),
+                },
+            )
         elif method == "turn/completed":
             for item in turn.get("items") or []:
                 if isinstance(item, dict):
@@ -703,6 +892,17 @@ class CodexAppServerManager:
             error = turn.get("error") if isinstance(turn.get("error"), dict) else {}
             if error:
                 tracker.error = str(error.get("message") or error)
+            self._record_turn_event(
+                tracker,
+                "turn_completed",
+                {
+                    "turn_id": turn_id,
+                    "status": tracker.status,
+                    "error": tracker.error,
+                },
+                current_item_type=None,
+                current_item_status=None,
+            )
             tracker.completed.set()
 
     def _send(self, message: Dict[str, Any]) -> None:
@@ -773,12 +973,6 @@ class CodexAppServerManager:
         config: Dict[str, Any] = {
             "model_reasoning_effort": reasoning_effort,
             "web_search": web_search_mode,
-            "features": {
-                "multi_agent": False,
-                "memories": False,
-                "remote_plugin": False,
-            },
-            "apps": {"_default": {"enabled": False}},
         }
         if reasoning_summary != "inherit":
             config["model_reasoning_summary"] = reasoning_summary
@@ -797,6 +991,8 @@ class CodexAppServerManager:
         web_search_mode: str,
         reasoning_summary: str,
         timeout: int,
+        ephemeral: bool = False,
+        sandbox: str = "workspace-write",
     ) -> str:
         runtime_workdir = _as_runtime_path(Path(self.workdir), self.use_wsl)
         thread_config = self._thread_config(
@@ -810,8 +1006,8 @@ class CodexAppServerManager:
                 "model": model,
                 "cwd": runtime_workdir,
                 "approvalPolicy": "never",
-                "sandbox": "workspace-write",
-                "ephemeral": False,
+                "sandbox": sandbox,
+                "ephemeral": bool(ephemeral),
                 "config": thread_config,
             },
             timeout=min(timeout, 120),
@@ -832,6 +1028,7 @@ class CodexAppServerManager:
         web_search_mode: str,
         reasoning_summary: str,
         timeout: int,
+        sandbox: str = "workspace-write",
     ) -> None:
         thread_config = self._thread_config(
             reasoning_effort,
@@ -850,7 +1047,7 @@ class CodexAppServerManager:
                     "model": model,
                     "cwd": runtime_workdir,
                     "approvalPolicy": "never",
-                    "sandbox": "workspace-write",
+                    "sandbox": sandbox,
                     "config": thread_config,
                 },
                 timeout=min(timeout, 120),
@@ -893,7 +1090,26 @@ class CodexAppServerManager:
                 role_name=role_name,
                 retry=retry,
                 max_turns=max(0, int(max_turns or 0)),
+                ephemeral=False,
             )
+
+    def run(self, request: Dict[str, Any], *, profile_name: str = "batch") -> Dict[str, Any]:
+        """Run one isolated turn on this long-lived process."""
+        run_key = f"{profile_name}:{uuid.uuid4().hex}"
+        with self._chat_lock(run_key):
+            return self._chat_locked(
+                request,
+                chat_id=run_key,
+                role_name=profile_name,
+                retry=False,
+                max_turns=1,
+                ephemeral=True,
+            )
+
+    def read_rate_limits(self, timeout: int = 30) -> Dict[str, Any]:
+        """Read account limits through the initialized shared connection."""
+        result = self._request("account/rateLimits/read", {}, timeout=max(1, int(timeout)))
+        return result if isinstance(result, dict) else {}
 
     def _chat_locked(
         self,
@@ -903,6 +1119,7 @@ class CodexAppServerManager:
         role_name: Optional[str],
         retry: bool,
         max_turns: int,
+        ephemeral: bool,
     ) -> Dict[str, Any]:
         self.start()
         model = str(request.get("model") or os.getenv("CODEX_PROXY_MODEL") or "gpt-5.6-sol")
@@ -943,7 +1160,20 @@ class CodexAppServerManager:
         if not isinstance(messages, list):
             raise CodexAppServerError("messages must be a list")
 
-        state = self.state_store.get(chat_id)
+        sandbox = str(
+            request.get("codex_sandbox")
+            or extra_body.get("codex_sandbox")
+            or "workspace-write"
+        ).strip().lower()
+        if sandbox not in {"read-only", "workspace-write"}:
+            sandbox = "workspace-write"
+        output_schema = request.get("output_schema")
+        if not isinstance(output_schema, dict):
+            output_schema = extra_body.get("output_schema")
+        if not isinstance(output_schema, dict):
+            output_schema = None
+
+        state = None if ephemeral else self.state_store.get(chat_id)
         effective_rotate_tokens = self.rotate_tokens
         state_context_window = int((state or {}).get("model_context_window") or 0)
         if state_context_window > 0:
@@ -974,6 +1204,7 @@ class CodexAppServerManager:
                     web_search_mode=web_search_mode,
                     reasoning_summary=reasoning_summary,
                     timeout=timeout,
+                    sandbox=sandbox,
                 )
             except _ResumeThreadError as exc:
                 logger.warning(
@@ -998,6 +1229,8 @@ class CodexAppServerManager:
                 web_search_mode=web_search_mode,
                 reasoning_summary=reasoning_summary,
                 timeout=timeout,
+                ephemeral=ephemeral,
+                sandbox=sandbox,
             )
             logger.info(
                 "Codex persistent thread started: chat=%s thread=%s reason=%s",
@@ -1012,6 +1245,7 @@ class CodexAppServerManager:
         artifact_root = Path(os.getenv("CODEX_PROXY_ARTIFACT_ROOT") or "tmp/images/codex")
         if not artifact_root.is_absolute():
             artifact_root = Path(self.workdir) / artifact_root
+        _cleanup_expired_artifacts(artifact_root)
         request_dir = artifact_root / request_id
         output_dir = request_dir / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1051,6 +1285,8 @@ class CodexAppServerManager:
                 "request_id": request_id,
                 "status": "starting",
                 "backend": "codex_app_server",
+                "pool_worker": self.instance_name,
+                "profile": role_name,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
                 "web_search": web_search_enabled,
@@ -1068,6 +1304,11 @@ class CodexAppServerManager:
                 "started_at": started_at,
             },
         )
+        codex_job_manager.record_event(
+            request_id,
+            "queued",
+            {"thread_id": thread_id, "profile": role_name},
+        )
         turn_id = ""
         tracker: Optional[_TurnTracker] = None
         try:
@@ -1080,6 +1321,7 @@ class CodexAppServerManager:
                     "effort": reasoning_effort,
                     "cwd": _as_runtime_path(Path(self.workdir), self.use_wsl),
                     "approvalPolicy": "never",
+                    **({"outputSchema": output_schema} if output_schema else {}),
                     **(
                         {"summary": reasoning_summary}
                         if reasoning_summary != "inherit"
@@ -1093,12 +1335,22 @@ class CodexAppServerManager:
             if not turn_id:
                 raise CodexAppServerError("Codex App Server turn/start returned no turn id")
             tracker = self._tracker(turn_id)
+            tracker.request_id = request_id
+            tracker.thread_id = thread_id
             codex_job_manager.update(
                 request_id,
                 status="running",
                 turn_id=turn_id,
                 _cancel_callback=lambda: self._interrupt_turn(thread_id, turn_id),
             )
+            if not tracker.started_recorded:
+                codex_job_manager.record_event(
+                    request_id,
+                    "turn_started",
+                    {"thread_id": thread_id, "turn_id": turn_id},
+                    status="running",
+                )
+                tracker.started_recorded = True
             if not tracker.completed.wait(timeout=timeout):
                 self._interrupt_turn(thread_id, turn_id)
                 raise CodexAppServerError(f"Codex App Server turn timed out after {timeout}s")
@@ -1109,8 +1361,16 @@ class CodexAppServerManager:
                     tracker.error or f"Codex App Server turn ended with status {tracker.status}"
                 )
 
-            text = tracker.agent_messages[-1].strip() if tracker.agent_messages else ""
+            response_messages = tracker.final_messages or tracker.unclassified_messages
+            text = response_messages[-1].strip() if response_messages else ""
             attachments = _collect_artifact_attachments(output_dir)
+            _write_artifact_manifest(
+                request_dir,
+                request_id=request_id,
+                backend="codex_app_server",
+                model=model,
+                attachments=attachments,
+            )
             if not text and attachments:
                 text = _default_text_for_attachments(attachments)
             if not text:
@@ -1151,9 +1411,15 @@ class CodexAppServerManager:
                 "usage_source": usage.get("source"),
                 "usage_estimated": bool(usage.get("estimated", False)),
                 "last_turn_id": turn_id,
+                "codex_version": self.codex_version,
+                "schema_hash": self.schema_hash,
+                "config_signature": self._thread_config_signature(
+                    self._thread_config(reasoning_effort, web_search_mode, reasoning_summary)
+                ),
                 "updated_at": datetime.now().isoformat(),
             }
-            self.state_store.put(chat_id, state_payload)
+            if not ephemeral:
+                self.state_store.put(chat_id, state_payload)
             codex_job_manager.update(
                 request_id,
                 status="completed",
@@ -1184,6 +1450,7 @@ class CodexAppServerManager:
                 "created": now,
                 "model": model,
                 "backend": "codex_app_server",
+                "pool_worker": self.instance_name,
                 "thread_id": thread_id,
                 "turn_id": turn_id,
                 "choices": [
@@ -1207,6 +1474,11 @@ class CodexAppServerManager:
             }
         except Exception as exc:
             codex_job_manager.update(request_id, error=str(exc))
+            codex_job_manager.record_event(
+                request_id,
+                "error",
+                {"message": str(exc)[:1000]},
+            )
             raise
         finally:
             if turn_id:
@@ -1228,25 +1500,28 @@ class CodexAppServerManager:
             if active_job:
                 status = str(active_job.get("status") or "")
                 if status == "completed":
+                    codex_job_manager.record_event(
+                        request_id,
+                        "job_finished",
+                        {"status": "completed"},
+                    )
                     codex_job_manager.finish(request_id, status="completed")
                 elif status in {"cancelling", "cancelled"}:
+                    codex_job_manager.record_event(
+                        request_id,
+                        "job_finished",
+                        {"status": "cancelled"},
+                    )
                     codex_job_manager.finish(request_id, status="cancelled", error="cancelled")
                 else:
+                    final_error = str(active_job.get("error") or "Codex App Server turn failed")
+                    codex_job_manager.record_event(
+                        request_id,
+                        "job_finished",
+                        {"status": "failed", "error": final_error},
+                    )
                     codex_job_manager.finish(
                         request_id,
                         status="failed",
-                        error=str(active_job.get("error") or "Codex App Server turn failed"),
+                        error=final_error,
                     )
-
-
-_manager_lock = threading.Lock()
-_manager: Optional[CodexAppServerManager] = None
-
-
-def get_codex_app_server_manager() -> CodexAppServerManager:
-    global _manager
-    if _manager is None:
-        with _manager_lock:
-            if _manager is None:
-                _manager = CodexAppServerManager()
-    return _manager

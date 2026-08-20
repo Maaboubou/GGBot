@@ -1,5 +1,9 @@
 {
   "schema_version": 2,
+  "plugin_api_version": 2,
+  "storage": {"cache_retention_days": 7, "cache_limit_mb": 1024},
+  "backup": {"schema_version": 1, "include_persistent_storage": false, "include_generated_files": true, "supports_restore_migration": false, "sensitive": false},
+  "health": {"critical": false, "timeout_seconds": 8},
   "listeners": [
     {"event": "text_message_received", "handler": "handle_text", "title": "开始菜单翻译", "trigger": {"kind": "keyword", "summary": "消息包含任一菜单翻译关键词", "config_keys": ["trigger_keywords"], "conditions": ["命中后进入限时图片收集会话"]}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "stop_on_consumed"},
     {"event": "image_message_received", "handler": "handle_image", "title": "接收菜单图片", "trigger": {"kind": "session", "summary": "当前聊天存在等待菜单图片的翻译会话", "config_keys": [], "conditions": []}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "stop_on_consumed"}

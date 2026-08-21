@@ -141,6 +141,7 @@ Install.bat
 - API 文档：<http://127.0.0.1:8888/docs>
 - 主应用健康检查：<http://127.0.0.1:8888/health>
 - 微信桥接健康检查：<http://127.0.0.1:5555/health>
+- 微信桥接进程存活检查：<http://127.0.0.1:5555/live>
 
 ### 3. 添加模型连接
 
@@ -299,9 +300,12 @@ Install.bat
 curl.exe http://127.0.0.1:8888/health
 curl.exe http://127.0.0.1:8888/api/system/status
 curl.exe http://127.0.0.1:8888/api/wechat/status
+curl.exe http://127.0.0.1:5555/live
 curl.exe http://127.0.0.1:5555/health
 curl.exe http://127.0.0.1:5555/api/listeners/status
 ```
+
+`/live` 只表示桥接进程可响应；`/health` 返回微信连接、在线探针和监听器的缓存快照，不会在每次轮询时操作微信窗口。长期无人值守机器可先用 `/live` 区分进程故障，再查看 `/health` 中的 `health_status`、`online_probe`、`connection_id` 和监听器状态。桥接端口默认只监听本机，因此这些命令应在目标 Windows 主机中执行。
 
 日志默认位于：
 

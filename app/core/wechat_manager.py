@@ -11,10 +11,11 @@ import uuid
 from contextlib import contextmanager
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
+from urllib.parse import urlparse
 import requests
 
 from .event_bus import EventBus, get_event_bus, Event, EventType
-from ..utils.health_state import ConsecutiveHealthGate
+from ..utils.health_state import ConsecutiveHealthGate, should_resync_connection
 
 # --- wx_bot.py 的地址 ---
 WX_BOT_PORT = os.getenv("WX_BOT_PORT", "5555").strip() or "5555"
@@ -22,6 +23,7 @@ WX_BOT_URL = os.getenv("WX_BOT_URL", "").strip() or f"http://127.0.0.1:{WX_BOT_P
 LISTENER_API_TIMEOUT_SEC = 75
 CONNECTION_MONITOR_INTERVAL_SEC = 5
 CONNECTION_FAILURE_THRESHOLD = 3
+CONNECTION_RECOVERY_THRESHOLD = 2
 TEXT_SEND_API_TIMEOUT_SEC = 30
 
 @dataclass
@@ -47,6 +49,11 @@ class WeChatManager:
     def __init__(self, event_bus: Optional[EventBus] = None):
         self.event_bus = event_bus or get_event_bus()
         self.logger = logging.getLogger(__name__)
+        self._http = requests.Session()
+        bridge_host = (urlparse(WX_BOT_URL).hostname or "").lower()
+        if bridge_host in {"127.0.0.1", "localhost", "::1"}:
+            # 本机桥接流量不能被系统 HTTP(S)_PROXY 送到外部代理。
+            self._http.trust_env = False
         self._running = False
         self._listened_chats = {}
         self._stats = {
@@ -65,6 +72,9 @@ class WeChatManager:
             'timestamp': 0
         }
         self._last_reconnected_ts: float = 0.0
+        self._last_connection_id: Optional[str] = None
+        self._last_health_error_signature: Optional[str] = None
+        self._last_health_error_logged_at: float = 0.0
 
     def _post_outbound(self, endpoint: str, payload: Dict[str, Any], timeout: int) -> requests.Response:
         """
@@ -77,7 +87,7 @@ class WeChatManager:
                 endpoint,
                 payload.get("who") or payload.get("chat_name")
             )
-            return requests.post(
+            return self._http.post(
                 f"{WX_BOT_URL}{endpoint}",
                 json=payload,
                 timeout=timeout
@@ -93,6 +103,7 @@ class WeChatManager:
         """启动微信管理器并检查与wx_bot的连接"""
         self.logger.info("Starting WeChat manager (API client mode)...")
         self._last_health = self._get_health()
+        self._last_connection_id = self._last_health.get("connection_id") or None
         if self._last_health.get('wechat_connected'):
             self.logger.info("✅ Successfully connected to wx_bot service.")
             self._running = True
@@ -117,38 +128,75 @@ class WeChatManager:
 
     def _check_wechat_connection(self) -> bool:
         """通过API检查与wx_bot的连接状态"""
-        try:
-            response = requests.get(f"{WX_BOT_URL}/health", timeout=3)
-            response.raise_for_status()
-            data = response.json()
-            return data.get("status") == "ok" and data.get("wechat_connected", False)
-        except requests.RequestException as e:
-            self.logger.error(f"Connection check to wx_bot failed: {e}")
-            return False
+        health = self._get_health()
+        return bool(health.get("bridge_reachable") and health.get("wechat_connected"))
+
+    def _health_failure_sample(self, reason: str, error: object, latency_ms: float) -> Dict[str, Any]:
+        now = time.time()
+        signature = f"{reason}:{type(error).__name__}:{error}"
+        if signature != self._last_health_error_signature or now - self._last_health_error_logged_at >= 60:
+            self._last_health_error_signature = signature
+            self._last_health_error_logged_at = now
+            self.logger.warning(
+                "wx_bot health request failed: reason=%s latency_ms=%.1f error=%s",
+                reason,
+                latency_ms,
+                error,
+            )
+        return {
+            'bridge_reachable': False,
+            'wechat_connected': False,
+            'wechat_online': False,
+            'health_status': 'unavailable',
+            'failure_reason': reason,
+            'failure_error': str(error),
+            'response_latency_ms': round(latency_ms, 1),
+            'online_probe': {},
+            'connection_id': None,
+            'listeners': {},
+            'timestamp': now,
+        }
 
     def _get_health(self) -> Dict[str, Any]:
         """获取 wx_bot 健康状态详情（包含 online/connected）"""
+        started = time.perf_counter()
         try:
-            response = requests.get(f"{WX_BOT_URL}/health", timeout=3)
+            response = self._http.get(f"{WX_BOT_URL}/health", timeout=3)
             response.raise_for_status()
             data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("wx_bot health response is not an object")
+            latency_ms = (time.perf_counter() - started) * 1000
             listeners = data.get('listeners') or {}
             self._sync_listened_chats_from_listener_status(listeners)
+            self._last_health_error_signature = None
             return {
+                'bridge_reachable': True,
                 'wechat_connected': bool(data.get('wechat_connected')),
                 'wechat_online': bool(data.get('wechat_online')),
                 'health_status': data.get('health_status', 'ok'),
+                'failure_reason': None,
+                'failure_error': None,
+                'response_latency_ms': round(latency_ms, 1),
+                'online_probe': data.get('online_probe') or {},
+                'service_instance_id': data.get('service_instance_id'),
+                'connection_generation': data.get('connection_generation'),
+                'connection_id': data.get('connection_id'),
                 'listeners': listeners,
                 'timestamp': data.get('timestamp', time.time())
             }
-        except requests.RequestException:
-            return {
-                'wechat_connected': False,
-                'wechat_online': False,
-                'health_status': 'unavailable',
-                'listeners': {},
-                'timestamp': time.time()
-            }
+        except requests.Timeout as e:
+            latency_ms = (time.perf_counter() - started) * 1000
+            return self._health_failure_sample("bridge_timeout", e, latency_ms)
+        except ValueError as e:
+            latency_ms = (time.perf_counter() - started) * 1000
+            return self._health_failure_sample("invalid_response", e, latency_ms)
+        except requests.RequestException as e:
+            latency_ms = (time.perf_counter() - started) * 1000
+            return self._health_failure_sample("bridge_request_error", e, latency_ms)
+        except Exception as e:
+            latency_ms = (time.perf_counter() - started) * 1000
+            return self._health_failure_sample("health_processing_error", e, latency_ms)
 
     def _sync_listened_chats_from_listener_status(self, listeners: Dict[str, Any]) -> None:
         """用 wx_bot 的 desired/actual 快照刷新本进程里的活跃监听视图。"""
@@ -192,17 +240,27 @@ class WeChatManager:
             health_gate = ConsecutiveHealthGate(
                 self._last_health,
                 failure_threshold=CONNECTION_FAILURE_THRESHOLD,
+                recovery_threshold=CONNECTION_RECOVERY_THRESHOLD,
             )
             while not self._monitor_stop_flag:
                 try:
                     current = self._get_health()
                     transition = health_gate.observe(current)
                     if not transition.accepted:
-                        self.logger.debug(
-                            "Ignoring transient wx_bot health failure %s/%s",
-                            transition.consecutive_failures,
-                            CONNECTION_FAILURE_THRESHOLD,
-                        )
+                        if current.get("wechat_connected") and current.get("wechat_online"):
+                            self.logger.debug(
+                                "Waiting for stable wx_bot recovery %s/%s",
+                                transition.consecutive_successes,
+                                CONNECTION_RECOVERY_THRESHOLD,
+                            )
+                        else:
+                            self.logger.debug(
+                                "Ignoring transient wx_bot health failure %s/%s reason=%s",
+                                transition.consecutive_failures,
+                                CONNECTION_FAILURE_THRESHOLD,
+                                current.get("failure_reason")
+                                or (current.get("online_probe") or {}).get("state"),
+                            )
                         time.sleep(CONNECTION_MONITOR_INTERVAL_SEC)
                         continue
 
@@ -211,25 +269,45 @@ class WeChatManager:
                     if not transition.healthy:
                         if transition.became_unhealthy:
                             self.logger.warning(
-                                "wx_bot health failed %s consecutive times; marking connection unavailable",
+                                "wx_bot health confirmed unavailable after %s failures: "
+                                "reason=%s latency_ms=%s probe_state=%s",
                                 transition.consecutive_failures,
+                                transition.confirmed.get("failure_reason") or "wechat_offline",
+                                transition.confirmed.get("response_latency_ms"),
+                                (transition.confirmed.get("online_probe") or {}).get("state"),
                             )
                         time.sleep(CONNECTION_MONITOR_INTERVAL_SEC)
                         continue
 
-                    if transition.reconnected:
+                    connection_id = transition.confirmed.get("connection_id") or None
+                    connection_changed = bool(
+                        connection_id and connection_id != self._last_connection_id
+                    )
+                    if should_resync_connection(
+                        self._last_connection_id,
+                        connection_id,
+                        recovered=transition.reconnected,
+                    ):
                         now_ts = time.time()
-                        # 1分钟内避免重复恢复
-                        if now_ts - self._last_reconnected_ts > 60:
+                        should_publish = connection_changed or now_ts - self._last_reconnected_ts > 60
+                        if should_publish:
                             self._last_reconnected_ts = now_ts
-                            self.logger.info("🔄 检测到微信已确认恢复，发布一次监听器同步事件...")
+                            if connection_id:
+                                self._last_connection_id = connection_id
+                            self.logger.info(
+                                "🔄 检测到新的微信连接实例，发布一次监听器同步事件: connection_id=%s",
+                                connection_id or "legacy",
+                            )
                             try:
                                 if self.event_bus:
                                     self.event_bus.publish(
                                         Event(
                                             type=EventType.WECHAT_RECONNECTED,
                                             source="wechat_manager",
-                                            data={"timestamp": now_ts}
+                                            data={
+                                                "timestamp": now_ts,
+                                                "connection_id": connection_id,
+                                            }
                                         )
                                     )
                             except Exception as e:
@@ -246,7 +324,7 @@ class WeChatManager:
     def add_listen_chat(self, chat_name: str, exact: bool = False) -> bool:
         """添加监听聊天 - 通过API"""
         try:
-            response = requests.post(
+            response = self._http.post(
                 f"{WX_BOT_URL}/api/add_listener",
                 json={"who": chat_name},
                 timeout=LISTENER_API_TIMEOUT_SEC
@@ -272,7 +350,7 @@ class WeChatManager:
     def remove_listen_chat(self, chat_name: str) -> bool:
         """移除监听聊天 - 通过API"""
         try:
-            response = requests.post(
+            response = self._http.post(
                 f"{WX_BOT_URL}/api/remove_listener",
                 json={"who": chat_name},
                 timeout=5
@@ -466,7 +544,7 @@ class WeChatManager:
             return None
 
         try:
-            response = requests.post(
+            response = self._http.post(
                 f"{WX_BOT_URL}/api/resolve_link_url",
                 json={"chat_name": chat_name, "message_id": message_id, "timeout": timeout},
                 timeout=max(timeout + 15, 20)
@@ -504,7 +582,7 @@ class WeChatManager:
             try:
                 self.logger.info(f"🖼️ {description} - 下载引用图片 (消息ID: {message_id}, 超时: {timeout}秒)")
 
-                response = requests.post(
+                response = self._http.post(
                     f"{WX_BOT_URL}/api/download_quote_image_on_demand",
                     json={"chat_name": chat_name, "message_id": message_id},
                     timeout=timeout
@@ -575,7 +653,7 @@ class WeChatManager:
             try:
                 self.logger.info(f"🖼️ {description} - 下载图片 (消息ID: {message_id}, 超时: {timeout}秒)")
 
-                response = requests.post(
+                response = self._http.post(
                     f"{WX_BOT_URL}/api/download_image_message",
                     json={"chat_name": chat_name, "message_id": message_id},
                     timeout=timeout
@@ -637,7 +715,7 @@ class WeChatManager:
     def get_chat_info(self, chat_name: str) -> Dict[str, Any]:
         """获取聊天信息 - 通过API（模拟chat.ChatInfo()）"""
         try:
-            response = requests.post(
+            response = self._http.post(
                 f"{WX_BOT_URL}/api/get_chat_info",
                 json={"who": chat_name},
                 timeout=10
@@ -659,7 +737,7 @@ class WeChatManager:
     def keep_running(self) -> None:
         """保持运行 - 通过API（模拟wx.KeepRunning()）"""
         try:
-            response = requests.post(
+            response = self._http.post(
                 f"{WX_BOT_URL}/api/keep_running",
                 json={},
                 timeout=10
@@ -678,7 +756,7 @@ class WeChatManager:
         """重启微信连接 - 通过API"""
         try:
             self.logger.info("🔄 Requesting WeChat restart...")
-            response = requests.post(
+            response = self._http.post(
                 f"{WX_BOT_URL}/api/restart_wechat",
                 json={},
                 timeout=10
@@ -702,7 +780,7 @@ class WeChatManager:
         """获取所有好友 - 通过API"""
         try:
             params = {"keywords": keywords} if keywords else {}
-            response = requests.get(f"{WX_BOT_URL}/api/get_friends", params=params, timeout=10)
+            response = self._http.get(f"{WX_BOT_URL}/api/get_friends", params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
 
@@ -718,7 +796,7 @@ class WeChatManager:
     def get_recent_groups(self) -> List[Dict[str, Any]]:
         """获取最近群聊列表 - 通过API"""
         try:
-            response = requests.get(f"{WX_BOT_URL}/api/get_groups", timeout=10)
+            response = self._http.get(f"{WX_BOT_URL}/api/get_groups", timeout=10)
             response.raise_for_status()
             data = response.json()
 
@@ -734,7 +812,7 @@ class WeChatManager:
     def get_current_chat_info(self) -> Dict[str, Any]:
         """获取当前聊天信息 - 通过API"""
         try:
-            response = requests.get(f"{WX_BOT_URL}/api/get_current_chat", timeout=10)
+            response = self._http.get(f"{WX_BOT_URL}/api/get_current_chat", timeout=10)
             response.raise_for_status()
             data = response.json()
 
@@ -750,7 +828,7 @@ class WeChatManager:
     def get_my_info(self) -> Dict[str, Any]:
         """获取当前用户信息 - 通过API"""
         try:
-            response = requests.get(f"{WX_BOT_URL}/api/get_my_info", timeout=10)
+            response = self._http.get(f"{WX_BOT_URL}/api/get_my_info", timeout=10)
             response.raise_for_status()
             data = response.json()
 
@@ -771,7 +849,7 @@ class WeChatManager:
     def get_listener_status(self) -> Dict[str, Any]:
         """获取 wx_bot 侧期望监听、实际监听窗口和缺失项。"""
         try:
-            response = requests.get(f"{WX_BOT_URL}/api/listeners/status", timeout=5)
+            response = self._http.get(f"{WX_BOT_URL}/api/listeners/status", timeout=5)
             response.raise_for_status()
             data = response.json()
             if data.get("status") == "success":
@@ -795,6 +873,10 @@ class WeChatManager:
             **self._stats,
             'connected': bool(cached_health.get('wechat_connected')),
             'running': self._running,
+            'bridge_reachable': bool(cached_health.get('bridge_reachable')),
+            'health_status': cached_health.get('health_status'),
+            'connection_id': cached_health.get('connection_id'),
+            'online_probe': cached_health.get('online_probe') or {},
             'listened_chats': list(self._listened_chats.keys()),
             'listener_status': listener_status
         }
@@ -814,7 +896,7 @@ class WeChatManager:
     def is_online(self) -> bool:
         """检查微信是否在线 - 通过API（模拟wx.IsOnline()）"""
         try:
-            response = requests.get(
+            response = self._http.get(
                 f"{WX_BOT_URL}/api/is_online",
                 timeout=5
             )

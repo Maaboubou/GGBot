@@ -54,6 +54,7 @@ from app.models.base import SessionLocal
 from app.models.user_permission import WeChatUser
 from app.utils.daily_schedule import BEIJING_TIMEZONE, next_daily_run_at
 from app.utils.inflight_deduplicator import InFlightDeduplicator
+from app.utils.health_state import OnlineProbeTracker
 from app.utils.logging_utils import create_rotating_file_handler
 from app.utils.wechat_media import image_file_fingerprint, is_probable_wechat_media_window
 from app.utils.wechat_listener_recovery import open_listener_from_existing_session
@@ -154,12 +155,75 @@ listener_daily_restart_last_at: float = 0.0
 listener_daily_restart_next_at: float = next_daily_run_at(hour=LISTENER_DAILY_RESTART_HOUR)
 listener_daily_restart_last_targets: list[str] = []
 listener_daily_restart_last_error: str = ""
-last_wechat_online = True
+ONLINE_PROBE_INTERVAL_SEC = 5
+ONLINE_PROBE_LOCK_TIMEOUT_SEC = 0.25
+ONLINE_PROBE_FAILURE_THRESHOLD = 3
+ONLINE_PROBE_RECOVERY_THRESHOLD = 2
+online_probe_tracker = OnlineProbeTracker(
+    initial_online=False,
+    failure_threshold=ONLINE_PROBE_FAILURE_THRESHOLD,
+    recovery_threshold=ONLINE_PROBE_RECOVERY_THRESHOLD,
+)
+wechat_service_instance_id = uuid.uuid4().hex
+wechat_connection_generation = 0
+last_wechat_online = False
 last_wechat_online_checked_at: float = 0.0
 last_browser_more_offset_from_right: int | None = None
 COPY_LINK_FAST_PROBE_TIMEOUT_SEC = 0.2
 COPY_LINK_MENU_REOPEN_INTERVAL_SEC = 0.05
 COPY_LINK_POSITION_FAST_MISS_LIMIT = 8
+
+
+def _sync_online_probe_legacy_fields(snapshot: dict) -> dict:
+    """Keep legacy globals coherent while callers migrate to probe metadata."""
+    global last_wechat_online, last_wechat_online_checked_at
+    last_wechat_online = bool(snapshot.get("online"))
+    checked_at = snapshot.get("checked_at")
+    if checked_at:
+        last_wechat_online_checked_at = float(checked_at)
+    return snapshot
+
+
+def _online_probe_snapshot() -> dict:
+    return _sync_online_probe_legacy_fields(online_probe_tracker.snapshot())
+
+
+def _online_probe_mark_connected() -> dict:
+    return _sync_online_probe_legacy_fields(
+        online_probe_tracker.mark_connected(source="client_initialized")
+    )
+
+
+def _online_probe_mark_disconnected(reason: str) -> dict:
+    return _sync_online_probe_legacy_fields(
+        online_probe_tracker.mark_disconnected(reason)
+    )
+
+
+def _online_probe_record_result(online: bool, duration_ms: float) -> dict:
+    return _sync_online_probe_legacy_fields(
+        online_probe_tracker.record_result(
+            online,
+            duration_ms=duration_ms,
+            source="connection_supervisor",
+        )
+    )
+
+
+def _online_probe_record_error(error: object, duration_ms: float) -> dict:
+    return _sync_online_probe_legacy_fields(
+        online_probe_tracker.record_error(
+            error,
+            duration_ms=duration_ms,
+            source="connection_supervisor",
+        )
+    )
+
+
+def _online_probe_record_busy(reason: str = "ui_lock_busy") -> dict:
+    return _sync_online_probe_legacy_fields(
+        online_probe_tracker.record_busy(reason)
+    )
 
 
 def _parse_sender_blacklist(raw_value) -> list[str]:
@@ -2199,11 +2263,9 @@ def _ensure_listener_watchdog_started() -> None:
                     # 避免锁外看到旧对象，进锁后却对 None/新对象操作。
                     if not wx:
                         continue
-                    try:
-                        if not wx.IsOnline():
-                            continue
-                    except Exception as e:
-                        logger.debug(f"监听窗口看护跳过：微信在线状态检查失败: {e}")
+                    # IsOnline 只能由连接监控线程主动探测。watchdog 复用确认缓存，
+                    # 避免两个 5/20 秒循环并发访问同一 UIA 对象。
+                    if not _online_probe_snapshot().get("online"):
                         continue
 
                     if time.time() >= listener_daily_restart_next_at:
@@ -2385,7 +2447,8 @@ logger = logging.getLogger(__name__)
 _load_seen_message_ids()
 
 # --- FastAPI主应用地址 ---
-MAIN_APP_URL = os.getenv("MAIN_APP_URL") or f"http://127.0.0.1:{os.getenv('WEB_PORT', '8888')}"
+_web_port = os.getenv("WEB_PORT", "8888").strip() or "8888"
+MAIN_APP_URL = os.getenv("MAIN_APP_URL", "").strip() or f"http://127.0.0.1:{_web_port}"
 
 
 # --- 微信核心逻辑 ---
@@ -2415,7 +2478,7 @@ def _stop_wechat_client(client, reason: str) -> None:
 
 def start_wechat_logic():
     """初始化微信并保持运行，支持自动重连"""
-    global wx, restart_requested, last_wechat_online, last_wechat_online_checked_at
+    global wx, restart_requested, wechat_connection_generation
 
     retry_count = 0
     max_retries = 3
@@ -2436,8 +2499,14 @@ def start_wechat_logic():
             with wx_ui_lock:
                 current_client = WeChat(start_listener=True)
                 wx = current_client
+                wechat_connection_generation += 1
+                _online_probe_mark_connected()
                 _reset_listener_recovery_after_connection()
-            logger.info("✅ WeChat connected successfully!")
+            logger.info(
+                "✅ WeChat connected successfully! connection_id=%s:%s",
+                wechat_service_instance_id,
+                wechat_connection_generation,
+            )
             _ensure_listener_watchdog_started()
 
             # 重置重试计数
@@ -2464,22 +2533,56 @@ def start_wechat_logic():
                     disconnect_reason = "manual_restart"
                     break
 
-                # 检查微信是否还在线
+                # 只有连接监控线程主动执行 IsOnline。UI 正忙时跳过本轮并保留
+                # 最近确认状态；false/异常达到阈值后才销毁连接。
+                acquired = wx_ui_lock.acquire(timeout=ONLINE_PROBE_LOCK_TIMEOUT_SEC)
+                if not acquired:
+                    _online_probe_record_busy()
+                    time.sleep(ONLINE_PROBE_INTERVAL_SEC)
+                    continue
+
+                probe_started = time.perf_counter()
                 try:
-                    online = bool(current_client.IsOnline())
-                    last_wechat_online = online
-                    last_wechat_online_checked_at = time.time()
-                    if not online:
-                        logger.warning("⚠️ 检测到微信掉线，将重新连接...")
-                        disconnect_reason = "wechat_offline"
+                    if wx is not current_client:
+                        disconnect_reason = "connection_replaced"
                         break
-                except Exception as check_e:
-                    logger.warning(f"⚠️ 检查微信状态时出现异常: {check_e}")
-                    disconnect_reason = f"online_check_failed:{check_e}"
-                    break
+                    try:
+                        online = bool(current_client.IsOnline())
+                        duration_ms = (time.perf_counter() - probe_started) * 1000
+                        probe = _online_probe_record_result(online, duration_ms)
+                    except Exception as check_e:
+                        duration_ms = (time.perf_counter() - probe_started) * 1000
+                        probe = _online_probe_record_error(check_e, duration_ms)
+
+                    if not probe.get("online"):
+                        logger.warning(
+                            "⚠️ 微信在线状态已确认异常，将重新连接: state=%s "
+                            "failures=%s/%s kind=%s error=%s duration_ms=%s",
+                            probe.get("state"),
+                            probe.get("consecutive_failures"),
+                            probe.get("failure_threshold"),
+                            probe.get("last_failure_kind"),
+                            probe.get("last_error"),
+                            probe.get("last_duration_ms"),
+                        )
+                        disconnect_reason = "wechat_offline_confirmed"
+                        break
+
+                    if probe.get("state") == "suspect":
+                        logger.debug(
+                            "微信在线探针瞬时失败，保留已确认连接: failures=%s/%s "
+                            "kind=%s error=%s duration_ms=%s",
+                            probe.get("consecutive_failures"),
+                            probe.get("failure_threshold"),
+                            probe.get("last_failure_kind"),
+                            probe.get("last_error"),
+                            probe.get("last_duration_ms"),
+                        )
+                finally:
+                    wx_ui_lock.release()
 
                 # 等待5秒后再次检查
-                time.sleep(5)
+                time.sleep(ONLINE_PROBE_INTERVAL_SEC)
 
             # 退出监控循环，准备重连
             logger.info("🔄 准备重新连接...")
@@ -2503,8 +2606,7 @@ def start_wechat_logic():
                 if wx is current_client:
                     wx = None
                 _stop_wechat_client(current_client, disconnect_reason)
-            last_wechat_online = False
-            last_wechat_online_checked_at = time.time()
+            _online_probe_mark_disconnected(disconnect_reason)
 
             # 确保COM被正确卸载
             try:
@@ -4404,49 +4506,75 @@ def keep_running():
         logger.error(f"Error starting KeepRunning: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/live', methods=['GET'])
+def liveness_check():
+    """纯进程存活检查；不依赖微信、监听器或任何 UI 状态。"""
+    return jsonify({
+        "status": "ok",
+        "service": "wx_bot",
+        "service_instance_id": wechat_service_instance_id,
+        "timestamp": time.time(),
+    })
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    """健康检查"""
+    """返回只读健康快照；轮询接口绝不主动触碰微信 UI。"""
+    now = time.time()
     wechat_connected = wx is not None
-    wechat_online = bool(wechat_connected and last_wechat_online)
-    online_check_skipped = False
-    desired_snapshot = {}
+    online_probe = _online_probe_snapshot()
+    online_probe["stale"] = bool(
+        online_probe.get("age_sec") is None
+        or float(online_probe.get("age_sec") or 0) > ONLINE_PROBE_INTERVAL_SEC * 6
+    )
+    wechat_online = bool(wechat_connected and online_probe.get("online"))
 
     with desired_listeners_lock:
         desired_snapshot = {name: meta.copy() for name, meta in desired_listeners.items()}
 
     actual = list(last_listener_actual_snapshot)
-    probe_skipped = False
-    if wechat_connected:
-        acquired = wx_ui_lock.acquire(blocking=False)
-        if acquired:
-            try:
-                try:
-                    wechat_online = bool(wx.IsOnline())
-                except Exception as e:
-                    logger.debug(f"Health check - failed to get online status: {e}")
-                    wechat_online = False
-                actual = _get_actual_listener_names()
-            except Exception as e:
-                logger.debug(f"Health check - failed to get listener windows: {e}")
-            finally:
-                wx_ui_lock.release()
-        else:
-            # 链接解析/图片下载等 UI 操作正在进行时，健康检查必须快速返回。
-            probe_skipped = True
-            online_check_skipped = True
-            wechat_online = True
+    listener_snapshot_age_sec = None
+    if last_listener_actual_snapshot_at > 0:
+        listener_snapshot_age_sec = round(max(0.0, now - last_listener_actual_snapshot_at), 1)
+    listener_snapshot_stale = bool(
+        not last_listener_actual_snapshot_at
+        or (
+            listener_snapshot_age_sec is not None
+            and listener_snapshot_age_sec > LISTENER_WATCHDOG_INTERVAL_SEC * 3
+        )
+    )
+    listener_payload = _listener_status_payload(
+        desired_snapshot,
+        actual,
+        probe_skipped=listener_snapshot_stale,
+    )
 
-    listener_payload = _listener_status_payload(desired_snapshot, actual, probe_skipped=probe_skipped)
+    if not wechat_connected or not wechat_online:
+        health_status = "unavailable"
+    elif online_probe.get("state") in {"busy", "suspect", "recovering"} or online_probe.get("stale"):
+        health_status = "degraded"
+    elif listener_payload["status"] in {"degraded", "unknown"}:
+        health_status = "degraded"
+    else:
+        health_status = "ok"
+
+    connection_id = None
+    if wechat_connected and wechat_connection_generation > 0:
+        connection_id = f"{wechat_service_instance_id}:{wechat_connection_generation}"
 
     return jsonify({
         "status": "ok",
-        "health_status": "degraded" if listener_payload["status"] == "degraded" else "ok",
+        "health_status": health_status,
         "wechat_connected": wechat_connected,
         "wechat_online": wechat_online,
-        "online_check_skipped": online_check_skipped,
+        "online_check_skipped": True,
+        "online_check_mode": "cached",
+        "online_probe": online_probe,
+        "service_instance_id": wechat_service_instance_id,
+        "connection_generation": wechat_connection_generation,
+        "connection_id": connection_id,
         "listeners": listener_payload,
-        "timestamp": time.time(),
+        "timestamp": now,
         "service": "wx_bot"
     })
 
@@ -4583,44 +4711,21 @@ def rebuild_listener():
 
 @app.route('/api/is_online', methods=['GET'])
 def is_online():
-    """检查微信是否在线"""
-    global last_wechat_online, last_wechat_online_checked_at
+    """返回连接监控线程维护的在线缓存，不创建第二个 UI 探针。"""
     if not wx:
         return jsonify({"status": "error", "message": "WeChat not connected", "online": False}), 503
 
-    try:
-        acquired = wx_ui_lock.acquire(blocking=False)
-        if not acquired:
-            return jsonify({
-                "status": "success",
-                "online": True,
-                "check_skipped": True,
-                "cached_online": last_wechat_online,
-                "cached_at": last_wechat_online_checked_at,
-                "message": "Online check skipped while WeChat UI is busy"
-            })
-
-        # 调用wxautox的IsOnline方法
-        try:
-            online = bool(wx.IsOnline())
-            last_wechat_online = online
-            last_wechat_online_checked_at = time.time()
-        finally:
-            wx_ui_lock.release()
-        return jsonify({
-            "status": "success",
-            "online": online,
-            "check_skipped": False,
-            "message": "Online status checked"
-        })
-    except Exception as e:
-        logger.error(f"Error checking online status: {e}")
-        # 如果IsOnline()抛异常，通常意味着微信未登录或掉线
-        return jsonify({
-            "status": "error", 
-            "online": False,
-            "message": f"Failed to check online status: {str(e)}"
-        })
+    online_probe = _online_probe_snapshot()
+    return jsonify({
+        "status": "success",
+        "online": bool(online_probe.get("online")),
+        "check_skipped": True,
+        "check_mode": "cached",
+        "cached_online": bool(online_probe.get("online")),
+        "cached_at": online_probe.get("checked_at"),
+        "online_probe": online_probe,
+        "message": "Online status served from the connection supervisor cache",
+    })
 
 @app.route('/api/download_quote_image_on_demand', methods=['POST'])
 def download_quote_image_on_demand():

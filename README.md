@@ -75,7 +75,7 @@ flowchart LR
 
 ```powershell
 cd C:\Users\你的用户名
-git clone https://github.com/Seren-dipity/GGBot.git
+git clone https://github.com/Maaboubou/GGBot.git
 cd GGBot
 .\一键启动.bat
 ```
@@ -117,7 +117,7 @@ Install.bat
 
 ## 升级与更新记录
 
-面向使用者的版本公告发布在 [GitHub Releases](https://github.com/Seren-dipity/GGBot/releases)，仓库内的长期变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+面向使用者的版本公告发布在 [GitHub Releases](https://github.com/Maaboubou/GGBot/releases)，仓库内的长期变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 升级前建议先在“系统 → 备份与迁移”中创建并校验备份，然后停止正在执行的长任务、更新代码与依赖并重启 GGBot。涉及插件接入方式或数据结构的版本会在 Release 公告中单独列出迁移提醒。
 
@@ -498,4 +498,4 @@ app/plugins/my_plugin/
 
 项目使用 [MIT License](LICENSE)。
 
-问题与改进建议请提交到 [GitHub Issues](https://github.com/Seren-dipity/GGBot/issues)。
+问题与改进建议请提交到 [GitHub Issues](https://github.com/Maaboubou/GGBot/issues)。

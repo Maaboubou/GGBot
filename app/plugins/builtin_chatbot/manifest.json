@@ -19,14 +19,6 @@
       "propagation": "continue"
     },
     {
-      "event": "image_message_received",
-      "handler": "handle_image_message",
-      "title": "图片 OCR 入库",
-      "trigger": {"kind": "dynamic", "summary": "开启 OCR 时异步提取图片文字并写入聊天上下文", "config_keys": [], "conditions": ["仅记录上下文，不消费消息"]},
-      "scope": {"level": "global", "chat_types": ["group", "user"]},
-      "propagation": "observe"
-    },
-    {
       "event": "quote_image_message_received",
       "handler": "handle_quote_image_message",
       "title": "引用图片回复",

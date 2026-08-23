@@ -1803,7 +1803,7 @@ const App = {
                 ['主动回复', '按群聊独立启用'],
                 ['@触发', flags.allow_mention_trigger ? '允许' : '关闭'],
                 ['长期记忆', flags.memory_enabled ? '开启' : '关闭'],
-                ['网页搜索 / 图片识别', `${flags.search_enabled ? '搜索开启' : '搜索关闭'} · ${flags.ocr_enabled ? 'OCR 开启' : 'OCR 关闭'}`]
+                ['网页搜索 / 图片内容补充', `${flags.search_enabled ? '搜索开启' : '搜索关闭'} · ${flags.image_enrichment_enabled ? '图片补充开启' : '图片补充关闭'}`]
             ];
             globalSummary.innerHTML = rows.map(([label, value]) => `
                 <div><span>${label}</span><strong>${UI.escapeHtml(String(value))}</strong></div>

@@ -217,115 +217,39 @@ async def receive_wechat_message(
 
 @router.get("/connectivity/websearch")
 async def test_websearch_connectivity():
-    """测试网络搜索相关模型的连通性"""
+    """测试内置 DDGS 搜索工具，不再依赖独立搜索模型映射。"""
     import asyncio
-    import litellm
-    from litellm import completion
-    from app.services.llm_manager import get_llm_manager
+    import time
 
-    llm_manager = get_llm_manager()
-    mapping = llm_manager.config.get("plugin_mappings", {}).get("builtin_chatbot", {}).get("web_search", {})
-    
-    if not mapping:
-        return {"status": "error", "message": "未找到网络搜索(builtin_chatbot.web_search)配置"}
-        
-    models_to_test = []
-    
-    # 提取Primary模型
-    primary_id = mapping.get("primary")
-    if primary_id:
-        models_to_test.append({"role": "primary", "id": primary_id})
-        
-    # 提取Fallback模型
-    for fb_id in mapping.get("fallback", []):
-         models_to_test.append({"role": "fallback", "id": fb_id})
+    from app.services.local_web_search import LocalWebSearchService
 
-    if not models_to_test:
-        return {"status": "error", "message": "网络搜索未配置任何模型(Primary/Fallback)"}
-
-    results = []
-
-    async def _test_single_model(model_info):
-        model_id = model_info["id"]
-        role = model_info["role"]
-        
-        model_cfg = llm_manager.config.get("models", {}).get(model_id)
-        if not model_cfg:
-            return {
-                "role": role,
-                "id": model_id,
-                "model_name": "Unknown",
-                "ok": False,
-                "latency_ms": 0,
-                "message": "模型配置不存在"
-            }
-            
-        # 提取参数
-        params = {
-            "model": model_cfg["model"],
-            "messages": [{"role": "user", "content": "Hello"}],
-            "max_tokens": 1,
-            "timeout": 10
+    service = LocalWebSearchService(
+        timeout_seconds=10,
+        max_results=1,
+        fetch_max_pages=0,
+    )
+    started_at = time.perf_counter()
+    try:
+        results = await asyncio.to_thread(
+            service.search,
+            ["DDGS connectivity test"],
+            fetch_pages=False,
+        )
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return {
+            "status": "success",
+            "provider": "ddgs",
+            "ok": bool(results),
+            "latency_ms": latency_ms,
+            "result_count": len(results),
+            "message": "Success" if results else "DDGS 未返回结果",
         }
-        
-        # 认证信息
-        if "api_key" in model_cfg:
-            resolved_key = llm_manager._resolve_env(model_cfg["api_key"])
-            if resolved_key:
-                params["api_key"] = resolved_key
-        if "api_base" in model_cfg:
-            resolved_base = llm_manager._resolve_env(model_cfg["api_base"])
-            if resolved_base:
-                params["api_base"] = resolved_base
-                
-        # 确保代理环境变量已生效
-        llm_manager.apply_proxy_env_vars()
-                
-        import time
-        t0 = time.perf_counter()
-        try:
-            # 运行在线程池中，因为litellm.completion是同步操作
-            resp = await asyncio.to_thread(completion, **params)
-            latency_ms = int((time.perf_counter() - t0) * 1000)
-            
-            return {
-                "role": role,
-                "id": model_id,
-                "model_name": model_cfg["model"],
-                "ok": True,
-                "latency_ms": latency_ms,
-                "message": "Success"
-            }
-        except Exception as e:
-            latency_ms = int((time.perf_counter() - t0) * 1000)
-            error_msg = str(e)
-            # 简短化错误信息，以便在前端展示
-            if len(error_msg) > 100:
-                error_msg = error_msg[:100] + "..."
-            
-            return {
-                "role": role,
-                "id": model_id,
-                "model_name": model_cfg["model"],
-                "ok": False,
-                "latency_ms": latency_ms,
-                "message": f"{type(e).__name__}: {error_msg}"
-            }
-
-    # 并发测试所有模型
-    tasks = [_test_single_model(info) for info in models_to_test]
-    results = await asyncio.gather(*tasks)
-
-    return {
-        "status": "success",
-        "data": results
-    }
-
-    # 并发测试所有模型
-    tasks = [_test_single_model(info) for info in models_to_test]
-    results = await asyncio.gather(*tasks)
-
-    return {
-        "status": "success",
-        "data": results
-    }
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return {
+            "status": "error",
+            "provider": "ddgs",
+            "ok": False,
+            "latency_ms": latency_ms,
+            "message": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }

@@ -3,10 +3,13 @@
 专门负责无差别记录所有聊天消息
 """
 
+import base64
 import logging
+import os
 import time
 from app.core.event_bus import Event, EventType
 from app.plugins.builtin_chatbot.chat_log import ChatLogManager
+from app.plugins.builtin_chat_logger.image_understanding import understand_image
 from app.utils.plugin_config import get_config
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,23 @@ class ChatLoggerPlugin:
         # 启动后台清理线程
         self._cleanup_thread_started = False
         self._cleanup_thread = None
+
+    def is_image_enrichment_enabled(self) -> bool:
+        """图片内容补充属于聊天记录能力，配置变更后即时生效。"""
+        value = get_config(
+            "image_enrichment_enabled",
+            True,
+            plugin_name="builtin_chat_logger",
+        )
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def describe_image_for_chat(self, image_base64: str):
+        """为不支持视觉输入的聊天模型复用聊天记录图片补充能力。"""
+        if not self.is_image_enrichment_enabled():
+            return None
+        return understand_image(image_base64)
         
     def start_cleanup_scheduler(self):
         """启动定期清理任务"""
@@ -117,20 +137,84 @@ class ChatLoggerPlugin:
                 logger.debug(f"📝 跳过无效图片消息: chat={chat_name}, sender={sender}")
                 return False
             
-            # 记录图片消息
-            self.chat_log_manager.save_message(
+            enrichment_enabled = self.is_image_enrichment_enabled()
+            message_id = event.data.get("message_id", "")
+
+            # 先记录原始图片消息，再由后台任务原位补充其内容。这样不会制造
+            # 一个名为 OCR 的伪发送者，也不会改变聊天消息的先后顺序。
+            row_id = self.chat_log_manager.save_message(
                 chat_name,
                 sender,
                 "[图片]",
                 sender_id=sender_id,
                 sender_remark=sender_remark,
+                message_type="image",
+                source_message_id=message_id,
+                image_enrichment={"status": "pending"} if enrichment_enabled else {"status": "disabled"},
             )
             logger.debug(f"📝 记录图片消息: {chat_name} - {sender}")
+
+            if enrichment_enabled and row_id:
+                data = dict(event.data or {})
+                wx_manager = (event.context or {}).get("wx")
+                self.context.workers.start(
+                    f"image-enrichment-{chat_name}-{message_id or time.time_ns()}",
+                    self._process_image_enrichment,
+                    args=(data, wx_manager, row_id),
+                )
             
             return False
         except Exception as e:
             logger.error(f"📝 记录图片消息失败: {e}")
             return False
+
+    def _process_image_enrichment(self, data, wx_manager, row_id: str) -> None:
+        """后台下载并理解图片，然后更新原始聊天记录行。"""
+        chat_name = str(data.get("chat_name") or "")
+        file_path = str(data.get("file_path") or "")
+        message_id = data.get("message_id")
+        try:
+            if (not file_path or not os.path.exists(file_path)) and wx_manager and message_id:
+                file_path = wx_manager.download_image_message(chat_name, message_id) or ""
+
+            if not file_path or not os.path.exists(file_path):
+                self.chat_log_manager.update_image_enrichment(
+                    chat_name,
+                    row_id,
+                    status="failed",
+                    error="图片文件不可用或下载失败",
+                )
+                logger.warning("📝 图片内容补充跳过，图片文件不可用: %s", message_id)
+                return
+
+            with open(file_path, "rb") as image_file:
+                image_base64 = base64.b64encode(image_file.read()).decode("utf-8")
+
+            description = understand_image(image_base64)
+            if not description:
+                self.chat_log_manager.update_image_enrichment(
+                    chat_name,
+                    row_id,
+                    status="failed",
+                    error="图片理解模型未返回有效内容",
+                )
+                return
+
+            self.chat_log_manager.update_image_enrichment(
+                chat_name,
+                row_id,
+                description=description,
+                status="completed",
+            )
+            logger.info("📝 图片内容已补充到原聊天记录: %s", chat_name)
+        except Exception as e:
+            self.chat_log_manager.update_image_enrichment(
+                chat_name,
+                row_id,
+                status="failed",
+                error=str(e),
+            )
+            logger.error("📝 图片内容补充失败: %s", e)
     
     def handle_link_message(self, event: Event):
         """处理链接消息事件"""
@@ -224,6 +308,27 @@ class ChatLoggerPlugin:
 chat_logger_plugin = None
 
 
+def get_chat_logger_plugin():
+    """返回当前聊天记录插件实例。"""
+    return chat_logger_plugin
+
+
+def describe_image_for_chat(image_base64: str):
+    """供聊天机器人在主模型不支持视觉时复用图片内容补充。"""
+    if chat_logger_plugin:
+        return chat_logger_plugin.describe_image_for_chat(image_base64)
+    enabled = get_config(
+        "image_enrichment_enabled",
+        True,
+        plugin_name="builtin_chat_logger",
+    )
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return None
+    return understand_image(image_base64)
+
+
 def handle_text_message(event: Event):
     """处理文本消息事件"""
     global chat_logger_plugin
@@ -311,4 +416,3 @@ def unregister():
         chat_logger_plugin.stop_cleanup_scheduler()
     chat_logger_plugin = None
     logger.info("ChatLogger plugin unregistered")
-

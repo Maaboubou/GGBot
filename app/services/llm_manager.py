@@ -421,6 +421,40 @@ class LLMManager:
                         ", ".join(sorted(removed)),
                     )
 
+        # 搜索工具不再占用独立模型路由；历史 OCR/vision 路由统一迁移到
+        # 聊天记录插件的图片内容补充任务。此清理在“空模型”判断前执行，
+        # 让升级后的公开版也不会继续展示失效点位。
+        all_mappings = self.config.setdefault("plugin_mappings", {})
+        chatbot_mappings = all_mappings.get("builtin_chatbot")
+        if not isinstance(chatbot_mappings, dict):
+            chatbot_mappings = {}
+        if chatbot_mappings.pop("web_search", None) is not None:
+            modified = True
+            logger.info("🧹 已删除旧模型路由 builtin_chatbot.web_search")
+        legacy_image_mapping = chatbot_mappings.pop("ocr", None)
+        if legacy_image_mapping is not None:
+            modified = True
+            logger.info("🧹 已迁移旧模型路由 builtin_chatbot.ocr")
+        legacy_vision_mapping = chatbot_mappings.pop("vision", None)
+        if legacy_vision_mapping is not None:
+            modified = True
+            logger.info("🧹 已迁移未使用的旧模型路由 builtin_chatbot.vision")
+
+        logger_mappings = all_mappings.get("builtin_chat_logger")
+        if not isinstance(logger_mappings, dict):
+            logger_mappings = {}
+        if "image_understanding" not in logger_mappings:
+            replacement = legacy_image_mapping
+            if not isinstance(replacement, dict):
+                replacement = legacy_vision_mapping or chatbot_mappings.get("chat")
+            if isinstance(replacement, dict) and replacement.get("primary"):
+                logger_mappings["image_understanding"] = copy.deepcopy(replacement)
+                all_mappings["builtin_chat_logger"] = logger_mappings
+                modified = True
+                logger.info(
+                    "🧹 图片模型路由归属已调整为 builtin_chat_logger.image_understanding"
+                )
+
         # 没有模型时不写入任何预设模型 ID 或任务映射，避免制造无效配置。
         if not self.config.get("models"):
             if migration_needed or modified:
@@ -507,14 +541,6 @@ class LLMManager:
             "builtin_chatbot",
             {},
         )
-        if "ocr" not in chatbot_mappings:
-            chatbot_mappings["ocr"] = {
-                "primary": "gpt4",
-                "fallback": ["gemini-flash"],
-                "override_params": {},
-            }
-            modified = True
-
         if (
             "followup_judge" not in chatbot_mappings
             and "deepseek" in self.config.get("models", {})
@@ -698,6 +724,51 @@ class LLMManager:
         model_id = str(mapping.get("primary") or "").strip()
         model_config = self.config.get("models", {}).get(model_id)
         return bool(model_config and self._is_local_codex_model(model_config))
+
+    def get_call_capabilities(self, plugin_name: str, call_type: str) -> Dict[str, Any]:
+        """Return normalized capabilities for the configured primary route.
+
+        Callers use this boundary instead of scattering provider/model-name
+        checks throughout plugins.  ``native_web_search`` intentionally means
+        the local Codex runtime; ordinary providers use GGBot's local tools.
+        """
+        self._check_and_reload_if_modified()
+        mapping = self._get_mapping(plugin_name, call_type) or {}
+        model_id = str(mapping.get("primary") or "").strip()
+        model_config = self.config.get("models", {}).get(model_id) or {}
+        model_name = str(model_config.get("model") or model_id)
+        local_codex = bool(model_config and self._is_local_codex_model(model_config))
+
+        vision = bool(
+            model_config.get("supports_vision")
+            or model_config.get("vision")
+            or model_config.get("image_input")
+        )
+        function_calling = bool(model_config.get("supports_function_calling"))
+        if model_name and not local_codex:
+            try:
+                vision = vision or bool(litellm.supports_vision(model_name))
+            except Exception:
+                pass
+            try:
+                function_calling = function_calling or bool(
+                    litellm.supports_function_calling(model_name)
+                )
+            except Exception:
+                pass
+        return {
+            "model_id": model_id,
+            "model": model_name,
+            "provider": str(
+                model_config.get("custom_llm_provider")
+                or model_config.get("provider")
+                or ""
+            ),
+            "local_codex": local_codex,
+            "native_web_search": local_codex,
+            "vision": bool(vision or local_codex),
+            "tool_calling": bool(function_calling or local_codex),
+        }
 
     def count_rendered_prompt_tokens(
         self,
@@ -940,6 +1011,39 @@ class LLMManager:
                     plugins.append({"id": "web"})
                     params["extra_body"]["plugins"] = plugins
 
+    @staticmethod
+    def _remove_model_native_web_search(params: dict) -> None:
+        """Remove provider-native search from a non-Codex local-tool call."""
+        tools = []
+        for tool in params.get("tools") or []:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            name = str(function.get("name") or "") if isinstance(function, dict) else ""
+            if name == "$web_search" or (isinstance(tool, dict) and "google_search" in tool):
+                continue
+            tools.append(tool)
+        if tools:
+            params["tools"] = tools
+        else:
+            params.pop("tools", None)
+
+        extra_body = params.get("extra_body")
+        if isinstance(extra_body, dict):
+            plugins = [
+                plugin
+                for plugin in extra_body.get("plugins") or []
+                if not (isinstance(plugin, dict) and plugin.get("id") == "web")
+            ]
+            if plugins:
+                extra_body["plugins"] = plugins
+            else:
+                extra_body.pop("plugins", None)
+            for key in ("web_search", "codex_web_search", "web_search_options"):
+                extra_body.pop(key, None)
+        params.pop("web_search", None)
+        params.pop("codex_web_search", None)
+        params.pop("web_search_options", None)
+        params.pop("enable_web_search", None)
+
     # ─────────────────────────── 主调用接口 ──────────────────────────
 
     def call(
@@ -980,6 +1084,10 @@ class LLMManager:
         caller_tools        = kwargs.get("tools")       # 调用方 tools（如 google_search）
         attachment_capture  = kwargs.get("_wxautox_attachment_capture")
         allow_image_input   = bool(kwargs.get("_wxautox_allow_image_input"))
+        require_image_input = bool(kwargs.get("_wxautox_require_image_input"))
+        disable_model_web_search = bool(
+            kwargs.get("_wxautox_disable_model_web_search")
+        )
         codex_chat_id       = str(kwargs.get("_wxautox_chat_id") or "").strip()
         codex_role_name     = str(kwargs.get("_wxautox_role_name") or "").strip()
         history_chat_name   = str(
@@ -1040,6 +1148,8 @@ class LLMManager:
             "tools",
             "_wxautox_attachment_capture",
             "_wxautox_allow_image_input",
+            "_wxautox_require_image_input",
+            "_wxautox_disable_model_web_search",
             "_wxautox_chat_id",
             "_wxautox_chat_name",
             "_wxautox_role_name",
@@ -1066,6 +1176,8 @@ class LLMManager:
             caller_tools=caller_tools,
             extra_kwargs=extra_kwargs,
         )
+        if disable_model_web_search:
+            self._remove_model_native_web_search(primary_params)
         if allow_image_input:
             primary_params.setdefault("extra_body", {})["wxautox_allow_image_input"] = True
 
@@ -1086,6 +1198,8 @@ class LLMManager:
                     caller_tools=caller_tools,
                     extra_kwargs=extra_kwargs,
                 )
+                if disable_model_web_search:
+                    self._remove_model_native_web_search(fb_params)
                 if self._model_circuit_open(str(fb_params.get("model") or fb_id)):
                     logger.warning("⚡ 跳过熔断中的备用模型: %s", fb_params.get("model") or fb_id)
                     continue
@@ -1131,7 +1245,7 @@ class LLMManager:
                     fallback_vision_flags[id(fb)] = bool(fb.pop("_wxautox_supports_vision", False))
 
             # 视觉降级：主模型不支持视觉时剔除图片（fallback 由 litellm 处理）。
-            # OCR 和 vision 强依赖图片，必须保留图片输入并由模型调用结果决定成败。
+            # 明确要求图片输入的能力必须保留图片，并由模型调用结果决定成败。
             target_model = safe_params.get("model", "")
             try:
                 supports_vision = configured_supports_vision or litellm.supports_vision(target_model) or "grok" in target_model.lower()
@@ -1139,7 +1253,7 @@ class LLMManager:
                 supports_vision = configured_supports_vision or "grok" in target_model.lower()
 
             # 特殊处理：不仅检查主模型，如果 call_type 需要剔除图片，对所有 fallback 也要剔除
-            if call_type not in ["ocr", "vision"]:
+            if not require_image_input and call_type != "vision":
                 # 处理主模型
                 if "messages" in safe_params and safe_params["messages"]:
                     if "perplexity/" in target_model or not supports_vision:

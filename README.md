@@ -7,8 +7,8 @@ GGBot 是一个运行在 Windows 上的本地微信自动化助手。它把微�
 ## 主要能力
 
 - 微信接入：监听指定私聊或群聊，发送文本、图片和文件，并监控微信与监听窗口状态。
-- AI 助手：支持多个模型供应商、独立 API Key、任务路由、角色、Judge 主动回复、图片理解和连续对话。
-- 聊天记录：按聊天保存文本、图片、链接和引用消息，供检索、周报及 AI 上下文使用。
+- AI 助手：支持多个模型供应商、独立 API Key、任务路由、角色、Judge 主动回复、内置网页搜索和连续对话。
+- 聊天记录：按聊天保存文本、图片、链接和引用消息，并可在后台补充图片的视觉内容与可见文字。
 - 聊天级权限：每个联系人或群聊可以分别选择允许使用的插件，群聊还可设置是否必须 `@机器人`。
 - 插件系统：内置链接摘要、翻译、汇率、周报、磁链检查和菜单翻译，并支持按 Manifest v2 规范继续扩展。
 - 本地管理：通过 GGbot 管理面板维护聊天、插件、模型、任务路由、角色、Judge 和记忆设置。
@@ -164,6 +164,7 @@ Install.bat
 |---|---|
 | `builtin_chatbot.chat` | 普通聊天回复 |
 | `builtin_chatbot.judge` | 群聊主动回复判断 |
+| `builtin_chat_logger.image_understanding` | 为聊天记录图片补充场景、对象和可见文字 |
 | `builtin_translation.translate` | 文本翻译 |
 | `menu_translator.vision` | 菜单图片识别与翻译 |
 | `summary_plus.summary` | 网页与公众号内容摘要 |
@@ -171,7 +172,9 @@ Install.bat
 | `summary_plus.bilibili_mindmap` | B站视频字幕思维导图 |
 | `summary_plus.youtube_mindmap` | YouTube 字幕思维导图 |
 
-图片回复还会使用 Chatbot 的视觉调用能力，最终显示的任务列表以当前插件声明和管理面板为准。
+搜索不再需要独立模型路由。普通对话模型先用同一个 `builtin_chatbot.chat` 判断是否需要搜索，再由程序内置的 DDGS 执行检索；DDGS 不需要账号、API Key 或独立服务维护。本地 Codex 作为聊天模型时会跳过 DDGS，继续使用 Codex 原生搜索；“启用网页搜索”是两条路径共用的总开关。
+
+引用图片回复也不再使用 Chatbot 的独立 `ocr` 或 `vision` 路由。聊天模型支持视觉时直接接收图片；不支持视觉时使用 `builtin_chat_logger.image_understanding` 生成的文字补充，补充失败则明确说明无法判断图片。
 
 如果任务路由中没有模型选项，先确认“模型连接”页面已有保存成功的连接并通过测试，然后刷新任务路由页面。微信桥接、聊天记录、汇率和磁链检查等非 AI 功能不依赖模型。
 
@@ -248,8 +251,8 @@ Install.bat
 
 | 插件 | 功能 | 典型触发 |
 |---|---|---|
-| `builtin_chat_logger` | 保存文本、图片、链接和引用消息 | 已授权聊天中的消息 |
-| `builtin_chatbot` | AI 对话、角色、Judge、图片理解、搜索和本地记忆 | 私聊、群聊 `@`、Judge 或回复续接 |
+| `builtin_chat_logger` | 保存文本、图片、链接和引用消息，并可补充图片内容 | 已授权聊天中的消息 |
+| `builtin_chatbot` | AI 对话、角色、Judge、网页搜索和本地记忆 | 私聊、群聊 `@`、Judge 或回复续接 |
 | `builtin_translation` | 文本和引用消息翻译 | 已授权聊天中的非空文本 |
 | `boc_rate` | 中国银行牌价、历史走势和汇率异动提醒 | “汇率”、币种关键词；定时任务 |
 | `Weekly` | 根据聊天记录生成并推送周报 | 定时任务；管理员私聊命令 |

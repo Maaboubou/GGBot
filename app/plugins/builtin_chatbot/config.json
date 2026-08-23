@@ -7,7 +7,8 @@
   "category": "ai",
   "requires": [
     "openai",
-    "google-genai"
+    "google-genai",
+    "ddgs"
   ],
   "ui": {
     "icon": "bi-robot",
@@ -29,18 +30,6 @@
         "description": "判断未再次 @ 的跟进消息是否应继续回复",
         "category": "对话",
         "order": 30
-      },
-      "web_search": {
-        "label": "网页预搜索",
-        "description": "在回复前整理需要的网页资料",
-        "category": "工具",
-        "order": 40
-      },
-      "ocr": {
-        "label": "图片理解",
-        "description": "识别图片中的文字和视觉内容",
-        "category": "工具",
-        "order": 50
       },
       "memory_generate": {
         "label": "记忆生成模型",
@@ -80,8 +69,8 @@
         "order": 30
       },
       "tools": {
-        "title": "网页与图片",
-        "description": "控制回复前的网页预搜索和图片理解",
+        "title": "网页搜索",
+        "description": "普通模型使用内置 DDGS 搜索；本地 Codex 使用原生搜索",
         "order": 40
       },
       "context": {
@@ -245,12 +234,12 @@
     },
     "ephemeral_context_ratio": {
       "type": "number",
-      "description": "可用上下文中给本轮搜索、OCR和当前问题预留的比例",
+      "description": "可用上下文中给本轮搜索、当前图片和当前问题预留的比例",
       "default": 0.1
     },
     "ephemeral_context_max_tokens": {
       "type": "integer",
-      "description": "单轮搜索和 OCR 临时资料的绝对 Token 上限",
+      "description": "单轮搜索和当前图片临时资料的绝对 Token 上限",
       "default": 16000
     },
     "memory_enabled": {
@@ -565,13 +554,46 @@
     },
     "search_enabled": {
       "type": "boolean",
-      "description": "是否启用框架预搜索；Chat 回复主模型为本地 Codex 时自动跳过",
+      "description": "统一网页搜索开关：普通模型使用内置 DDGS，本地 Codex 使用原生搜索",
       "default": true
     },
-    "ocr_enabled": {
-      "type": "boolean",
-      "description": "是否启用大模型图片识别",
-      "default": false
+    "search_region": {
+      "type": "string",
+      "description": "DDGS 搜索区域；仅影响非 Codex 对话",
+      "default": "cn-zh",
+      "level": "advanced"
+    },
+    "search_safesearch": {
+      "type": "string",
+      "description": "DDGS 安全搜索级别；仅影响非 Codex 对话",
+      "default": "moderate",
+      "enum": ["on", "moderate", "off"],
+      "enum_labels": {"on": "严格", "moderate": "适中", "off": "关闭"},
+      "level": "advanced"
+    },
+    "search_max_results": {
+      "type": "integer",
+      "description": "每轮 DDGS 最多保留的搜索结果数",
+      "default": 6,
+      "minimum": 1,
+      "maximum": 20,
+      "level": "advanced"
+    },
+    "search_fetch_max_pages": {
+      "type": "integer",
+      "description": "每轮最多进一步读取的网页数；0 表示只使用搜索摘要",
+      "default": 2,
+      "minimum": 0,
+      "maximum": 5,
+      "level": "advanced"
+    },
+    "search_timeout_seconds": {
+      "type": "integer",
+      "description": "DDGS 搜索和单页读取超时秒数",
+      "default": 10,
+      "minimum": 3,
+      "maximum": 60,
+      "level": "advanced"
     },
     "allow_mention_trigger": {
       "type": "boolean",
@@ -598,16 +620,6 @@
       "type": "string",
       "description": "主动回复裁判的系统提示词（支持{chat_text}占位符）",
       "default": "## Role\n你是一个谨慎的聊天群组观察员，负责判断 AI 助手是否应该参与当前对话。\n\n## Context\n以下是最近的聊天记录：\n[对话开始]\n{chat_text}\n[对话结束]\n\n## Rules\n- 明确提到机器人、请求帮助或提出适合 AI 回答的问题时，可以回复。\n- 纯表情、复读、礼貌收尾或参与会打扰正常交流时，不回复。\n- 不确定时优先不主动介入。\n\n## Output\n仅输出 JSON：\n{\n  \"atmosphere\": \"当前聊天氛围\",\n  \"should_reply\": true,\n  \"reason\": \"简短说明判断理由\"\n}"
-    },
-    "search_prompt": {
-      "type": "string",
-      "description": "网络搜索的统一系统提示词(适用于主动和@模式)",
-      "default": "你是网络搜索引擎，专门为聊天机器人提供搜索参考信息。你的输出将作为原始资料供机器人进一步处理，不会直接展示给用户。\n\n**重要**: 上下文中的最后一条消息是用户的核心问题，你需要重点针对这条消息进行搜索。历史消息仅用于理解对话背景和上下文，不要被历史消息干扰搜索重点。\n\n工作流程:\n1. **理解上下文**:\n   - 快速浏览历史消息，理解对话主题和背景\n   - 重点关注最后一条消息，这是需要搜索的核心内容\n\n2. **搜索必要性判断** (倾向于积极搜索):\n   - ⚠️ **必须搜索**: 股价、汇率、天气、新闻、赛事结果、政策法规等时效性信息 → 必须搜索获取最新数据\n   - **应该搜索**: 疑问句、包含\"为什么/为何/怎么/怎样/如何/谁/什么时候\"等疑问词 → 进行搜索\n   - **可以搜索**: 具体事实查询（公司信息、产品参数、营业时间、历史事件等）→ 进行搜索\n   - **无需搜索**: 纯闲聊、表情、礼貌用语、个人观点讨论 → 返回\"无结果\"\n\n3. **搜索执行**:\n   - 基于最后一条消息提取关键词进行搜索\n   - 结合上下文理解用户真实意图\n   - 对于时效性信息，优先查找最新数据（注明具体时间）\n\n4. **搜索有结果时**:\n   - 整理关键信息，必须包含时间、数据、具体事实\n   - 对于股价/汇率等数值信息，必须注明具体时间点和数据来源\n   - 除了官方消息，也整理网络舆论和网友观点\n   - 保持信息完整性，可以详细一些（机器人会再次筛选）\n   - 明确标注信息来源的可靠性和时效性\n\n5. **搜索无关联结果时**:\n   - 直接返回\"无结果\"\n\n输出格式要求:\n- 有搜索价值且找到相关信息: 直接输出整理后的信息内容\n- 无搜索必要或未找到相关信息: 仅输出\"无结果\"\n\n记住: 你只负责提供原始搜索资料，最终回复由聊天机器人处理。积极搜索，特别是时效性信息必须搜索！"
-    },
-    "ocr_prompt": {
-      "type": "string",
-      "description": "OCR图片文字识别提示词",
-      "default": "你是一个专业的OCR文字识别和图片理解引擎。你的任务是识别出图片中的所有文字和内容，并按原排版格式尽可能原样输出。输出格式：OCR文字：{识别到的文字内容}。图片内容：{图片内容简要描述}。"
     }
   },
   "config": {
@@ -679,13 +691,15 @@
     "memory_candidate_retention_days": 90,
     "memory_maintenance_interval_hours": 24,
     "search_enabled": true,
-    "ocr_enabled": false,
+    "search_region": "cn-zh",
+    "search_safesearch": "moderate",
+    "search_max_results": 6,
+    "search_fetch_max_pages": 2,
+    "search_timeout_seconds": 10,
     "allow_mention_trigger": true,
     "proactive_interval_minutes": 1,
     "proactive_msg_threshold": 5,
     "proactive_judge_model": "deepseek-chat",
-    "proactive_judge_prompt": "## Role\n你是一个谨慎的聊天群组观察员，负责判断 AI 助手是否应该参与当前对话。\n\n## Context\n以下是最近的聊天记录：\n[对话开始]\n{chat_text}\n[对话结束]\n\n## Rules\n- 明确提到机器人、请求帮助或提出适合 AI 回答的问题时，可以回复。\n- 纯表情、复读、礼貌收尾或参与会打扰正常交流时，不回复。\n- 不确定时优先不主动介入。\n\n## Output\n仅输出 JSON：\n{\n  \"atmosphere\": \"当前聊天氛围\",\n  \"should_reply\": true,\n  \"reason\": \"简短说明判断理由\"\n}",
-    "search_prompt": "你是网络搜索引擎，专门为聊天机器人提供搜索参考信息。你的输出将作为原始资料供机器人进一步处理，不会直接展示给用户。\n\n**重要**: 上下文中的最后一条消息是用户的核心问题，你需要重点针对这条消息进行搜索。历史消息仅用于理解对话背景和上下文，不要被历史消息干扰搜索重点。\n\n工作流程:\n1. **理解上下文**:\n   - 快速浏览历史消息，理解对话主题和背景\n   - 重点关注最后一条消息，这是需要搜索的核心内容\n\n2. **搜索必要性判断** (倾向于积极搜索):\n   - ⚠️ **必须搜索**: 股价、汇率、天气、新闻、赛事结果、政策法规等时效性信息 → 必须搜索获取最新数据\n   - **应该搜索**: 疑问句、包含\"为什么/为何/怎么/怎样/如何/谁/什么时候\"等疑问词 → 进行搜索\n   - **可以搜索**: 具体事实查询（公司信息、产品参数、营业时间、历史事件等）→ 进行搜索\n   - **无需搜索**: 纯闲聊、表情、礼貌用语、个人观点讨论 → 返回\"无结果\"\n\n3. **搜索执行**:\n   - 基于最后一条消息提取关键词进行搜索\n   - 结合上下文理解用户真实意图\n   - 对于时效性信息，优先查找最新数据（注明具体时间）\n\n4. **搜索有结果时**:\n   - 整理关键信息，必须包含时间、数据、具体事实\n   - 对于股价/汇率等数值信息，必须注明具体时间点和数据来源\n   - 除了官方消息，也整理网络舆论和网友观点\n   - 保持信息完整性，可以详细一些（机器人会再次筛选）\n   - 明确标注信息来源的可靠性和时效性\n\n5. **搜索无关联结果时**:\n   - 直接返回\"无结果\"\n\n输出格式要求:\n- 有搜索价值且找到相关信息: 直接输出整理后的信息内容\n- 无搜索必要或未找到相关信息: 仅输出\"无结果\"\n\n记住: 你只负责提供原始搜索资料，最终回复由聊天机器人处理。积极搜索，特别是时效性信息必须搜索！",
-    "ocr_prompt": "你是一个专业的OCR文字识别和图片理解引擎。你的任务是识别出图片中的所有文字和内容，并按原排版格式尽可能原样输出。输出格式：OCR文字：{识别到的文字内容}。图片内容：{图片内容简要描述}。"
+    "proactive_judge_prompt": "## Role\n你是一个谨慎的聊天群组观察员，负责判断 AI 助手是否应该参与当前对话。\n\n## Context\n以下是最近的聊天记录：\n[对话开始]\n{chat_text}\n[对话结束]\n\n## Rules\n- 明确提到机器人、请求帮助或提出适合 AI 回答的问题时，可以回复。\n- 纯表情、复读、礼貌收尾或参与会打扰正常交流时，不回复。\n- 不确定时优先不主动介入。\n\n## Output\n仅输出 JSON：\n{\n  \"atmosphere\": \"当前聊天氛围\",\n  \"should_reply\": true,\n  \"reason\": \"简短说明判断理由\"\n}"
   }
 }

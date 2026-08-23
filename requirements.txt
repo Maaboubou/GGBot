@@ -11,9 +11,11 @@ requests
 urllib3
 certifi
 httpx
+beautifulsoup4
 selenium
 websocket-client>=1.8,<2
 playwright>=1.58,<2
+ddgs>=9.15,<10
 yt-dlp>=2026.7.4
 yt-dlp-danmaku>=0.3,<1
 youtube-transcript-api>=1.2,<2

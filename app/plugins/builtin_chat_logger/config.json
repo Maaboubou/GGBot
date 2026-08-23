@@ -1,41 +1,74 @@
 {
   "name": "builtin_chat_logger",
   "display_name": "聊天记录",
-  "version": "1.0.0",
-  "description": "无差别记录所有聊天消息，支持文本、图片、链接和引用消息",
+  "version": "2.0.0",
+  "description": "记录聊天消息，并可在后台为图片补充可检索的文字与视觉内容",
   "author": "Project Contributors",
   "category": "utility",
   "requires": [],
+  "ui": {
+    "icon": "bi-journal-text",
+    "llm_tasks": {
+      "image_understanding": {
+        "label": "图片内容补充",
+        "description": "识别聊天记录图片中的场景、对象和可见文字",
+        "category": "聊天记录",
+        "order": 10
+      }
+    },
+    "settings_notice": "图片内容补充属于聊天记录能力：开启后会在后台更新原始图片记录，不会额外生成一条机器人消息。",
+    "settings_groups": {
+      "logging": {
+        "title": "记录范围",
+        "description": "选择需要保留的消息类型和日志保留策略",
+        "order": 10
+      },
+      "image": {
+        "title": "图片内容补充",
+        "description": "将图片的视觉内容和可见文字补充到原始聊天记录",
+        "order": 20
+      }
+    }
+  },
   "config_schema": {
     "log_message_types": {
       "type": "array",
+      "group": "logging",
       "description": "记录的消息类型",
-      "default": [
-        "text",
-        "image",
-        "link",
-        "quote"
-      ]
+      "default": ["text", "image", "link", "quote"]
     },
     "max_log_size_mb": {
       "type": "integer",
+      "group": "logging",
       "description": "单个聊天记录文件最大大小（MB）",
       "default": 100
     },
     "max_log_days": {
       "type": "integer",
+      "group": "logging",
       "description": "聊天记录保留天数",
       "default": 7
+    },
+    "image_enrichment_enabled": {
+      "type": "boolean",
+      "group": "image",
+      "title": "启用图片内容补充",
+      "description": "后台理解聊天中的图片，并把结果更新到原始图片记录；关闭后只记录“[图片]”",
+      "default": false
+    },
+    "image_understanding_prompt": {
+      "type": "textarea",
+      "group": "image",
+      "level": "advanced",
+      "title": "图片理解提示词",
+      "description": "控制图片场景、对象和可见文字的提取方式",
+      "default": "你是聊天记录的图片内容补充工具。\n请客观描述图片中的主要场景、对象、界面和可见文字，不要推测看不见的信息。\n如果图片包含文字，尽量准确抄录；如果没有可辨认文字，也要描述视觉内容。\n输出纯文本，先写“内容描述：”，需要时再写“可见文字：”。总长度控制在 500 字以内。"
     }
   },
   "config": {
-    "log_message_types": [
-      "text",
-      "image",
-      "link",
-      "quote"
-    ],
+    "log_message_types": ["text", "image", "link", "quote"],
     "max_log_size_mb": 100,
-    "max_log_days": 7
+    "max_log_days": 7,
+    "image_enrichment_enabled": false
   }
 }

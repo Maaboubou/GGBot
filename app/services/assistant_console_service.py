@@ -254,7 +254,13 @@ class AssistantConsoleService:
             "allow_mention_trigger": bool(get_plugin_setting("builtin_chatbot", "allow_mention_trigger", True)),
             "memory_enabled": bool(get_plugin_setting("builtin_chatbot", "memory_enabled", True)),
             "search_enabled": bool(get_plugin_setting("builtin_chatbot", "search_enabled", True)),
-            "ocr_enabled": bool(get_plugin_setting("builtin_chatbot", "ocr_enabled", False)),
+            "image_enrichment_enabled": bool(
+                get_plugin_setting(
+                    "builtin_chat_logger",
+                    "image_enrichment_enabled",
+                    True,
+                )
+            ),
             "memory": global_memory_config,
         }
         enabled_chats = sum(1 for chat in chats if chat["enabled"])

@@ -132,7 +132,14 @@ CHATBOT_GROUP_FIELDS = {
         "codex_max_turns_per_thread",
         "codex_exec_fallback_enabled",
     },
-    "tools": {"search_enabled", "ocr_enabled", "search_prompt", "ocr_prompt"},
+    "tools": {
+        "search_enabled",
+        "search_region",
+        "search_safesearch",
+        "search_max_results",
+        "search_fetch_max_pages",
+        "search_timeout_seconds",
+    },
 }
 
 CHATBOT_BASIC_FIELDS = {
@@ -152,7 +159,6 @@ CHATBOT_BASIC_FIELDS = {
     "memory_retention_days",
     "memory_retrieval_top_k",
     "search_enabled",
-    "ocr_enabled",
 }
 
 SUMMARY_GROUP_FIELDS = {
@@ -219,7 +225,13 @@ FIELD_TITLE_OVERRIDES = {
     "trigger_word": "触发词",
     "model_name": "模型",
     "search_enabled": "启用网页搜索",
-    "ocr_enabled": "启用图片识别",
+    "search_region": "DDGS 搜索区域",
+    "search_safesearch": "DDGS 安全搜索",
+    "search_max_results": "搜索结果上限",
+    "search_fetch_max_pages": "深入读取网页数",
+    "search_timeout_seconds": "搜索超时",
+    "image_enrichment_enabled": "启用图片内容补充",
+    "image_understanding_prompt": "图片理解提示词",
     "allow_mention_trigger": "允许群聊 @ 触发",
     "memory_enabled": "长期记忆总开关",
     "memory_background_enabled": "后台生成记忆",

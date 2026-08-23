@@ -12,8 +12,7 @@
     ],
     "image_message_received": [
       "builtin_chat_logger:image_message_received:handle_image_message",
-      "menu_translator:image_message_received:handle_image",
-      "builtin_chatbot:image_message_received:handle_image_message"
+      "menu_translator:image_message_received:handle_image"
     ],
     "link_message_received": [
       "builtin_chat_logger:link_message_received:handle_link_message",

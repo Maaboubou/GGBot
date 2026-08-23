@@ -40,7 +40,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
 
     <!-- App CSS -->
-    <link href="/static/assets/css/style.css?v=3.6.5" rel="stylesheet">
+    <link href="/static/assets/css/style.css?v=3.6.6" rel="stylesheet">
     <link href="/static/assets/css/dashboard.css?v=3.5.3" rel="stylesheet">
 </head>
 
@@ -1049,6 +1049,36 @@
 
                         <div class="model-config-layout">
                             <div class="model-config-main">
+                                <section class="litellm-update-card" id="litellmUpdateCard" aria-live="polite">
+                                    <div class="litellm-update-main">
+                                        <span class="litellm-update-icon"><i class="bi bi-box-seam"></i></span>
+                                        <div>
+                                            <div class="litellm-update-title">
+                                                <strong>本机 LiteLLM</strong>
+                                                <span class="litellm-update-badge" id="litellmUpdateBadge">读取中</span>
+                                            </div>
+                                            <p id="litellmUpdateSummary">正在读取当前模型适配器版本…</p>
+                                        </div>
+                                    </div>
+                                    <div class="litellm-update-actions">
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="litellmCheckButton"
+                                            onclick="LLMManager.checkLiteLLMUpdate()">
+                                            <i class="bi bi-arrow-clockwise me-1"></i>检查更新
+                                        </button>
+                                        <button type="button" class="btn btn-primary btn-sm d-none" id="litellmUpdateButton"
+                                            onclick="LLMManager.startLiteLLMUpdate()">
+                                            <i class="bi bi-download me-1"></i>立即更新
+                                        </button>
+                                        <button type="button" class="btn btn-warning btn-sm d-none" id="litellmRestartButton"
+                                            onclick="App.restartSystem()">
+                                            <i class="bi bi-power me-1"></i>重启后生效
+                                        </button>
+                                    </div>
+                                    <div class="litellm-update-progress d-none" id="litellmUpdateProgress">
+                                        <div><i id="litellmUpdateProgressBar"></i></div>
+                                        <span id="litellmUpdateMessage">准备更新…</span>
+                                    </div>
+                                </section>
                                 <section class="model-form-section">
                                     <div class="model-form-section-heading">
                                         <span class="model-form-step">1</span>
@@ -1356,10 +1386,10 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
     <!-- App Scripts -->
-    <script src="/static/assets/js/api.js?v=3.5.1"></script>
+    <script src="/static/assets/js/api.js?v=3.5.2"></script>
     <script src="/static/assets/js/ui.js?v=3.4.2"></script>
     <script src="/static/assets/js/system_operations.js?v=1.2.1"></script>
-    <script src="/static/assets/js/llm_manager.js?v=3.2.8"></script>
+    <script src="/static/assets/js/llm_manager.js?v=3.2.9"></script>
     <script src="/static/assets/js/main.js?v=3.6.2"></script>
     <script src="/static/assets/js/memory_console.js?v=1.0.1"></script>
 

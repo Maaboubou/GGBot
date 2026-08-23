@@ -6102,6 +6102,34 @@ body.automation-pointer-sorting * {
 
 .model-config-main { min-width: 0; }
 
+.litellm-update-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.65rem 1rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+    padding: 0.75rem 0.85rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: linear-gradient(135deg, var(--accent-soft), var(--bg-card) 62%);
+}
+
+.litellm-update-main { display: flex; min-width: 0; align-items: center; gap: 0.65rem; }
+.litellm-update-icon { display: grid; width: 2.15rem; height: 2.15rem; flex: 0 0 2.15rem; place-items: center; border-radius: var(--radius-sm); background: var(--bg-card); color: var(--primary); box-shadow: var(--shadow-sm); }
+.litellm-update-title { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+.litellm-update-title strong { color: var(--text-main); font-size: 0.75rem; }
+.litellm-update-main p { margin: 0.16rem 0 0; color: var(--text-secondary); font-size: 0.61rem; line-height: 1.5; }
+.litellm-update-badge { padding: 0.12rem 0.38rem; border-radius: 999px; background: var(--bg-subtle); color: var(--text-secondary); font-size: 0.52rem; font-weight: 700; }
+.litellm-update-badge.ready { background: var(--success-soft); color: var(--success); }
+.litellm-update-badge.available { background: var(--warning-soft); color: var(--warning); }
+.litellm-update-badge.running { background: var(--info-soft); color: var(--info); }
+.litellm-update-badge.failed { background: var(--danger-soft); color: var(--danger); }
+.litellm-update-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; }
+.litellm-update-progress { display: grid; grid-column: 1 / -1; grid-template-columns: minmax(120px, 1fr) auto; align-items: center; gap: 0.55rem; }
+.litellm-update-progress > div { overflow: hidden; height: 0.3rem; border-radius: 999px; background: var(--bg-subtle); }
+.litellm-update-progress i { display: block; width: 0; height: 100%; border-radius: inherit; background: var(--primary); transition: width 0.25s ease; }
+.litellm-update-progress span { color: var(--text-secondary); font-size: 0.56rem; }
+
 .model-form-section,
 .model-advanced-options,
 .model-form-review,
@@ -6618,6 +6646,10 @@ body.automation-pointer-sorting * {
 }
 
 @media (max-width: 767.98px) {
+    .litellm-update-card { grid-template-columns: 1fr; align-items: stretch; }
+    .litellm-update-actions { justify-content: flex-start; }
+    .litellm-update-progress { grid-template-columns: 1fr; }
+
     .llm-route-group-header { align-items: stretch; flex-direction: column; }
     .llm-route-group-header .llm-prompts-button { align-self: flex-start; }
 

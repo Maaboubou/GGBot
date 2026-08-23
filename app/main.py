@@ -36,6 +36,7 @@ from .api import internal as internal_api
 from .api import codex_proxy
 from .api import codex_jobs
 from .api import llm_config
+from .api import litellm_updates
 from .models import user_permission as models_permission
 from .models import setting as models_setting
 from dotenv import load_dotenv
@@ -700,6 +701,7 @@ app.include_router(chatbot_roles.router, prefix="/api/chatbot/roles", tags=["cha
 app.include_router(chatbot_judges.router, prefix="/api/chatbot/judges", tags=["chatbot_judges"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(llm_config.router)  # LLM 配置管理 API（已包含 /api/llm 前缀）
+app.include_router(litellm_updates.router)
 
 # 静态文件服务（前端）
 # 挂载web目录作为静态文件服务

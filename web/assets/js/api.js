@@ -64,6 +64,12 @@ const API = {
         checkHealth: () => API.get('/health')
     },
 
+    litellm: {
+        getStatus: () => API.get('/api/llm/litellm/status'),
+        checkUpdate: () => API.post('/api/llm/litellm/check'),
+        startUpdate: () => API.post('/api/llm/litellm/update')
+    },
+
     backups: {
         getOverview: () => API.get('/api/backups/'),
         create: options => API.post('/api/backups/', options),

@@ -12,6 +12,10 @@ const LLMManager = {
     catalogModels: [],
     catalogVersion: '',
     catalogRequestId: 0,
+    litellmUpdateStatus: {},
+    litellmUpdatePollTimer: null,
+    litellmUpdateNotified: '',
+    litellmUpdateChecking: false,
     credentialStatusRequestId: 0,
     sharedCredentialStatus: { name: '', configured: false, source: 'unknown' },
     modelSortable: null,
@@ -330,6 +334,7 @@ const LLMManager = {
                 document.getElementById('modelExtraBody').value = '';
                 document.getElementById('modelEditMode').value = 'false';
                 this.closeModelCatalog();
+                this.clearLiteLLMUpdatePoll();
             });
         }
 
@@ -476,6 +481,168 @@ const LLMManager = {
         } catch (error) {
             console.warn('LiteLLM catalog providers unavailable:', error);
             this.catalogProviders = [];
+        }
+    },
+
+    clearLiteLLMUpdatePoll() {
+        if (this.litellmUpdatePollTimer) {
+            clearTimeout(this.litellmUpdatePollTimer);
+            this.litellmUpdatePollTimer = null;
+        }
+    },
+
+    scheduleLiteLLMUpdatePoll() {
+        this.clearLiteLLMUpdatePoll();
+        const modal = document.getElementById('addModelModal');
+        if (!modal?.classList.contains('show')) return;
+        this.litellmUpdatePollTimer = setTimeout(() => {
+            this.loadLiteLLMUpdateStatus({ quiet: true, poll: true });
+        }, 1200);
+    },
+
+    renderLiteLLMUpdateStatus(status = {}) {
+        this.litellmUpdateStatus = status || {};
+        const badge = document.getElementById('litellmUpdateBadge');
+        const summary = document.getElementById('litellmUpdateSummary');
+        const checkButton = document.getElementById('litellmCheckButton');
+        const updateButton = document.getElementById('litellmUpdateButton');
+        const restartButton = document.getElementById('litellmRestartButton');
+        const progress = document.getElementById('litellmUpdateProgress');
+        const progressBar = document.getElementById('litellmUpdateProgressBar');
+        const message = document.getElementById('litellmUpdateMessage');
+        if (!badge || !summary || !checkButton || !updateButton || !restartButton || !progress) return;
+
+        const operation = status.operation || {};
+        const running = Boolean(status.operation_running || ['queued', 'running'].includes(operation.status));
+        const failed = operation.status === 'failed';
+        const restartRequired = Boolean(status.restart_required);
+        const updateAvailable = Boolean(status.update_available);
+        const runtimeVersion = status.runtime_version || this.catalogVersion || '未知';
+        const installedVersion = status.installed_version || runtimeVersion;
+        const availableVersion = status.available_version || '';
+
+        badge.className = 'litellm-update-badge';
+        if (running) {
+            badge.textContent = '更新中';
+            badge.classList.add('running');
+        } else if (failed) {
+            badge.textContent = '更新失败';
+            badge.classList.add('failed');
+        } else if (restartRequired) {
+            badge.textContent = '等待重启';
+            badge.classList.add('available');
+        } else if (updateAvailable) {
+            badge.textContent = `可更新 ${availableVersion}`;
+            badge.classList.add('available');
+        } else if (availableVersion) {
+            badge.textContent = '已是最新';
+            badge.classList.add('ready');
+        } else {
+            badge.textContent = '尚未检查';
+        }
+
+        const environment = status.environment_label || '当前 Python 环境';
+        if (restartRequired && runtimeVersion !== installedVersion) {
+            summary.textContent = `运行中 ${runtimeVersion} · 已安装 ${installedVersion}；重启全部服务后切换新版。`;
+        } else {
+            summary.textContent = `当前 ${runtimeVersion} · ${environment}${availableVersion ? ` · PyPI ${availableVersion}` : ''}`;
+        }
+
+        checkButton.disabled = running || this.litellmUpdateChecking;
+        checkButton.innerHTML = this.litellmUpdateChecking
+            ? '<span class="spinner-border spinner-border-sm me-1"></span>检查中'
+            : '<i class="bi bi-arrow-clockwise me-1"></i>检查更新';
+        updateButton.classList.toggle('d-none', !updateAvailable || running || restartRequired);
+        updateButton.disabled = running;
+        if (updateAvailable && availableVersion) {
+            updateButton.innerHTML = `<i class="bi bi-download me-1"></i>更新到 ${this.escapeHtml(availableVersion)}`;
+        }
+        restartButton.classList.toggle('d-none', !restartRequired || running);
+        progress.classList.toggle('d-none', !running);
+        if (running) {
+            const percent = Math.max(0, Math.min(Number(operation.progress || 0), 100));
+            if (progressBar) progressBar.style.width = `${percent}%`;
+            if (message) message.textContent = operation.message || '正在更新 LiteLLM…';
+        }
+    },
+
+    async loadLiteLLMUpdateStatus(options = {}) {
+        try {
+            const response = await API.litellm.getStatus();
+            const status = response.data || {};
+            this.renderLiteLLMUpdateStatus(status);
+            if (status.operation_running) {
+                this.scheduleLiteLLMUpdatePoll();
+            } else {
+                this.clearLiteLLMUpdatePoll();
+                const operation = status.operation || {};
+                const notificationKey = operation.operation_id && operation.status
+                    ? `${operation.operation_id}:${operation.status}`
+                    : '';
+                if (options.poll && notificationKey && notificationKey !== this.litellmUpdateNotified) {
+                    this.litellmUpdateNotified = notificationKey;
+                    if (operation.status === 'succeeded') {
+                        UI.showSuccess(status.restart_required
+                            ? 'LiteLLM 更新完成；请重启全部服务后再使用新版模型目录。'
+                            : (operation.message || '当前已是最新版本'));
+                    } else if (operation.status === 'failed') {
+                        UI.showError(`LiteLLM 更新失败：${operation.message || '请查看服务日志'}`);
+                    }
+                }
+            }
+            return status;
+        } catch (error) {
+            this.clearLiteLLMUpdatePoll();
+            if (!options.quiet) UI.showError(`读取 LiteLLM 状态失败：${error.message}`);
+            return null;
+        }
+    },
+
+    async checkLiteLLMUpdate() {
+        if (this.litellmUpdateChecking) return;
+        this.litellmUpdateChecking = true;
+        this.renderLiteLLMUpdateStatus(this.litellmUpdateStatus);
+        try {
+            const response = await API.litellm.checkUpdate();
+            const checked = response.data || {};
+            const status = await this.loadLiteLLMUpdateStatus({ quiet: true }) || {
+                ...this.litellmUpdateStatus,
+                ...checked,
+            };
+            this.renderLiteLLMUpdateStatus(status);
+            if (checked.update_available) {
+                UI.showInfo(`发现 LiteLLM ${checked.available_version}，确认后可在当前环境中更新。`);
+            } else {
+                UI.showSuccess('当前 LiteLLM 已是 PyPI 最新版本。');
+            }
+        } catch (error) {
+            UI.showError(`检查 LiteLLM 更新失败：${error.message}`);
+        } finally {
+            this.litellmUpdateChecking = false;
+            this.renderLiteLLMUpdateStatus(this.litellmUpdateStatus);
+        }
+    },
+
+    async startLiteLLMUpdate() {
+        const status = this.litellmUpdateStatus || {};
+        const target = status.available_version || '最新版';
+        const current = status.installed_version || status.runtime_version || '当前版本';
+        const environment = status.environment_label || '当前 Python 环境';
+        const confirmed = await UI.confirm(
+            `确定将 LiteLLM 从 ${current} 更新到 ${target} 吗？\n\n更新只会作用于${environment}中的固定包 litellm。当前进程会继续使用旧版，完成后必须重启全部服务才会切换新版。`,
+            {
+                title: '更新本机 LiteLLM',
+                confirmText: '开始更新',
+                variant: 'primary',
+            }
+        );
+        if (!confirmed) return;
+        try {
+            await API.litellm.startUpdate();
+            UI.showInfo('LiteLLM 更新任务已开始，可在此处查看进度。');
+            await this.loadLiteLLMUpdateStatus({ quiet: true });
+        } catch (error) {
+            UI.showError(`启动 LiteLLM 更新失败：${error.message}`);
         }
     },
 
@@ -1897,6 +2064,7 @@ const LLMManager = {
         this.modelIdAutofill = true;
         const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('addModelModal'));
         modal.show();
+        this.loadLiteLLMUpdateStatus();
         await this.applyProviderPreset('openai');
         this.updateModelFormReview();
     },
@@ -1943,6 +2111,7 @@ const LLMManager = {
         document.getElementById('addModelModalSubtitle').textContent = 'API Key 留空会保持不变。';
         const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('addModelModal'));
         modal.show();
+        this.loadLiteLLMUpdateStatus();
         await this.applyConfigToModelForm(modelId, config, { edit: true });
     },
 

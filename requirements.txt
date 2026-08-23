@@ -23,6 +23,7 @@ json-repair>=0.59,<1
 
 # AI providers and local retrieval
 litellm
+packaging>=23,<27
 openai
 google-genai
 tiktoken>=0.12,<1

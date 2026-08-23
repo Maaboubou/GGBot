@@ -121,18 +121,7 @@ def _event_dedup_schema() -> JsonSchema:
     return _object({"decisions": _array(decision)})
 
 
-def _people_updates_schema() -> JsonSchema:
-    update = _object(
-        {
-            "name": _string(),
-            "profile": _string(),
-            "confidence": _number(),
-        }
-    )
-    return _object({"people_updates": _array(update)})
-
-
-def _stage_schema(*, include_people: bool) -> JsonSchema:
+def _stage_schema() -> JsonSchema:
     properties: Dict[str, JsonSchema] = {
         "summary": _string(),
         "stable_facts": _string_array(),
@@ -142,8 +131,6 @@ def _stage_schema(*, include_people: bool) -> JsonSchema:
         "open_items": _string_array(),
         "stale_or_uncertain": _string_array(),
     }
-    if include_people:
-        properties.update(_people_updates_schema()["properties"])
     return _object(properties)
 
 
@@ -431,35 +418,21 @@ def codex_memory_output_schema(
     """Return a strict Codex output schema for production memory call types."""
     normalized = str(call_type or "").strip()
     hint = str(schema_hint or "")
-    prompt_text = "\n".join(
-        str(message.get("content") or "")
-        for message in messages
-        if isinstance(message, Mapping)
-    )
-
-    if normalized == "memory_event":
+    if normalized == "memory_event_extract":
         return _event_schema()
-    if normalized == "memory_verify":
+    if normalized == "memory_event_review":
         return _event_verify_schema()
-    if normalized == "memory_dedup":
+    if normalized == "memory_event_relation":
         return _event_dedup_schema()
-    if normalized == "memory_stage":
-        if "keep_fact_ids" in hint:
-            # status_updates has arbitrary fact IDs as object keys, which the
-            # strict Structured Outputs subset cannot represent safely.
-            return None
-        if "people_updates" in hint and "阶段" not in hint:
-            return _people_updates_schema()
-        return _stage_schema(include_people="people_updates" in hint)
-    if normalized == "memory_person_observe":
-        if "observations" in hint:
-            return _observation_schema()
-        if "verifications" in hint:
-            return _observation_verification_schema(
-                projection='"item_id"' in prompt_text
-            )
-        return None
-    if normalized == "memory_person_period":
+    if normalized == "memory_stage_summarize":
+        return _stage_schema()
+    if normalized == "memory_person_extract":
+        return _observation_schema() if "observations" in hint else None
+    if normalized == "memory_person_review":
+        return _observation_verification_schema(projection=False)
+    if normalized == "memory_person_projection_review":
+        return _observation_verification_schema(projection=True)
+    if normalized == "memory_person_period_summarize":
         return _period_schema()
     if normalized == "memory_person_consolidate":
         return _consolidation_schema()

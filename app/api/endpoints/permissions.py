@@ -37,12 +37,6 @@ class ChatMemoryEventCorrection(BaseModel):
     corrected_event: Optional[Dict[str, Any]] = None
 
 
-class ChatMemoryPersonUpdate(BaseModel):
-    profile_text: str = Field(default="", max_length=12000)
-    reason: str = Field(min_length=2, max_length=1000)
-    keep_override: bool = True
-
-
 class ChatMemoryPersonAliasCreate(BaseModel):
     alias_name: str = Field(min_length=1, max_length=80)
     external_id: str = Field(default="", max_length=160)
@@ -54,26 +48,12 @@ class ChatMemoryPersonMerge(BaseModel):
     reason: str = Field(min_length=2, max_length=1000)
 
 
-class ChatMemoryPersonFactUpdate(BaseModel):
-    field: str = Field(min_length=1, max_length=40)
-    value: str = Field(min_length=1, max_length=500)
-    status: str = Field(default="current", max_length=20)
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    valid_from: str = Field(default="", max_length=40)
-    valid_to: str = Field(default="", max_length=40)
-    observed_at: str = Field(default="", max_length=40)
-    temporal_note: str = Field(default="", max_length=200)
-    source_event_ids: List[int] = Field(default_factory=list, max_length=20)
-    replaces_fact_ids: List[int] = Field(default_factory=list, max_length=20)
-    reason: str = Field(min_length=2, max_length=1000)
-
-
-class ChatMemoryPersonV3ObservationReview(BaseModel):
+class ChatMemoryPersonObservationReview(BaseModel):
     quality_status: Literal["active", "quarantined", "rejected"]
     reason: str = Field(min_length=2, max_length=1000)
 
 
-class ChatMemoryPersonV3FactUpdate(BaseModel):
+class ChatMemoryPersonFactUpdate(BaseModel):
     field: str = Field(min_length=1, max_length=40)
     value: str = Field(min_length=1, max_length=600)
     slot_key: str = Field(default="", max_length=120)
@@ -149,19 +129,6 @@ def _invalidate_chatbot_memory_context(chat_name: str) -> None:
     except Exception:
         pass
 
-
-def _reject_legacy_person_write_when_v3_active(store, chat_name: str) -> None:
-    from app.plugins.builtin_chatbot.person_memory_v3 import PersonMemoryV3Store
-
-    state = PersonMemoryV3Store(store).get_chat_state(chat_name)
-    if state and state.get("mode") in {"building", "active"}:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "该聊天已使用统一人物记忆，请通过人物观察与事实版本接口修改；"
-                "旧版人物摘要写入口已停止使用"
-            ),
-        )
 
 @router.post("/users", response_model=schemas_permission.WeChatUser)
 def create_wechat_user(
@@ -285,45 +252,27 @@ def browse_user_memory_people(
 ):
     """Return all current person profiles for the selected chat."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import (
-        PERSON_FACT_FIELDS,
-        PERSON_FACT_STATUSES,
-        PERSON_FIELD_LABELS,
-        MemoryStore,
-    )
+    from app.plugins.builtin_chatbot.memory_store import MemoryStore
 
     store = MemoryStore()
-    from app.plugins.builtin_chatbot.person_memory_v3 import (
-        PersonMemoryV3Store,
+    from app.plugins.builtin_chatbot.person_memory import (
+        PersonMemoryStore,
     )
 
-    v3 = PersonMemoryV3Store(store)
-    v3_state = v3.get_chat_state(db_user.chat_name)
+    person_store = PersonMemoryStore(store)
+    person_state = person_store.get_chat_state(db_user.chat_name)
     identity_items = store.list_person_directory(db_user.chat_name)
     merge_suggestions = store.list_person_merge_suggestions(
         db_user.chat_name
     )
-    v3_items = v3.list_profiles(db_user.chat_name) if v3_state else []
-    if v3_items:
-        items = v3_items
-        schema_version = 3
-        items.sort(
-            key=lambda item: (
-                int(item.get("observation_count") or 0),
-                str(item.get("snapshot_created_at") or ""),
-            ),
-            reverse=True,
-        )
-    else:
-        items = store.list_people(db_user.chat_name)
-        schema_version = 2
-        items.sort(
-            key=lambda item: (
-                str(item.get("updated_at") or ""),
-                int(item.get("source_event_id") or 0),
-            ),
-            reverse=True,
-        )
+    items = person_store.list_profiles(db_user.chat_name)
+    items.sort(
+        key=lambda item: (
+            int(item.get("observation_count") or 0),
+            str(item.get("snapshot_created_at") or ""),
+        ),
+        reverse=True,
+    )
     return {
         "status": "success",
         "data": {
@@ -333,69 +282,28 @@ def browse_user_memory_people(
             "identity_items": identity_items,
             "identity_total": len(identity_items),
             "merge_suggestions": merge_suggestions,
-            "schema_version": schema_version,
-            "v3_state": v3_state,
-            "v3_observation_stats": (
-                v3.observation_stats(db_user.chat_name)
-                if v3_state
-                else {
-                    "total": 0,
-                    "active": 0,
-                    "quarantined": 0,
-                    "rejected": 0,
-                }
+            "person_state": person_state,
+            "observation_stats": person_store.observation_stats(
+                db_user.chat_name
             ),
-            "v3_candidate_stats": (
-                v3.candidate_stats(db_user.chat_name)
-                if v3_state
-                else {
-                    "total": 0,
-                    "pending": 0,
-                    "verified": 0,
-                    "quarantined": 0,
-                    "rejected": 0,
-                }
-            ),
-            "v3_pipeline_stats": (
-                v3.pipeline_stats(db_user.chat_name)
-                if v3_state
-                else {
-                    "source_messages": 0,
-                    "links": 0,
-                    "pending_links": 0,
-                    "pending_people": 0,
-                }
-            ),
-            "fact_schema": {
-                "fields": [
-                    {
-                        "value": field_name,
-                        "label": PERSON_FIELD_LABELS.get(
-                            field_name,
-                            field_name,
-                        ),
-                    }
-                    for field_name in sorted(PERSON_FACT_FIELDS)
-                    if field_name != "legacy_summary"
-                ],
-                "statuses": sorted(PERSON_FACT_STATUSES),
-            },
+            "candidate_stats": person_store.candidate_stats(db_user.chat_name),
+            "pipeline_stats": person_store.pipeline_stats(db_user.chat_name),
         },
     }
 
 
-@router.get("/users/{user_id}/memory/people/v3/audits")
-def browse_user_memory_person_v3_audits(
+@router.get("/users/{user_id}/memory/people/audits")
+def browse_user_memory_person_audits(
     user_id: int,
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
     from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory_v3 import (
-        PersonMemoryV3Store,
+    from app.plugins.builtin_chatbot.person_memory import (
+        PersonMemoryStore,
     )
 
-    items = PersonMemoryV3Store(MemoryStore()).list_audits(
+    items = PersonMemoryStore(MemoryStore()).list_audits(
         db_user.chat_name,
         include_snapshots=False,
     )
@@ -412,161 +320,8 @@ def browse_user_memory_person_v3_audits(
     }
 
 
-@router.get("/users/{user_id}/memory/people/{person_id}/v3")
-def get_user_memory_person_v3(
-    user_id: int,
-    person_id: int,
-    db: Session = Depends(models_base.get_db),
-):
-    db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory_v3 import (
-        PersonMemoryV3Store,
-    )
-
-    profile = PersonMemoryV3Store(MemoryStore()).get_profile(
-        db_user.chat_name,
-        person_id,
-    )
-    if profile is None:
-        raise HTTPException(status_code=404, detail="v3 person not found")
-    return {
-        "status": "success",
-        "data": {
-            "chat_name": db_user.chat_name,
-            "profile": profile,
-        },
-    }
-
-
-@router.post(
-    "/users/{user_id}/memory/people/{person_id}/v3/observations/"
-    "{observation_id}/review"
-)
-def review_user_memory_person_v3_observation(
-    user_id: int,
-    person_id: int,
-    observation_id: int,
-    payload: ChatMemoryPersonV3ObservationReview,
-    db: Session = Depends(models_base.get_db),
-):
-    db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory_v3 import (
-        PersonMemoryV3Store,
-    )
-
-    v3 = PersonMemoryV3Store(MemoryStore())
-    observation = v3.get_observation(db_user.chat_name, observation_id)
-    if (
-        observation is None
-        or int(observation.get("person_id") or 0) != int(person_id)
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="observation does not belong to this person",
-        )
-    try:
-        result = v3.review_observation(
-            db_user.chat_name,
-            observation_id,
-            quality_status=payload.quality_status,
-            reason=payload.reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
-    return {"status": "success", "data": result}
-
-
-@router.post("/users/{user_id}/memory/people/{person_id}/v3/facts")
-def add_user_memory_person_v3_fact(
-    user_id: int,
-    person_id: int,
-    payload: ChatMemoryPersonV3FactUpdate,
-    db: Session = Depends(models_base.get_db),
-):
-    db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory_v3 import (
-        PersonMemoryV3Store,
-    )
-
-    value = payload.dict(exclude={"reason"})
-    try:
-        result = PersonMemoryV3Store(MemoryStore()).add_manual_fact(
-            db_user.chat_name,
-            person_id,
-            value,
-            reason=payload.reason,
-        )
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
-    return {"status": "success", "data": result}
-
-
-@router.delete(
-    "/users/{user_id}/memory/people/{person_id}/v3/facts/{fact_id}"
-)
-def delete_user_memory_person_v3_fact(
-    user_id: int,
-    person_id: int,
-    fact_id: int,
-    reason: str = Query(min_length=2, max_length=1000),
-    db: Session = Depends(models_base.get_db),
-):
-    db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory_v3 import (
-        PersonMemoryV3Store,
-    )
-
-    try:
-        result = PersonMemoryV3Store(MemoryStore()).delete_fact(
-            db_user.chat_name,
-            person_id,
-            fact_id,
-            reason=reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
-    return {"status": "success", "data": result}
-
-
-@router.post("/users/{user_id}/memory/people/{person_id}/v3/refresh")
-def refresh_user_memory_person_v3(
-    user_id: int,
-    person_id: int,
-    db: Session = Depends(models_base.get_db),
-):
-    db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
-
-    service = ChatMemoryService(ChatLogManager(), ChatContextManager())
-    try:
-        result = service.person_memory_v3.consolidate_person(
-            db_user.chat_name,
-            person_id,
-            force=True,
-            observation_limit=500,
-        )
-    finally:
-        service.close()
-    if result is None:
-        raise HTTPException(
-            status_code=400,
-            detail="person has no active observations to refresh",
-        )
-    _invalidate_chatbot_memory_context(db_user.chat_name)
-    return {"status": "success", "data": result}
-
-
-@router.get("/users/{user_id}/memory/people/audits")
-def browse_user_memory_person_audits(
+@router.get("/users/{user_id}/memory/people/identity-audits")
+def browse_user_memory_person_identity_audits(
     user_id: int,
     db: Session = Depends(models_base.get_db),
 ):
@@ -588,6 +343,159 @@ def browse_user_memory_person_audits(
             "total": len(items),
         },
     }
+
+
+@router.get("/users/{user_id}/memory/people/{person_id}")
+def get_user_memory_person(
+    user_id: int,
+    person_id: int,
+    db: Session = Depends(models_base.get_db),
+):
+    db_user = _get_user_or_404(db, user_id)
+    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.plugins.builtin_chatbot.person_memory import (
+        PersonMemoryStore,
+    )
+
+    profile = PersonMemoryStore(MemoryStore()).get_profile(
+        db_user.chat_name,
+        person_id,
+    )
+    if profile is None:
+        raise HTTPException(status_code=404, detail="person not found")
+    return {
+        "status": "success",
+        "data": {
+            "chat_name": db_user.chat_name,
+            "profile": profile,
+        },
+    }
+
+
+@router.post(
+    "/users/{user_id}/memory/people/{person_id}/observations/"
+    "{observation_id}/review"
+)
+def review_user_memory_person_observation(
+    user_id: int,
+    person_id: int,
+    observation_id: int,
+    payload: ChatMemoryPersonObservationReview,
+    db: Session = Depends(models_base.get_db),
+):
+    db_user = _get_user_or_404(db, user_id)
+    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.plugins.builtin_chatbot.person_memory import (
+        PersonMemoryStore,
+    )
+
+    person_store = PersonMemoryStore(MemoryStore())
+    observation = person_store.get_observation(db_user.chat_name, observation_id)
+    if (
+        observation is None
+        or int(observation.get("person_id") or 0) != int(person_id)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="observation does not belong to this person",
+        )
+    try:
+        result = person_store.review_observation(
+            db_user.chat_name,
+            observation_id,
+            quality_status=payload.quality_status,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_chatbot_memory_context(db_user.chat_name)
+    return {"status": "success", "data": result}
+
+
+@router.post("/users/{user_id}/memory/people/{person_id}/facts")
+def add_user_memory_person_fact(
+    user_id: int,
+    person_id: int,
+    payload: ChatMemoryPersonFactUpdate,
+    db: Session = Depends(models_base.get_db),
+):
+    db_user = _get_user_or_404(db, user_id)
+    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.plugins.builtin_chatbot.person_memory import (
+        PersonMemoryStore,
+    )
+
+    value = payload.dict(exclude={"reason"})
+    try:
+        result = PersonMemoryStore(MemoryStore()).add_manual_fact(
+            db_user.chat_name,
+            person_id,
+            value,
+            reason=payload.reason,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_chatbot_memory_context(db_user.chat_name)
+    return {"status": "success", "data": result}
+
+
+@router.delete(
+    "/users/{user_id}/memory/people/{person_id}/facts/{fact_id}"
+)
+def delete_user_memory_person_fact(
+    user_id: int,
+    person_id: int,
+    fact_id: int,
+    reason: str = Query(min_length=2, max_length=1000),
+    db: Session = Depends(models_base.get_db),
+):
+    db_user = _get_user_or_404(db, user_id)
+    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.plugins.builtin_chatbot.person_memory import (
+        PersonMemoryStore,
+    )
+
+    try:
+        result = PersonMemoryStore(MemoryStore()).delete_fact(
+            db_user.chat_name,
+            person_id,
+            fact_id,
+            reason=reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_chatbot_memory_context(db_user.chat_name)
+    return {"status": "success", "data": result}
+
+
+@router.post("/users/{user_id}/memory/people/{person_id}/refresh")
+def refresh_user_memory_person(
+    user_id: int,
+    person_id: int,
+    db: Session = Depends(models_base.get_db),
+):
+    db_user = _get_user_or_404(db, user_id)
+    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
+    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
+    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+
+    service = ChatMemoryService(ChatLogManager(), ChatContextManager())
+    try:
+        result = service.person_memory.consolidate_person(
+            db_user.chat_name,
+            person_id,
+            force=True,
+            observation_limit=500,
+        )
+    finally:
+        service.close()
+    if result is None:
+        raise HTTPException(
+            status_code=400,
+            detail="person has no active observations to refresh",
+        )
+    _invalidate_chatbot_memory_context(db_user.chat_name)
+    return {"status": "success", "data": result}
 
 
 @router.post("/users/{user_id}/memory/people/{person_id}/aliases")
@@ -637,60 +545,10 @@ def merge_user_memory_person(
     return {"status": "success", "data": {"audit": audit}}
 
 
-@router.post("/users/{user_id}/memory/people/{person_id}/facts")
-def upsert_user_memory_person_fact(
-    user_id: int,
-    person_id: int,
-    payload: ChatMemoryPersonFactUpdate,
-    db: Session = Depends(models_base.get_db),
-):
-    db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-
-    fact = payload.dict(exclude={"reason"})
-    store = MemoryStore()
-    _reject_legacy_person_write_when_v3_active(store, db_user.chat_name)
-    try:
-        audit = store.upsert_person_fact_manual(
-            db_user.chat_name,
-            person_id,
-            fact,
-            reason=payload.reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
-    return {"status": "success", "data": {"audit": audit}}
-
-
-@router.delete("/users/{user_id}/memory/people/{person_id}/facts/{fact_id}")
-def delete_user_memory_person_fact(
-    user_id: int,
-    person_id: int,
-    fact_id: int,
-    reason: str = Query(min_length=2, max_length=1000),
-    db: Session = Depends(models_base.get_db),
-):
-    db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-
-    store = MemoryStore()
-    _reject_legacy_person_write_when_v3_active(store, db_user.chat_name)
-    try:
-        audit = store.delete_person_fact_manual(
-            db_user.chat_name,
-            person_id,
-            fact_id,
-            reason=reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
-    return {"status": "success", "data": {"audit": audit}}
-
-
-@router.post("/users/{user_id}/memory/people/audits/{audit_id}/revert")
-def revert_user_memory_person_audit(
+@router.post(
+    "/users/{user_id}/memory/people/identity-audits/{audit_id}/revert"
+)
+def revert_user_memory_person_identity_audit(
     user_id: int,
     audit_id: int,
     db: Session = Depends(models_base.get_db),
@@ -829,36 +687,6 @@ def revert_user_memory_correction(
         service.close()
     _invalidate_chatbot_memory_context(db_user.chat_name)
     return {"status": "success", "data": result}
-
-
-@router.put("/users/{user_id}/memory/people/{person_name}")
-def update_user_memory_person(
-    user_id: int,
-    person_name: str,
-    payload: ChatMemoryPersonUpdate,
-    db: Session = Depends(models_base.get_db),
-):
-    """Manually edit and optionally lock a person profile."""
-    db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-
-    store = MemoryStore()
-    _reject_legacy_person_write_when_v3_active(store, db_user.chat_name)
-    try:
-        correction = store.update_person_manual(
-            db_user.chat_name,
-            person_name,
-            profile_text=payload.profile_text,
-            reason=payload.reason,
-            keep_override=payload.keep_override,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
-    return {
-        "status": "success",
-        "data": {"correction": correction},
-    }
 
 
 @router.get("/users/{user_id}/memory/events/{event_id}/source")

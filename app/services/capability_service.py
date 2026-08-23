@@ -75,12 +75,15 @@ def normalize_llm_task_descriptors(config: Mapping[str, Any]) -> Dict[str, Dict[
             order = int(raw_descriptor.get("order", 500))
         except (TypeError, ValueError, OverflowError):
             order = 500
-        tasks[task_id] = {
+        descriptor = {
             "label": label,
             "description": description,
             "category": category,
             "order": max(-10000, min(order, 10000)),
         }
+        if raw_descriptor.get("advanced") is True:
+            descriptor["advanced"] = True
+        tasks[task_id] = descriptor
     return tasks
 
 GROUP_META = OrderedDict(
@@ -143,8 +146,8 @@ CHATBOT_BASIC_FIELDS = {
     "memory_enabled",
     "memory_background_enabled",
     "memory_verification_enabled",
-    "memory_person_v3_enabled",
-    "memory_person_v3_include_high_sensitivity",
+    "memory_person_enabled",
+    "memory_person_include_high_sensitivity",
     "memory_embedding_enabled",
     "memory_retention_days",
     "memory_retrieval_top_k",
@@ -221,8 +224,8 @@ FIELD_TITLE_OVERRIDES = {
     "memory_enabled": "长期记忆总开关",
     "memory_background_enabled": "后台生成记忆",
     "memory_verification_enabled": "高风险证据复核",
-    "memory_person_v3_enabled": "人物记忆",
-    "memory_person_v3_include_high_sensitivity": "回答中使用高敏感人物记忆",
+    "memory_person_enabled": "人物记忆",
+    "memory_person_include_high_sensitivity": "回答中使用高敏感人物记忆",
     "memory_embedding_enabled": "本地向量检索",
     "memory_retention_days": "记忆检索范围",
     "memory_retrieval_top_k": "每次最多召回的事件",

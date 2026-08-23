@@ -258,52 +258,28 @@ const API = {
             return API.get(`/api/permissions/users/${userId}/memory/events?${query.toString()}`);
         },
         getMemoryPeople: (userId) => API.get(`/api/permissions/users/${userId}/memory/people`),
-        getMemoryPersonV3: (userId, personId) => (
-            API.get(`/api/permissions/users/${userId}/memory/people/${personId}/v3`)
+        getMemoryPerson: (userId, personId) => (
+            API.get(`/api/permissions/users/${userId}/memory/people/${personId}`)
         ),
-        getMemoryPersonV3Audits: (userId) => (
-            API.get(`/api/permissions/users/${userId}/memory/people/v3/audits`)
+        getMemoryPersonAudits: (userId) => (
+            API.get(`/api/permissions/users/${userId}/memory/people/audits`)
         ),
-        reviewMemoryPersonV3Observation: (
+        reviewMemoryPersonObservation: (
             userId,
             personId,
             observationId,
             payload
         ) => (
             API.post(
-                `/api/permissions/users/${userId}/memory/people/${personId}/v3/observations/${observationId}/review`,
+                `/api/permissions/users/${userId}/memory/people/${personId}/observations/${observationId}/review`,
                 payload
             )
         ),
-        addMemoryPersonV3Fact: (userId, personId, payload) => (
+        addMemoryPersonFact: (userId, personId, payload) => (
             API.post(
-                `/api/permissions/users/${userId}/memory/people/${personId}/v3/facts`,
+                `/api/permissions/users/${userId}/memory/people/${personId}/facts`,
                 payload
             )
-        ),
-        deleteMemoryPersonV3Fact: (userId, personId, factId, reason) => (
-            API.request(
-                `/api/permissions/users/${userId}/memory/people/${personId}/v3/facts/${factId}?reason=${encodeURIComponent(reason)}`,
-                { method: 'DELETE' }
-            )
-        ),
-        refreshMemoryPersonV3: (userId, personId) => (
-            API.post(
-                `/api/permissions/users/${userId}/memory/people/${personId}/v3/refresh`,
-                {}
-            )
-        ),
-        getMemoryPersonAudits: (userId) => (
-            API.get(`/api/permissions/users/${userId}/memory/people/audits`)
-        ),
-        addMemoryPersonAlias: (userId, personId, payload) => (
-            API.post(`/api/permissions/users/${userId}/memory/people/${personId}/aliases`, payload)
-        ),
-        mergeMemoryPerson: (userId, personId, payload) => (
-            API.post(`/api/permissions/users/${userId}/memory/people/${personId}/merge`, payload)
-        ),
-        upsertMemoryPersonFact: (userId, personId, payload) => (
-            API.post(`/api/permissions/users/${userId}/memory/people/${personId}/facts`, payload)
         ),
         deleteMemoryPersonFact: (userId, personId, factId, reason) => (
             API.request(
@@ -311,8 +287,23 @@ const API = {
                 { method: 'DELETE' }
             )
         ),
-        revertMemoryPersonAudit: (userId, auditId) => (
-            API.post(`/api/permissions/users/${userId}/memory/people/audits/${auditId}/revert`, {})
+        refreshMemoryPerson: (userId, personId) => (
+            API.post(
+                `/api/permissions/users/${userId}/memory/people/${personId}/refresh`,
+                {}
+            )
+        ),
+        getMemoryPersonIdentityAudits: (userId) => (
+            API.get(`/api/permissions/users/${userId}/memory/people/identity-audits`)
+        ),
+        addMemoryPersonAlias: (userId, personId, payload) => (
+            API.post(`/api/permissions/users/${userId}/memory/people/${personId}/aliases`, payload)
+        ),
+        mergeMemoryPerson: (userId, personId, payload) => (
+            API.post(`/api/permissions/users/${userId}/memory/people/${personId}/merge`, payload)
+        ),
+        revertMemoryPersonIdentityAudit: (userId, auditId) => (
+            API.post(`/api/permissions/users/${userId}/memory/people/identity-audits/${auditId}/revert`, {})
         ),
         getMemoryCorrections: (userId, activeOnly = false) => (
             API.get(`/api/permissions/users/${userId}/memory/corrections?active_only=${activeOnly ? 'true' : 'false'}`)

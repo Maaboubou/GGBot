@@ -21,7 +21,7 @@ from app.plugins.builtin_chatbot.memory_store import MemoryStore
 logger = logging.getLogger(__name__)
 
 
-PERSON_MEMORY_V3_SCHEMA_VERSION = 3
+PERSON_MEMORY_SCHEMA_VERSION = 3
 OBSERVATION_FIELDS = {
     "identity",
     "group_role",
@@ -568,10 +568,10 @@ def _iso_day(value: Any) -> str:
     return parsed.date().isoformat() if parsed is not None else ""
 
 
-class PersonMemoryV3Store:
-    """Persistence and deterministic validation for person-memory v3."""
+class PersonMemoryStore:
+    """Persistence and deterministic validation for person memory."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, store: MemoryStore) -> None:
         self.store = store
@@ -586,7 +586,7 @@ class PersonMemoryV3Store:
             schema_row = connection.execute(
                 """
                 SELECT version FROM memory_schema_meta
-                WHERE component = 'person_v3'
+                WHERE component = 'person_memory'
                 """
             ).fetchone()
             if (
@@ -596,12 +596,14 @@ class PersonMemoryV3Store:
                 return
             connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS memory_person_v3_state (
+                CREATE TABLE IF NOT EXISTS memory_person_state (
                     chat_name TEXT PRIMARY KEY,
                     schema_version INTEGER NOT NULL DEFAULT 3,
                     mode TEXT NOT NULL DEFAULT 'building',
                     source_namespace TEXT NOT NULL DEFAULT 'live_chat_log',
                     observation_source_cursor INTEGER NOT NULL DEFAULT 0,
+                    ingestion_cursor INTEGER NOT NULL DEFAULT 0,
+                    ingestion_message_count INTEGER NOT NULL DEFAULT 0,
                     active_snapshot_generation INTEGER NOT NULL DEFAULT 0,
                     last_observation_at TEXT,
                     last_consolidation_at TEXT,
@@ -635,7 +637,7 @@ class PersonMemoryV3Store:
                     sensitivity TEXT NOT NULL DEFAULT 'low',
                     quality_status TEXT NOT NULL DEFAULT 'active',
                     rejection_reason TEXT NOT NULL DEFAULT '',
-                    extractor_version TEXT NOT NULL DEFAULT 'person-v3',
+                    extractor_version TEXT NOT NULL DEFAULT 'person-memory',
                     batch_key TEXT NOT NULL DEFAULT '',
                     fingerprint TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -750,7 +752,7 @@ class PersonMemoryV3Store:
                     rendered_text TEXT NOT NULL DEFAULT '',
                     evidence_observation_ids_json TEXT NOT NULL DEFAULT '[]',
                     source_observation_max_id INTEGER NOT NULL DEFAULT 0,
-                    generator_version TEXT NOT NULL DEFAULT 'person-v3',
+                    generator_version TEXT NOT NULL DEFAULT 'person-memory',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(chat_name, person_id, period_key)
@@ -768,7 +770,7 @@ class PersonMemoryV3Store:
                     evidence_observation_ids_json TEXT NOT NULL DEFAULT '[]',
                     source_observation_max_id INTEGER NOT NULL DEFAULT 0,
                     is_active INTEGER NOT NULL DEFAULT 1,
-                    generator_version TEXT NOT NULL DEFAULT 'person-v3',
+                    generator_version TEXT NOT NULL DEFAULT 'person-memory',
                     created_at TEXT NOT NULL,
                     UNIQUE(chat_name, person_id, generation)
                 );
@@ -788,7 +790,7 @@ class PersonMemoryV3Store:
                     PRIMARY KEY(chat_name, person_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS memory_person_v3_audit (
+                CREATE TABLE IF NOT EXISTS memory_person_projection_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_name TEXT NOT NULL,
                     person_id INTEGER NOT NULL DEFAULT 0,
@@ -802,10 +804,10 @@ class PersonMemoryV3Store:
                     created_at TEXT NOT NULL,
                     reverted_at TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_person_v3_audit_chat
-                    ON memory_person_v3_audit(chat_name, status, id);
+                CREATE INDEX IF NOT EXISTS idx_person_audit_chat
+                    ON memory_person_projection_audit(chat_name, status, id);
 
-                CREATE TABLE IF NOT EXISTS memory_person_v3_suppressions (
+                CREATE TABLE IF NOT EXISTS memory_person_suppressions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_name TEXT NOT NULL,
                     person_id INTEGER NOT NULL,
@@ -820,8 +822,8 @@ class PersonMemoryV3Store:
                         target_key, status
                     )
                 );
-                CREATE INDEX IF NOT EXISTS idx_person_v3_suppressions_person
-                    ON memory_person_v3_suppressions(
+                CREATE INDEX IF NOT EXISTS idx_person_suppressions_person
+                    ON memory_person_suppressions(
                         chat_name, person_id, target_type, status
                     );
 
@@ -901,10 +903,88 @@ class PersonMemoryV3Store:
                     );
                 """
             )
+            self._upgrade_versioned_table_names(connection)
+            state_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(memory_person_state)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("ingestion_cursor", "INTEGER NOT NULL DEFAULT 0"),
+                ("ingestion_message_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in state_columns:
+                    connection.execute(
+                        f"ALTER TABLE memory_person_state "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                UPDATE memory_person_state SET
+                    ingestion_cursor = MAX(
+                        ingestion_cursor,
+                        COALESCE((
+                            SELECT MAX(source_cursor)
+                            FROM memory_person_source_messages AS source
+                            WHERE source.chat_name = memory_person_state.chat_name
+                              AND source.source_namespace =
+                                  memory_person_state.source_namespace
+                        ), 0)
+                    ),
+                    ingestion_message_count = MAX(
+                        ingestion_message_count,
+                        COALESCE((
+                            SELECT MAX(source_cursor)
+                            FROM memory_person_source_messages AS source
+                            WHERE source.chat_name = memory_person_state.chat_name
+                              AND source.source_namespace =
+                                  memory_person_state.source_namespace
+                        ), 0)
+                    )
+                """
+            )
             self.store.set_schema_component_version(
-                "person_v3",
+                "person_memory",
                 self.SCHEMA_VERSION,
                 connection=connection,
+            )
+            connection.execute(
+                "DELETE FROM memory_schema_meta WHERE component = ?",
+                ("person_v3",),
+            )
+
+    @staticmethod
+    def _upgrade_versioned_table_names(connection: Any) -> None:
+        """Copy the former version-labelled tables into stable names once."""
+        table_names = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        for source, target in (
+            ("memory_person_v3_state", "memory_person_state"),
+            ("memory_person_v3_audit", "memory_person_projection_audit"),
+            ("memory_person_v3_suppressions", "memory_person_suppressions"),
+        ):
+            if source not in table_names or target not in table_names:
+                continue
+            source_columns = {
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({source})")
+            }
+            target_columns = [
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({target})")
+            ]
+            columns = [column for column in target_columns if column in source_columns]
+            if not columns:
+                continue
+            projection = ",".join(columns)
+            connection.execute(
+                f"INSERT OR IGNORE INTO {target}({projection}) "
+                f"SELECT {projection} FROM {source}"
             )
 
     def ensure_chat_state(
@@ -919,28 +999,28 @@ class PersonMemoryV3Store:
         with self.store._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO memory_person_v3_state(
+                INSERT INTO memory_person_state(
                     chat_name, schema_version, mode, source_namespace, updated_at
                 ) VALUES(?, ?, ?, ?, ?)
                 ON CONFLICT(chat_name) DO UPDATE SET
                     schema_version = excluded.schema_version,
                     source_namespace = CASE
-                        WHEN memory_person_v3_state.source_namespace = ''
+                        WHEN memory_person_state.source_namespace = ''
                         THEN excluded.source_namespace
-                        ELSE memory_person_v3_state.source_namespace
+                        ELSE memory_person_state.source_namespace
                     END,
                     updated_at = excluded.updated_at
                 """,
                 (
                     chat_name,
-                    PERSON_MEMORY_V3_SCHEMA_VERSION,
+                    PERSON_MEMORY_SCHEMA_VERSION,
                     normalized_mode,
                     source_namespace,
                     now,
                 ),
             )
             row = connection.execute(
-                "SELECT * FROM memory_person_v3_state WHERE chat_name = ?",
+                "SELECT * FROM memory_person_state WHERE chat_name = ?",
                 (chat_name,),
             ).fetchone()
         return dict(row) if row is not None else {}
@@ -948,10 +1028,42 @@ class PersonMemoryV3Store:
     def get_chat_state(self, chat_name: str) -> Dict[str, Any]:
         with self.store._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM memory_person_v3_state WHERE chat_name = ?",
+                "SELECT * FROM memory_person_state WHERE chat_name = ?",
                 (chat_name,),
             ).fetchone()
         return dict(row) if row is not None else {}
+
+    def set_ingestion_cursor(
+        self,
+        chat_name: str,
+        *,
+        source_cursor: int,
+        source_message_count: int,
+        monotonic: bool = True,
+    ) -> Dict[str, Any]:
+        self.ensure_chat_state(chat_name, source_namespace="live_chat_log")
+        now = self.now()
+        assignment = (
+            "ingestion_cursor = MAX(ingestion_cursor, ?), "
+            "ingestion_message_count = MAX(ingestion_message_count, ?)"
+            if monotonic
+            else "ingestion_cursor = ?, ingestion_message_count = ?"
+        )
+        with self.store._connection() as connection:
+            connection.execute(
+                f"""
+                UPDATE memory_person_state SET
+                    {assignment}, updated_at = ?
+                WHERE chat_name = ?
+                """,
+                (
+                    max(0, int(source_cursor)),
+                    max(0, int(source_message_count)),
+                    now,
+                    chat_name,
+                ),
+            )
+        return self.get_chat_state(chat_name)
 
     def set_chat_mode(self, chat_name: str, mode: str) -> Dict[str, Any]:
         if mode not in {"building", "active", "disabled"}:
@@ -961,7 +1073,7 @@ class PersonMemoryV3Store:
         with self.store._connection() as connection:
             connection.execute(
                 """
-                UPDATE memory_person_v3_state SET
+                UPDATE memory_person_state SET
                     mode = ?,
                     activated_at = CASE
                         WHEN ? = 'active' THEN COALESCE(activated_at, ?)
@@ -1895,7 +2007,7 @@ class PersonMemoryV3Store:
                         raw.get("sensitivity") or "low",
                         raw.get("quality_status") or "active",
                         _clean_text(raw.get("rejection_reason"), 500),
-                        raw.get("extractor_version") or "person-v3",
+                        raw.get("extractor_version") or "person-memory",
                         batch_key or str(raw.get("batch_key") or ""),
                         fingerprint,
                         now,
@@ -1930,13 +2042,13 @@ class PersonMemoryV3Store:
             if max_cursor:
                 connection.execute(
                     """
-                    INSERT INTO memory_person_v3_state(
+                    INSERT INTO memory_person_state(
                         chat_name, schema_version, mode, source_namespace,
                         observation_source_cursor, last_observation_at, updated_at
                     ) VALUES(?, ?, 'building', ?, ?, ?, ?)
                     ON CONFLICT(chat_name) DO UPDATE SET
                         observation_source_cursor = MAX(
-                            memory_person_v3_state.observation_source_cursor,
+                            memory_person_state.observation_source_cursor,
                             excluded.observation_source_cursor
                         ),
                         last_observation_at = excluded.last_observation_at,
@@ -1944,7 +2056,7 @@ class PersonMemoryV3Store:
                     """,
                     (
                         chat_name,
-                        PERSON_MEMORY_V3_SCHEMA_VERSION,
+                        PERSON_MEMORY_SCHEMA_VERSION,
                         source_namespace,
                         max_cursor,
                         now,
@@ -2154,7 +2266,7 @@ class PersonMemoryV3Store:
         *,
         evidence_observation_ids: Iterable[int],
         source_observation_max_id: int,
-        generator_version: str = "person-v3",
+        generator_version: str = "person-memory",
     ) -> int:
         ids = sorted(
             {
@@ -2438,7 +2550,7 @@ class PersonMemoryV3Store:
             return None
         suppressed = connection.execute(
             """
-            SELECT 1 FROM memory_person_v3_suppressions
+            SELECT 1 FROM memory_person_suppressions
             WHERE chat_name = ? AND person_id = ?
               AND target_type = 'fact' AND target_key = ?
               AND status = 'active'
@@ -2936,7 +3048,7 @@ class PersonMemoryV3Store:
             str(row["target_key"]).split("|", 1)[-1]
             for row in connection.execute(
                 """
-                SELECT target_key FROM memory_person_v3_suppressions
+                SELECT target_key FROM memory_person_suppressions
                 WHERE chat_name = ? AND person_id = ?
                   AND status = 'active' AND target_type IN('fact', 'snapshot')
                 """,
@@ -3210,7 +3322,7 @@ class PersonMemoryV3Store:
         source_observation_max_id: int,
         minimum_pattern_days: int = 3,
         minimum_pattern_span_days: int = 30,
-        generator_version: str = "person-v3",
+        generator_version: str = "person-memory",
     ) -> Dict[str, Any]:
         now = self.now()
         fact_ids: List[int] = []
@@ -3523,7 +3635,7 @@ class PersonMemoryV3Store:
             )
             connection.execute(
                 """
-                UPDATE memory_person_v3_state SET
+                UPDATE memory_person_state SET
                     active_snapshot_generation = MAX(
                         active_snapshot_generation, ?
                     ),
@@ -3574,7 +3686,7 @@ class PersonMemoryV3Store:
         remove_observation_id: int = 0,
         remove_normalized_text: str = "",
         now: str,
-        generator_version: str = "person-v3-manual",
+        generator_version: str = "person-memory-manual",
     ) -> int:
         row = connection.execute(
             """
@@ -3741,7 +3853,7 @@ class PersonMemoryV3Store:
                 )
             connection.execute(
                 """
-                INSERT INTO memory_person_v3_audit(
+                INSERT INTO memory_person_projection_audit(
                     chat_name, person_id, action, target_type, target_id,
                     reason, before_json, after_json, created_at
                 ) VALUES(?, ?, 'review_observation', 'observation', ?, ?, ?, ?, ?)
@@ -3937,7 +4049,7 @@ class PersonMemoryV3Store:
             person_id,
             projection,
             source_observation_max_id=observation_id,
-            generator_version="person-v3-manual",
+            generator_version="person-memory-manual",
         )
         with self.store._connection() as connection:
             fact_row = connection.execute(
@@ -3962,7 +4074,7 @@ class PersonMemoryV3Store:
             )
             cursor = connection.execute(
                 """
-                INSERT INTO memory_person_v3_audit(
+                INSERT INTO memory_person_projection_audit(
                     chat_name, person_id, action, target_type, target_id,
                     reason, before_json, after_json, created_at
                 ) VALUES(?, ?, 'add_manual_fact', 'fact', ?, ?, '{}', ?, ?)
@@ -4022,7 +4134,7 @@ class PersonMemoryV3Store:
             )
             connection.execute(
                 """
-                INSERT OR IGNORE INTO memory_person_v3_suppressions(
+                INSERT OR IGNORE INTO memory_person_suppressions(
                     chat_name, person_id, target_type, target_key,
                     reason, status, created_at
                 ) VALUES(?, ?, 'fact', ?, ?, 'active', ?)
@@ -4044,7 +4156,7 @@ class PersonMemoryV3Store:
             )
             cursor = connection.execute(
                 """
-                INSERT INTO memory_person_v3_audit(
+                INSERT INTO memory_person_projection_audit(
                     chat_name, person_id, action, target_type, target_id,
                     reason, before_json, after_json, created_at
                 ) VALUES(?, ?, 'delete_fact', 'fact', ?, ?, ?, ?, ?)
@@ -4080,7 +4192,7 @@ class PersonMemoryV3Store:
         with self.store._connection() as connection:
             rows = connection.execute(
                 f"""
-                SELECT {projection} FROM memory_person_v3_audit
+                SELECT {projection} FROM memory_person_projection_audit
                 WHERE chat_name = ?
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -4393,7 +4505,7 @@ class PersonMemoryV3Store:
         return profile
 
 
-class PersonMemoryV3Engine:
+class PersonMemoryEngine:
     """Extract raw-message observations and maintain evidence-backed profiles."""
 
     def __init__(
@@ -4405,7 +4517,7 @@ class PersonMemoryV3Engine:
         excluded_person_names: Optional[Iterable[str]] = None,
     ) -> None:
         self.store = store
-        self.v3 = PersonMemoryV3Store(store)
+        self.ledger = PersonMemoryStore(store)
         self.context_manager = context_manager
         self.call_json = call_json
         self.excluded_person_names = {
@@ -4445,7 +4557,6 @@ class PersonMemoryV3Engine:
         target_person_id: int = 0,
         max_observations: int = 6,
         minimum_memory_value: float = 0.78,
-        person_centric: bool = False,
     ) -> Optional[Dict[str, Any]]:
         if not messages:
             return {"inserted": 0, "observations": []}
@@ -4504,22 +4615,17 @@ class PersonMemoryV3Engine:
             0.35,
             min(0.95, float(minimum_memory_value or 0.78)),
         )
-        target_identity = None
-        if int(target_person_id or 0) > 0:
-            target_identity = next(
-                (
-                    person
-                    for person in self.store.list_people(
-                        chat_name,
-                        include_empty=True,
-                    )
-                    if int(person.get("person_id") or 0)
-                    == int(target_person_id)
-                ),
-                None,
-            )
-            if target_identity is None:
-                return {"inserted": 0, "observations": []}
+        target_identity = next(
+            (
+                person
+                for person in self.store.list_person_directory(chat_name)
+                if int(person.get("person_id") or 0)
+                == int(target_person_id or 0)
+            ),
+            None,
+        )
+        if target_identity is None:
+            return {"inserted": 0, "observations": []}
         observed_sender_ids = sorted(
             {
                 str(message.get("sender_id") or "").strip()
@@ -4539,18 +4645,10 @@ class PersonMemoryV3Engine:
                 "role": "system",
                 "content": (
                     "你是人物长期记忆的“观察记录员”，直接阅读原始群聊，不写人物简介。"
-                    + (
-                        "本批消息已经按一个目标人物聚合。高召回提取该人物的身份、经历、"
-                        "职业与地点变化、明确计划、长期兴趣信号、技能、群内角色和关系"
-                        "信号；不要因为尚未形成完整人物简介而丢弃有明确原文支持的候选。"
-                        f"最多输出{observation_limit}条，按长期价值排序，不要求凑满。"
-                        if person_centric
-                        else
-                        "只提取半年后仍可能帮助识别人、理解近况或自然续聊的原子观察。"
-                        "对每个候选先问：半年后知道它是否仍有用？如果答案是否定或不确定，"
-                        "就不要输出。通常120条消息应只有0-3条观察；每批硬上限"
-                        f"{observation_limit}条，不要求凑满。"
-                    )
+                    "本批消息已经按一个目标人物聚合。高召回提取该人物的身份、经历、"
+                    "职业与地点变化、明确计划、长期兴趣信号、技能、群内角色和关系"
+                    "信号；不要因为尚未形成完整人物简介而丢弃有明确原文支持的候选。"
+                    f"最多输出{observation_limit}条，按长期价值排序，不要求凑满。"
                     + "普通寒暄、一次性观点、下注/赔率/接龙流水、临时输赢、"
                     "商品或新闻链接、临时游戏邀约/段位、一次性技术排障、当天上班休息、"
                     "下载网速、天气、纯玩笑、角色扮演和无法确定主语的内容一律不提取。"
@@ -4577,19 +4675,15 @@ class PersonMemoryV3Engine:
                 "role": "user",
                 "content": (
                     f"群聊：{chat_name}\n"
-                    + (
-                        "目标人物："
-                        f"{target_identity.get('person_name') if target_identity else ''}\n"
-                        "目标人物别名："
-                        f"{_json_dump([alias.get('alias_name') for alias in (target_identity or {}).get('aliases', [])])}\n"
-                        "目标人物稳定 sender_id："
-                        f"{_json_dump(sorted({str(alias.get('external_id') or '') for alias in (target_identity or {}).get('aliases', []) if str(alias.get('external_id') or '')}))}\n"
-                        "subject_sender_id 只能填写上述目标ID；若本批未出现"
-                        "目标本人消息且无法确认ID则填空，绝不能填写第三方说话人的ID。\n"
-                        f"核心人物消息游标：{_json_dump(sorted(core_cursor_set))}\n"
-                        if person_centric
-                        else f"核心游标：{core_start_cursor}-{core_end_cursor}\n"
-                    )
+                    + "目标人物："
+                    f"{target_identity.get('person_name')}\n"
+                    "目标人物别名："
+                    f"{_json_dump([alias.get('alias_name') for alias in target_identity.get('aliases', [])])}\n"
+                    "目标人物稳定 sender_id："
+                    f"{_json_dump(sorted({str(alias.get('external_id') or '') for alias in target_identity.get('aliases', []) if str(alias.get('external_id') or '')}))}\n"
+                    "subject_sender_id 只能填写上述目标ID；若本批未出现"
+                    "目标本人消息且无法确认ID则填空，绝不能填写第三方说话人的ID。\n"
+                    f"核心人物消息游标：{_json_dump(sorted(core_cursor_set))}\n"
                     +
                     f"本批出现的 sender_id：{_json_dump(observed_sender_ids)}\n"
                     f"本批出现的昵称：{_json_dump(observed_names)}\n\n"
@@ -4621,7 +4715,7 @@ class PersonMemoryV3Engine:
         ]
         try:
             payload = self.call_json(
-                call_type="memory_person_observe",
+                call_type="memory_person_extract",
                 messages=prompt,
                 schema_hint='根对象必须是 {"observations":[...]}',
                 chat_name=chat_name,
@@ -4648,7 +4742,7 @@ class PersonMemoryV3Engine:
             candidate["candidate_id"] = f"c{index}"
             raw_candidates.append(candidate)
         if int(target_person_id or 0) > 0 and batch_key:
-            self.v3.record_claim_candidates(
+            self.ledger.record_claim_candidates(
                 chat_name,
                 int(target_person_id),
                 source_namespace,
@@ -4829,11 +4923,7 @@ class PersonMemoryV3Engine:
                 continue
             if field_name in {"other", "current_status"} and (
                 memory_value
-                < (
-                    max(value_floor + 0.12, 0.72)
-                    if person_centric
-                    else 0.9
-                )
+                < max(value_floor + 0.12, 0.72)
                 or durability != "lifecycle"
             ):
                 filtered_low_value += 1
@@ -4988,7 +5078,7 @@ class PersonMemoryV3Engine:
                     "sensitivity": sensitivity,
                     "quality_status": quality_status,
                     "rejection_reason": rejection_reason,
-                    "extractor_version": "person-v3.1",
+                    "extractor_version": "person-memory.1",
                 }
             )
         asserted = [
@@ -5064,7 +5154,7 @@ class PersonMemoryV3Engine:
             ]
             try:
                 verification_payload = self.call_json(
-                    call_type="memory_person_observe",
+                    call_type="memory_person_review",
                     messages=verification_prompt,
                     schema_hint='根对象必须是 {"verifications":[...]}',
                     chat_name=chat_name,
@@ -5168,7 +5258,7 @@ class PersonMemoryV3Engine:
             for observation in normalized
             if id(observation) in accepted_object_ids
         ]
-        result = self.v3.add_observations(
+        result = self.ledger.add_observations(
             chat_name,
             accepted,
             source_namespace=source_namespace,
@@ -5234,7 +5324,7 @@ class PersonMemoryV3Engine:
                     "reason": reason,
                     "verification": verification,
                 }
-            self.v3.update_claim_candidate_results(
+            self.ledger.update_claim_candidate_results(
                 chat_name,
                 batch_key,
                 candidate_results,
@@ -5343,7 +5433,7 @@ class PersonMemoryV3Engine:
     ) -> Dict[str, Any]:
         """Process independent person queues without a global group quota."""
 
-        due = self.v3.due_indexed_people(
+        due = self.ledger.due_indexed_people(
             chat_name,
             threshold=threshold,
             limit=max_people,
@@ -5363,7 +5453,7 @@ class PersonMemoryV3Engine:
         for state in due:
             person_id = int(state.get("person_id") or 0)
             namespace = str(state.get("source_namespace") or "")
-            batch = self.v3.next_indexed_person_batch(
+            batch = self.ledger.next_indexed_person_batch(
                 chat_name,
                 person_id,
                 namespace,
@@ -5396,11 +5486,10 @@ class PersonMemoryV3Engine:
                 target_person_id=person_id,
                 max_observations=max_observations,
                 minimum_memory_value=minimum_memory_value,
-                person_centric=True,
             )
             if result is None:
                 continue
-            self.v3.mark_indexed_person_batch_processed(
+            self.ledger.mark_indexed_person_batch_processed(
                 chat_name,
                 person_id,
                 namespace,
@@ -5487,7 +5576,7 @@ class PersonMemoryV3Engine:
             if not reason:
                 continue
             try:
-                self.v3.review_observation(
+                self.ledger.review_observation(
                     chat_name,
                     int(observation["id"]),
                     quality_status="rejected",
@@ -5629,7 +5718,7 @@ class PersonMemoryV3Engine:
             }
         )
         with self.store._connection() as connection:
-            observations = self.v3._verified_observations(
+            observations = self.ledger._verified_observations(
                 connection,
                 chat_name,
                 person_id,
@@ -5781,7 +5870,7 @@ class PersonMemoryV3Engine:
         ]
         try:
             payload = self.call_json(
-                call_type="memory_person_observe",
+                call_type="memory_person_projection_review",
                 messages=prompt,
                 schema_hint='根对象必须是 {"verifications":[...]}',
                 chat_name=chat_name,
@@ -5919,13 +6008,13 @@ class PersonMemoryV3Engine:
         minimum_pattern_span_days: int = 30,
     ) -> Optional[Dict[str, Any]]:
         identity = None
-        for person in self.store.list_people(chat_name, include_empty=True):
+        for person in self.store.list_person_directory(chat_name):
             if int(person.get("person_id") or 0) == int(person_id):
                 identity = person
                 break
         if identity is None:
             return None
-        observations = self.v3.list_observations(
+        observations = self.ledger.list_observations(
             chat_name,
             person_id=person_id,
             quality_status="active",
@@ -5943,7 +6032,7 @@ class PersonMemoryV3Engine:
                 person_id,
                 rejected_count,
             )
-            observations = self.v3.list_observations(
+            observations = self.ledger.list_observations(
                 chat_name,
                 person_id=person_id,
                 quality_status="active",
@@ -5953,11 +6042,11 @@ class PersonMemoryV3Engine:
         observations.reverse()
         if not observations:
             return None
-        existing_facts = self.v3.list_current_facts(chat_name, person_id)
-        existing_patterns = self.v3.list_patterns(chat_name, person_id)
-        existing_relationships = self.v3.list_relationships(chat_name, person_id)
-        period_summaries = self.v3.list_period_summaries(chat_name, person_id)
-        existing_snapshot = self.v3.get_active_snapshot(
+        existing_facts = self.ledger.list_current_facts(chat_name, person_id)
+        existing_patterns = self.ledger.list_patterns(chat_name, person_id)
+        existing_relationships = self.ledger.list_relationships(chat_name, person_id)
+        period_summaries = self.ledger.list_period_summaries(chat_name, person_id)
+        existing_snapshot = self.ledger.get_active_snapshot(
             chat_name,
             person_id,
         )
@@ -5983,10 +6072,7 @@ class PersonMemoryV3Engine:
                         if alias.get("status") == "confirmed"
                     ],
                 }
-                for person in self.store.list_people(
-                    chat_name,
-                    include_empty=True,
-                )
+                for person in self.store.list_person_directory(chat_name)
                 if int(person.get("person_id") or 0) != int(person_id)
                 and str(person.get("person_name") or "").strip().casefold()
                 not in self.excluded_person_names
@@ -6159,14 +6245,14 @@ class PersonMemoryV3Engine:
         if projection is None:
             return None
         source_max = max(int(observation["id"]) for observation in observations)
-        applied = self.v3.apply_projection(
+        applied = self.ledger.apply_projection(
             chat_name,
             person_id,
             projection,
             source_observation_max_id=source_max,
             minimum_pattern_days=3,
             minimum_pattern_span_days=minimum_pattern_span_days,
-            generator_version="person-v3.1",
+            generator_version="person-memory.1",
         )
         return {
             **applied,
@@ -6183,7 +6269,7 @@ class PersonMemoryV3Engine:
         force: bool = False,
         limit: int = 8,
     ) -> Dict[str, Any]:
-        due = self.v3.due_people(
+        due = self.ledger.due_people(
             chat_name,
             threshold=threshold,
             force=force,
@@ -6213,13 +6299,13 @@ class PersonMemoryV3Engine:
         event_participants: Iterable[str] = (),
         maximum_people: int = 3,
     ) -> List[Dict[str, Any]]:
-        state = self.v3.get_chat_state(chat_name)
+        state = self.ledger.get_chat_state(chat_name)
         if state.get("mode") != "active":
             return []
         query = str(content or "")
         participants = {str(value or "").strip() for value in event_participants}
         selected = []
-        for profile in self.v3.list_profiles(chat_name, include_building=False):
+        for profile in self.ledger.list_profiles(chat_name, include_building=False):
             aliases = {
                 str(alias.get("alias_name") or "").strip()
                 for alias in profile.get("aliases") or []

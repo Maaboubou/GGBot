@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 
 from app.models.user_permission import UserPermission, WeChatUser
 from app.plugins.builtin_chatbot.memory_store import MemoryStore
-from app.plugins.builtin_chatbot.person_memory_v3 import PersonMemoryV3Store
+from app.plugins.builtin_chatbot.memory_config import upgrade_memory_config_keys
+from app.plugins.builtin_chatbot.person_memory import PersonMemoryStore
 from app.utils.plugin_config import get_plugin_config
 
 
@@ -44,7 +45,7 @@ class MemoryConsoleService:
     def __init__(self, db: Session, *, store: Optional[MemoryStore] = None):
         self.db = db
         self.store = store or MemoryStore()
-        self.person_v3 = PersonMemoryV3Store(self.store)
+        self.person = PersonMemoryStore(self.store)
 
     def _user(self, user_id: int) -> WeChatUser:
         user = self.db.query(WeChatUser).filter(WeChatUser.id == int(user_id)).first()
@@ -90,6 +91,7 @@ class MemoryConsoleService:
 
     @staticmethod
     def validate_memory_overrides(overrides: Dict[str, Any]) -> Dict[str, Any]:
+        overrides = upgrade_memory_config_keys(overrides)
         plugin_config = get_plugin_config("builtin_chatbot")
         schema = plugin_config.get("config_schema") or {}
         result: Dict[str, Any] = {}
@@ -138,6 +140,7 @@ class MemoryConsoleService:
                 for key, value in profile.items()
                 if str(key).startswith("memory_")
             }
+        overrides = upgrade_memory_config_keys(overrides)
         overrides = {
             key: value
             for key, value in overrides.items()
@@ -266,8 +269,8 @@ class MemoryConsoleService:
         limit: int = 20,
     ) -> Dict[str, Any]:
         user = self._user(user_id)
-        state = self.person_v3.get_chat_state(user.chat_name)
-        items, total = self.person_v3.browse_profiles(
+        state = self.person.get_chat_state(user.chat_name)
+        items, total = self.person.browse_profiles(
             user.chat_name,
             query=query,
             offset=offset,
@@ -283,7 +286,7 @@ class MemoryConsoleService:
 
     def person_detail(self, user_id: int, person_id: int) -> Dict[str, Any]:
         user = self._user(user_id)
-        profile = self.person_v3.get_profile(user.chat_name, int(person_id))
+        profile = self.person.get_profile(user.chat_name, int(person_id))
         if profile is None:
             raise MemoryConsoleError("人物资料不存在")
         return {"profile": profile}
@@ -398,13 +401,13 @@ class MemoryConsoleService:
         reason: str,
     ) -> Dict[str, Any]:
         user = self._user(user_id)
-        observation = self.person_v3.get_observation(
+        observation = self.person.get_observation(
             user.chat_name,
             int(observation_id),
         )
         if observation is None or int(observation.get("person_id") or 0) != int(person_id):
             raise MemoryConsoleError("观察证据不属于该人物")
-        result = self.person_v3.review_observation(
+        result = self.person.review_observation(
             user.chat_name,
             int(observation_id),
             quality_status=quality_status,
@@ -422,7 +425,7 @@ class MemoryConsoleService:
         reason: str,
     ) -> Dict[str, Any]:
         user = self._user(user_id)
-        result = self.person_v3.add_manual_fact(
+        result = self.person.add_manual_fact(
             user.chat_name,
             int(person_id),
             fact,
@@ -440,7 +443,7 @@ class MemoryConsoleService:
         reason: str,
     ) -> Dict[str, Any]:
         user = self._user(user_id)
-        result = self.person_v3.delete_fact(
+        result = self.person.delete_fact(
             user.chat_name,
             int(person_id),
             int(fact_id),
@@ -609,7 +612,7 @@ class MemoryConsoleService:
             UNION ALL
             SELECT 'person_memory', id, action, reason, status, target_id,
                    created_at, reverted_at
-            FROM memory_person_v3_audit WHERE chat_name = ?
+            FROM memory_person_projection_audit WHERE chat_name = ?
             UNION ALL
             SELECT 'maintenance', id, action, reason, 'completed', 0,
                    created_at, NULL

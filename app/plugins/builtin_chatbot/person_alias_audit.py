@@ -1,4 +1,4 @@
-"""Evidence-backed alias audit for person-memory v3.
+"""Evidence-backed alias audit for person memory.
 
 The historical person rebuild primarily learns facts about message authors.
 Group nicknames such as "熊猫" often appear only in other members' messages,
@@ -31,12 +31,12 @@ import litellm
 from app.plugins.builtin_chatbot.context_manager import ChatContextManager
 from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
 from app.plugins.builtin_chatbot.memory_store import MemoryStore
-from app.plugins.builtin_chatbot.person_memory_v3 import (
-    PersonMemoryV3Engine,
+from app.plugins.builtin_chatbot.person_memory import (
+    PersonMemoryEngine,
     _clean_text,
     _json_load,
 )
-from app.plugins.builtin_chatbot.person_memory_v3_rebuild import (
+from app.plugins.builtin_chatbot.person_memory_rebuild import (
     DeepSeekBudget,
     _NoChatLog,
     _backup_database,
@@ -741,27 +741,11 @@ def _configure_alias_manager(workspace: Path):
         "builtin_chatbot",
         {},
     )
-    for call_type in (
-        "memory_person_alias_discover",
-        "memory_person_alias_verify",
-    ):
+    for call_type in ("memory_generate", "memory_review"):
         mapping = chatbot.setdefault(call_type, {})
         mapping["primary"] = "deepseek"
         mapping["fallback"] = []
-        override = mapping.setdefault("override_params", {})
-        override.update(
-            {
-                "temperature": 0.0,
-                "max_tokens": (
-                    5000
-                    if call_type == "memory_person_alias_discover"
-                    else 1200
-                ),
-                "timeout": 180,
-                "response_format": {"type": "json_object"},
-                "extra_body": {"thinking": {"type": "disabled"}},
-            }
-        )
+        mapping["override_params"] = {}
     return manager
 
 
@@ -1024,7 +1008,7 @@ def _verify_person(
 
         try:
             response = call_json(
-                call_type="memory_person_alias_verify",
+                call_type="memory_person_alias_review",
                 chat_name=corpus.chat_name,
                 schema_hint=schema_hint,
                 messages=verification_messages(rendered),
@@ -1037,7 +1021,7 @@ def _verify_person(
             )
             try:
                 response = call_json(
-                    call_type="memory_person_alias_verify",
+                    call_type="memory_person_alias_review",
                     chat_name=corpus.chat_name,
                     schema_hint=schema_hint,
                     messages=verification_messages(compact_evidence),
@@ -2158,7 +2142,7 @@ def refresh_merged_profiles(
         workspace=workspace / "refresh",
         budget=budget,
     )
-    engine = PersonMemoryV3Engine(
+    engine = PersonMemoryEngine(
         MemoryStore(database),
         context_manager,
         call_json,

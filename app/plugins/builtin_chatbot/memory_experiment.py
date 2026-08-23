@@ -37,7 +37,7 @@ OPAQUE_MEMORY_TYPES = frozenset(
         "其他/未知",
     }
 )
-MEMORY_TABLES = ("memory_state", "memory_events", "memory_people")
+MEMORY_TABLES = ("memory_state", "memory_events")
 
 
 class MemoryExperimentError(ValueError):

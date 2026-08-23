@@ -462,88 +462,42 @@ def _memory_config(manifest: Dict[str, Any]) -> Dict[str, Any]:
 
 def _configure_experiment_llm(
     manager: LLMManager,
-    manifest: Dict[str, Any],
+    _manifest: Dict[str, Any],
 ) -> None:
     """Tune structured calls only inside the isolated backfill manager."""
-    planned = manifest.get("planned_memory_config") or {}
-    desired_event_max_tokens = max(
-        1000,
-        min(8000, int(planned.get("event_max_tokens") or 4000)),
-    )
-    desired_dedup_max_tokens = max(
-        1000,
-        min(8000, int(planned.get("dedup_max_tokens") or 6000)),
-    )
-    desired_verify_max_tokens = max(
-        2000,
-        min(6000, int(planned.get("verify_max_tokens") or 4000)),
-    )
-    desired_stage_max_tokens = max(
-        4000,
-        min(12000, int(planned.get("stage_max_tokens") or 8000)),
-    )
     plugin_mappings = manager.config.get("plugin_mappings")
     if not isinstance(plugin_mappings, dict):
         return
     plugin = plugin_mappings.get("builtin_chatbot")
     if not isinstance(plugin, dict):
         return
-    event_mapping = plugin.get("memory_event")
-    if isinstance(event_mapping, dict):
-        overrides = event_mapping.setdefault("override_params", {})
+    generate_mapping = plugin.get("memory_generate")
+    if isinstance(generate_mapping, dict):
+        overrides = generate_mapping.setdefault("override_params", {})
         if isinstance(overrides, dict):
-            overrides["max_tokens"] = max(
-                desired_event_max_tokens,
-                int(overrides.get("max_tokens") or 0),
-            )
             # DeepSeek reasoning tokens count against max_tokens. With
             # thinking enabled, long batches frequently spend the entire
             # ceiling before emitting the JSON payload.
             overrides["extra_body"] = {
                 "thinking": {"type": "disabled"},
             }
-
-    mapping = plugin.get("memory_dedup")
-    if isinstance(mapping, dict):
-        overrides = mapping.setdefault("override_params", {})
-        if isinstance(overrides, dict):
-            overrides["max_tokens"] = max(
-                desired_dedup_max_tokens,
-                int(overrides.get("max_tokens") or 0),
-            )
-
-    verification_mapping = plugin.get("memory_verify")
-    if isinstance(verification_mapping, dict):
-        overrides = verification_mapping.setdefault("override_params", {})
-        if isinstance(overrides, dict):
-            overrides["max_tokens"] = max(
-                desired_verify_max_tokens,
-                int(overrides.get("max_tokens") or 0),
-            )
-
     models = manager.config.get("models")
-    stage_mapping = plugin.get("memory_stage")
+    synthesize_mapping = plugin.get("memory_synthesize")
     if (
         isinstance(models, dict)
         and "deepseek-followup" in models
-        and isinstance(stage_mapping, dict)
+        and isinstance(synthesize_mapping, dict)
     ):
-        previous_primary = str(stage_mapping.get("primary") or "").strip()
-        stage_mapping["primary"] = "deepseek-followup"
+        previous_primary = str(synthesize_mapping.get("primary") or "").strip()
+        synthesize_mapping["primary"] = "deepseek-followup"
         fallbacks = [
             str(item).strip()
-            for item in stage_mapping.get("fallback") or []
+            for item in synthesize_mapping.get("fallback") or []
             if str(item).strip() and str(item).strip() != "deepseek-followup"
         ]
         if previous_primary and previous_primary != "deepseek-followup":
             fallbacks.insert(0, previous_primary)
-        stage_mapping["fallback"] = list(dict.fromkeys(fallbacks))
-        stage_overrides = stage_mapping.setdefault("override_params", {})
-        if isinstance(stage_overrides, dict):
-            stage_overrides["max_tokens"] = max(
-                desired_stage_max_tokens,
-                int(stage_overrides.get("max_tokens") or 0),
-            )
+        synthesize_mapping["fallback"] = list(dict.fromkeys(fallbacks))
 
 
 def _extract_batches(

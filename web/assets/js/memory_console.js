@@ -337,9 +337,9 @@
                 document.getElementById('memoryLibraryEventCount').textContent =
                     Number(data.event_count || 0).toLocaleString();
                 document.getElementById('memoryLibraryPeopleCount').textContent =
-                    Number(data.person_memory_v3?.profile_count || data.people_count || 0).toLocaleString();
+                    Number(data.person_memory?.profile_count || data.people_count || 0).toLocaleString();
                 const reviewCount = Number(data.quarantined_event_count || 0)
-                    + Number(data.person_memory_v3?.observations?.quarantined || 0);
+                    + Number(data.person_memory?.observations?.quarantined || 0);
                 document.getElementById('memoryLibraryReviewCount').textContent =
                     reviewCount.toLocaleString();
                 const summary = document.getElementById('memoryLibrarySummary');
@@ -349,7 +349,7 @@
                             <span class="memory-status-dot ${effective.memory_enabled ? 'is-on' : 'is-off'}"></span>
                             <strong>${this.escapeHtml(this.memoryModeLabel(config.mode, !!effective.memory_enabled))}</strong>
                             <span>${Number(data.active_event_count || 0).toLocaleString()} 条有效记忆</span>
-                            <span>${Number(data.person_memory_v3?.profile_count || 0).toLocaleString()} 个人物</span>
+                            <span>${Number(data.person_memory?.profile_count || 0).toLocaleString()} 个人物</span>
                             <span>${this.formatMemoryBytes(storage.logical_bytes || 0)} 逻辑数据</span>
                             <button class="btn btn-sm btn-outline-secondary ms-auto" type="button"
                                 onclick="App.refreshMemoryLibrary()">
@@ -576,14 +576,14 @@
                             <details class="memory-detail-section">
                                 <summary>纠正这条记忆</summary>
                                 <form class="memory-correction-form" data-event-id="${Number(event.id)}"
-                                    onsubmit="event.preventDefault(); App.submitMemoryEventCorrectionV2(this);">
+                                    onsubmit="event.preventDefault(); App.submitMemoryEventCorrection(this);">
                                     <label>哪里不准确<textarea class="form-control" name="false_claims" rows="2" required></textarea></label>
                                     <label>正确信息<textarea class="form-control" name="corrected_claim" rows="2"></textarea></label>
                                     <label>涉及人物<input class="form-control" name="affected_people" value="${this.escapeHtml((event.participants || []).join('、'))}"></label>
                                     <label>核对原因<input class="form-control" name="reason" required maxlength="1000"></label>
                                     <div class="d-flex justify-content-between gap-2">
                                         <button class="btn btn-outline-danger" type="button"
-                                            onclick="App.deleteMemoryEventV2(${Number(event.id)}, this)">删除记忆</button>
+                                            onclick="App.deleteMemoryEvent(${Number(event.id)}, this)">删除记忆</button>
                                         <button class="btn btn-primary" type="submit">提交纠正</button>
                                     </div>
                                 </form>
@@ -594,7 +594,7 @@
             }
         },
 
-        async submitMemoryEventCorrectionV2(form) {
+        async submitMemoryEventCorrection(form) {
             const state = this._memoryLibraryState;
             const eventId = Number(form?.dataset.eventId || 0);
             if (!state?.userId || !eventId) return;
@@ -618,7 +618,7 @@
             })) return;
             try {
                 const result = responseData(await API.memory.correctEvent(state.userId, eventId, payload));
-                const affected = Number(result.correction?.after?.person_v3?.observation_count || 0);
+                const affected = Number(result.correction?.after?.person?.observation_count || 0);
                 UI.showSuccess(`记忆已纠正${affected ? `，同时隔离 ${affected} 条人物证据` : ''}`);
                 this.closeMemoryDrawer();
                 this.invalidateMemorySections(['overview', 'events', 'reviews', 'changes']);
@@ -628,7 +628,7 @@
             }
         },
 
-        async deleteMemoryEventV2(eventId) {
+        async deleteMemoryEvent(eventId) {
             const state = this._memoryLibraryState;
             if (!state?.userId) return;
             if (!await UI.confirm('删除后会退出检索，并同步隔离相关人物证据。操作可从变更记录撤销。', {
@@ -714,7 +714,7 @@
                             <div class="memory-fact-list">${facts.map(fact => `
                                 <div><span>${this.escapeHtml(fact.value || '')}</span>
                                     <small>${this.escapeHtml(fact.field_name || '')} · ${this.escapeHtml(fact.status || '')}</small>
-                                    ${fact.manual_lock ? `<input class="form-control form-control-sm" name="fact_delete_reason" maxlength="1000" placeholder="删除原因"><button class="btn btn-sm btn-link text-danger" onclick="App.deleteMemoryPersonFactV2(${Number(person.person_id)}, ${Number(fact.id)}, this)">删除</button>` : ''}
+                                    ${fact.manual_lock ? `<input class="form-control form-control-sm" name="fact_delete_reason" maxlength="1000" placeholder="删除原因"><button class="btn btn-sm btn-link text-danger" onclick="App.deleteMemoryPersonFact(${Number(person.person_id)}, ${Number(fact.id)}, this)">删除</button>` : ''}
                                 </div>`).join('') || '<span class="text-muted">暂无结构化事实</span>'}</div>
                         </details>
                         ${patterns.length ? `<details class="memory-detail-section"><summary>稳定特点（${patterns.length}）</summary>
@@ -724,11 +724,11 @@
                                 <div class="memory-observation-item">
                                     <p>${this.escapeHtml(item.statement || '')}</p>
                                     <small>${this.escapeHtml(item.observed_at || '')} · ${this.escapeHtml(item.quality_status || '')}</small>
-                                    ${item.quality_status === 'active' ? `<div class="d-flex flex-wrap gap-2 mt-2"><input class="form-control form-control-sm flex-grow-1" name="review_reason" maxlength="1000" placeholder="隔离原因"><button class="btn btn-sm btn-outline-warning" onclick="App.reviewMemoryObservationV2(${Number(person.person_id)}, ${Number(item.id)}, 'quarantined', this)">隔离</button></div>` : ''}
+                                    ${item.quality_status === 'active' ? `<div class="d-flex flex-wrap gap-2 mt-2"><input class="form-control form-control-sm flex-grow-1" name="review_reason" maxlength="1000" placeholder="隔离原因"><button class="btn btn-sm btn-outline-warning" onclick="App.reviewMemoryObservation(${Number(person.person_id)}, ${Number(item.id)}, 'quarantined', this)">隔离</button></div>` : ''}
                                 </div>`).join('')}</div>
                         </details>
                         <details class="memory-detail-section"><summary>添加人工事实</summary>
-                            <form onsubmit="event.preventDefault(); App.addMemoryPersonFactV2(${Number(person.person_id)}, this);">
+                            <form onsubmit="event.preventDefault(); App.addMemoryPersonFact(${Number(person.person_id)}, this);">
                                 <select class="form-select mb-2" name="field"><option value="other">一般事实</option><option value="preference">偏好</option><option value="occupation">职业</option><option value="location">地点</option><option value="plan">计划</option><option value="current_status">当前状态</option></select>
                                 <textarea class="form-control mb-2" name="value" required maxlength="600"></textarea>
                                 <input class="form-control mb-2" name="reason" required placeholder="添加原因">
@@ -736,13 +736,13 @@
                             </form>
                         </details>
                         <details class="memory-detail-section"><summary>身份工具</summary>
-                            <form class="mb-3" onsubmit="event.preventDefault(); App.addMemoryPersonAliasV2(${Number(person.person_id)}, this);">
+                            <form class="mb-3" onsubmit="event.preventDefault(); App.addMemoryPersonAlias(${Number(person.person_id)}, this);">
                                 <label class="form-label">添加确认别名</label>
                                 <input class="form-control mb-2" name="alias_name" required maxlength="80" placeholder="昵称或曾用名">
                                 <input class="form-control mb-2" name="reason" required minlength="2" maxlength="1000" placeholder="添加原因">
                                 <button class="btn btn-outline-primary" type="submit">添加别名</button>
                             </form>
-                            <form class="border-top pt-3" onsubmit="event.preventDefault(); App.mergeMemoryPersonV2(${Number(person.person_id)}, this);">
+                            <form class="border-top pt-3" onsubmit="event.preventDefault(); App.mergeMemoryPerson(${Number(person.person_id)}, this);">
                                 <label class="form-label">合并重复人物</label>
                                 <input class="form-control mb-2" name="target_person_name" required maxlength="80" placeholder="要保留的准确姓名或确认别名">
                                 <input class="form-control mb-2" name="reason" required minlength="2" maxlength="1000" placeholder="合并原因">
@@ -756,7 +756,7 @@
             }
         },
 
-        async reviewMemoryObservationV2(personId, observationId, status, trigger = null) {
+        async reviewMemoryObservation(personId, observationId, status, trigger = null) {
             const state = this._memoryLibraryState;
             const row = trigger?.closest('.memory-observation-item, .memory-review-row');
             const reason = row?.querySelector('[name="review_reason"]')?.value?.trim() || '';
@@ -783,7 +783,7 @@
             }
         },
 
-        async addMemoryPersonFactV2(personId, form) {
+        async addMemoryPersonFact(personId, form) {
             const state = this._memoryLibraryState;
             if (!state?.userId) return;
             try {
@@ -802,7 +802,7 @@
             }
         },
 
-        async deleteMemoryPersonFactV2(personId, factId, trigger = null) {
+        async deleteMemoryPersonFact(personId, factId, trigger = null) {
             const state = this._memoryLibraryState;
             const row = trigger?.closest('.memory-fact-list > div');
             const reason = row?.querySelector('[name="fact_delete_reason"]')?.value?.trim() || '';
@@ -822,7 +822,7 @@
             }
         },
 
-        async addMemoryPersonAliasV2(personId, form) {
+        async addMemoryPersonAlias(personId, form) {
             const state = this._memoryLibraryState;
             if (!state?.userId || !form?.reportValidity()) return;
             try {
@@ -838,7 +838,7 @@
             }
         },
 
-        async mergeMemoryPersonV2(personId, form) {
+        async mergeMemoryPerson(personId, form) {
             const state = this._memoryLibraryState;
             if (!state?.userId || !form?.reportValidity()) return;
             if (!await UI.confirm('当前人物的证据、事实和别名会迁移到目标人物。确认继续吗？', {
@@ -890,10 +890,10 @@
                     ? '<div class="memory-empty-state"><i class="bi bi-shield-check"></i><span>目前没有待复核内容</span></div>'
                     : `<div class="memory-review-columns">
                         <section><h5>待复核记忆 <span>${Number(data.events?.total || 0)}</span></h5>
-                            ${events.map(item => `<div class="memory-review-row"><button class="btn btn-link p-0 text-start" onclick="App.openMemoryEventDetail(${Number(item.id)})"><strong>${this.escapeHtml(item.title || '')}</strong></button><span>${this.escapeHtml(item.verification_note || '需要人工确认')}</span><input class="form-control form-control-sm" name="event_review_reason" maxlength="1000" placeholder="复核原因（必填）"><div class="d-flex gap-2"><button class="btn btn-sm btn-success" onclick="App.reviewMemoryEventV2(${Number(item.id)}, 'approve', this)">通过</button><button class="btn btn-sm btn-outline-danger" onclick="App.reviewMemoryEventV2(${Number(item.id)}, 'reject', this)">拒绝</button></div></div>`).join('') || '<p class="text-muted">暂无</p>'}
+                            ${events.map(item => `<div class="memory-review-row"><button class="btn btn-link p-0 text-start" onclick="App.openMemoryEventDetail(${Number(item.id)})"><strong>${this.escapeHtml(item.title || '')}</strong></button><span>${this.escapeHtml(item.verification_note || '需要人工确认')}</span><input class="form-control form-control-sm" name="event_review_reason" maxlength="1000" placeholder="复核原因（必填）"><div class="d-flex gap-2"><button class="btn btn-sm btn-success" onclick="App.reviewMemoryEvent(${Number(item.id)}, 'approve', this)">通过</button><button class="btn btn-sm btn-outline-danger" onclick="App.reviewMemoryEvent(${Number(item.id)}, 'reject', this)">拒绝</button></div></div>`).join('') || '<p class="text-muted">暂无</p>'}
                         </section>
                         <section><h5>待复核人物证据 <span>${Number(data.observations?.total || 0)}</span></h5>
-                            ${observations.map(item => `<div class="memory-review-row"><strong>${this.escapeHtml(item.person_name || '未知人物')}</strong><span>${this.escapeHtml(item.statement || '')}</span><input class="form-control form-control-sm" name="review_reason" maxlength="1000" placeholder="复核原因（必填）"><div class="d-flex gap-2"><button class="btn btn-sm btn-success" onclick="App.reviewMemoryObservationV2(${Number(item.person_id)}, ${Number(item.id)}, 'active', this)">确认</button><button class="btn btn-sm btn-outline-danger" onclick="App.reviewMemoryObservationV2(${Number(item.person_id)}, ${Number(item.id)}, 'rejected', this)">拒绝</button></div></div>`).join('') || '<p class="text-muted">暂无</p>'}
+                            ${observations.map(item => `<div class="memory-review-row"><strong>${this.escapeHtml(item.person_name || '未知人物')}</strong><span>${this.escapeHtml(item.statement || '')}</span><input class="form-control form-control-sm" name="review_reason" maxlength="1000" placeholder="复核原因（必填）"><div class="d-flex gap-2"><button class="btn btn-sm btn-success" onclick="App.reviewMemoryObservation(${Number(item.person_id)}, ${Number(item.id)}, 'active', this)">确认</button><button class="btn btn-sm btn-outline-danger" onclick="App.reviewMemoryObservation(${Number(item.person_id)}, ${Number(item.id)}, 'rejected', this)">拒绝</button></div></div>`).join('') || '<p class="text-muted">暂无</p>'}
                         </section>
                     </div>`);
                 if (pagination) {
@@ -908,7 +908,7 @@
             }
         },
 
-        async reviewMemoryEventV2(eventId, decision, trigger) {
+        async reviewMemoryEvent(eventId, decision, trigger) {
             const state = this._memoryLibraryState;
             const row = trigger?.closest('.memory-review-row');
             const reason = row?.querySelector('[name="event_review_reason"]')?.value?.trim() || '';
@@ -951,7 +951,7 @@
                     ? `<div class="memory-change-list">${data.items.map(item => {
                         const reversible = item.status === 'active'
                             && ['event', 'stage', 'person_identity'].includes(item.category);
-                        return `<article class="memory-change-row"><span class="memory-change-type">${this.escapeHtml(labels[item.category] || item.category)}</span><div><strong>${this.escapeHtml(item.action || '')}</strong><p>${this.escapeHtml(item.reason || '')}</p><small>${this.escapeHtml(item.created_at || '')} · ${this.escapeHtml(item.status || '')}</small></div>${reversible ? `<button class="btn btn-sm btn-outline-danger" onclick="App.revertMemoryChangeV2('${item.category}', ${Number(item.id)})">撤销</button>` : ''}</article>`;
+                        return `<article class="memory-change-row"><span class="memory-change-type">${this.escapeHtml(labels[item.category] || item.category)}</span><div><strong>${this.escapeHtml(item.action || '')}</strong><p>${this.escapeHtml(item.reason || '')}</p><small>${this.escapeHtml(item.created_at || '')} · ${this.escapeHtml(item.status || '')}</small></div>${reversible ? `<button class="btn btn-sm btn-outline-danger" onclick="App.revertMemoryChange('${item.category}', ${Number(item.id)})">撤销</button>` : ''}</article>`;
                     }).join('')}</div>`
                     : '<div class="memory-empty-state"><i class="bi bi-journal"></i><span>暂无人工变更记录</span></div>';
                 pagination.innerHTML = this.renderMemoryPagination(
@@ -964,7 +964,7 @@
             }
         },
 
-        async revertMemoryChangeV2(category, changeId) {
+        async revertMemoryChange(category, changeId) {
             const state = this._memoryLibraryState;
             if (!state?.userId) return;
             if (!await UI.confirm('撤销会恢复这次变更前的状态；若有更晚的相关修改，系统会拒绝操作。', {
@@ -996,7 +996,7 @@
                     source_messages: '人物来源消息', message_links: '人物消息关联',
                     candidates: '人物候选', observations: '人物证据',
                     person_snapshots: '人物快照', corrections: '事件纠错快照',
-                    person_audits: '人物身份审计', person_v3_audits: '人物资料审计'
+                    identity_audits: '人物身份审计', projection_audits: '人物资料审计'
                 };
                 container.innerHTML = `
                     <div class="memory-maintenance-grid">
@@ -1010,7 +1010,7 @@
                             <div class="memory-card-kicker">可安全清理</div>
                             <h4>${Number(cleanup.rejected_candidate_count || 0).toLocaleString()} 条过期候选</h4>
                             <p>这些候选已经被证据核验拒绝，不属于正式记忆，预计释放 ${this.formatMemoryBytes(cleanup.estimated_bytes || 0)}。</p>
-                            <button class="btn btn-outline-primary" type="button" onclick="App.cleanupMemoryCandidatesV2()" ${cleanup.rejected_candidate_count ? '' : 'disabled'}>清理 90 天前候选</button>
+                            <button class="btn btn-outline-primary" type="button" onclick="App.cleanupMemoryCandidates()" ${cleanup.rejected_candidate_count ? '' : 'disabled'}>清理 90 天前候选</button>
                         </section>
                         <section class="memory-maintenance-card memory-storage-card">
                             <div class="memory-card-kicker">逻辑数据占用</div>
@@ -1021,7 +1021,7 @@
                             <h4>先确认聊天，再执行维护</h4>
                             <p>请输入完整聊天名称 <code>${this.escapeHtml(preview.confirmation || '')}</code>。备份使用 SQLite 在线备份机制，包含整个记忆数据库，运行中的读写也能保持一致。</p>
                             <input class="form-control mb-3" id="memoryMaintenanceConfirmation" autocomplete="off" placeholder="输入聊天名称确认">
-                            <button class="btn btn-outline-primary" type="button" onclick="App.createMemoryBackupV2(this)"><i class="bi bi-shield-check me-1"></i>创建清理前备份</button>
+                            <button class="btn btn-outline-primary" type="button" onclick="App.createMemoryBackup(this)"><i class="bi bi-shield-check me-1"></i>创建清理前备份</button>
                             <div class="form-text mt-2">备份保存在 <code>${this.escapeHtml(data.backup?.directory || 'data/memory_backups')}</code>，不会自动上传。</div>
                         </section>
                         <section class="memory-maintenance-card memory-danger-card">
@@ -1029,10 +1029,10 @@
                             <h4>清理当前聊天的记忆</h4>
                             <p>清理不会删除聊天原始日志；审计记录会保留，但已删除的记忆内容只能从数据库备份恢复。</p>
                             <div class="memory-danger-actions">
-                                <button class="btn btn-outline-danger" onclick="App.clearMemoryScopeV2('stage')">清理状态摘要</button>
-                                <button class="btn btn-outline-danger" onclick="App.clearMemoryScopeV2('events')">清理 ${Number(preview.events?.events || 0)} 条记忆</button>
-                                <button class="btn btn-outline-danger" onclick="App.clearMemoryScopeV2('people')">清理人物资料</button>
-                                <button class="btn btn-danger" onclick="App.clearMemoryScopeV2('all')">清理全部</button>
+                                <button class="btn btn-outline-danger" onclick="App.clearMemoryScope('stage')">清理状态摘要</button>
+                                <button class="btn btn-outline-danger" onclick="App.clearMemoryScope('events')">清理 ${Number(preview.events?.events || 0)} 条记忆</button>
+                                <button class="btn btn-outline-danger" onclick="App.clearMemoryScope('people')">清理人物资料</button>
+                                <button class="btn btn-danger" onclick="App.clearMemoryScope('all')">清理全部</button>
                             </div>
                         </section>
                     </div>`;
@@ -1041,7 +1041,7 @@
             }
         },
 
-        async createMemoryBackupV2(button) {
+        async createMemoryBackup(button) {
             const state = this._memoryLibraryState;
             const confirmation = document.getElementById('memoryMaintenanceConfirmation')?.value || '';
             if (!state?.userId) return;
@@ -1064,7 +1064,7 @@
             }
         },
 
-        async cleanupMemoryCandidatesV2() {
+        async cleanupMemoryCandidates() {
             const state = this._memoryLibraryState;
             const confirmation = document.getElementById('memoryMaintenanceConfirmation')?.value || '';
             if (!state?.userId) return;
@@ -1081,7 +1081,7 @@
             }
         },
 
-        async clearMemoryScopeV2(scope) {
+        async clearMemoryScope(scope) {
             const state = this._memoryLibraryState;
             const confirmation = document.getElementById('memoryMaintenanceConfirmation')?.value || '';
             if (!state?.userId) return;

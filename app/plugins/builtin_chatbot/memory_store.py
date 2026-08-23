@@ -15,62 +15,12 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 import numpy as np
 
 
-PERSON_FACT_FIELDS = {
-    "identity",
-    "group_role",
-    "occupation",
-    "employer",
-    "education",
-    "location",
-    "family",
-    "relationship",
-    "health",
-    "preference",
-    "interest",
-    "skill",
-    "asset",
-    "experience",
-    "habit",
-    "plan",
-    "current_status",
-    "legacy_summary",
-    "other",
-}
-PERSON_FACT_STATUSES = {
-    "current",
-    "historical",
-    "planned",
-    "uncertain",
-    "disputed",
-}
-PERSON_FIELD_LABELS = {
-    "identity": "身份信息",
-    "group_role": "群内角色",
-    "occupation": "职业",
-    "employer": "单位",
-    "education": "教育经历",
-    "location": "地点",
-    "family": "家庭",
-    "relationship": "人物关系",
-    "health": "健康",
-    "preference": "偏好",
-    "interest": "兴趣",
-    "skill": "技能",
-    "asset": "设备与资产",
-    "experience": "经历",
-    "habit": "习惯",
-    "plan": "计划",
-    "current_status": "当前状态",
-    "legacy_summary": "旧版资料",
-    "other": "其他",
-}
-
-PERSON_V3_CHAT_TABLES = (
+PERSON_MEMORY_CHAT_TABLES = (
     "memory_person_claim_candidates",
     "memory_person_pipeline_state",
     "memory_person_message_links",
     "memory_person_source_messages",
-    "memory_person_v3_suppressions",
+    "memory_person_suppressions",
     "memory_person_snapshots",
     "memory_person_period_summaries",
     "memory_person_relationships",
@@ -78,12 +28,11 @@ PERSON_V3_CHAT_TABLES = (
     "memory_person_fact_versions",
     "memory_person_refresh_state",
     "memory_person_observations",
-    "memory_person_v3_state",
+    "memory_person_state",
+    "memory_person_projection_audit",
 )
 
-PERSON_LEGACY_CHAT_TABLES = (
-    "memory_people",
-    "memory_person_facts",
+PERSON_IDENTITY_CHAT_TABLES = (
     "memory_person_aliases",
     "memory_person_identities",
     "memory_person_audit",
@@ -105,7 +54,7 @@ def _json_load(value: Any, default: Any) -> Any:
 
 
 class MemoryStore:
-    CORE_SCHEMA_VERSION = 3
+    CORE_SCHEMA_VERSION = 4
     _schema_locks_guard = threading.Lock()
     _schema_locks: Dict[str, threading.RLock] = {}
 
@@ -274,20 +223,6 @@ class MemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_memory_events_chat_time
                     ON memory_events(chat_name, end_time);
 
-                CREATE TABLE IF NOT EXISTS memory_people (
-                    chat_name TEXT NOT NULL,
-                    person_name TEXT NOT NULL,
-                    profile_json TEXT NOT NULL DEFAULT '{}',
-                    profile_text TEXT NOT NULL DEFAULT '',
-                    source_event_id INTEGER NOT NULL DEFAULT 0,
-                    manual_override INTEGER NOT NULL DEFAULT 0,
-                    manual_note TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(chat_name, person_name)
-                );
-                CREATE INDEX IF NOT EXISTS idx_memory_people_chat
-                    ON memory_people(chat_name);
-
                 CREATE TABLE IF NOT EXISTS memory_person_identities (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_name TEXT NOT NULL,
@@ -325,40 +260,6 @@ class MemoryStore:
                     idx_memory_person_aliases_external_confirmed
                     ON memory_person_aliases(chat_name, external_id)
                     WHERE external_id != '' AND status = 'confirmed';
-
-                CREATE TABLE IF NOT EXISTS memory_person_facts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_name TEXT NOT NULL,
-                    person_id INTEGER NOT NULL,
-                    field_name TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    normalized_value TEXT NOT NULL,
-                    fact_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'current',
-                    confidence REAL NOT NULL DEFAULT 0.5,
-                    valid_from TEXT,
-                    valid_to TEXT,
-                    observed_at TEXT,
-                    first_seen_at TEXT,
-                    last_seen_at TEXT,
-                    temporal_note TEXT NOT NULL DEFAULT '',
-                    source_event_id INTEGER NOT NULL DEFAULT 0,
-                    source_event_ids_json TEXT NOT NULL DEFAULT '[]',
-                    evidence_json TEXT NOT NULL DEFAULT '[]',
-                    mention_count INTEGER NOT NULL DEFAULT 1,
-                    manual_override INTEGER NOT NULL DEFAULT 0,
-                    superseded_by_fact_id INTEGER NOT NULL DEFAULT 0,
-                    deleted_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(chat_name, person_id, fact_key)
-                );
-                CREATE INDEX IF NOT EXISTS idx_memory_person_facts_person
-                    ON memory_person_facts(person_id, status, deleted_at, id);
-                CREATE INDEX IF NOT EXISTS idx_memory_person_facts_chat
-                    ON memory_person_facts(chat_name, field_name, status);
-                CREATE INDEX IF NOT EXISTS idx_memory_person_facts_event
-                    ON memory_person_facts(source_event_id);
 
                 CREATE TABLE IF NOT EXISTS memory_person_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -483,20 +384,6 @@ class MemoryStore:
                     connection.execute(
                         f"ALTER TABLE memory_events ADD COLUMN {column_name} {definition}"
                     )
-            people_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(memory_people)"
-                ).fetchall()
-            }
-            for column_name, definition in (
-                ("manual_override", "INTEGER NOT NULL DEFAULT 0"),
-                ("manual_note", "TEXT NOT NULL DEFAULT ''"),
-            ):
-                if column_name not in people_columns:
-                    connection.execute(
-                        f"ALTER TABLE memory_people ADD COLUMN {column_name} {definition}"
-                    )
             state_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -540,7 +427,6 @@ class MemoryStore:
                 )
                 """
             )
-            self._migrate_legacy_people(connection)
             connection.execute(
                 """
                 INSERT INTO memory_schema_meta(component, version, updated_at)
@@ -722,27 +608,6 @@ class MemoryStore:
         return (
             bool(str(chat_name or "").strip())
             and name.casefold() == str(chat_name).strip().casefold()
-        )
-
-    @classmethod
-    def _person_fact_key(
-        cls,
-        field_name: str,
-        value: Any,
-        *,
-        valid_from: Any = "",
-        valid_to: Any = "",
-    ) -> str:
-        field = str(field_name or "other").strip().lower()
-        if field == "legacy_summary":
-            return "legacy_summary"
-        return "|".join(
-            (
-                field,
-                cls._normalize_person_text(value),
-                str(valid_from or "").strip(),
-                str(valid_to or "").strip(),
-            )
         )
 
     def _ensure_person_identity(
@@ -1019,275 +884,6 @@ class MemoryStore:
         )
         return int(row["id"])
 
-    def _upsert_person_fact(
-        self,
-        connection: sqlite3.Connection,
-        chat_name: str,
-        person_id: int,
-        fact: Dict[str, Any],
-        *,
-        default_source_event_id: int = 0,
-    ) -> int:
-        field_name = str(fact.get("field") or fact.get("field_name") or "other").strip().lower()
-        if field_name not in PERSON_FACT_FIELDS:
-            field_name = "other"
-        value = re.sub(r"\s+", " ", str(fact.get("value") or "").strip())
-        if not value:
-            return 0
-        status = str(fact.get("status") or "current").strip().lower()
-        if status not in PERSON_FACT_STATUSES:
-            status = "uncertain"
-        try:
-            confidence = max(0.0, min(1.0, float(fact.get("confidence", 0.5))))
-        except (TypeError, ValueError):
-            confidence = 0.5
-        valid_from = str(fact.get("valid_from") or "").strip()
-        valid_to = str(fact.get("valid_to") or "").strip()
-        observed_at = str(
-            fact.get("observed_at")
-            or fact.get("last_seen_at")
-            or ""
-        ).strip()
-        source_ids = sorted(
-            {
-                int(value)
-                for value in (
-                    fact.get("source_event_ids")
-                    or fact.get("evidence_event_ids")
-                    or [default_source_event_id]
-                )
-                if str(value or "").isdigit() and int(value) > 0
-            }
-        )
-        source_event_id = int(
-            fact.get("source_event_id")
-            or (source_ids[-1] if source_ids else default_source_event_id)
-            or 0
-        )
-        if source_event_id > 0 and source_event_id not in source_ids:
-            source_ids.append(source_event_id)
-            source_ids.sort()
-        if not observed_at and source_event_id > 0:
-            event_row = connection.execute(
-                """
-                SELECT COALESCE(NULLIF(end_time, ''), start_time, created_at)
-                AS observed_at
-                FROM memory_events WHERE id = ? AND chat_name = ?
-                """,
-                (source_event_id, chat_name),
-            ).fetchone()
-            if event_row is not None:
-                observed_at = str(event_row["observed_at"] or "").strip()
-        evidence = fact.get("evidence") or []
-        if not isinstance(evidence, list):
-            evidence = []
-        fact_key = str(fact.get("fact_key") or "").strip() or self._person_fact_key(
-            field_name,
-            value,
-            valid_from=valid_from,
-            valid_to=valid_to,
-        )
-        now = self._now()
-        existing = connection.execute(
-            """
-            SELECT * FROM memory_person_facts
-            WHERE chat_name = ? AND person_id = ? AND fact_key = ?
-            """,
-            (chat_name, int(person_id), fact_key),
-        ).fetchone()
-        if existing is None:
-            cursor = connection.execute(
-                """
-                INSERT INTO memory_person_facts(
-                    chat_name, person_id, field_name, value,
-                    normalized_value, fact_key, status, confidence,
-                    valid_from, valid_to, observed_at,
-                    first_seen_at, last_seen_at, temporal_note,
-                    source_event_id, source_event_ids_json, evidence_json,
-                    mention_count, manual_override,
-                    superseded_by_fact_id, deleted_at,
-                    created_at, updated_at
-                ) VALUES(
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    1, ?, 0, NULL, ?, ?
-                )
-                """,
-                (
-                    chat_name,
-                    int(person_id),
-                    field_name,
-                    value,
-                    self._normalize_person_text(value),
-                    fact_key,
-                    status,
-                    confidence,
-                    valid_from or None,
-                    valid_to or None,
-                    observed_at or None,
-                    observed_at or None,
-                    observed_at or None,
-                    str(fact.get("temporal_note") or "").strip(),
-                    source_event_id,
-                    _json_dump(source_ids),
-                    _json_dump(evidence[:20]),
-                    int(bool(fact.get("manual_override", False))),
-                    now,
-                    now,
-                ),
-            )
-            fact_id = int(cursor.lastrowid)
-        else:
-            fact_id = int(existing["id"])
-            if int(existing["manual_override"] or 0) and not fact.get("manual_override"):
-                return fact_id
-            merged_sources = sorted(
-                set(_json_load(existing["source_event_ids_json"], []))
-                | set(source_ids)
-            )
-            merged_evidence = list(_json_load(existing["evidence_json"], []))
-            for item in evidence:
-                if item not in merged_evidence:
-                    merged_evidence.append(item)
-            first_seen = str(existing["first_seen_at"] or "")
-            last_seen = str(existing["last_seen_at"] or "")
-            if observed_at:
-                first_seen = min(
-                    value for value in (first_seen, observed_at) if value
-                )
-                last_seen = max(last_seen, observed_at)
-            connection.execute(
-                """
-                UPDATE memory_person_facts SET
-                    value = ?, normalized_value = ?, status = ?,
-                    confidence = MAX(confidence, ?),
-                    valid_from = COALESCE(NULLIF(?, ''), valid_from),
-                    valid_to = COALESCE(NULLIF(?, ''), valid_to),
-                    observed_at = COALESCE(NULLIF(?, ''), observed_at),
-                    first_seen_at = NULLIF(?, ''),
-                    last_seen_at = NULLIF(?, ''),
-                    temporal_note = CASE
-                        WHEN ? != '' THEN ? ELSE temporal_note
-                    END,
-                    source_event_id = MAX(source_event_id, ?),
-                    source_event_ids_json = ?,
-                    evidence_json = ?,
-                    mention_count = mention_count + 1,
-                    manual_override = MAX(manual_override, ?),
-                    deleted_at = NULL,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    value,
-                    self._normalize_person_text(value),
-                    status,
-                    confidence,
-                    valid_from,
-                    valid_to,
-                    observed_at,
-                    first_seen,
-                    last_seen,
-                    str(fact.get("temporal_note") or "").strip(),
-                    str(fact.get("temporal_note") or "").strip(),
-                    source_event_id,
-                    _json_dump(merged_sources),
-                    _json_dump(merged_evidence[:40]),
-                    int(bool(fact.get("manual_override", False))),
-                    now,
-                    fact_id,
-                ),
-            )
-        replacement_ids = {
-            int(value)
-            for value in (fact.get("replaces_fact_ids") or [])
-            if str(value or "").isdigit() and int(value) > 0
-        }
-        if replacement_ids:
-            placeholders = ",".join("?" for _ in replacement_ids)
-            connection.execute(
-                f"""
-                UPDATE memory_person_facts SET
-                    status = 'historical',
-                    valid_to = COALESCE(valid_to, NULLIF(?, '')),
-                    superseded_by_fact_id = ?,
-                    updated_at = ?
-                WHERE chat_name = ? AND person_id = ?
-                  AND id IN({placeholders})
-                  AND id != ? AND manual_override = 0
-                """,
-                (
-                    valid_from or observed_at,
-                    fact_id,
-                    now,
-                    chat_name,
-                    int(person_id),
-                    *sorted(replacement_ids),
-                    fact_id,
-                ),
-            )
-        return fact_id
-
-    def _migrate_legacy_people(self, connection: sqlite3.Connection) -> None:
-        rows = connection.execute(
-            "SELECT * FROM memory_people ORDER BY chat_name, person_name"
-        ).fetchall()
-        for row in rows:
-            name = str(row["person_name"] or "").strip()
-            if not name:
-                continue
-            person_id = self._ensure_person_identity(
-                connection,
-                str(row["chat_name"]),
-                name,
-                source="legacy_profile",
-                confidence=1.0,
-                observed_at=str(row["updated_at"] or ""),
-            )
-            profile_text = str(row["profile_text"] or "").strip()
-            if profile_text:
-                has_structured = connection.execute(
-                    """
-                    SELECT 1 FROM memory_person_facts
-                    WHERE chat_name = ? AND person_id = ?
-                      AND field_name != 'legacy_summary'
-                      AND deleted_at IS NULL
-                    LIMIT 1
-                    """,
-                    (str(row["chat_name"]), person_id),
-                ).fetchone()
-                profile = _json_load(row["profile_json"], {})
-                if has_structured is not None or (
-                    isinstance(profile, dict)
-                    and isinstance(profile.get("facts"), list)
-                ):
-                    continue
-                existing_legacy = connection.execute(
-                    """
-                    SELECT id FROM memory_person_facts
-                    WHERE chat_name = ? AND person_id = ?
-                      AND fact_key = 'legacy_summary'
-                    """,
-                    (str(row["chat_name"]), person_id),
-                ).fetchone()
-                if existing_legacy is not None:
-                    continue
-                self._upsert_person_fact(
-                    connection,
-                    str(row["chat_name"]),
-                    person_id,
-                    {
-                        "field": "legacy_summary",
-                        "value": profile_text,
-                        "status": "uncertain",
-                        "confidence": float(profile.get("confidence", 0.5))
-                        if isinstance(profile, dict)
-                        else 0.5,
-                        "observed_at": str(row["updated_at"] or ""),
-                        "source_event_id": int(row["source_event_id"] or 0),
-                        "manual_override": int(row["manual_override"] or 0),
-                    },
-                    default_source_event_id=int(row["source_event_id"] or 0),
-                )
 
     def get_state(self, chat_name: str) -> Dict[str, Any]:
         with self._connection() as connection:
@@ -1371,12 +967,12 @@ class MemoryStore:
                 "memory_corrections",
                 "LENGTH(before_json) + LENGTH(after_json)",
             ),
-            "person_audits": (
+            "identity_audits": (
                 "memory_person_audit",
                 "LENGTH(before_json) + LENGTH(after_json)",
             ),
-            "person_v3_audits": (
-                "memory_person_v3_audit",
+            "projection_audits": (
+                "memory_person_projection_audit",
                 "LENGTH(before_json) + LENGTH(after_json)",
             ),
         }
@@ -1758,7 +1354,7 @@ class MemoryStore:
         return result
 
     @staticmethod
-    def _render_person_v3_snapshot(
+    def _render_person_snapshot(
         sections: Dict[str, List[Dict[str, Any]]],
     ) -> str:
         labels = {
@@ -1781,7 +1377,7 @@ class MemoryStore:
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks)
 
-    def _event_correction_v3_snapshot(
+    def _event_correction_person_snapshot(
         self,
         connection: sqlite3.Connection,
         chat_name: str,
@@ -1866,24 +1462,24 @@ class MemoryStore:
             connection,
             chat_name,
             person_ids,
-            include_v3_derived=True,
+            include_derived=True,
         )
         return {
             "person_ids": sorted(person_ids),
             "observations": observations,
-            "derived": snapshot.get("v3_derived") or {},
+            "derived": snapshot.get("derived") or {},
             "audit_cutoff_id": int(
                 connection.execute(
                     """
                     SELECT COALESCE(MAX(id), 0) AS value
-                    FROM memory_person_v3_audit WHERE chat_name = ?
+                    FROM memory_person_projection_audit WHERE chat_name = ?
                     """,
                     (chat_name,),
                 ).fetchone()["value"]
             ),
         }
 
-    def _apply_event_correction_to_v3(
+    def _apply_event_correction_to_person(
         self,
         connection: sqlite3.Connection,
         chat_name: str,
@@ -1996,7 +1592,7 @@ class MemoryStore:
                 "UPDATE memory_person_snapshots SET is_active = 0 WHERE id = ?",
                 (int(row["id"]),),
             )
-            rendered = self._render_person_v3_snapshot(filtered)
+            rendered = self._render_person_snapshot(filtered)
             if rendered:
                 evidence_ids = sorted(
                     {
@@ -2024,7 +1620,7 @@ class MemoryStore:
                         rendered,
                         _json_dump(evidence_ids),
                         int(row["source_observation_max_id"] or 0),
-                        "person-v3-event-correction",
+                        "person-event-correction",
                         now,
                     ),
                 )
@@ -2041,7 +1637,7 @@ class MemoryStore:
                 continue
             cursor = connection.execute(
                 """
-                INSERT INTO memory_person_v3_audit(
+                INSERT INTO memory_person_projection_audit(
                     chat_name, person_id, action, target_type, target_id,
                     reason, before_json, after_json, status, created_at
                 ) VALUES(?, ?, 'event_correction', 'event', ?, ?, ?, ?, 'active', ?)
@@ -2069,7 +1665,7 @@ class MemoryStore:
             "created_snapshot_ids": created_snapshot_ids,
         }
 
-    def _restore_event_correction_v3(
+    def _restore_event_correction_person(
         self,
         connection: sqlite3.Connection,
         chat_name: str,
@@ -2091,12 +1687,12 @@ class MemoryStore:
         cutoff_id = int(snapshot.get("audit_cutoff_id") or 0)
         ignored_audit_ids = {
             int(value)
-            for value in (after.get("person_v3") or {}).get("audit_ids") or []
+            for value in (after.get("person") or {}).get("audit_ids") or []
             if int(value) > 0
         }
         later_rows = connection.execute(
             f"""
-            SELECT id FROM memory_person_v3_audit
+            SELECT id FROM memory_person_projection_audit
             WHERE chat_name = ? AND person_id IN({placeholders})
               AND status = 'active' AND id > ?
             ORDER BY id DESC
@@ -2110,7 +1706,7 @@ class MemoryStore:
         ]
         if blocking:
             raise ValueError(
-                "存在影响同一人物的更晚 v3 修改，"
+                "存在影响同一人物的更晚人物修改，"
                 f"请先处理人物修改 #{blocking[0]}"
             )
 
@@ -2137,7 +1733,7 @@ class MemoryStore:
             "memory_person_period_summaries",
             "memory_person_snapshots",
             "memory_person_refresh_state",
-            "memory_person_v3_suppressions",
+            "memory_person_suppressions",
             "memory_person_pipeline_state",
         ):
             if table not in derived:
@@ -2166,7 +1762,7 @@ class MemoryStore:
             audit_placeholders = ",".join("?" for _ in ignored_audit_ids)
             connection.execute(
                 f"""
-                UPDATE memory_person_v3_audit
+                UPDATE memory_person_projection_audit
                 SET status = 'reverted', reverted_at = ?
                 WHERE chat_name = ? AND id IN({audit_placeholders})
                 """,
@@ -2770,110 +2366,6 @@ class MemoryStore:
             )
         return self.get_state(chat_name)
 
-    def upsert_people(
-        self,
-        chat_name: str,
-        people: Iterable[Dict[str, Any]],
-        *,
-        source_event_id: int,
-    ) -> int:
-        count = 0
-        now = self._now()
-        with self._connection() as connection:
-            for person in people:
-                name = str(person.get("name") or "").strip()
-                if not name:
-                    continue
-                profile_text = str(person.get("profile") or "").strip()
-                aliases = [
-                    str(value or "").strip()
-                    for value in (person.get("aliases") or [])
-                    if str(value or "").strip()
-                ]
-                person_id = self._ensure_person_identity(
-                    connection,
-                    chat_name,
-                    name,
-                    external_id=str(person.get("external_id") or ""),
-                    source="memory_stage",
-                    confidence=float(person.get("confidence", 0.5) or 0.5),
-                    observed_at=str(person.get("observed_at") or ""),
-                )
-                for alias in aliases:
-                    self._upsert_person_alias(
-                        connection,
-                        chat_name,
-                        person_id,
-                        alias,
-                        external_id=str(person.get("external_id") or ""),
-                        source="memory_stage",
-                        confidence=float(person.get("confidence", 0.5) or 0.5),
-                        observed_at=str(person.get("observed_at") or ""),
-                        status="suggested",
-                    )
-                structured_facts = [
-                    value
-                    for value in (person.get("facts") or [])
-                    if isinstance(value, dict)
-                ]
-                for fact in structured_facts:
-                    self._upsert_person_fact(
-                        connection,
-                        chat_name,
-                        person_id,
-                        fact,
-                        default_source_event_id=max(0, int(source_event_id)),
-                    )
-                if profile_text and not structured_facts:
-                    self._upsert_person_fact(
-                        connection,
-                        chat_name,
-                        person_id,
-                        {
-                            "field": "legacy_summary",
-                            "value": profile_text,
-                            "status": "uncertain",
-                            "confidence": float(
-                                person.get("confidence", 0.5) or 0.5
-                            ),
-                            "observed_at": str(person.get("observed_at") or now),
-                            "source_event_id": max(0, int(source_event_id)),
-                        },
-                        default_source_event_id=max(0, int(source_event_id)),
-                    )
-                projection_text = (
-                    profile_text
-                    or self._render_person_profile(
-                        self._list_person_facts_connection(
-                            connection,
-                            person_id,
-                        )
-                    )
-                )
-                connection.execute(
-                    """
-                INSERT INTO memory_people(
-                    chat_name, person_name, profile_json, profile_text,
-                    source_event_id, updated_at
-                    ) VALUES(?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(chat_name, person_name) DO UPDATE SET
-                        profile_json = excluded.profile_json,
-                    profile_text = excluded.profile_text,
-                    source_event_id = excluded.source_event_id,
-                    updated_at = excluded.updated_at
-                WHERE memory_people.manual_override = 0
-                    """,
-                    (
-                        chat_name,
-                        name,
-                        _json_dump(person),
-                        projection_text,
-                        max(0, int(source_event_id)),
-                        now,
-                    ),
-                )
-                count += 1
-        return count
 
     def observe_message_identities(
         self,
@@ -3126,211 +2618,26 @@ class MemoryStore:
             ).fetchall()
         ]
 
-    @staticmethod
-    def _list_person_facts_connection(
-        connection: sqlite3.Connection,
-        person_id: int,
-        *,
-        include_deleted: bool = False,
-    ) -> List[Dict[str, Any]]:
-        deleted_clause = "" if include_deleted else "AND deleted_at IS NULL"
-        rows = connection.execute(
-            f"""
-            SELECT * FROM memory_person_facts
-            WHERE person_id = ? {deleted_clause}
-              AND (
-                source_event_id = 0
-                OR EXISTS(
-                    SELECT 1 FROM memory_events AS source_event
-                    WHERE source_event.id = memory_person_facts.source_event_id
-                      AND source_event.is_invalidated = 0
-                      AND source_event.superseded_by_event_id = 0
-                      AND source_event.verification_status != 'quarantined'
-                )
-              )
-            ORDER BY
-                CASE status
-                    WHEN 'current' THEN 0
-                    WHEN 'planned' THEN 1
-                    WHEN 'uncertain' THEN 2
-                    WHEN 'disputed' THEN 3
-                    ELSE 4
-                END,
-                COALESCE(NULLIF(last_seen_at, ''), observed_at, updated_at) DESC,
-                id DESC
-            """,
-            (int(person_id),),
-        ).fetchall()
-        result: List[Dict[str, Any]] = []
-        for row in rows:
-            value = dict(row)
-            value["source_event_ids"] = _json_load(
-                value.pop("source_event_ids_json", None),
-                [],
-            )
-            value["evidence"] = _json_load(
-                value.pop("evidence_json", None),
-                [],
-            )
-            result.append(value)
-        return result
-
-    @staticmethod
-    def _render_person_profile(facts: Iterable[Dict[str, Any]]) -> str:
-        values = [dict(fact) for fact in facts]
-        structured = [
-            fact
-            for fact in values
-            if fact.get("field_name") != "legacy_summary"
-            and not fact.get("deleted_at")
-        ]
-        if not structured:
-            legacy = next(
-                (
-                    fact
-                    for fact in values
-                    if fact.get("field_name") == "legacy_summary"
-                    and not fact.get("deleted_at")
-                ),
-                None,
-            )
-            return str(legacy.get("value") or "") if legacy else ""
-        lines: List[str] = []
-        for fact in structured:
-            label = PERSON_FIELD_LABELS.get(
-                str(fact.get("field_name") or "other"),
-                "其他",
-            )
-            time_parts = []
-            if fact.get("valid_from"):
-                time_parts.append(f"自 {fact['valid_from']}")
-            if fact.get("valid_to"):
-                time_parts.append(f"至 {fact['valid_to']}")
-            elif fact.get("last_seen_at") or fact.get("observed_at"):
-                time_parts.append(
-                    f"最后确认 {fact.get('last_seen_at') or fact.get('observed_at')}"
-                )
-            status = str(fact.get("status") or "current")
-            status_note = {
-                "historical": "历史",
-                "planned": "计划",
-                "uncertain": "待确认",
-                "disputed": "有争议",
-            }.get(status, "")
-            suffix = "；".join(
-                value for value in [status_note, *time_parts] if value
-            )
-            lines.append(
-                f"{label}：{fact.get('value') or ''}"
-                + (f"（{suffix}）" if suffix else "")
-            )
-        return "\n".join(lines)
-
-    def list_people(
-        self,
-        chat_name: str,
-        *,
-        include_empty: bool = False,
-    ) -> List[Dict[str, Any]]:
+    def list_person_directory(self, chat_name: str) -> List[Dict[str, Any]]:
+        """Return every active identity, including identities without a profile."""
         with self._connection() as connection:
-            rows = connection.execute(
+            people = []
+            for row in connection.execute(
                 """
                 SELECT * FROM memory_person_identities
                 WHERE chat_name = ? AND status = 'active'
-                ORDER BY canonical_name
+                ORDER BY canonical_name, id
                 """,
                 (chat_name,),
-            ).fetchall()
-            result = []
-            for row in rows:
-                identity = dict(row)
-                person_id = int(identity["id"])
-                facts = self._list_person_facts_connection(
+            ).fetchall():
+                person = dict(row)
+                person["person_id"] = int(person["id"])
+                person["person_name"] = str(person["canonical_name"])
+                person["aliases"] = self._list_person_aliases_connection(
                     connection,
-                    person_id,
+                    int(person["id"]),
                 )
-                legacy = connection.execute(
-                    """
-                    SELECT * FROM memory_people
-                    WHERE chat_name = ? AND person_name = ?
-                    """,
-                    (chat_name, identity["canonical_name"]),
-                ).fetchone()
-                if not facts and legacy is None and not include_empty:
-                    continue
-                aliases = self._list_person_aliases_connection(
-                    connection,
-                    person_id,
-                )
-                legacy_value = dict(legacy) if legacy is not None else {}
-                structured_facts = [
-                    fact
-                    for fact in facts
-                    if fact.get("field_name") != "legacy_summary"
-                ]
-                profile_text = (
-                    self._render_person_profile(structured_facts)
-                    if structured_facts
-                    else str(legacy_value.get("profile_text") or "")
-                    or self._render_person_profile(facts)
-                )
-                source_event_id = max(
-                    [
-                        int(fact.get("source_event_id") or 0)
-                        for fact in facts
-                    ]
-                    + [int(legacy_value.get("source_event_id") or 0)]
-                )
-                updated_at = max(
-                    [
-                        str(fact.get("updated_at") or "")
-                        for fact in facts
-                    ]
-                    + [
-                        str(identity.get("updated_at") or ""),
-                        str(legacy_value.get("updated_at") or ""),
-                    ]
-                )
-                result.append(
-                    {
-                        "person_id": person_id,
-                        "person_name": str(identity["canonical_name"]),
-                        "canonical_name": str(identity["canonical_name"]),
-                        "aliases": aliases,
-                        "facts": structured_facts,
-                        "legacy_facts": [
-                            fact
-                            for fact in facts
-                            if fact.get("field_name") == "legacy_summary"
-                        ],
-                        "profile_text": profile_text,
-                        "profile": {
-                            "schema_version": 2,
-                            "name": str(identity["canonical_name"]),
-                            "aliases": [
-                                alias["alias_name"]
-                                for alias in aliases
-                                if alias.get("status") == "confirmed"
-                            ],
-                            "facts": structured_facts,
-                        },
-                        "source_event_id": source_event_id,
-                        "manual_override": max(
-                            [int(fact.get("manual_override") or 0) for fact in facts]
-                            + [int(legacy_value.get("manual_override") or 0)]
-                        ),
-                        "manual_note": str(
-                            legacy_value.get("manual_note") or ""
-                        ),
-                        "updated_at": updated_at,
-                    }
-                )
-        return result
-
-    def list_person_directory(self, chat_name: str) -> List[Dict[str, Any]]:
-        """Return every active identity, including identities without a profile."""
-        people = self.list_people(chat_name, include_empty=True)
-        with self._connection() as connection:
+                people.append(person)
             available_tables = {
                 str(row["name"])
                 for row in connection.execute(
@@ -3352,7 +2659,6 @@ class MemoryStore:
                     and alias.get("status") == "confirmed"
                     for alias in person.get("aliases") or []
                 )
-                person["v2_fact_count"] = len(person.get("facts") or [])
                 for table, key in count_specs:
                     if table not in available_tables:
                         person[key] = 0
@@ -3374,7 +2680,6 @@ class MemoryStore:
             + float(person.get("source_link_count") or 0) * 4.0
             + float(person.get("observation_count") or 0) * 8.0
             + float(person.get("candidate_count") or 0) * 2.0
-            + float(person.get("v2_fact_count") or 0) * 10.0
         )
 
     def list_person_merge_suggestions(
@@ -3527,320 +2832,13 @@ class MemoryStore:
             row = connection.execute(
                 """
                 SELECT COUNT(*) AS value
-                FROM memory_person_identities AS identity
-                WHERE identity.chat_name = ? AND identity.status = 'active'
-                  AND (
-                    EXISTS(
-                        SELECT 1 FROM memory_person_facts AS fact
-                        WHERE fact.person_id = identity.id
-                          AND fact.deleted_at IS NULL
-                    )
-                    OR EXISTS(
-                        SELECT 1 FROM memory_people AS legacy
-                        WHERE legacy.chat_name = identity.chat_name
-                          AND legacy.person_name = identity.canonical_name
-                    )
-                  )
+                FROM memory_person_identities
+                WHERE chat_name = ? AND status = 'active'
                 """,
                 (chat_name,),
             ).fetchone()
         return int(row["value"] if row else 0)
 
-    def clear_generated_person_facts(self, chat_name: str) -> int:
-        """Clear rebuildable facts while retaining manual edits and legacy input."""
-        with self._connection() as connection:
-            cursor = connection.execute(
-                """
-                DELETE FROM memory_person_facts
-                WHERE chat_name = ? AND manual_override = 0
-                  AND field_name != 'legacy_summary'
-                """,
-                (chat_name,),
-            )
-            connection.execute(
-                """
-                DELETE FROM memory_person_aliases
-                WHERE chat_name = ? AND status = 'suggested'
-                  AND source IN('memory_stage', 'person_rebuild')
-                """,
-                (chat_name,),
-            )
-        return max(0, int(cursor.rowcount or 0))
-
-    def retire_legacy_person_profiles(self, chat_name: str) -> Dict[str, int]:
-        """Remove legacy prose projections after structured facts are ready."""
-
-        with self._connection() as connection:
-            facts = connection.execute(
-                """
-                DELETE FROM memory_person_facts
-                WHERE chat_name = ? AND field_name = 'legacy_summary'
-                """,
-                (chat_name,),
-            )
-            profiles = connection.execute(
-                """
-                DELETE FROM memory_people
-                WHERE chat_name = ?
-                """,
-                (chat_name,),
-            )
-        return {
-            "facts": max(0, int(facts.rowcount or 0)),
-            "profiles": max(0, int(profiles.rowcount or 0)),
-        }
-
-    def finalize_person_fact_temporality(
-        self,
-        chat_name: str,
-        *,
-        reference_time: str = "",
-    ) -> int:
-        """Mark older single-value and stale volatile observations historical."""
-        reference = str(reference_time or "").strip()
-        try:
-            reference_date = datetime.fromisoformat(reference).replace(tzinfo=None)
-        except ValueError:
-            reference_date = datetime.now()
-        changed = 0
-        with self._connection() as connection:
-            identities = connection.execute(
-                """
-                SELECT id FROM memory_person_identities
-                WHERE chat_name = ? AND status = 'active'
-                """,
-                (chat_name,),
-            ).fetchall()
-            now = self._now()
-            for identity in identities:
-                person_id = int(identity["id"])
-                facts = connection.execute(
-                    """
-                    SELECT * FROM memory_person_facts
-                    WHERE chat_name = ? AND person_id = ?
-                      AND deleted_at IS NULL AND manual_override = 0
-                      AND field_name != 'legacy_summary'
-                    ORDER BY COALESCE(
-                        NULLIF(last_seen_at, ''),
-                        NULLIF(observed_at, ''),
-                        NULLIF(valid_from, ''),
-                        created_at
-                    ) DESC, id DESC
-                    """,
-                    (chat_name, person_id),
-                ).fetchall()
-                by_field: Dict[str, List[sqlite3.Row]] = {}
-                for fact in facts:
-                    by_field.setdefault(str(fact["field_name"]), []).append(fact)
-                for field_name in (
-                    "employer",
-                    "location",
-                    "current_status",
-                ):
-                    current_values = [
-                        fact
-                        for fact in by_field.get(field_name, [])
-                        if str(fact["status"]) == "current"
-                    ]
-                    if len(current_values) <= 1:
-                        continue
-                    for fact in current_values[1:]:
-                        cursor = connection.execute(
-                            """
-                            UPDATE memory_person_facts SET
-                                status = 'historical',
-                                valid_to = COALESCE(
-                                    valid_to,
-                                    NULLIF(?, '')
-                                ),
-                                updated_at = ?
-                            WHERE id = ? AND manual_override = 0
-                            """,
-                            (
-                                str(
-                                    current_values[0]["valid_from"]
-                                    or current_values[0]["observed_at"]
-                                    or ""
-                                ),
-                                now,
-                                int(fact["id"]),
-                            ),
-                        )
-                        changed += max(0, int(cursor.rowcount or 0))
-                for field_name in (
-                    "health",
-                    "current_status",
-                    "plan",
-                    "asset",
-                ):
-                    for fact in by_field.get(field_name, []):
-                        if str(fact["status"]) not in {"current", "planned"}:
-                            continue
-                        time_text = str(
-                            fact["last_seen_at"]
-                            or fact["observed_at"]
-                            or fact["valid_from"]
-                            or ""
-                        ).strip()
-                        try:
-                            observed = datetime.fromisoformat(
-                                time_text
-                            ).replace(tzinfo=None)
-                        except ValueError:
-                            continue
-                        stale_days = {
-                            "current_status": 90,
-                            "plan": 180,
-                            "health": 365,
-                            "asset": 730,
-                        }[field_name]
-                        if (reference_date - observed).days <= stale_days:
-                            continue
-                        cursor = connection.execute(
-                            """
-                            UPDATE memory_person_facts SET
-                                status = 'historical',
-                                valid_to = COALESCE(valid_to, ?),
-                                temporal_note = CASE
-                                    WHEN temporal_note = '' THEN ?
-                                    ELSE temporal_note
-                                END,
-                                updated_at = ?
-                            WHERE id = ? AND manual_override = 0
-                            """,
-                            (
-                                time_text,
-                                "长期未再次确认，按历史状态保留",
-                                now,
-                                int(fact["id"]),
-                            ),
-                        )
-                        changed += max(0, int(cursor.rowcount or 0))
-                for fact in facts:
-                    if str(fact["status"]) != "planned":
-                        continue
-                    time_text = str(
-                        fact["last_seen_at"]
-                        or fact["observed_at"]
-                        or fact["valid_from"]
-                        or ""
-                    ).strip()
-                    try:
-                        observed = datetime.fromisoformat(
-                            time_text
-                        ).replace(tzinfo=None)
-                    except ValueError:
-                        continue
-                    if (reference_date - observed).days <= 180:
-                        continue
-                    cursor = connection.execute(
-                        """
-                        UPDATE memory_person_facts SET
-                            status = 'historical',
-                            valid_to = COALESCE(valid_to, ?),
-                            temporal_note = CASE
-                                WHEN temporal_note = '' THEN ?
-                                ELSE temporal_note
-                            END,
-                            updated_at = ?
-                        WHERE id = ? AND manual_override = 0
-                        """,
-                        (
-                            time_text,
-                            "计划已超过时效窗口，按历史状态保留",
-                            now,
-                            int(fact["id"]),
-                        ),
-                    )
-                    changed += max(0, int(cursor.rowcount or 0))
-        return changed
-
-    def apply_person_fact_selection(
-        self,
-        chat_name: str,
-        person_id: int,
-        *,
-        keep_fact_ids: Iterable[int],
-        status_updates: Optional[Dict[int, str]] = None,
-        reason: str = "人物资料质量压缩",
-    ) -> Dict[str, int]:
-        keep_ids = {
-            int(value)
-            for value in keep_fact_ids
-            if int(value) > 0
-        }
-        updates = status_updates or {}
-        now = self._now()
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT id FROM memory_person_facts
-                WHERE chat_name = ? AND person_id = ?
-                  AND field_name != 'legacy_summary'
-                  AND manual_override = 0
-                """,
-                (chat_name, int(person_id)),
-            ).fetchall()
-            all_ids = {int(row["id"]) for row in rows}
-            remove_ids = all_ids - keep_ids
-            if remove_ids:
-                placeholders = ",".join("?" for _ in remove_ids)
-                connection.execute(
-                    f"""
-                    UPDATE memory_person_facts SET
-                        deleted_at = ?,
-                        temporal_note = CASE
-                            WHEN temporal_note = '' THEN ?
-                            ELSE temporal_note
-                        END,
-                        updated_at = ?
-                    WHERE id IN({placeholders})
-                    """,
-                    (
-                        now,
-                        str(reason or "人物资料质量压缩"),
-                        now,
-                        *sorted(remove_ids),
-                    ),
-                )
-            if keep_ids:
-                placeholders = ",".join("?" for _ in keep_ids)
-                connection.execute(
-                    f"""
-                    UPDATE memory_person_facts
-                    SET deleted_at = NULL, updated_at = ?
-                    WHERE id IN({placeholders})
-                    """,
-                    (now, *sorted(keep_ids)),
-                )
-            changed_status = 0
-            for fact_id, status in updates.items():
-                normalized = str(status or "").strip().lower()
-                if int(fact_id) not in keep_ids:
-                    continue
-                if normalized not in PERSON_FACT_STATUSES:
-                    continue
-                cursor = connection.execute(
-                    """
-                    UPDATE memory_person_facts
-                    SET status = ?, updated_at = ?
-                    WHERE chat_name = ? AND person_id = ? AND id = ?
-                      AND manual_override = 0
-                    """,
-                    (
-                        normalized,
-                        now,
-                        chat_name,
-                        int(person_id),
-                        int(fact_id),
-                    ),
-                )
-                changed_status += max(0, int(cursor.rowcount or 0))
-        return {
-            "kept": len(all_ids & keep_ids),
-            "pruned": len(remove_ids),
-            "status_updates": changed_status,
-        }
 
     def _person_snapshot(
         self,
@@ -3848,14 +2846,13 @@ class MemoryStore:
         chat_name: str,
         person_ids: Iterable[int],
         *,
-        include_v3_derived: bool = False,
+        include_derived: bool = False,
     ) -> Dict[str, Any]:
         ids = sorted({int(value) for value in person_ids if int(value) > 0})
         if not ids:
             return {
                 "identities": [],
                 "aliases": [],
-                "facts": [],
             }
         placeholders = ",".join("?" for _ in ids)
         identities = [
@@ -3880,23 +2877,11 @@ class MemoryStore:
                 (chat_name, *ids),
             ).fetchall()
         ]
-        facts = [
-            dict(row)
-            for row in connection.execute(
-                f"""
-                SELECT * FROM memory_person_facts
-                WHERE chat_name = ? AND person_id IN({placeholders})
-                ORDER BY id
-                """,
-                (chat_name, *ids),
-            ).fetchall()
-        ]
         result = {
             "identities": identities,
             "aliases": aliases,
-            "facts": facts,
         }
-        if not include_v3_derived:
+        if not include_derived:
             return result
 
         table_names = {
@@ -3908,19 +2893,19 @@ class MemoryStore:
                 """
             ).fetchall()
         }
-        v3_tables: Dict[str, List[Dict[str, Any]]] = {}
+        derived_tables: Dict[str, List[Dict[str, Any]]] = {}
         for table in (
             "memory_person_fact_versions",
             "memory_person_patterns",
             "memory_person_period_summaries",
             "memory_person_snapshots",
             "memory_person_refresh_state",
-            "memory_person_v3_suppressions",
+            "memory_person_suppressions",
             "memory_person_pipeline_state",
         ):
             if table not in table_names:
                 continue
-            v3_tables[table] = [
+            derived_tables[table] = [
                 dict(row)
                 for row in connection.execute(
                     f"""
@@ -3932,7 +2917,7 @@ class MemoryStore:
                 ).fetchall()
             ]
         if "memory_person_relationships" in table_names:
-            v3_tables["memory_person_relationships"] = [
+            derived_tables["memory_person_relationships"] = [
                 dict(row)
                 for row in connection.execute(
                     f"""
@@ -3947,7 +2932,7 @@ class MemoryStore:
                     (chat_name, *ids, *ids),
                 ).fetchall()
             ]
-        result["v3_derived"] = v3_tables
+        result["derived"] = derived_tables
         return result
 
     @staticmethod
@@ -4235,7 +3220,7 @@ class MemoryStore:
                 connection,
                 chat_name,
                 affected,
-                include_v3_derived=True,
+                include_derived=True,
             )
             table_names = {
                 str(row["name"])
@@ -4315,88 +3300,6 @@ class MemoryStore:
                     """,
                     (target_id, self._now(), int(alias["id"])),
                 )
-            source_facts = connection.execute(
-                """
-                SELECT * FROM memory_person_facts
-                WHERE chat_name = ? AND person_id = ? ORDER BY id
-                """,
-                (chat_name, source_id),
-            ).fetchall()
-            for fact in source_facts:
-                target_fact = connection.execute(
-                    """
-                    SELECT * FROM memory_person_facts
-                    WHERE chat_name = ? AND person_id = ? AND fact_key = ?
-                    """,
-                    (chat_name, target_id, str(fact["fact_key"])),
-                ).fetchone()
-                if target_fact is None:
-                    connection.execute(
-                        """
-                        UPDATE memory_person_facts
-                        SET person_id = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (target_id, self._now(), int(fact["id"])),
-                    )
-                    continue
-                source_events = set(
-                    _json_load(fact["source_event_ids_json"], [])
-                )
-                target_events = set(
-                    _json_load(target_fact["source_event_ids_json"], [])
-                )
-                source_evidence = list(
-                    _json_load(fact["evidence_json"], [])
-                )
-                target_evidence = list(
-                    _json_load(target_fact["evidence_json"], [])
-                )
-                for item in source_evidence:
-                    if item not in target_evidence:
-                        target_evidence.append(item)
-                connection.execute(
-                    """
-                    UPDATE memory_person_facts SET
-                        confidence = MAX(confidence, ?),
-                        source_event_id = MAX(source_event_id, ?),
-                        source_event_ids_json = ?,
-                        evidence_json = ?,
-                        mention_count = mention_count + ?,
-                        first_seen_at = CASE
-                            WHEN first_seen_at IS NULL THEN ?
-                            WHEN ? IS NULL THEN first_seen_at
-                            ELSE MIN(first_seen_at, ?)
-                        END,
-                        last_seen_at = CASE
-                            WHEN last_seen_at IS NULL THEN ?
-                            WHEN ? IS NULL THEN last_seen_at
-                            ELSE MAX(last_seen_at, ?)
-                        END,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        float(fact["confidence"] or 0.0),
-                        int(fact["source_event_id"] or 0),
-                        _json_dump(sorted(source_events | target_events)),
-                        _json_dump(target_evidence[:40]),
-                        int(fact["mention_count"] or 1),
-                        fact["first_seen_at"],
-                        fact["first_seen_at"],
-                        fact["first_seen_at"],
-                        fact["last_seen_at"],
-                        fact["last_seen_at"],
-                        fact["last_seen_at"],
-                        self._now(),
-                        int(target_fact["id"]),
-                    ),
-                )
-                connection.execute(
-                    "DELETE FROM memory_person_facts WHERE id = ?",
-                    (int(fact["id"]),),
-                )
-
             copied_artifacts: Dict[str, List[int]] = {
                 "observation": [],
                 "message_link": [],
@@ -4450,7 +3353,7 @@ class MemoryStore:
                     }
                     value["context_json"] = _json_dump(context)
                     value["extractor_version"] = (
-                        str(value.get("extractor_version") or "person-v3")
+                        str(value.get("extractor_version") or "person-memory")
                         + "+identity-merge"
                     )[:100]
                     value["updated_at"] = self._now()
@@ -4562,10 +3465,10 @@ class MemoryStore:
                             ),
                         )
 
-            if "memory_person_v3_suppressions" in table_names:
+            if "memory_person_suppressions" in table_names:
                 source_suppressions = connection.execute(
                     """
-                    SELECT * FROM memory_person_v3_suppressions
+                    SELECT * FROM memory_person_suppressions
                     WHERE chat_name = ? AND person_id = ?
                     ORDER BY id
                     """,
@@ -4574,7 +3477,7 @@ class MemoryStore:
                 for row in source_suppressions:
                     cursor = connection.execute(
                         """
-                        INSERT OR IGNORE INTO memory_person_v3_suppressions(
+                        INSERT OR IGNORE INTO memory_person_suppressions(
                             chat_name, person_id, target_type, target_key,
                             reason, status, created_at, reverted_at
                         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -4670,7 +3573,7 @@ class MemoryStore:
                     (chat_name,),
                 ).fetchone()
                 observation_max_id = int(row["value"] or 0)
-            after["v3_merge"] = {
+            after["person_merge"] = {
                 "copied_observations": len(
                     copied_artifacts["observation"]
                 ),
@@ -4714,108 +3617,6 @@ class MemoryStore:
                         for artifact_id in artifact_ids
                     ],
                 )
-        return self.get_person_audit(chat_name, audit_id) or {}
-
-    def upsert_person_fact_manual(
-        self,
-        chat_name: str,
-        person_id: int,
-        fact: Dict[str, Any],
-        *,
-        reason: str,
-    ) -> Dict[str, Any]:
-        note = str(reason or "").strip()
-        if not note:
-            raise ValueError("fact edit reason is required")
-        with self._connection() as connection:
-            identity = connection.execute(
-                """
-                SELECT id FROM memory_person_identities
-                WHERE chat_name = ? AND id = ? AND status = 'active'
-                """,
-                (chat_name, int(person_id)),
-            ).fetchone()
-            if identity is None:
-                raise ValueError("person does not exist")
-            before = self._person_snapshot(
-                connection,
-                chat_name,
-                [int(person_id)],
-            )
-            value = dict(fact)
-            value["manual_override"] = True
-            self._upsert_person_fact(
-                connection,
-                chat_name,
-                int(person_id),
-                value,
-            )
-            after = self._person_snapshot(
-                connection,
-                chat_name,
-                [int(person_id)],
-            )
-            audit_id = self._record_person_audit(
-                connection,
-                chat_name,
-                action="upsert_fact",
-                reason=note,
-                affected_person_ids=[int(person_id)],
-                before=before,
-                after=after,
-            )
-        return self.get_person_audit(chat_name, audit_id) or {}
-
-    def delete_person_fact_manual(
-        self,
-        chat_name: str,
-        person_id: int,
-        fact_id: int,
-        *,
-        reason: str,
-    ) -> Dict[str, Any]:
-        note = str(reason or "").strip()
-        if not note:
-            raise ValueError("fact delete reason is required")
-        with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT id FROM memory_person_facts
-                WHERE chat_name = ? AND person_id = ? AND id = ?
-                  AND deleted_at IS NULL
-                """,
-                (chat_name, int(person_id), int(fact_id)),
-            ).fetchone()
-            if row is None:
-                raise ValueError("person fact does not exist")
-            before = self._person_snapshot(
-                connection,
-                chat_name,
-                [int(person_id)],
-            )
-            now = self._now()
-            connection.execute(
-                """
-                UPDATE memory_person_facts
-                SET deleted_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (now, now, int(fact_id)),
-            )
-            after = self._person_snapshot(
-                connection,
-                chat_name,
-                [int(person_id)],
-            )
-            audit_id = self._record_person_audit(
-                connection,
-                chat_name,
-                action="delete_fact",
-                reason=note,
-                affected_person_ids=[int(person_id)],
-                before=before,
-                after=after,
-            )
         return self.get_person_audit(chat_name, audit_id) or {}
 
     @staticmethod
@@ -4943,12 +3744,12 @@ class MemoryStore:
             if (
                 audit.get("action") == "merge_people"
                 and affected
-                and "memory_person_v3_audit" in table_names
+                and "memory_person_projection_audit" in table_names
             ):
                 placeholders = ",".join("?" for _ in affected)
-                newer_v3 = connection.execute(
+                newer_projection = connection.execute(
                     f"""
-                    SELECT id FROM memory_person_v3_audit
+                    SELECT id FROM memory_person_projection_audit
                     WHERE chat_name = ? AND status = 'active'
                       AND person_id IN({placeholders})
                       AND created_at > ?
@@ -4960,10 +3761,10 @@ class MemoryStore:
                         str(audit.get("created_at") or ""),
                     ),
                 ).fetchone()
-                if newer_v3 is not None:
+                if newer_projection is not None:
                     raise ValueError(
-                        "合并后存在更晚的 v3 人工修改，"
-                        f"请先处理 v3 修改 #{int(newer_v3['id'])}"
+                        "合并后存在更晚的人物人工修改，"
+                        f"请先处理 人物修改 #{int(newer_projection['id'])}"
                     )
             if (
                 audit.get("action") == "merge_people"
@@ -4971,7 +3772,7 @@ class MemoryStore:
                 and "memory_person_observations" in table_names
             ):
                 placeholders = ",".join("?" for _ in affected)
-                merge_meta = audit.get("after", {}).get("v3_merge", {})
+                merge_meta = audit.get("after", {}).get("person_merge", {})
                 observation_max_id = int(
                     merge_meta.get("observation_max_id") or 0
                 )
@@ -5003,7 +3804,7 @@ class MemoryStore:
             artifact_tables = {
                 "observation": "memory_person_observations",
                 "message_link": "memory_person_message_links",
-                "suppression": "memory_person_v3_suppressions",
+                "suppression": "memory_person_suppressions",
             }
             for artifact_type, artifact_ids in merge_artifacts.items():
                 table = artifact_tables.get(artifact_type)
@@ -5018,8 +3819,8 @@ class MemoryStore:
                     )
 
             before = audit.get("before") or {}
-            v3_before = before.get("v3_derived") or {}
-            if affected and v3_before:
+            derived_before = before.get("derived") or {}
+            if affected and derived_before:
                 placeholders = ",".join("?" for _ in affected)
                 params = (chat_name, *sorted(affected))
                 for table in (
@@ -5028,7 +3829,7 @@ class MemoryStore:
                     "memory_person_period_summaries",
                     "memory_person_snapshots",
                     "memory_person_refresh_state",
-                    "memory_person_v3_suppressions",
+                    "memory_person_suppressions",
                     "memory_person_pipeline_state",
                 ):
                     if table not in table_names:
@@ -5064,7 +3865,7 @@ class MemoryStore:
                     "memory_person_period_summaries",
                     "memory_person_snapshots",
                     "memory_person_refresh_state",
-                    "memory_person_v3_suppressions",
+                    "memory_person_suppressions",
                     "memory_person_pipeline_state",
                 )
                 for table in restore_order:
@@ -5073,7 +3874,7 @@ class MemoryStore:
                     self._restore_rows(
                         connection,
                         table,
-                        v3_before.get(table) or [],
+                        derived_before.get(table) or [],
                     )
             if affected:
                 placeholders = ",".join("?" for _ in affected)
@@ -5081,13 +3882,6 @@ class MemoryStore:
                 connection.execute(
                     f"""
                     DELETE FROM memory_person_aliases
-                    WHERE chat_name = ? AND person_id IN({placeholders})
-                    """,
-                    params,
-                )
-                connection.execute(
-                    f"""
-                    DELETE FROM memory_person_facts
                     WHERE chat_name = ? AND person_id IN({placeholders})
                     """,
                     params,
@@ -5118,16 +3912,6 @@ class MemoryStore:
                     ) VALUES({",".join("?" for _ in columns)})
                     """,
                     [alias[column] for column in columns],
-                )
-            for fact in before.get("facts") or []:
-                columns = list(fact)
-                connection.execute(
-                    f"""
-                    INSERT INTO memory_person_facts(
-                        {",".join(columns)}
-                    ) VALUES({",".join("?" for _ in columns)})
-                    """,
-                    [fact[column] for column in columns],
                 )
             now = self._now()
             connection.execute(
@@ -5205,7 +3989,6 @@ class MemoryStore:
         corrected_event: Optional[Dict[str, Any]] = None,
         existing_replacement_event_id: int = 0,
         stage_after: Optional[Dict[str, Any]] = None,
-        people_after: Optional[Iterable[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         normalized_action = str(action or "").strip().lower()
         if normalized_action not in {
@@ -5256,17 +4039,6 @@ class MemoryStore:
                 "SELECT * FROM memory_state WHERE chat_name = ?",
                 (chat_name,),
             ).fetchone()
-            person_rows = {
-                str(row["person_name"]): dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT * FROM memory_people
-                    WHERE chat_name = ?
-                    """,
-                    (chat_name,),
-                ).fetchall()
-                if str(row["person_name"]) in people_names
-            }
             before: Dict[str, Any] = {
                 "target": {
                     "id": int(target["id"]),
@@ -5286,23 +4058,19 @@ class MemoryStore:
                     "verification_note": str(target["verification_note"] or ""),
                 },
                 "state": dict(state_row) if state_row is not None else None,
-                "people": {
-                    name: person_rows.get(name)
-                    for name in people_names
-                },
             }
-            person_v3_before = (
+            person_before = (
                 {}
                 if normalized_action == "approve_review"
-                else self._event_correction_v3_snapshot(
+                else self._event_correction_person_snapshot(
                     connection,
                     chat_name,
                     target,
                     people_names,
                 )
             )
-            if person_v3_before:
-                before["person_v3"] = person_v3_before
+            if person_before:
+                before["person"] = person_before
 
             replacement = None
             if normalized_action == "replace_existing":
@@ -5518,42 +4286,14 @@ class MemoryStore:
                     ),
                 )
 
-            for person in people_after or []:
-                name = str(person.get("name") or "").strip()
-                if not name:
-                    continue
-                profile_text = str(person.get("profile") or "").strip()
-                connection.execute(
-                    """
-                    INSERT INTO memory_people(
-                        chat_name, person_name, profile_json, profile_text,
-                        source_event_id, manual_override, manual_note,
-                        updated_at
-                    ) VALUES(?, ?, ?, ?, ?, 0, '', ?)
-                    ON CONFLICT(chat_name, person_name) DO UPDATE SET
-                        profile_json = excluded.profile_json,
-                        profile_text = excluded.profile_text,
-                        source_event_id = excluded.source_event_id,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        chat_name,
-                        name,
-                        _json_dump(person),
-                        profile_text,
-                        replacement_event_id or int(target_event_id),
-                        now,
-                    ),
-                )
-
-            person_v3_after = (
+            person_after = (
                 {}
                 if normalized_action == "approve_review"
-                else self._apply_event_correction_to_v3(
+                else self._apply_event_correction_to_person(
                     connection,
                     chat_name,
                     int(target_event_id),
-                    person_v3_before,
+                    person_before,
                     correction_id=correction_id,
                     reason=normalized_reason,
                     now=now,
@@ -5564,12 +4304,7 @@ class MemoryStore:
                 "target_event_id": int(target_event_id),
                 "replacement_event_id": replacement_event_id,
                 "stage_changed": stage_after is not None,
-                "people_changed": [
-                    str(person.get("name") or "")
-                    for person in people_after or []
-                    if str(person.get("name") or "")
-                ],
-                "person_v3": person_v3_after,
+                "person": person_after,
             }
             connection.execute(
                 """
@@ -5610,90 +4345,6 @@ class MemoryStore:
             value[target] = _json_load(value.pop(source, None), default)
         return value
 
-    def update_person_manual(
-        self,
-        chat_name: str,
-        person_name: str,
-        *,
-        profile_text: str,
-        reason: str,
-        keep_override: bool = True,
-    ) -> Dict[str, Any]:
-        name = str(person_name or "").strip()
-        note = str(reason or "").strip()
-        if not name or not note:
-            raise ValueError("person name and edit reason are required")
-        now = self._now()
-        with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM memory_people
-                WHERE chat_name = ? AND person_name = ?
-                """,
-                (chat_name, name),
-            ).fetchone()
-            before_person = dict(row) if row is not None else None
-            connection.execute(
-                """
-                INSERT INTO memory_people(
-                    chat_name, person_name, profile_json, profile_text,
-                    source_event_id, manual_override, manual_note, updated_at
-                ) VALUES(?, ?, ?, ?, 0, ?, ?, ?)
-                ON CONFLICT(chat_name, person_name) DO UPDATE SET
-                    profile_json = excluded.profile_json,
-                    profile_text = excluded.profile_text,
-                    manual_override = excluded.manual_override,
-                    manual_note = excluded.manual_note,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    chat_name,
-                    name,
-                    _json_dump(
-                        {
-                            "name": name,
-                            "profile": str(profile_text or "").strip(),
-                            "manually_edited": True,
-                        }
-                    ),
-                    str(profile_text or "").strip(),
-                    int(bool(keep_override)),
-                    note,
-                    now,
-                ),
-            )
-            after_person = dict(
-                connection.execute(
-                    """
-                    SELECT * FROM memory_people
-                    WHERE chat_name = ? AND person_name = ?
-                    """,
-                    (chat_name, name),
-                ).fetchone()
-            )
-            correction_cursor = connection.execute(
-                """
-                INSERT INTO memory_corrections(
-                    chat_name, target_event_id, replacement_event_id,
-                    action, reason, false_claims_json, corrected_claim,
-                    affected_people_json, before_json, after_json,
-                    status, created_at
-                ) VALUES(
-                    ?, 0, 0, 'person_edit', ?, '[]', '', ?, ?, ?,
-                    'active', ?
-                )
-                """,
-                (
-                    chat_name,
-                    note,
-                    _json_dump([name]),
-                    _json_dump({"people": {name: before_person}}),
-                    _json_dump({"people": {name: after_person}}),
-                    now,
-                ),
-            )
-            correction_id = int(correction_cursor.lastrowid)
-        return self.get_correction(chat_name, correction_id) or {}
 
     def revert_correction(
         self,
@@ -5855,47 +4506,11 @@ class MemoryStore:
                     ),
                 )
 
-            for name, person in (before.get("people") or {}).items():
-                if person is None:
-                    connection.execute(
-                        """
-                        DELETE FROM memory_people
-                        WHERE chat_name = ? AND person_name = ?
-                        """,
-                        (chat_name, name),
-                    )
-                    continue
-                connection.execute(
-                    """
-                    INSERT INTO memory_people(
-                        chat_name, person_name, profile_json, profile_text,
-                        source_event_id, manual_override, manual_note,
-                        updated_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(chat_name, person_name) DO UPDATE SET
-                        profile_json = excluded.profile_json,
-                        profile_text = excluded.profile_text,
-                        source_event_id = excluded.source_event_id,
-                        manual_override = excluded.manual_override,
-                        manual_note = excluded.manual_note,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        chat_name,
-                        name,
-                        str(person.get("profile_json") or "{}"),
-                        str(person.get("profile_text") or ""),
-                        int(person.get("source_event_id") or 0),
-                        int(person.get("manual_override") or 0),
-                        str(person.get("manual_note") or ""),
-                        str(person.get("updated_at") or now),
-                    ),
-                )
-            if before.get("person_v3"):
-                self._restore_event_correction_v3(
+            if before.get("person"):
+                self._restore_event_correction_person(
                     connection,
                     chat_name,
-                    before["person_v3"],
+                    before["person"],
                     after,
                     reverted_at=now,
                 )
@@ -5942,22 +4557,26 @@ class MemoryStore:
                     (now, chat_name),
                 )
             if normalized in {"all", "people"}:
-                connection.execute(
-                    """
-                    UPDATE memory_person_audit
-                    SET status = 'cleared', reverted_at = ?
-                    WHERE chat_name = ? AND status = 'active'
-                    """,
-                    (now, chat_name),
-                )
-                connection.execute(
-                    """
-                    UPDATE memory_person_v3_audit
-                    SET status = 'cleared', reverted_at = ?
-                    WHERE chat_name = ? AND status = 'active'
-                    """,
-                    (now, chat_name),
-                )
+                for audit_table in (
+                    "memory_person_projection_audit",
+                    "memory_person_audit",
+                ):
+                    exists = connection.execute(
+                        """
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = ?
+                        """,
+                        (audit_table,),
+                    ).fetchone()
+                    if exists is not None:
+                        connection.execute(
+                            f"""
+                            UPDATE {audit_table}
+                            SET status = 'cleared', reverted_at = ?
+                            WHERE chat_name = ? AND status = 'active'
+                            """,
+                            (now, chat_name),
+                        )
             if normalized in {"all", "events"}:
                 connection.execute(
                     """
@@ -5973,7 +4592,7 @@ class MemoryStore:
                     (chat_name,),
                 )
                 if normalized == "all":
-                    for table in PERSON_V3_CHAT_TABLES:
+                    for table in PERSON_MEMORY_CHAT_TABLES:
                         exists = connection.execute(
                             """
                             SELECT 1 FROM sqlite_master
@@ -5991,14 +4610,6 @@ class MemoryStore:
                         DELETE FROM memory_person_merge_artifacts
                         WHERE chat_name = ?
                         """,
-                        (chat_name,),
-                    )
-                    connection.execute(
-                        "DELETE FROM memory_people WHERE chat_name = ?",
-                        (chat_name,),
-                    )
-                    connection.execute(
-                        "DELETE FROM memory_person_facts WHERE chat_name = ?",
                         (chat_name,),
                     )
                     connection.execute(
@@ -6025,7 +4636,7 @@ class MemoryStore:
                     (self._now(), chat_name),
                 )
             elif normalized == "people":
-                for table in PERSON_V3_CHAT_TABLES:
+                for table in PERSON_MEMORY_CHAT_TABLES:
                     exists = connection.execute(
                         """
                         SELECT 1 FROM sqlite_master
@@ -6043,14 +4654,6 @@ class MemoryStore:
                     DELETE FROM memory_person_merge_artifacts
                     WHERE chat_name = ?
                     """,
-                    (chat_name,),
-                )
-                connection.execute(
-                    "DELETE FROM memory_people WHERE chat_name = ?",
-                    (chat_name,),
-                )
-                connection.execute(
-                    "DELETE FROM memory_person_facts WHERE chat_name = ?",
                     (chat_name,),
                 )
                 connection.execute(

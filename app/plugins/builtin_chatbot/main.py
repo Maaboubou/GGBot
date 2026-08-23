@@ -23,6 +23,12 @@ from app.plugins.builtin_chatbot.web_search import WebSearchService
 from app.plugins.builtin_chatbot.chat_log import ChatLogManager
 from app.plugins.builtin_chatbot.context_manager import ChatContextManager
 from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+from app.plugins.builtin_chatbot.memory_config import (
+    load_memory_config,
+    memory_config_defaults,
+    sanitize_memory_config,
+    upgrade_memory_config_keys,
+)
 from app.plugins.builtin_chatbot.role_manager import RoleManager
 from app.plugins.builtin_chatbot.judge_manager import JudgeManager
 from app.utils.dashboard_events import append_dashboard_event
@@ -110,238 +116,13 @@ class ChatBotPlugin:
         self.ephemeral_context_max_tokens = int(
             get_config("ephemeral_context_max_tokens", 16000, plugin_name=plugin_name)
         )
-        self.memory_enabled = bool(get_config("memory_enabled", True, plugin_name=plugin_name))
-        self.memory_background_enabled = bool(
-            get_config("memory_background_enabled", True, plugin_name=plugin_name)
-        )
-        self.memory_event_min_messages = int(
-            get_config("memory_event_min_messages", 20, plugin_name=plugin_name)
-        )
-        self.memory_event_target_messages = int(
-            get_config("memory_event_target_messages", 40, plugin_name=plugin_name)
-        )
-        self.memory_event_max_messages = int(
-            get_config("memory_event_max_messages", 60, plugin_name=plugin_name)
-        )
-        self.memory_event_context_before_messages = int(
-            get_config(
-                "memory_event_context_before_messages",
-                12,
-                plugin_name=plugin_name,
+        memory_values = load_memory_config(
+            lambda key, default: get_config(
+                key, default, plugin_name=plugin_name
             )
         )
-        self.memory_event_context_after_messages = int(
-            get_config(
-                "memory_event_context_after_messages",
-                12,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_event_max_cards = int(
-            get_config("memory_event_max_cards", 6, plugin_name=plugin_name)
-        )
-        self.memory_event_input_token_budget = int(
-            get_config("memory_event_input_token_budget", 16000, plugin_name=plugin_name)
-        )
-        self.memory_initial_backfill_messages = int(
-            get_config("memory_initial_backfill_messages", 2000, plugin_name=plugin_name)
-        )
-        self.memory_max_chunks_per_run = int(
-            get_config("memory_max_chunks_per_run", 3, plugin_name=plugin_name)
-        )
-        self.memory_stage_event_threshold = int(
-            get_config("memory_stage_event_threshold", 40, plugin_name=plugin_name)
-        )
-        self.memory_stage_input_event_limit = int(
-            get_config("memory_stage_input_event_limit", 80, plugin_name=plugin_name)
-        )
-        self.memory_stage_input_token_budget = int(
-            get_config("memory_stage_input_token_budget", 24000, plugin_name=plugin_name)
-        )
-        self.memory_stage_char_limit = int(
-            get_config("memory_stage_char_limit", 6000, plugin_name=plugin_name)
-        )
-        self.memory_retrieval_top_k = int(
-            get_config("memory_retrieval_top_k", 6, plugin_name=plugin_name)
-        )
-        self.memory_query_recent_messages = int(
-            get_config("memory_query_recent_messages", 12, plugin_name=plugin_name)
-        )
-        self.memory_context_max_tokens = int(
-            get_config("memory_context_max_tokens", 6000, plugin_name=plugin_name)
-        )
-        self.memory_person_v3_enabled = bool(
-            get_config("memory_person_v3_enabled", True, plugin_name=plugin_name)
-        )
-        self.memory_person_v3_auto_activate_live = bool(
-            get_config(
-                "memory_person_v3_auto_activate_live",
-                True,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_person_centric_enabled = bool(
-            get_config(
-                "memory_person_v3_person_centric_enabled",
-                True,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_min_pending_messages = int(
-            get_config(
-                "memory_person_v3_min_pending_messages",
-                30,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_batch_related_messages = int(
-            get_config(
-                "memory_person_v3_batch_related_messages",
-                80,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_max_batch_people = int(
-            get_config(
-                "memory_person_v3_max_batch_people",
-                4,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_max_observations_per_batch = int(
-            get_config(
-                "memory_person_v3_max_observations_per_batch",
-                16,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_input_token_budget = int(
-            get_config(
-                "memory_person_v3_input_token_budget",
-                24000,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_candidate_memory_value = float(
-            get_config(
-                "memory_person_v3_candidate_memory_value",
-                0.58,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_refresh_threshold = int(
-            get_config(
-                "memory_person_v3_refresh_threshold",
-                10,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_max_refresh_people = int(
-            get_config(
-                "memory_person_v3_max_refresh_people",
-                4,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_retrieval_max_people = int(
-            get_config(
-                "memory_person_v3_retrieval_max_people",
-                3,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_retrieval_max_items = int(
-            get_config(
-                "memory_person_v3_retrieval_max_items",
-                12,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_person_v3_include_high_sensitivity = bool(
-            get_config(
-                "memory_person_v3_include_high_sensitivity",
-                False,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_embedding_enabled = bool(
-            get_config("memory_embedding_enabled", True, plugin_name=plugin_name)
-        )
-        self.memory_embedding_model = str(
-            get_config(
-                "memory_embedding_model",
-                "BAAI/bge-small-zh-v1.5",
-                plugin_name=plugin_name,
-            )
-            or "BAAI/bge-small-zh-v1.5"
-        )
-        self.memory_embedding_threads = int(
-            get_config("memory_embedding_threads", 4, plugin_name=plugin_name)
-        )
-        self.memory_embedding_batch_size = int(
-            get_config("memory_embedding_batch_size", 8, plugin_name=plugin_name)
-        )
-        self.memory_dedup_enabled = bool(
-            get_config("memory_dedup_enabled", True, plugin_name=plugin_name)
-        )
-        self.memory_verification_enabled = bool(
-            get_config(
-                "memory_verification_enabled",
-                True,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_dedup_lookback_days = int(
-            get_config("memory_dedup_lookback_days", 30, plugin_name=plugin_name)
-        )
-        self.memory_dedup_candidate_threshold = float(
-            get_config(
-                "memory_dedup_candidate_threshold",
-                0.78,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_duplicate_similarity_threshold = float(
-            get_config(
-                "memory_duplicate_similarity_threshold",
-                0.90,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_retrieval_mmr_lambda = float(
-            get_config(
-                "memory_retrieval_mmr_lambda",
-                0.72,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_retrieval_diversity_threshold = float(
-            get_config(
-                "memory_retrieval_diversity_threshold",
-                0.92,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_checkpoint_max_tokens = int(
-            get_config("memory_checkpoint_max_tokens", 4000, plugin_name=plugin_name)
-        )
-        self.memory_retention_days = int(
-            get_config("memory_retention_days", 0, plugin_name=plugin_name)
-        )
-        self.memory_candidate_retention_days = int(
-            get_config(
-                "memory_candidate_retention_days",
-                90,
-                plugin_name=plugin_name,
-            )
-        )
-        self.memory_maintenance_interval_hours = int(
-            get_config(
-                "memory_maintenance_interval_hours",
-                24,
-                plugin_name=plugin_name,
-            )
-        )
+        for key, value in memory_values.items():
+            setattr(self, key, value)
         self.default_role = get_config("default_role", "default", plugin_name=plugin_name)
         self.search_enabled = get_config("search_enabled", True, plugin_name=plugin_name)
         self.ocr_enabled = get_config("ocr_enabled", False, plugin_name=plugin_name)
@@ -3172,166 +2953,40 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         return sender.strip() in self._get_ignored_senders(chat_name)
 
     def _get_default_memory_config(self) -> Dict[str, Any]:
+        declared = memory_config_defaults()
         return {
             "context_message_fetch_limit": self.context_message_fetch_limit,
             "context_window_strategy": self.context_window_strategy,
             "anchor_message_count": self.anchor_message_count,
             "anchor_rollover_prompt_tokens": self.anchor_rollover_prompt_tokens,
-            "memory_enabled": self.memory_enabled,
-            "memory_background_enabled": self.memory_background_enabled,
-            "memory_event_min_messages": self.memory_event_min_messages,
-            "memory_event_target_messages": self.memory_event_target_messages,
-            "memory_event_max_messages": self.memory_event_max_messages,
-            "memory_event_context_before_messages": self.memory_event_context_before_messages,
-            "memory_event_context_after_messages": self.memory_event_context_after_messages,
-            "memory_event_max_cards": self.memory_event_max_cards,
-            "memory_event_input_token_budget": self.memory_event_input_token_budget,
-            "memory_initial_backfill_messages": self.memory_initial_backfill_messages,
-            "memory_max_chunks_per_run": self.memory_max_chunks_per_run,
-            "memory_stage_event_threshold": self.memory_stage_event_threshold,
-            "memory_stage_input_event_limit": self.memory_stage_input_event_limit,
-            "memory_stage_input_token_budget": self.memory_stage_input_token_budget,
-            "memory_stage_char_limit": self.memory_stage_char_limit,
-            "memory_retrieval_top_k": self.memory_retrieval_top_k,
-            "memory_query_recent_messages": self.memory_query_recent_messages,
-            "memory_context_max_tokens": self.memory_context_max_tokens,
-            "memory_person_v3_enabled": self.memory_person_v3_enabled,
-            "memory_person_v3_auto_activate_live": self.memory_person_v3_auto_activate_live,
-            "memory_person_v3_person_centric_enabled": self.memory_person_v3_person_centric_enabled,
-            "memory_person_v3_min_pending_messages": self.memory_person_v3_min_pending_messages,
-            "memory_person_v3_batch_related_messages": self.memory_person_v3_batch_related_messages,
-            "memory_person_v3_max_batch_people": self.memory_person_v3_max_batch_people,
-            "memory_person_v3_max_observations_per_batch": self.memory_person_v3_max_observations_per_batch,
-            "memory_person_v3_input_token_budget": self.memory_person_v3_input_token_budget,
-            "memory_person_v3_candidate_memory_value": self.memory_person_v3_candidate_memory_value,
-            "memory_person_v3_refresh_threshold": self.memory_person_v3_refresh_threshold,
-            "memory_person_v3_max_refresh_people": self.memory_person_v3_max_refresh_people,
-            "memory_person_v3_retrieval_max_people": self.memory_person_v3_retrieval_max_people,
-            "memory_person_v3_retrieval_max_items": self.memory_person_v3_retrieval_max_items,
-            "memory_person_v3_include_high_sensitivity": self.memory_person_v3_include_high_sensitivity,
-            "memory_embedding_enabled": self.memory_embedding_enabled,
-            "memory_embedding_model": self.memory_embedding_model,
-            "memory_embedding_threads": self.memory_embedding_threads,
-            "memory_embedding_batch_size": self.memory_embedding_batch_size,
-            "memory_dedup_enabled": self.memory_dedup_enabled,
-            "memory_verification_enabled": self.memory_verification_enabled,
-            "memory_dedup_lookback_days": self.memory_dedup_lookback_days,
-            "memory_dedup_candidate_threshold": self.memory_dedup_candidate_threshold,
-            "memory_duplicate_similarity_threshold": self.memory_duplicate_similarity_threshold,
-            "memory_retrieval_mmr_lambda": self.memory_retrieval_mmr_lambda,
-            "memory_retrieval_diversity_threshold": self.memory_retrieval_diversity_threshold,
-            "memory_checkpoint_max_tokens": self.memory_checkpoint_max_tokens,
-            "memory_retention_days": self.memory_retention_days,
-            "memory_candidate_retention_days": self.memory_candidate_retention_days,
-            "memory_maintenance_interval_hours": self.memory_maintenance_interval_hours,
+            **{
+                key: getattr(self, key, default)
+                for key, default in declared.items()
+            },
         }
 
     def _sanitize_memory_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        defaults = self._get_default_memory_config()
-        int_ranges = {
-            "context_message_fetch_limit": (20, 20000),
-            "anchor_message_count": (20, 5000),
-            "anchor_rollover_prompt_tokens": (4096, 1000000),
-            "memory_event_min_messages": (5, 200),
-            "memory_event_target_messages": (5, 500),
-            "memory_event_max_messages": (5, 1000),
-            "memory_event_context_before_messages": (0, 100),
-            "memory_event_context_after_messages": (0, 100),
-            "memory_event_max_cards": (1, 12),
-            "memory_event_input_token_budget": (1024, 100000),
-            "memory_initial_backfill_messages": (0, 100000),
-            "memory_max_chunks_per_run": (1, 20),
-            "memory_stage_event_threshold": (5, 500),
-            "memory_stage_input_event_limit": (5, 500),
-            "memory_stage_input_token_budget": (2048, 200000),
-            "memory_stage_char_limit": (1000, 20000),
-            "memory_retrieval_top_k": (1, 20),
-            "memory_query_recent_messages": (1, 100),
-            "memory_context_max_tokens": (512, 20000),
-            "memory_person_v3_refresh_threshold": (1, 100),
-            "memory_person_v3_max_refresh_people": (1, 20),
-            "memory_person_v3_min_pending_messages": (5, 500),
-            "memory_person_v3_batch_related_messages": (8, 500),
-            "memory_person_v3_max_batch_people": (1, 20),
-            "memory_person_v3_max_observations_per_batch": (4, 30),
-            "memory_person_v3_input_token_budget": (4000, 100000),
-            "memory_person_v3_retrieval_max_people": (1, 6),
-            "memory_person_v3_retrieval_max_items": (3, 20),
-            "memory_embedding_threads": (1, 8),
-            "memory_embedding_batch_size": (1, 64),
-            "memory_dedup_lookback_days": (1, 3650),
-            "memory_checkpoint_max_tokens": (512, 100000),
-            "memory_retention_days": (0, 3650),
-            "memory_candidate_retention_days": (7, 3650),
-            "memory_maintenance_interval_hours": (1, 720),
-        }
-        for key, (lower, upper) in int_ranges.items():
-            try:
-                value = int(config.get(key, defaults[key]))
-            except Exception:
-                value = defaults[key]
-            config[key] = max(lower, min(upper, value))
-
-        for key in (
-            "memory_enabled",
-            "memory_background_enabled",
-            "memory_embedding_enabled",
-            "memory_dedup_enabled",
-            "memory_verification_enabled",
-            "memory_person_v3_enabled",
-            "memory_person_v3_auto_activate_live",
-            "memory_person_v3_person_centric_enabled",
-            "memory_person_v3_include_high_sensitivity",
+        sanitized = dict(config)
+        sanitized.update(sanitize_memory_config(config))
+        for key, lower, upper, fallback in (
+            ("context_message_fetch_limit", 20, 20000, self.context_message_fetch_limit),
+            ("anchor_message_count", 20, 5000, self.anchor_message_count),
+            ("anchor_rollover_prompt_tokens", 4096, 1000000, self.anchor_rollover_prompt_tokens),
         ):
-            config[key] = bool(config.get(key, defaults[key]))
-
-        float_ranges = {
-            "memory_dedup_candidate_threshold": (0.5, 0.99),
-            "memory_duplicate_similarity_threshold": (0.6, 0.999),
-            "memory_retrieval_mmr_lambda": (0.1, 1.0),
-            "memory_retrieval_diversity_threshold": (0.6, 0.999),
-            "memory_person_v3_candidate_memory_value": (0.35, 0.95),
-        }
-        for key, (lower, upper) in float_ranges.items():
             try:
-                value = float(config.get(key, defaults[key]))
+                value = int(config.get(key, fallback))
             except (TypeError, ValueError):
-                value = float(defaults[key])
-            config[key] = max(lower, min(upper, value))
-        config["memory_duplicate_similarity_threshold"] = max(
-            config["memory_dedup_candidate_threshold"],
-            config["memory_duplicate_similarity_threshold"],
-        )
-
-        config["memory_event_target_messages"] = max(
-            config["memory_event_min_messages"],
-            config["memory_event_target_messages"],
-        )
-        config["memory_event_max_messages"] = max(
-            config["memory_event_target_messages"],
-            config["memory_event_max_messages"],
-        )
-        config["memory_stage_input_event_limit"] = max(
-            config["memory_stage_event_threshold"],
-            config["memory_stage_input_event_limit"],
-        )
-        config["memory_embedding_model"] = str(
-            config.get("memory_embedding_model")
-            or defaults["memory_embedding_model"]
-        ).strip()
-
+                value = int(fallback)
+            sanitized[key] = max(lower, min(upper, value))
         strategy = str(
             config.get("context_window_strategy")
-            or defaults.get("context_window_strategy")
+            or self.context_window_strategy
             or "anchored_append"
         ).strip().lower()
-        config["context_window_strategy"] = (
-            strategy
-            if strategy in {"sliding", "anchored_append"}
-            else "anchored_append"
+        sanitized["context_window_strategy"] = (
+            strategy if strategy in {"sliding", "anchored_append"} else "anchored_append"
         )
-
-        return config
+        return sanitized
 
     def _memory_source_fetch_limit(self, memory_config: Dict[str, Any]) -> int:
         """Reply construction only needs the configured recent raw window."""
@@ -3347,7 +3002,11 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             if raw_profile:
                 profile = json.loads(raw_profile)
                 if isinstance(profile, dict) and profile.get("enabled"):
-                    overrides = profile.get("overrides") if isinstance(profile.get("overrides"), dict) else profile
+                    overrides = upgrade_memory_config_keys(
+                        profile.get("overrides")
+                        if isinstance(profile.get("overrides"), dict)
+                        else profile
+                    )
                     for key in config.keys():
                         if key in overrides and overrides[key] is not None:
                             config[key] = overrides[key]
@@ -3358,8 +3017,8 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         sanitized = self._sanitize_memory_config(config)
         # Bot replies are present in the same raw chat log as human messages.
         # They must never be learned back as a group member profile.
-        sanitized["memory_person_v3_excluded_sender_names"] = self._bot_names_for_chat(chat_name)
-        sanitized["memory_person_v3_excluded_sender_ids"] = []
+        sanitized["memory_person_excluded_sender_names"] = self._bot_names_for_chat(chat_name)
+        sanitized["memory_person_excluded_sender_ids"] = []
         return sanitized
 
     def _analyze_chat_state(self, chat_name: str, scan_threshold: Optional[int] = None) -> Dict[str, Any]:

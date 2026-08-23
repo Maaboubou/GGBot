@@ -1817,8 +1817,9 @@ const App = {
                 modelSummary.innerHTML = '<div class="assistant-empty-inline">尚未配置 Chatbot 模型路由。</div>';
             } else {
                 const labels = {
-                    chat: '对话回复', judge: '主动判断', memory_event: '记忆事件',
-                    memory_verify: '记忆校验', memory_stage: '阶段摘要', memory_person_observe: '人物观察'
+                    chat: '对话回复', judge: '主动判断',
+                    memory_generate: '记忆生成', memory_review: '记忆审核',
+                    memory_synthesize: '记忆归纳'
                 };
                 modelSummary.innerHTML = mappings.slice(0, 6).map(([type, mapping]) => `
                     <div><span>${UI.escapeHtml(labels[type] || type)}</span><strong>${UI.escapeHtml(mapping.primary || '未设置')}</strong></div>
@@ -1978,7 +1979,7 @@ const App = {
                     <div class="assistant-memory-custom ${memory.mode === 'custom' ? '' : 'd-none'}" id="assistantMemoryCustom">
                         <div class="assistant-memory-custom-switches">
                             <label class="assistant-setting-switch"><span><strong>证据复核</strong><small>低可信内容先进入待复核区，不直接参与回答。</small></span><input class="form-check-input" type="checkbox" name="memory_verification_enabled" ${memoryValue('memory_verification_enabled', true) ? 'checked' : ''}></label>
-                            <label class="assistant-setting-switch"><span><strong>人物记忆</strong><small>从有来源的观察证据维护人物事实和关系。</small></span><input class="form-check-input" type="checkbox" name="memory_person_v3_enabled" ${memoryValue('memory_person_v3_enabled', true) ? 'checked' : ''}></label>
+                            <label class="assistant-setting-switch"><span><strong>人物记忆</strong><small>从有来源的观察证据维护人物事实和关系。</small></span><input class="form-check-input" type="checkbox" name="memory_person_enabled" ${memoryValue('memory_person_enabled', true) ? 'checked' : ''}></label>
                         </div>
                         <div class="row g-3 mt-1">
                             <div class="col-md-6"><label class="form-label">检索时间范围（天）</label><input class="form-control" name="memory_retention_days" type="number" min="0" max="3650" value="${Number(memoryValue('memory_retention_days', 365))}"><div class="form-text">仅限制回答时检索的历史范围；不会删除数据。填 0 表示不限。</div></div>
@@ -2069,7 +2070,7 @@ const App = {
             memory_overrides: memoryMode === 'custom' ? {
                 memory_enabled: true,
                 memory_verification_enabled: form.elements.memory_verification_enabled.checked,
-                memory_person_v3_enabled: form.elements.memory_person_v3_enabled.checked,
+                memory_person_enabled: form.elements.memory_person_enabled.checked,
                 memory_retention_days: Number(form.elements.memory_retention_days.value),
                 memory_retrieval_top_k: Number(form.elements.memory_retrieval_top_k.value)
             } : {},

@@ -10,7 +10,6 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -18,15 +17,12 @@ import numpy as np
 
 from app.plugins.builtin_chatbot.context_manager import ChatContextManager
 from app.plugins.builtin_chatbot.embedding_service import LocalEmbeddingService
-from app.plugins.builtin_chatbot.memory_store import (
-    PERSON_FACT_FIELDS,
-    PERSON_FACT_STATUSES,
-    MemoryStore,
-)
+from app.plugins.builtin_chatbot.memory_store import MemoryStore
 from app.plugins.builtin_chatbot.memory_output_schemas import (
     codex_memory_output_schema,
 )
-from app.plugins.builtin_chatbot.person_memory_v3 import PersonMemoryV3Engine
+from app.plugins.builtin_chatbot.memory_scheduler import MemoryBackgroundScheduler
+from app.plugins.builtin_chatbot.person_memory import PersonMemoryEngine
 from app.services.llm_manager import get_llm_manager
 
 logger = logging.getLogger(__name__)
@@ -55,12 +51,7 @@ class ChatMemoryService:
         self.llm_history_chat_name = str(llm_history_chat_name or "").strip()
         self.llm_history_mode = str(llm_history_mode or "full").strip().lower()
         self.llm_usage_callback = llm_usage_callback
-        self._executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="chat-memory",
-        )
-        self._pending_lock = threading.Lock()
-        self._pending: set[str] = set()
+        self._scheduler = MemoryBackgroundScheduler(max_workers=2)
         self._chat_locks_guard = threading.Lock()
         self._chat_locks: Dict[str, threading.RLock] = {}
         self._retrieval_cache_lock = threading.Lock()
@@ -74,12 +65,11 @@ class ChatMemoryService:
             ],
         ] = OrderedDict()
         self._retrieval_cache_max_chats = 16
-        self.person_memory_v3 = PersonMemoryV3Engine(
+        self.person_memory = PersonMemoryEngine(
             self.store,
             self.context_manager,
             self._call_memory_json,
         )
-        self._last_person_chunk_stats: Dict[str, Any] = {}
         self._closed = False
 
     def _lock_for(self, chat_name: str) -> threading.RLock:
@@ -92,7 +82,7 @@ class ChatMemoryService:
 
     def close(self) -> None:
         self._closed = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._scheduler.close()
 
     def _configure_embedding(self, config: Dict[str, Any]) -> None:
         model_name = str(
@@ -125,49 +115,38 @@ class ChatMemoryService:
         ):
             return False
         self._configure_embedding(config)
-        ingestion_due = (
+        event_due = (
             config.get("memory_background_enabled", True)
-            and self._ingestion_is_due(chat_name, config)
+            and self._event_ingestion_is_due(chat_name, config)
+        )
+        person_due = (
+            config.get("memory_background_enabled", True)
+            and config.get("memory_person_enabled", True)
+            and self._person_ingestion_is_due(chat_name, config)
         )
         embedding_due = (
             config.get("memory_embedding_enabled", True)
             and self.embedding_service.can_attempt_load
         )
-        if not ingestion_due and not embedding_due:
+        if not event_due and not person_due and not embedding_due:
             return False
-
-        with self._pending_lock:
-            if chat_name in self._pending:
-                return False
-            self._pending.add(chat_name)
 
         config_copy = dict(config)
 
         def worker() -> None:
-            try:
-                if ingestion_due:
-                    self.process_pending(chat_name, config_copy)
-                elif self.embedding_service.warmup():
-                    self._embed_missing_events(
-                        chat_name,
-                        limit=max(
-                            1,
-                            int(
-                                config_copy.get("memory_embedding_batch_size")
-                                or 8
-                            )
-                            * 2,
-                        ),
-                    )
-                    self.invalidate(chat_name)
-            except Exception:
-                logger.exception("⚠️ Event memory refresh failed for %s", chat_name)
-            finally:
-                with self._pending_lock:
-                    self._pending.discard(chat_name)
+            if event_due or person_due:
+                self.process_pending(chat_name, config_copy)
+            elif self.embedding_service.warmup():
+                self._embed_missing_events(
+                    chat_name,
+                    limit=max(
+                        1,
+                        int(config_copy.get("memory_embedding_batch_size") or 8) * 2,
+                    ),
+                )
+                self.invalidate(chat_name)
 
-        self._executor.submit(worker)
-        return True
+        return self._scheduler.submit(chat_name, worker, logger=logger)
 
     def _initialize_state_if_needed(
         self,
@@ -213,7 +192,7 @@ class ChatMemoryService:
         start_cursor = max(0, physical_count - available)
         return physical_count, cumulative_count, available, start_cursor
 
-    def _ingestion_is_due(self, chat_name: str, config: Dict[str, Any]) -> bool:
+    def _event_ingestion_is_due(self, chat_name: str, config: Dict[str, Any]) -> bool:
         state = self._initialize_state_if_needed(chat_name, config)
         _, _, available, _ = self._available_messages(chat_name, state)
         target = max(
@@ -225,6 +204,156 @@ class ChatMemoryService:
             int(config.get("memory_event_context_after_messages") or 12),
         )
         return available >= target + lookahead
+
+    def _initialize_person_state_if_needed(
+        self,
+        chat_name: str,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        state = self.person_memory.ledger.ensure_chat_state(
+            chat_name,
+            source_namespace="live_chat_log",
+        )
+        physical_count = int(self.chat_log_manager.count_log_messages(chat_name) or 0)
+        cumulative_count = int(
+            self.chat_log_manager.count_messages(chat_name) or physical_count
+        )
+        if (
+            int(state.get("ingestion_cursor") or 0) == 0
+            and int(state.get("ingestion_message_count") or 0) == 0
+            and physical_count > 0
+        ):
+            backfill = max(
+                0,
+                int(config.get("memory_initial_backfill_messages") or 0),
+            )
+            kept = min(physical_count, backfill)
+            state = self.person_memory.ledger.set_ingestion_cursor(
+                chat_name,
+                source_cursor=max(0, physical_count - kept),
+                source_message_count=max(0, cumulative_count - kept),
+                monotonic=False,
+            )
+        return state
+
+    def _person_available_messages(
+        self,
+        chat_name: str,
+        state: Dict[str, Any],
+    ) -> Tuple[int, int, int, int]:
+        physical_count = int(self.chat_log_manager.count_log_messages(chat_name) or 0)
+        cumulative_count = int(
+            self.chat_log_manager.count_messages(chat_name) or physical_count
+        )
+        cumulative_delta = max(
+            0,
+            cumulative_count - int(state.get("ingestion_message_count") or 0),
+        )
+        available = min(physical_count, cumulative_delta)
+        start_cursor = max(0, physical_count - available)
+        return physical_count, cumulative_count, available, start_cursor
+
+    def _person_ingestion_is_due(
+        self,
+        chat_name: str,
+        config: Dict[str, Any],
+    ) -> bool:
+        state = self._initialize_person_state_if_needed(chat_name, config)
+        _, _, available, _ = self._person_available_messages(chat_name, state)
+        target = max(
+            5,
+            int(config.get("memory_person_index_target_messages") or 20),
+        )
+        return available >= target
+
+    def _index_person_pending_messages(
+        self,
+        chat_name: str,
+        config: Dict[str, Any],
+        *,
+        force_tail: bool,
+    ) -> Dict[str, int]:
+        if not config.get("memory_person_enabled", True):
+            return {"chunks": 0, "messages": 0, "links": 0}
+
+        target = max(
+            5,
+            int(config.get("memory_person_index_target_messages") or 20),
+        )
+        batch_limit = max(
+            target,
+            min(
+                500,
+                int(config.get("memory_person_batch_related_messages") or 80) * 2,
+            ),
+        )
+        max_chunks = max(
+            1,
+            min(20, int(config.get("memory_max_chunks_per_run") or 3)),
+        )
+        totals = {"chunks": 0, "messages": 0, "links": 0}
+        for _ in range(max_chunks):
+            state = self._initialize_person_state_if_needed(chat_name, config)
+            _, cumulative_count, available, start_cursor = (
+                self._person_available_messages(chat_name, state)
+            )
+            if available <= 0 or (available < target and not force_tail):
+                break
+            requested = min(available, batch_limit)
+            end_cursor = start_cursor + requested
+            messages = self.chat_log_manager.get_messages_range(
+                chat_name,
+                start_cursor=start_cursor,
+                end_cursor=end_cursor,
+                limit=max(1, requested),
+            )
+            selected = [
+                dict(message)
+                for message in messages
+                if start_cursor < int(message.get("_log_cursor") or 0) <= end_cursor
+            ]
+            if not selected:
+                break
+            selected_end = max(
+                int(message.get("_log_cursor") or 0) for message in selected
+            )
+            self.store.observe_message_identities(
+                chat_name,
+                selected,
+                source=(
+                    "historical_message"
+                    if any(message.get("sender_id") for message in selected)
+                    else "live_message"
+                ),
+            )
+            indexed = self.person_memory.ledger.index_person_messages(
+                chat_name,
+                selected,
+                source_namespace="live_chat_log",
+                core_cursors=[
+                    int(message.get("_log_cursor") or 0) for message in selected
+                ],
+                excluded_sender_names=(
+                    config.get("memory_person_excluded_sender_names") or []
+                ),
+                excluded_sender_ids=(
+                    config.get("memory_person_excluded_sender_ids") or []
+                ),
+            )
+            processed_delta = max(0, selected_end - start_cursor)
+            self.person_memory.ledger.set_ingestion_cursor(
+                chat_name,
+                source_cursor=selected_end,
+                source_message_count=min(
+                    cumulative_count,
+                    int(state.get("ingestion_message_count") or 0)
+                    + processed_delta,
+                ),
+            )
+            totals["chunks"] += 1
+            totals["messages"] += len(selected)
+            totals["links"] += int(indexed.get("links") or 0)
+        return totals
 
     def process_pending(
         self,
@@ -243,7 +372,6 @@ class ChatMemoryService:
             created_events = 0
             person_observations = 0
             person_quarantined = 0
-            person_links_indexed = 0
             for _ in range(max_chunks):
                 result = self._process_one_chunk(
                     chat_name,
@@ -254,15 +382,13 @@ class ChatMemoryService:
                     break
                 chunks += 1
                 created_events += result
-                person_observations += int(
-                    self._last_person_chunk_stats.get("inserted") or 0
-                )
-                person_quarantined += int(
-                    self._last_person_chunk_stats.get("quarantined") or 0
-                )
-                person_links_indexed += int(
-                    self._last_person_chunk_stats.get("links") or 0
-                )
+
+            person_index = self._index_person_pending_messages(
+                chat_name,
+                config,
+                force_tail=force_tail,
+            )
+            person_links_indexed = int(person_index.get("links") or 0)
 
             person_batches = {
                 "people_due": 0,
@@ -272,21 +398,15 @@ class ChatMemoryService:
                 "quarantined": 0,
                 "results": [],
             }
-            if (
-                config.get("memory_person_v3_enabled", False)
-                and config.get(
-                    "memory_person_v3_person_centric_enabled",
-                    True,
-                )
-            ):
+            if config.get("memory_person_enabled", True):
                 person_batches = (
-                    self.person_memory_v3.process_due_person_batches(
+                    self.person_memory.process_due_person_batches(
                         chat_name,
                         threshold=max(
                             1,
                             int(
                                 config.get(
-                                    "memory_person_v3_min_pending_messages",
+                                    "memory_person_min_pending_messages",
                                     30,
                                 )
                                 or 30
@@ -296,7 +416,7 @@ class ChatMemoryService:
                             8,
                             int(
                                 config.get(
-                                    "memory_person_v3_batch_related_messages",
+                                    "memory_person_batch_related_messages",
                                     80,
                                 )
                                 or 80
@@ -308,7 +428,7 @@ class ChatMemoryService:
                                 20,
                                 int(
                                     config.get(
-                                        "memory_person_v3_max_batch_people",
+                                        "memory_person_max_batch_people",
                                         4,
                                     )
                                     or 4
@@ -319,7 +439,7 @@ class ChatMemoryService:
                             4000,
                             int(
                                 config.get(
-                                    "memory_person_v3_input_token_budget",
+                                    "memory_person_input_token_budget",
                                     24000,
                                 )
                                 or 24000
@@ -331,7 +451,7 @@ class ChatMemoryService:
                                 30,
                                 int(
                                     config.get(
-                                        "memory_person_v3_max_observations_per_batch",
+                                        "memory_person_max_observations_per_batch",
                                         16,
                                     )
                                     or 16
@@ -344,7 +464,7 @@ class ChatMemoryService:
                                 0.95,
                                 float(
                                     config.get(
-                                        "memory_person_v3_candidate_memory_value",
+                                        "memory_person_candidate_memory_value",
                                         0.58,
                                     )
                                     or 0.58
@@ -354,13 +474,13 @@ class ChatMemoryService:
                         force=force_tail,
                         excluded_sender_names=(
                             config.get(
-                                "memory_person_v3_excluded_sender_names"
+                                "memory_person_excluded_sender_names"
                             )
                             or []
                         ),
                         excluded_sender_ids=(
                             config.get(
-                                "memory_person_v3_excluded_sender_ids"
+                                "memory_person_excluded_sender_ids"
                             )
                             or []
                         ),
@@ -388,14 +508,14 @@ class ChatMemoryService:
                 "people_refreshed": 0,
                 "results": [],
             }
-            if config.get("memory_person_v3_enabled", False):
-                person_refresh = self.person_memory_v3.refresh_due_people(
+            if config.get("memory_person_enabled", False):
+                person_refresh = self.person_memory.refresh_due_people(
                     chat_name,
                     threshold=max(
                         1,
                         int(
                             config.get(
-                                "memory_person_v3_refresh_threshold",
+                                "memory_person_refresh_threshold",
                                 10,
                             )
                             or 10
@@ -407,7 +527,7 @@ class ChatMemoryService:
                             20,
                             int(
                                 config.get(
-                                    "memory_person_v3_max_refresh_people",
+                                    "memory_person_max_refresh_people",
                                     4,
                                 )
                                 or 4
@@ -415,25 +535,14 @@ class ChatMemoryService:
                         ),
                     ),
                 )
-                if (
-                    int(person_refresh.get("people_refreshed") or 0) > 0
-                    and config.get(
-                        "memory_person_v3_auto_activate_live",
-                        True,
-                    )
-                ):
-                    v3_state = self.person_memory_v3.v3.get_chat_state(
-                        chat_name
-                    )
+                if int(person_refresh.get("people_refreshed") or 0) > 0:
+                    person_state = self.person_memory.ledger.get_chat_state(chat_name)
                     if (
-                        v3_state.get("mode") == "building"
-                        and v3_state.get("source_namespace")
+                        person_state.get("mode") == "building"
+                        and person_state.get("source_namespace")
                         == "live_chat_log"
                     ):
-                        self.person_memory_v3.v3.set_chat_mode(
-                            chat_name,
-                            "active",
-                        )
+                        self.person_memory.ledger.set_chat_mode(chat_name, "active")
             maintenance = self.store.maybe_prune_transient_candidates(
                 chat_name,
                 rejected_older_than_days=max(
@@ -453,6 +562,7 @@ class ChatMemoryService:
                 "person_observations": person_observations,
                 "person_quarantined": person_quarantined,
                 "person_links_indexed": person_links_indexed,
+                "person_messages_indexed": int(person_index.get("messages") or 0),
                 "person_links_processed": int(
                     person_batches.get("links_processed") or 0
                 ),
@@ -474,7 +584,6 @@ class ChatMemoryService:
         *,
         force_tail: bool,
     ) -> Optional[int]:
-        self._last_person_chunk_stats = {}
         state = self._initialize_state_if_needed(chat_name, config)
         _, cumulative_count, available, start_cursor = self._available_messages(
             chat_name,
@@ -534,46 +643,6 @@ class ChatMemoryService:
         if len(selected_core_messages) < minimum:
             return None
 
-        self.store.observe_message_identities(
-            chat_name,
-            selected,
-            source="historical_message"
-            if any(message.get("sender_id") for message in selected)
-            else "live_message",
-        )
-        person_centric_enabled = bool(
-            config.get(
-                "memory_person_v3_person_centric_enabled",
-                True,
-            )
-        )
-        if (
-            config.get("memory_person_v3_enabled", False)
-            and person_centric_enabled
-        ):
-            self._last_person_chunk_stats = (
-                self.person_memory_v3.v3.index_person_messages(
-                    chat_name,
-                    selected,
-                    source_namespace="live_chat_log",
-                    core_cursors=[
-                        int(message.get("_log_cursor") or 0)
-                        for message in selected_core_messages
-                    ],
-                    excluded_sender_names=(
-                        config.get(
-                            "memory_person_v3_excluded_sender_names"
-                        )
-                        or []
-                    ),
-                    excluded_sender_ids=(
-                        config.get(
-                            "memory_person_v3_excluded_sender_ids"
-                        )
-                        or []
-                    ),
-                )
-            )
         cards = self._extract_event_cards(
             chat_name,
             selected,
@@ -589,35 +658,6 @@ class ChatMemoryService:
         )
         if cards is None:
             return None
-        if (
-            config.get("memory_person_v3_enabled", False)
-            and not person_centric_enabled
-        ):
-            person_result = self.person_memory_v3.extract_observations(
-                chat_name,
-                selected,
-                core_start_cursor=core_start_cursor,
-                core_end_cursor=selected_core_end_cursor,
-                source_namespace="live_chat_log",
-                batch_key=(
-                    f"live_chat_log:{core_start_cursor}:"
-                    f"{selected_core_end_cursor}"
-                ),
-                excluded_sender_names=(
-                    config.get("memory_person_v3_excluded_sender_names")
-                    or []
-                ),
-                excluded_sender_ids=(
-                    config.get("memory_person_v3_excluded_sender_ids")
-                    or []
-                ),
-            )
-            # Person memory owns its own evidence cursor.  Do not advance the
-            # shared raw-message ingestion cursor when this independent write
-            # failed, otherwise the missing raw batch could never be retried.
-            if person_result is None:
-                return None
-            self._last_person_chunk_stats = person_result
         for card in cards:
             card_start = int(
                 card.get("source_start_cursor") or core_start_cursor
@@ -866,7 +906,7 @@ class ChatMemoryService:
         ]
         try:
             payload = self._call_memory_json(
-                call_type="memory_event",
+                call_type="memory_event_extract",
                 messages=prompt,
                 schema_hint=(
                     '根对象必须是 {"events":[...]}；events 是数组，'
@@ -1256,7 +1296,7 @@ class ChatMemoryService:
         failure_note = ""
         try:
             parsed = self._call_memory_json(
-                call_type="memory_verify",
+                call_type="memory_event_review",
                 messages=prompt,
                 schema_hint='根对象必须是 {"decisions":[...]}。',
                 chat_name=chat_name,
@@ -1770,7 +1810,7 @@ class ChatMemoryService:
             },
         ]
         parsed = self._call_memory_json(
-            call_type="memory_dedup",
+            call_type="memory_event_relation",
             messages=messages,
             schema_hint='根对象必须是 {"decisions":[...]}。',
             chat_name=chat_name,
@@ -2169,7 +2209,7 @@ class ChatMemoryService:
         ]
         try:
             payload = self._call_memory_json(
-                call_type="memory_stage",
+                call_type="memory_stage_summarize",
                 messages=prompt,
                 schema_hint=(
                     "根对象必须包含 summary、stable_facts、active_topics、"
@@ -2409,161 +2449,8 @@ class ChatMemoryService:
                 )
                 if not cls._contains_false_claim(value, false_claims)
             ]
-        people = []
-        for person in cls._normalize_people_updates(
-            normalized.get("people_updates")
-        ):
-            value = dict(person)
-            value["profile"] = cls._remove_false_claim_sentences(
-                value.get("profile"),
-                false_claims,
-            )
-            value["facts"] = [
-                fact
-                for fact in value.get("facts") or []
-                if not cls._contains_false_claim(
-                    fact.get("value"),
-                    false_claims,
-                )
-            ]
-            if value["profile"] or value["facts"]:
-                people.append(value)
-        normalized["people_updates"] = people
+        normalized.pop("people_updates", None)
         return normalized
-
-    @classmethod
-    def _normalize_person_facts(
-        cls,
-        value: Any,
-        *,
-        available_event_ids: Optional[set[int]] = None,
-    ) -> List[Dict[str, Any]]:
-        if not isinstance(value, list):
-            return []
-        result: List[Dict[str, Any]] = []
-        for item in value[:30]:
-            if not isinstance(item, dict):
-                continue
-            field_name = str(
-                item.get("field") or item.get("field_name") or "other"
-            ).strip().lower()
-            if field_name not in PERSON_FACT_FIELDS:
-                field_name = "other"
-            if field_name == "legacy_summary":
-                continue
-            fact_value = cls._clean_text(item.get("value"), 500)
-            if not fact_value:
-                continue
-            status = str(item.get("status") or "uncertain").strip().lower()
-            if status not in PERSON_FACT_STATUSES:
-                status = "uncertain"
-            try:
-                confidence = max(
-                    0.0,
-                    min(1.0, float(item.get("confidence", 0.5))),
-                )
-            except (TypeError, ValueError):
-                confidence = 0.5
-            source_ids = sorted(
-                {
-                    cls._safe_int(event_id)
-                    for event_id in (
-                        item.get("source_event_ids")
-                        or item.get("evidence_event_ids")
-                        or []
-                    )
-                    if cls._safe_int(event_id) > 0
-                    and (
-                        available_event_ids is None
-                        or cls._safe_int(event_id) in available_event_ids
-                    )
-                }
-            )
-            # Automatically generated person facts are not allowed to become
-            # durable without a traceable source event.
-            if available_event_ids is not None and not source_ids:
-                continue
-            result.append(
-                {
-                    "field": field_name,
-                    "value": fact_value,
-                    "status": status,
-                    "confidence": confidence,
-                    "valid_from": cls._clean_text(
-                        item.get("valid_from"),
-                        40,
-                    ),
-                    "valid_to": cls._clean_text(
-                        item.get("valid_to"),
-                        40,
-                    ),
-                    "observed_at": cls._clean_text(
-                        item.get("observed_at"),
-                        40,
-                    ),
-                    "temporal_note": cls._clean_text(
-                        item.get("temporal_note"),
-                        200,
-                    ),
-                    "source_event_ids": source_ids,
-                    "replaces_fact_ids": sorted(
-                        {
-                            cls._safe_int(fact_id)
-                            for fact_id in (
-                                item.get("replaces_fact_ids") or []
-                            )
-                            if cls._safe_int(fact_id) > 0
-                        }
-                    ),
-                }
-            )
-        return result
-
-    @classmethod
-    def _normalize_people_updates(
-        cls,
-        value: Any,
-        *,
-        available_event_ids: Optional[set[int]] = None,
-    ) -> List[Dict[str, Any]]:
-        if not isinstance(value, list):
-            return []
-        result = []
-        for item in value[:30]:
-            if not isinstance(item, dict):
-                continue
-            name = cls._clean_text(item.get("name"), 80)
-            profile = cls._clean_text(item.get("profile"), 800)
-            facts = cls._normalize_person_facts(
-                item.get("facts"),
-                available_event_ids=available_event_ids,
-            )
-            if not name or (not profile and not facts):
-                continue
-            try:
-                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.5))))
-            except (TypeError, ValueError):
-                confidence = 0.5
-            if not profile:
-                profile = "；".join(
-                    str(fact.get("value") or "")
-                    for fact in facts[:12]
-                    if fact.get("value")
-                )[:800]
-            result.append(
-                {
-                    "name": name,
-                    "aliases": cls._string_list(
-                        item.get("aliases"),
-                        20,
-                        80,
-                    ),
-                    "profile": profile,
-                    "confidence": confidence,
-                    "facts": facts,
-                }
-            )
-        return result
 
     def build_retrieval_context(
         self,
@@ -2646,12 +2533,13 @@ class ChatMemoryService:
             for name in event.get("participants") or []
             if str(name).strip()
         }
-        person_v3_state = self.person_memory_v3.v3.get_chat_state(chat_name)
+        person_state = self.person_memory.ledger.get_chat_state(chat_name)
+        people: List[Dict[str, Any]] = []
         if (
-            config.get("memory_person_v3_enabled", False)
-            and person_v3_state.get("mode") == "active"
+            config.get("memory_person_enabled", False)
+            and person_state.get("mode") == "active"
         ):
-            people = self.person_memory_v3.select_profiles_for_query(
+            people = self.person_memory.select_profiles_for_query(
                 chat_name,
                 sender=sender,
                 content=content,
@@ -2662,7 +2550,7 @@ class ChatMemoryService:
                         6,
                         int(
                             config.get(
-                                "memory_person_v3_retrieval_max_people",
+                                "memory_person_retrieval_max_people",
                                 3,
                             )
                             or 3
@@ -2671,7 +2559,6 @@ class ChatMemoryService:
                 ),
             )
             for person in people:
-                person["profile_schema_version"] = 3
                 person["_retrieval_query"] = query_text
                 person["_retrieval_max_items"] = max(
                     3,
@@ -2679,7 +2566,7 @@ class ChatMemoryService:
                         20,
                         int(
                             config.get(
-                                "memory_person_v3_retrieval_max_items",
+                                "memory_person_retrieval_max_items",
                                 12,
                             )
                             or 12
@@ -2688,12 +2575,10 @@ class ChatMemoryService:
                 )
                 person["_include_high_sensitivity"] = bool(
                     config.get(
-                        "memory_person_v3_include_high_sensitivity",
+                        "memory_person_include_high_sensitivity",
                         False,
                     )
                 )
-        else:
-            people = self._select_people(chat_name, sender, content, events)
         state = self.store.get_state(chat_name)
         stage = str(state.get("stage_summary") or "").strip()
 
@@ -2942,67 +2827,14 @@ class ChatMemoryService:
 
     @staticmethod
     def _render_person_for_prompt(person: Dict[str, Any]) -> str:
-        if int(person.get("profile_schema_version") or 0) >= 3:
-            return PersonMemoryV3Engine.render_profile_for_query(
-                person,
-                str(person.get("_retrieval_query") or ""),
-                maximum_items=int(
-                    person.get("_retrieval_max_items") or 12
-                ),
-                include_high_sensitivity=bool(
-                    person.get("_include_high_sensitivity", False)
-                ),
-            )
-        facts = [
-            fact
-            for fact in person.get("facts") or []
-            if isinstance(fact, dict) and fact.get("value")
-        ]
-        if not facts:
-            return (
-                f"- {person.get('person_name') or '未知人物'}："
-                f"{person.get('profile_text') or ''}"
-            )
-        aliases = [
-            str(alias.get("alias_name") or "")
-            for alias in person.get("aliases") or []
-            if alias.get("status") == "confirmed"
-            and alias.get("alias_name") != person.get("person_name")
-        ][:6]
-        lines = [
-            f"- {person.get('person_name') or '未知人物'}"
-            + (f"（别名：{'、'.join(aliases)}）" if aliases else "")
-        ]
-        for fact in facts[:14]:
-            time_text = (
-                fact.get("valid_from")
-                or fact.get("last_seen_at")
-                or fact.get("observed_at")
-                or ""
-            )
-            source_ids = fact.get("source_event_ids") or []
-            metadata = "；".join(
-                value
-                for value in (
-                    str(fact.get("status") or "current"),
-                    f"时间 {time_text}" if time_text else "",
-                    (
-                        "证据事件 "
-                        + "、".join(
-                            f"#{int(value)}" for value in source_ids[-3:]
-                        )
-                        if source_ids
-                        else ""
-                    ),
-                )
-                if value
-            )
-            lines.append(
-                f"  · {fact.get('field_name') or 'other'}："
-                f"{fact.get('value') or ''}"
-                + (f"（{metadata}）" if metadata else "")
-            )
-        return "\n".join(lines)
+        return PersonMemoryEngine.render_profile_for_query(
+            person,
+            str(person.get("_retrieval_query") or ""),
+            maximum_items=int(person.get("_retrieval_max_items") or 12),
+            include_high_sensitivity=bool(
+                person.get("_include_high_sensitivity", False)
+            ),
+        )
 
     def _truncate_section_to_budget(
         self,
@@ -3114,9 +2946,6 @@ class ChatMemoryService:
         return {
             "person_id": int(person.get("person_id") or 0),
             "name": person.get("person_name") or "",
-            "profile_schema_version": int(
-                person.get("profile_schema_version") or 2
-            ),
             "aliases": [
                 alias.get("alias_name")
                 for alias in person.get("aliases") or []
@@ -3128,8 +2957,7 @@ class ChatMemoryService:
             "snapshot_id": int(person.get("snapshot_id") or 0),
             "snapshot_generation": int(person.get("generation") or 0),
             "observation_count": int(person.get("observation_count") or 0),
-            "profile_text": person.get("profile_text") or "",
-            "source_event_id": int(person.get("source_event_id") or 0),
+            "profile_text": person.get("rendered_text") or "",
             "updated_at": person.get("updated_at"),
             "selection_reasons": list(person.get("selection_reasons") or []),
             "prompt_text": prompt_text,
@@ -3460,71 +3288,6 @@ class ChatMemoryService:
         except ValueError:
             return datetime.min
 
-    def _select_people(
-        self,
-        chat_name: str,
-        sender: str,
-        content: str,
-        events: Sequence[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        people = self.store.list_people(chat_name)
-        if not people:
-            return []
-        event_names = {
-            str(name)
-            for event in events
-            for name in event.get("participants") or []
-        }
-        selected = []
-        for person in people:
-            name = person["person_name"]
-            confirmed_aliases = {
-                str(alias.get("alias_name") or "").strip()
-                for alias in person.get("aliases") or []
-                if alias.get("status") == "confirmed"
-                and str(alias.get("alias_name") or "").strip()
-            }
-            confirmed_aliases.add(name)
-            reasons = []
-            if sender in confirmed_aliases:
-                reasons.append("本轮发送者")
-            mentioned_aliases = sorted(
-                (
-                    alias
-                    for alias in confirmed_aliases
-                    if alias and alias in content
-                ),
-                key=len,
-                reverse=True,
-            )
-            if mentioned_aliases:
-                reasons.append("问题中提及")
-            matched_event_aliases = confirmed_aliases & event_names
-            if matched_event_aliases:
-                reasons.append("相关事件参与者")
-            if reasons:
-                value = dict(person)
-                value["selection_reasons"] = reasons
-                value["matched_aliases"] = sorted(
-                    set(mentioned_aliases) | matched_event_aliases
-                )
-                selected.append(value)
-        selected.sort(
-            key=lambda person: (
-                sender
-                in {
-                    str(alias.get("alias_name") or "")
-                    for alias in person.get("aliases") or []
-                    if alias.get("status") == "confirmed"
-                }
-                or person["person_name"] == sender,
-                bool(person.get("matched_aliases")),
-                int(person.get("source_event_id") or 0),
-            ),
-            reverse=True,
-        )
-        return selected[:6]
-
     @staticmethod
     def _render_event_for_prompt(event: Dict[str, Any]) -> str:
         card = event.get("card") if isinstance(event.get("card"), dict) else {}
@@ -3597,10 +3360,10 @@ class ChatMemoryService:
             chat_name,
             include_snapshots=False,
         )
-        person_v3_state = self.person_memory_v3.v3.get_chat_state(chat_name)
-        person_v3_observations = (
-            self.person_memory_v3.v3.observation_stats(chat_name)
-            if person_v3_state
+        person_state = self.person_memory.ledger.get_chat_state(chat_name)
+        person_observations = (
+            self.person_memory.ledger.observation_stats(chat_name)
+            if person_state
             else {
                 "total": 0,
                 "active": 0,
@@ -3608,16 +3371,12 @@ class ChatMemoryService:
                 "rejected": 0,
             }
         )
-        person_v3_profile_count = (
-            self.person_memory_v3.v3.count_profiles(chat_name)
-            if person_v3_state
+        person_profile_count = (
+            self.person_memory.ledger.count_profiles(chat_name)
+            if person_state
             else 0
         )
-        people_count = (
-            person_v3_profile_count
-            if person_v3_state
-            else self.store.count_people(chat_name)
-        )
+        people_count = person_profile_count
         return {
             "chat_name": chat_name,
             "stage_memory": {
@@ -3641,23 +3400,23 @@ class ChatMemoryService:
                 if correction.get("status") == "active"
             ),
             "people_count": people_count,
-            "person_memory_v3": {
+            "person_memory": {
                 "schema_version": int(
-                    person_v3_state.get("schema_version") or 3
+                    person_state.get("schema_version") or 3
                 ),
-                "mode": person_v3_state.get("mode") or "not_initialized",
+                "mode": person_state.get("mode") or "not_initialized",
                 "observation_source_cursor": int(
-                    person_v3_state.get("observation_source_cursor") or 0
+                    person_state.get("observation_source_cursor") or 0
                 ),
-                "last_observation_at": person_v3_state.get(
+                "last_observation_at": person_state.get(
                     "last_observation_at"
                 ),
-                "last_consolidation_at": person_v3_state.get(
+                "last_consolidation_at": person_state.get(
                     "last_consolidation_at"
                 ),
-                "activated_at": person_v3_state.get("activated_at"),
-                "profile_count": person_v3_profile_count,
-                "observations": person_v3_observations,
+                "activated_at": person_state.get("activated_at"),
+                "profile_count": person_profile_count,
+                "observations": person_observations,
             },
             "source_cursor": int(state.get("source_cursor") or 0),
             "source_message_count": int(state.get("source_message_count") or 0),
@@ -3703,29 +3462,27 @@ class ChatMemoryService:
                 "group_dynamics": [],
                 "open_items": [],
                 "stale_or_uncertain": [],
-                "people_updates": [],
             }
-        original_stage_people = self._normalize_people_updates(
-            stage_payload.get("people_updates")
-        )
-        people_by_name = {
-            person["person_name"]: person
-            for person in self.store.list_people(chat_name)
-            if person.get("person_name") in affected_people
-        }
+        stage_payload.pop("people_updates", None)
         correction = {
             "id": 0,
             "reason": str(reason or "").strip(),
             "false_claims": list(false_claims),
             "corrected_claim": str(corrected_claim or "").strip(),
+            "affected_people": [
+                str(value or "").strip()
+                for value in affected_people
+                if str(value or "").strip()
+            ],
         }
         prompt = [
             {
                 "role": "system",
                 "content": (
                     "你是记忆库人工纠错执行器。管理员已经核对原始聊天，给出的纠错结论"
-                    "是最高优先级事实，不得质疑。请只删除或修正与纠错冲突的阶段记忆和人物"
-                    "资料，其他内容尽量原样保留。不得从错误事件继续推断。输出一个JSON对象。"
+                    "是最高优先级事实，不得质疑。请只删除或修正与纠错冲突的阶段记忆，"
+                    "其他内容尽量原样保留。人物证据账本由独立流程处理，不要输出人物资料。"
+                    "不得从错误事件继续推断。输出一个JSON对象。"
                 ),
             },
             {
@@ -3735,24 +3492,19 @@ class ChatMemoryService:
                     f"错误事件：{json.dumps(self._json_safe_event(target_event), ensure_ascii=False)}\n"
                     f"人工纠错：{json.dumps(correction, ensure_ascii=False)}\n"
                     "当前阶段结构："
-                    f"{json.dumps(stage_payload, ensure_ascii=False)}\n"
-                    "受影响人物资料："
-                    f"{json.dumps({name: value.get('profile_text') or '' for name, value in people_by_name.items()}, ensure_ascii=False)}\n\n"
-                    "严格输出当前完整阶段结构及受影响人物的完整修正版资料："
+                    f"{json.dumps(stage_payload, ensure_ascii=False)}\n\n"
+                    "严格输出当前完整阶段结构："
                     '{"summary":"","stable_facts":[],"shared_claims":[],'
                     '"active_topics":[],"group_dynamics":[],"open_items":[],'
-                    '"stale_or_uncertain":[],"people_updates":['
-                    '{"name":"","profile":"","confidence":1.0}]}'
+                    '"stale_or_uncertain":[]}'
                 ),
             },
         ]
         try:
             repaired = self._call_memory_json(
-                call_type="memory_stage",
+                call_type="memory_stage_summarize",
                 messages=prompt,
-                schema_hint=(
-                    "根对象必须包含阶段记忆各数组和 people_updates。"
-                ),
+                schema_hint="根对象必须包含阶段记忆各数组。",
                 chat_name=chat_name,
             )
         except Exception as exc:
@@ -3763,44 +3515,13 @@ class ChatMemoryService:
                 exc,
             )
             repaired = dict(stage_payload)
-            repaired["people_updates"] = [
-                {
-                    "name": name,
-                    "profile": person.get("profile_text") or "",
-                    "confidence": 1.0,
-                }
-                for name, person in people_by_name.items()
-            ]
+        repaired.pop("people_updates", None)
         repaired = self._normalize_stage_categories(repaired)
         repaired = self._apply_manual_correction_constraints(
             repaired,
             [correction],
         )
-        repaired_people = {
-            person["name"]: person
-            for person in self._normalize_people_updates(
-                repaired.get("people_updates")
-            )
-            if person.get("name") in affected_people
-        }
-        for name, person in people_by_name.items():
-            if name in repaired_people:
-                continue
-            profile = self._remove_false_claim_sentences(
-                person.get("profile_text") or "",
-                false_claims,
-            )
-            if profile:
-                repaired_people[name] = {
-                    "name": name,
-                    "profile": profile,
-                    "confidence": 1.0,
-                }
-        repaired["people_updates"] = [
-            person
-            for person in original_stage_people
-            if person.get("name") not in affected_people
-        ] + list(repaired_people.values())
+        repaired.pop("people_updates", None)
         rendered = self._render_stage(repaired)
         if not rendered:
             rendered = self._remove_false_claim_sentences(
@@ -3812,7 +3533,6 @@ class ChatMemoryService:
                 "summary": rendered,
                 "structured": repaired,
             },
-            "people": list(repaired_people.values()),
         }
 
     @staticmethod
@@ -4048,7 +3768,6 @@ class ChatMemoryService:
                 existing_replacement_event_id or 0
             ),
             stage_after=derived["stage"],
-            people_after=derived["people"],
         )
         self.invalidate(chat_name)
         return {

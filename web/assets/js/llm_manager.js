@@ -256,6 +256,7 @@ const LLMManager = {
                 description: declared.description || '该插件未补充任务用途说明。',
                 category: declared.category || '模型任务',
                 order: Number.isFinite(declaredOrder) ? declaredOrder : 500,
+                advanced: Boolean(declared.advanced),
                 declared: true,
             };
         }
@@ -268,6 +269,7 @@ const LLMManager = {
             description: '插件尚未声明这项模型任务的用途。',
             category: '自定义',
             order: 900,
+            advanced: false,
             declared: false,
         };
     },
@@ -1288,6 +1290,10 @@ const LLMManager = {
                 const right = this.getTaskRouteMeta(pluginName, rightType);
                 return left.order - right.order || left.label.localeCompare(right.label, 'zh-CN');
             });
+            const advancedTaskCount = taskEntries.filter(([callType]) => (
+                this.getTaskRouteMeta(pluginName, callType).advanced
+            )).length;
+            const commonTaskCount = taskEntries.length - advancedTaskCount;
             html += `
                 <section class="llm-route-group">
                     <header class="llm-route-group-header">
@@ -1296,12 +1302,16 @@ const LLMManager = {
                             <div>
                                 <div class="llm-route-capability-title">
                                     <h6>${this.escapeHtml(capability.displayName)}</h6>
-                                    <span>${taskEntries.length} 项任务</span>
+                                    <span>${commonTaskCount} 项常用${advancedTaskCount ? ` · ${advancedTaskCount} 项高级` : ''}</span>
                                 </div>
                                 <p>${this.escapeHtml(capability.description)}</p>
                                 <small>内部标识：<code>${safePluginName}</code></small>
                             </div>
                         </div>
+                        ${advancedTaskCount ? `
+                        <button class="btn btn-sm btn-outline-secondary llm-route-advanced-toggle" data-plugin-name="${safePluginName}" aria-expanded="false">
+                            <i class="bi bi-sliders me-1"></i>显示高级路由
+                        </button>` : ''}
                         <button class="btn btn-sm btn-outline-secondary llm-prompts-button" data-plugin-name="${safePluginName}">
                             <i class="bi bi-chat-quote me-1"></i>管理提示词
                         </button>
@@ -1332,7 +1342,7 @@ const LLMManager = {
                 const routeKey = `${pluginName}.${callType}`;
 
                 html += `
-                    <tr class="llm-route-row${task.declared ? '' : ' is-undeclared'}">
+                    <tr class="llm-route-row${task.declared ? '' : ' is-undeclared'}${task.advanced ? ' is-advanced d-none' : ''}" data-plugin-name="${safePluginName}">
                         <td class="llm-route-task-cell">
                             <div class="llm-route-task-title">
                                 <strong>${this.escapeHtml(task.label)}</strong>
@@ -1376,6 +1386,18 @@ const LLMManager = {
         });
         container.querySelectorAll('.llm-mapping-edit').forEach(button => {
             button.addEventListener('click', () => this.editMapping(button.dataset.pluginName, button.dataset.callType));
+        });
+        container.querySelectorAll('.llm-route-advanced-toggle').forEach(button => {
+            button.addEventListener('click', () => {
+                const pluginName = button.dataset.pluginName;
+                const rows = container.querySelectorAll(`.llm-route-row.is-advanced[data-plugin-name="${CSS.escape(pluginName)}"]`);
+                const expanded = button.getAttribute('aria-expanded') !== 'true';
+                rows.forEach(row => row.classList.toggle('d-none', !expanded));
+                button.setAttribute('aria-expanded', String(expanded));
+                button.innerHTML = expanded
+                    ? '<i class="bi bi-chevron-up me-1"></i>收起高级路由'
+                    : '<i class="bi bi-sliders me-1"></i>显示高级路由';
+            });
         });
     },
 

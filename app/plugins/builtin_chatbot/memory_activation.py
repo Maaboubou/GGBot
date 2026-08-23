@@ -116,52 +116,7 @@ def _load_chat_bundle(database: Path, chat_name: str) -> Dict[str, Any]:
             "SELECT * FROM memory_state WHERE chat_name = ?",
             (chat_name,),
         ).fetchone()
-        people = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT * FROM memory_people
-                WHERE chat_name = ? ORDER BY person_name
-                """,
-                (chat_name,),
-            ).fetchall()
-        ]
-        person_identities: List[Dict[str, Any]] = []
-        person_aliases: List[Dict[str, Any]] = []
-        person_facts: List[Dict[str, Any]] = []
-        if _table_exists(connection, "memory_person_identities"):
-            person_identities = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT * FROM memory_person_identities
-                    WHERE chat_name = ? ORDER BY id
-                    """,
-                    (chat_name,),
-                ).fetchall()
-            ]
-        if _table_exists(connection, "memory_person_aliases"):
-            person_aliases = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT * FROM memory_person_aliases
-                    WHERE chat_name = ? ORDER BY id
-                    """,
-                    (chat_name,),
-                ).fetchall()
-            ]
-        if _table_exists(connection, "memory_person_facts"):
-            person_facts = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT * FROM memory_person_facts
-                    WHERE chat_name = ? ORDER BY id
-                    """,
-                    (chat_name,),
-                ).fetchall()
-            ]
+
         sources: List[Dict[str, Any]] = []
         if _table_exists(connection, "memory_sources"):
             sources = [
@@ -200,10 +155,6 @@ def _load_chat_bundle(database: Path, chat_name: str) -> Dict[str, Any]:
             "chat_name": chat_name,
             "events": events,
             "state": dict(state_row) if state_row is not None else None,
-            "people": people,
-            "person_identities": person_identities,
-            "person_aliases": person_aliases,
-            "person_facts": person_facts,
             "sources": sources,
             "event_messages": event_messages,
         }
@@ -225,27 +176,9 @@ def _replace_chat_bundle(
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout=60000")
     old_to_new: Dict[int, int] = {}
-    old_to_new_person: Dict[int, int] = {}
-    old_to_new_fact: Dict[int, int] = {}
     MemoryStore(target_database)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "DELETE FROM memory_person_facts WHERE chat_name = ?",
-            (chat_name,),
-        )
-        connection.execute(
-            "DELETE FROM memory_person_aliases WHERE chat_name = ?",
-            (chat_name,),
-        )
-        connection.execute(
-            "DELETE FROM memory_person_identities WHERE chat_name = ?",
-            (chat_name,),
-        )
-        connection.execute(
-            "DELETE FROM memory_people WHERE chat_name = ?",
-            (chat_name,),
-        )
         connection.execute(
             """
             DELETE FROM memory_event_messages
@@ -395,167 +328,6 @@ def _replace_chat_bundle(
                 ),
             )
 
-        for person in bundle.get("people") or []:
-            connection.execute(
-                """
-                INSERT INTO memory_people(
-                    chat_name, person_name, profile_json, profile_text,
-                    source_event_id, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    chat_name,
-                    str(person.get("person_name") or ""),
-                    str(person.get("profile_json") or "{}"),
-                    str(person.get("profile_text") or ""),
-                    old_to_new.get(
-                        int(person.get("source_event_id") or 0),
-                        0,
-                    ),
-                    str(person.get("updated_at") or _now()),
-                ),
-            )
-
-        for identity in bundle.get("person_identities") or []:
-            cursor = connection.execute(
-                """
-                INSERT INTO memory_person_identities(
-                    chat_name, canonical_name, status,
-                    merged_into_person_id, manual_lock,
-                    created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    chat_name,
-                    str(identity.get("canonical_name") or ""),
-                    str(identity.get("status") or "active"),
-                    0,
-                    int(identity.get("manual_lock") or 0),
-                    str(identity.get("created_at") or _now()),
-                    str(identity.get("updated_at") or _now()),
-                ),
-            )
-            old_to_new_person[int(identity.get("id") or 0)] = int(
-                cursor.lastrowid
-            )
-        for identity in bundle.get("person_identities") or []:
-            merged_old = int(identity.get("merged_into_person_id") or 0)
-            if merged_old:
-                connection.execute(
-                    """
-                    UPDATE memory_person_identities
-                    SET merged_into_person_id = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        old_to_new_person.get(merged_old, 0),
-                        old_to_new_person.get(int(identity.get("id") or 0), 0),
-                    ),
-                )
-        for alias in bundle.get("person_aliases") or []:
-            person_id = old_to_new_person.get(
-                int(alias.get("person_id") or 0),
-                0,
-            )
-            if not person_id:
-                continue
-            connection.execute(
-                """
-                INSERT INTO memory_person_aliases(
-                    chat_name, person_id, alias_name, external_id,
-                    source, confidence, status, first_seen_at,
-                    last_seen_at, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    chat_name,
-                    person_id,
-                    str(alias.get("alias_name") or ""),
-                    str(alias.get("external_id") or ""),
-                    str(alias.get("source") or "activation"),
-                    float(alias.get("confidence") or 0.0),
-                    str(alias.get("status") or "confirmed"),
-                    alias.get("first_seen_at"),
-                    alias.get("last_seen_at"),
-                    str(alias.get("created_at") or _now()),
-                    str(alias.get("updated_at") or _now()),
-                ),
-            )
-        for fact in bundle.get("person_facts") or []:
-            person_id = old_to_new_person.get(
-                int(fact.get("person_id") or 0),
-                0,
-            )
-            if not person_id:
-                continue
-            source_ids = [
-                old_to_new.get(int(value), 0)
-                for value in json.loads(
-                    str(fact.get("source_event_ids_json") or "[]")
-                )
-                if old_to_new.get(int(value), 0)
-            ]
-            cursor = connection.execute(
-                """
-                INSERT INTO memory_person_facts(
-                    chat_name, person_id, field_name, value,
-                    normalized_value, fact_key, status, confidence,
-                    valid_from, valid_to, observed_at,
-                    first_seen_at, last_seen_at, temporal_note,
-                    source_event_id, source_event_ids_json, evidence_json,
-                    mention_count, manual_override,
-                    superseded_by_fact_id, deleted_at,
-                    created_at, updated_at
-                ) VALUES(
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, 0, ?, ?, ?
-                )
-                """,
-                (
-                    chat_name,
-                    person_id,
-                    str(fact.get("field_name") or "other"),
-                    str(fact.get("value") or ""),
-                    str(fact.get("normalized_value") or ""),
-                    str(fact.get("fact_key") or ""),
-                    str(fact.get("status") or "uncertain"),
-                    float(fact.get("confidence") or 0.0),
-                    fact.get("valid_from"),
-                    fact.get("valid_to"),
-                    fact.get("observed_at"),
-                    fact.get("first_seen_at"),
-                    fact.get("last_seen_at"),
-                    str(fact.get("temporal_note") or ""),
-                    old_to_new.get(
-                        int(fact.get("source_event_id") or 0),
-                        0,
-                    ),
-                    json.dumps(source_ids, ensure_ascii=False),
-                    str(fact.get("evidence_json") or "[]"),
-                    int(fact.get("mention_count") or 1),
-                    int(fact.get("manual_override") or 0),
-                    fact.get("deleted_at"),
-                    str(fact.get("created_at") or _now()),
-                    str(fact.get("updated_at") or _now()),
-                ),
-            )
-            old_to_new_fact[int(fact.get("id") or 0)] = int(
-                cursor.lastrowid
-            )
-        for fact in bundle.get("person_facts") or []:
-            superseded_old = int(fact.get("superseded_by_fact_id") or 0)
-            if superseded_old:
-                connection.execute(
-                    """
-                    UPDATE memory_person_facts
-                    SET superseded_by_fact_id = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        old_to_new_fact.get(superseded_old, 0),
-                        old_to_new_fact.get(int(fact.get("id") or 0), 0),
-                    ),
-                )
 
         for source in bundle.get("sources") or []:
             connection.execute(
@@ -582,10 +354,6 @@ def _replace_chat_bundle(
         connection.close()
     return {
         "events": len(bundle.get("events") or []),
-        "people": len(bundle.get("people") or []),
-        "person_identities": len(bundle.get("person_identities") or []),
-        "person_aliases": len(bundle.get("person_aliases") or []),
-        "person_facts": len(bundle.get("person_facts") or []),
         "sources": len(bundle.get("sources") or []),
         "event_messages": len(bundle.get("event_messages") or []),
     }
@@ -736,10 +504,9 @@ def _load_memory_config(chat_name: str) -> Dict[str, Any]:
     config["memory_background_enabled"] = True
     config["memory_event_min_messages"] = 5
     config["memory_max_chunks_per_run"] = 20
-    # Event activation commits the event/legacy-person bundle only. Person V3
-    # has its own candidate and atomic activation path, so generating V3
-    # observations here would spend model calls that are never promoted.
-    config["memory_person_v3_enabled"] = False
+    # Event activation promotes only event and stage data. Person memory has
+    # its own candidate and atomic activation path, so do not build it here.
+    config["memory_person_enabled"] = False
     return config
 
 
@@ -913,12 +680,6 @@ def _validate_database(
                 (history_namespace, chat_name),
             ).fetchone()
         )
-        people = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM memory_people WHERE chat_name = ?",
-                (chat_name,),
-            ).fetchone()[0]
-        )
         state = connection.execute(
             "SELECT * FROM memory_state WHERE chat_name = ?",
             (chat_name,),
@@ -988,7 +749,6 @@ def _validate_database(
             )
         return {
             **{key: int(value or 0) for key, value in counts.items()},
-            "people": people,
             "archived_event_messages": archived_messages,
             "dangling_relations": dangling,
             "source_cursor": int(state["source_cursor"] or 0),

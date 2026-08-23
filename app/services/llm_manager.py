@@ -28,6 +28,12 @@ except ImportError:
     _requests = None
 
 from app.services.config_service import get_setting
+from app.plugins.builtin_chatbot.memory_tasks import (
+    MEMORY_ROUTE_PROFILES,
+    default_memory_route_mappings,
+    migrate_memory_route_mappings,
+    resolve_memory_mapping,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -425,6 +431,64 @@ class LLMManager:
             )
             return
 
+        # The public build does not inject preset routes, but an existing
+        # installation must still collapse its historical memory mappings.
+        chatbot_mappings = self.config.get("plugin_mappings", {}).get(
+            "builtin_chatbot",
+        )
+        if isinstance(chatbot_mappings, dict) and any(
+            str(key).startswith("memory_") for key in chatbot_mappings
+        ):
+            def existing_route(*call_types: str) -> Dict[str, Any]:
+                for call_type in call_types:
+                    mapping = chatbot_mappings.get(call_type)
+                    if (
+                        isinstance(mapping, dict)
+                        and str(mapping.get("primary") or "").strip()
+                    ):
+                        return mapping
+                return {}
+
+            first_model_id = next(iter(self.config.get("models", {})), "")
+            generate_route = existing_route(
+                "memory_generate",
+                "memory_event",
+                "memory_person_observe",
+                "chat",
+            )
+            review_route = existing_route(
+                "memory_review",
+                "memory_verify",
+                "memory_dedup",
+                "memory_person_observe",
+            ) or generate_route
+            synthesize_route = existing_route(
+                "memory_synthesize",
+                "memory_person_consolidate",
+                "memory_stage",
+                "memory_person_period",
+            ) or generate_route
+
+            def primary(mapping: Dict[str, Any]) -> str:
+                return str(mapping.get("primary") or first_model_id).strip()
+
+            def fallback(mapping: Dict[str, Any]) -> List[str]:
+                return list(mapping.get("fallback") or [])
+
+            memory_defaults = default_memory_route_mappings(
+                generate_primary=primary(generate_route),
+                review_primary=primary(review_route),
+                synthesize_primary=primary(synthesize_route),
+                generate_fallback=fallback(generate_route),
+                review_fallback=fallback(review_route),
+                synthesize_fallback=fallback(synthesize_route),
+            )
+            if migrate_memory_route_mappings(
+                chatbot_mappings,
+                memory_defaults,
+            ):
+                modified = True
+
         legacy_defaults_enabled = str(
             os.getenv("LLM_ENABLE_LEGACY_DEFAULT_MAPPINGS", "false")
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -490,8 +554,8 @@ class LLMManager:
             }
             modified = True
 
-        # Event memory has independent mappings. Article-summary model choices
-        # are only a sensible first-install default, never a runtime coupling.
+        # Memory route profiles are independent from article summarization.
+        # That model choice is only a first-install default.
         article_summary_mapping = (
             self.config.get("plugin_mappings", {})
             .get("summary_plus", {})
@@ -533,86 +597,17 @@ class LLMManager:
             if default_memory_primary != memory_dedup_primary
             else list(default_memory_fallback)
         )
-        memory_defaults = {
-            "memory_event": {
-                "primary": preferred_memory_primary,
-                "fallback": preferred_memory_fallback,
-                "override_params": {
-                    "temperature": 0.2,
-                    "max_tokens": 4000,
-                    "timeout": 120,
-                    "response_format": {"type": "json_object"},
-                    "extra_body": {"thinking": {"type": "disabled"}},
-                },
-            },
-            "memory_dedup": {
-                "primary": memory_dedup_primary,
-                "fallback": memory_dedup_fallback,
-                "override_params": {
-                    "temperature": 0.0,
-                    "max_tokens": 1000,
-                    "timeout": 45,
-                    "response_format": {"type": "json_object"},
-                },
-            },
-            "memory_verify": {
-                "primary": memory_dedup_primary,
-                "fallback": memory_dedup_fallback,
-                "override_params": {
-                    "temperature": 0.0,
-                    "max_tokens": 2000,
-                    "timeout": 60,
-                    "response_format": {"type": "json_object"},
-                },
-            },
-            "memory_stage": {
-                "primary": preferred_memory_primary,
-                "fallback": list(preferred_memory_fallback),
-                "override_params": {
-                    "temperature": 0.2,
-                    "max_tokens": 4000,
-                    "timeout": 180,
-                    "response_format": {"type": "json_object"},
-                },
-            },
-            "memory_person_observe": {
-                "primary": preferred_memory_primary,
-                "fallback": list(preferred_memory_fallback),
-                "override_params": {
-                    "temperature": 0.0,
-                    "max_tokens": 8000,
-                    "timeout": 180,
-                    "response_format": {"type": "json_object"},
-                    "extra_body": {"thinking": {"type": "disabled"}},
-                },
-            },
-            "memory_person_period": {
-                "primary": preferred_memory_high,
-                "fallback": list(preferred_memory_fallback),
-                "override_params": {
-                    "temperature": 0.1,
-                    "max_tokens": 5000,
-                    "timeout": 180,
-                    "response_format": {"type": "json_object"},
-                    "extra_body": {"thinking": {"type": "disabled"}},
-                },
-            },
-            "memory_person_consolidate": {
-                "primary": preferred_memory_high,
-                "fallback": list(preferred_memory_fallback),
-                "override_params": {
-                    "temperature": 0.1,
-                    "max_tokens": 7000,
-                    "timeout": 240,
-                    "response_format": {"type": "json_object"},
-                    "extra_body": {"thinking": {"type": "disabled"}},
-                },
-            },
-        }
-        for call_type, mapping in memory_defaults.items():
-            if call_type not in chatbot_mappings:
-                chatbot_mappings[call_type] = mapping
-                modified = True
+        memory_defaults = default_memory_route_mappings(
+            generate_primary=preferred_memory_primary,
+            review_primary=memory_dedup_primary,
+            synthesize_primary=preferred_memory_high,
+            generate_fallback=list(preferred_memory_fallback),
+            review_fallback=list(memory_dedup_fallback),
+            synthesize_fallback=list(preferred_memory_fallback),
+        )
+        if migrate_memory_route_mappings(chatbot_mappings, memory_defaults):
+            modified = True
+        for call_type in MEMORY_ROUTE_PROFILES:
             current = chatbot_mappings[call_type]
             primary = str(current.get("primary") or "").strip()
             fallback = []
@@ -623,10 +618,7 @@ class LLMManager:
             if fallback != list(current.get("fallback") or []):
                 current["fallback"] = fallback
                 modified = True
-            overrides = current.setdefault("override_params", {})
-            if "response_format" not in overrides:
-                overrides["response_format"] = {"type": "json_object"}
-                modified = True
+            current.setdefault("override_params", {})
 
         if "summary_plus" in self.config.get("plugin_mappings", {}):
             summary_mappings = self.config["plugin_mappings"]["summary_plus"]
@@ -1761,7 +1753,12 @@ class LLMManager:
 
     def _get_mapping(self, plugin_name: str, call_type: str) -> Optional[Dict]:
         """获取插件调用映射"""
-        return self.config.get("plugin_mappings", {}).get(plugin_name, {}).get(call_type)
+        plugin_mappings = self.config.get("plugin_mappings", {}).get(plugin_name, {})
+        if plugin_name == "builtin_chatbot":
+            memory_mapping = resolve_memory_mapping(plugin_mappings, call_type)
+            if memory_mapping is not None:
+                return memory_mapping
+        return plugin_mappings.get(call_type)
 
     def _get_proxy_url(self) -> Optional[str]:
         """从数据库读取代理配置，返回代理 URL 或 None（禁用）"""

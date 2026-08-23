@@ -512,10 +512,10 @@ async def lifespan(app: FastAPI):
         # requests can access it. Component versions make this idempotent and
         # safe across restarts and multiple store instances.
         from app.plugins.builtin_chatbot.memory_store import MemoryStore
-        from app.plugins.builtin_chatbot.person_memory_v3 import PersonMemoryV3Store
+        from app.plugins.builtin_chatbot.person_memory import PersonMemoryStore
 
         memory_store = MemoryStore()
-        PersonMemoryV3Store(memory_store)
+        PersonMemoryStore(memory_store)
         logger.info("Memory database schema ready: %s", memory_store.schema_versions())
 
         # 1. 初始化数据库

@@ -42,47 +42,24 @@
         "category": "工具",
         "order": 50
       },
-      "memory_event": {
-        "label": "事件记忆提取",
-        "description": "从原始消息中整理可检索的事件卡片",
+      "memory_generate": {
+        "label": "记忆生成模型",
+        "description": "负责从原始消息提取事件和人物证据",
         "category": "记忆",
         "order": 100
       },
-      "memory_verify": {
-        "label": "记忆证据复核",
-        "description": "核对高风险记忆的事实、主体和原始证据",
+      "memory_review": {
+        "label": "记忆审核模型",
+        "description": "负责证据复核、事件关系判断和人物投影审计",
         "category": "记忆",
         "order": 110
       },
-      "memory_dedup": {
-        "label": "记忆去重判断",
-        "description": "判断新事件是重复内容还是旧事件的更新",
+      "memory_synthesize": {
+        "label": "记忆归纳模型",
+        "description": "高级覆盖：负责阶段摘要和人物资料整合；默认继承生成模型",
         "category": "记忆",
-        "order": 120
-      },
-      "memory_stage": {
-        "label": "当前状态摘要",
-        "description": "根据有效事件维护群聊当前阶段状态",
-        "category": "记忆",
-        "order": 130
-      },
-      "memory_person_observe": {
-        "label": "人物证据观察",
-        "description": "从原始消息中提取有证据的人物信息",
-        "category": "记忆",
-        "order": 140
-      },
-      "memory_person_period": {
-        "label": "人物阶段整理",
-        "description": "整理人物在特定时间段的状态与变化",
-        "category": "记忆",
-        "order": 150
-      },
-      "memory_person_consolidate": {
-        "label": "人物资料整合",
-        "description": "将有效证据整合为人物事实、模式和关系",
-        "category": "记忆",
-        "order": 160
+        "order": 120,
+        "advanced": true
       }
     },
     "settings_notice": "这里是 AI 助手的全局默认值。聊天卡片上的“继承全局”会自动跟随这里；聊天配置只负责少量必要的单独覆盖。",
@@ -398,92 +375,89 @@
       "minimum": 512,
       "maximum": 20000
     },
-    "memory_person_v3_enabled": {
+    "memory_person_enabled": {
       "type": "boolean",
-      "description": "启用直接从原消息生成证据观察、事实版本、长期模式和人物快照的 v3 人物记忆",
+      "description": "启用直接从原消息生成证据观察、事实版本、长期模式和人物快照的人物记忆",
       "default": true
     },
-    "memory_person_v3_auto_activate_live": {
-      "type": "boolean",
-      "description": "纯在线群聊生成首个人物快照后自动切换到 v3；历史候选库仍必须手动激活",
-      "default": true
+    "memory_person_index_target_messages": {
+      "type": "integer",
+      "description": "人物消息索引独立累计多少条原消息后启动，不再受事件记忆批次控制",
+      "default": 20,
+      "minimum": 5,
+      "maximum": 500
     },
-    "memory_person_v3_person_centric_enabled": {
-      "type": "boolean",
-      "description": "按每个人的本人消息、别名提及和上下文独立生成高召回人物观察，避免全群竞争少量名额",
-      "default": true
-    },
-    "memory_person_v3_min_pending_messages": {
+    "memory_person_min_pending_messages": {
       "type": "integer",
       "description": "单个人物累计多少条本人或明确提及消息后启动一次增量炼化",
       "default": 30,
       "minimum": 5,
       "maximum": 500
     },
-    "memory_person_v3_batch_related_messages": {
+    "memory_person_batch_related_messages": {
       "type": "integer",
       "description": "单次人物中心炼化最多读取多少条该人物相关消息",
       "default": 80,
       "minimum": 8,
       "maximum": 500
     },
-    "memory_person_v3_max_batch_people": {
+    "memory_person_max_batch_people": {
       "type": "integer",
       "description": "单次后台任务最多处理多少个人物的相关消息队列",
       "default": 4,
       "minimum": 1,
       "maximum": 20
     },
-    "memory_person_v3_max_observations_per_batch": {
+    "memory_person_max_observations_per_batch": {
       "type": "integer",
       "description": "单次人物中心炼化最多生成多少条候选观察，候选仍需独立证据核验",
       "default": 16,
       "minimum": 4,
       "maximum": 30
     },
-    "memory_person_v3_input_token_budget": {
+    "memory_person_input_token_budget": {
       "type": "integer",
       "description": "单次人物中心炼化的原消息与邻近上下文输入 Token 上限",
       "default": 24000,
       "minimum": 4000,
       "maximum": 100000
     },
-    "memory_person_v3_candidate_memory_value": {
+    "memory_person_candidate_memory_value": {
       "type": "number",
       "description": "高召回候选的最低长期价值；候选不会未经证据核验直接进入人物画像",
       "default": 0.58,
       "minimum": 0.35,
       "maximum": 0.95
     },
-    "memory_person_v3_refresh_threshold": {
+    "memory_person_refresh_threshold": {
       "type": "integer",
       "description": "单个人物累计多少条新观察后刷新事实、模式、关系与人物快照",
       "default": 10,
       "minimum": 1,
       "maximum": 100
     },
-    "memory_person_v3_max_refresh_people": {
+    "memory_person_max_refresh_people": {
       "type": "integer",
       "description": "单次后台记忆任务最多刷新多少个人物快照",
       "default": 4,
       "minimum": 1,
       "maximum": 20
     },
-    "memory_person_v3_retrieval_max_people": {
+    "memory_person_retrieval_max_people": {
       "type": "integer",
-      "description": "单轮回复最多注入多少个直接相关人物的 v3 资料",
+      "description": "单轮回复最多注入多少个直接相关人物的资料",
       "default": 3,
       "minimum": 1,
       "maximum": 6
     },
-    "memory_person_v3_retrieval_max_items": {
+    "memory_person_retrieval_max_items": {
       "type": "integer",
       "description": "单个人物在一轮回复中最多注入多少条相关快照项目",
       "default": 12,
       "minimum": 3,
       "maximum": 20
     },
-    "memory_person_v3_include_high_sensitivity": {
+    "memory_person_include_high_sensitivity": {
       "type": "boolean",
       "description": "普通回复是否允许自动注入高敏感人物记忆；默认关闭",
       "default": false
@@ -676,20 +650,19 @@
     "memory_retrieval_top_k": 6,
     "memory_query_recent_messages": 12,
     "memory_context_max_tokens": 6000,
-    "memory_person_v3_enabled": true,
-    "memory_person_v3_auto_activate_live": true,
-    "memory_person_v3_person_centric_enabled": true,
-    "memory_person_v3_min_pending_messages": 30,
-    "memory_person_v3_batch_related_messages": 80,
-    "memory_person_v3_max_batch_people": 4,
-    "memory_person_v3_max_observations_per_batch": 16,
-    "memory_person_v3_input_token_budget": 24000,
-    "memory_person_v3_candidate_memory_value": 0.58,
-    "memory_person_v3_refresh_threshold": 10,
-    "memory_person_v3_max_refresh_people": 4,
-    "memory_person_v3_retrieval_max_people": 3,
-    "memory_person_v3_retrieval_max_items": 12,
-    "memory_person_v3_include_high_sensitivity": false,
+    "memory_person_enabled": true,
+    "memory_person_index_target_messages": 20,
+    "memory_person_min_pending_messages": 30,
+    "memory_person_batch_related_messages": 80,
+    "memory_person_max_batch_people": 4,
+    "memory_person_max_observations_per_batch": 16,
+    "memory_person_input_token_budget": 24000,
+    "memory_person_candidate_memory_value": 0.58,
+    "memory_person_refresh_threshold": 10,
+    "memory_person_max_refresh_people": 4,
+    "memory_person_retrieval_max_people": 3,
+    "memory_person_retrieval_max_items": 12,
+    "memory_person_include_high_sensitivity": false,
     "memory_embedding_enabled": true,
     "memory_embedding_model": "BAAI/bge-small-zh-v1.5",
     "memory_embedding_threads": 4,

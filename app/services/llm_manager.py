@@ -1044,6 +1044,28 @@ class LLMManager:
         params.pop("web_search_options", None)
         params.pop("enable_web_search", None)
 
+    @staticmethod
+    def _strip_internal_provider_params(params: dict) -> None:
+        """Keep wxautox routing metadata out of external provider payloads."""
+
+        def clean(payload: dict) -> None:
+            for key in list(payload):
+                if str(key).startswith("_wxautox_"):
+                    payload.pop(key, None)
+
+            extra_body = payload.get("extra_body")
+            if isinstance(extra_body, dict):
+                for key in list(extra_body):
+                    if str(key).startswith(("_wxautox_", "wxautox_")):
+                        extra_body.pop(key, None)
+                if not extra_body:
+                    payload.pop("extra_body", None)
+
+        clean(params)
+        for fallback in params.get("fallbacks") or []:
+            if isinstance(fallback, dict):
+                clean(fallback)
+
     # ─────────────────────────── 主调用接口 ──────────────────────────
 
     def call(
@@ -1178,12 +1200,11 @@ class LLMManager:
         )
         if disable_model_web_search:
             self._remove_model_native_web_search(primary_params)
-        if allow_image_input:
-            primary_params.setdefault("extra_body", {})["wxautox_allow_image_input"] = True
 
         # ── 5. 构建 fallback 列表 ──
         fallback_models = mapping.get("fallback", [])
         fallback_list = []
+        fallback_entries = []
         if fallback_models:
             for fb_id in fallback_models:
                 if fb_id == primary_model_id:
@@ -1204,10 +1225,25 @@ class LLMManager:
                     logger.warning("⚡ 跳过熔断中的备用模型: %s", fb_params.get("model") or fb_id)
                     continue
                 fallback_list.append(fb_params)
+                fallback_entries.append(
+                    {
+                        "model_id": fb_id,
+                        "model_config": fb_cfg,
+                        "params": fb_params,
+                    }
+                )
 
             if fallback_list:
-                if (
+                has_local_codex_fallback = any(
+                    self._is_local_codex_model(entry["model_config"])
+                    for entry in fallback_entries
+                )
+                use_litellm_native_fallbacks = (
                     not self._is_local_codex_model(model_config)
+                    and not has_local_codex_fallback
+                )
+                if (
+                    use_litellm_native_fallbacks
                     and self._model_circuit_open(str(primary_params.get("model") or primary_model_id))
                 ):
                     skipped_model = primary_params.get("model") or primary_model_id
@@ -1217,8 +1253,12 @@ class LLMManager:
                         skipped_model,
                         primary_params.get("model"),
                     )
-                if fallback_list:
+                if fallback_list and use_litellm_native_fallbacks:
                     primary_params["fallbacks"] = fallback_list
+            else:
+                has_local_codex_fallback = False
+        else:
+            has_local_codex_fallback = False
 
         # ── 6. 代理检查（缓存机制：无变化时为 no-op）──
         self.apply_proxy_env_vars()
@@ -1243,6 +1283,7 @@ class LLMManager:
             if "fallbacks" in safe_params and isinstance(safe_params["fallbacks"], list):
                 for fb in safe_params["fallbacks"]:
                     fallback_vision_flags[id(fb)] = bool(fb.pop("_wxautox_supports_vision", False))
+            self._strip_internal_provider_params(safe_params)
 
             # 视觉降级：主模型不支持视觉时剔除图片（fallback 由 litellm 处理）。
             # 明确要求图片输入的能力必须保留图片，并由模型调用结果决定成败。
@@ -1290,7 +1331,11 @@ class LLMManager:
             resp = litellm.completion(**safe_params)
             return resp, time.time() - t0
 
-        def _try_single_params(params: dict) -> tuple:
+        def _try_single_params(
+            params: dict,
+            candidate_model_config: Optional[dict] = None,
+        ) -> tuple:
+            active_model_config = candidate_model_config or model_config
             max_empty_retries = 3
             last_resp, last_time, last_result = None, 0, ""
 
@@ -1321,13 +1366,13 @@ class LLMManager:
                 if not result:
                     result = self._recover_empty_response_with_stream(
                         response=response,
-                        model_config=model_config,
+                        model_config=active_model_config,
                         primary_params=params,
                         call_timeout=params.get("timeout"),
                     )
                 
                 if self._is_retriable_content_failure(result):
-                    actual_model = self._resolve_actual_model(response, model_config)
+                    actual_model = self._resolve_actual_model(response, active_model_config)
                     logger.warning(
                         f"⚠️ LLM 返回可重试错误文本 [{actual_model}]，准备触发 fallback: "
                         f"{result[:160]}"
@@ -1341,7 +1386,7 @@ class LLMManager:
                 last_resp, last_time, last_result = response, response_time, result
                 
                 if attempt < max_empty_retries - 1:
-                    actual_model = self._resolve_actual_model(response, model_config)
+                    actual_model = self._resolve_actual_model(response, active_model_config)
                     logger.warning(
                         f"⚠️ LLM 返回空响应 [{actual_model}]，"
                         f"正在进行第 {attempt + 2}/{max_empty_retries} 次重试..."
@@ -1349,6 +1394,130 @@ class LLMManager:
                     time.sleep(1)  # 增加 1 秒延迟，避免过于频繁地请求不稳定服务器
             
             return last_resp, last_time, last_result
+
+        def _complete_fallback_success(
+            entry: Dict[str, Any],
+            response,
+            response_time: float,
+            result: str,
+        ) -> str:
+            candidate_config = entry["model_config"]
+            if self._is_local_codex_model(candidate_config):
+                codex_backend = (
+                    str(response.get("backend") or "")
+                    if isinstance(response, dict)
+                    else ""
+                )
+                backend_label = f"local_codex_{codex_backend or 'runtime'}"
+                self.last_used_model = (
+                    f"{backend_label}/{candidate_config.get('model', entry['model_id'])}"
+                )
+            else:
+                self.last_used_model = self._resolve_actual_model(
+                    response,
+                    candidate_config,
+                )
+
+            response_attachments = self._extract_attachments_from_response(response)
+            if isinstance(attachment_capture, list):
+                attachment_capture.clear()
+                attachment_capture.extend(response_attachments)
+            token_usage = self._extract_token_usage(response)
+            self._record_stats(
+                plugin_name,
+                call_type,
+                primary_model_id,
+                response,
+                response_time,
+                token_usage=token_usage,
+            )
+            self._record_cache_diagnostics(
+                plugin_name=plugin_name,
+                call_type=call_type,
+                model_id=primary_model_id,
+                actual_model=self.last_used_model,
+                messages=messages,
+                response_time=response_time,
+                token_usage=token_usage,
+                success=True,
+            )
+            self._record_call_history(
+                plugin_name,
+                call_type,
+                primary_model_id,
+                messages,
+                result,
+                response_time,
+                self.last_used_model,
+                token_usage.get("total_tokens", 0),
+                success=True,
+                reasoning_text=self._extract_reasoning_from_response(response),
+                token_usage=token_usage,
+                metadata=history_metadata,
+            )
+            logger.info(
+                f"✅ Fallback 成功: {len(result)} 字符 ({response_time:.2f}s) "
+                f"[实际模型: {self.last_used_model}]"
+            )
+            return result
+
+        def _attempt_managed_fallbacks(
+            entries: List[Dict[str, Any]],
+        ) -> Optional[str]:
+            """Run fallbacks in configured order across LiteLLM/Codex runtimes."""
+            for entry in entries:
+                candidate_config = entry["model_config"]
+                candidate_params = copy.deepcopy(entry["params"])
+                candidate_params.pop("fallbacks", None)
+                logger.info(
+                    "🔄 应用层 Fallback 重试: %s",
+                    candidate_params.get("model") or entry["model_id"],
+                )
+                try:
+                    if self._is_local_codex_model(candidate_config):
+                        response, response_time, result = self._call_local_codex(
+                            model_config=candidate_config,
+                            messages=messages,
+                            params=candidate_params,
+                            allow_image_input=allow_image_input,
+                            chat_id=codex_chat_id,
+                            role_name=codex_role_name,
+                            retry=codex_retry,
+                            codex_reasoning_effort=codex_reasoning_effort,
+                            codex_reasoning_summary=codex_reasoning_summary,
+                            codex_web_search_mode=(
+                                "disabled"
+                                if disable_model_web_search
+                                else codex_web_search_mode
+                            ),
+                            codex_timeout_seconds=codex_timeout_seconds,
+                            codex_max_turns=codex_max_turns,
+                            codex_exec_fallback=codex_exec_fallback,
+                            codex_output_schema=codex_output_schema,
+                        )
+                    else:
+                        response, response_time, result = _try_single_params(
+                            candidate_params,
+                            candidate_config,
+                        )
+                    if result:
+                        return _complete_fallback_success(
+                            entry,
+                            response,
+                            response_time,
+                            result,
+                        )
+                    logger.warning(
+                        "⚠️ Fallback 模型 %s 返回空内容",
+                        candidate_params.get("model") or entry["model_id"],
+                    )
+                except Exception as fallback_exc:
+                    logger.warning(
+                        "⚠️ Fallback 模型 %s 调用失败: %s",
+                        candidate_params.get("model") or entry["model_id"],
+                        fallback_exc,
+                    )
+            return None
 
         if self._is_local_codex_model(model_config):
             try:
@@ -1436,100 +1605,53 @@ class LLMManager:
                     metadata=history_metadata,
                 )
                 logger.error(f"❌ Local Codex CLI 调用失败: {plugin_name}.{call_type} -> {local_exc}")
-                if not fallback_list:
+                if not fallback_entries:
                     raise
                 logger.info("🔄 Local Codex CLI 失败，尝试 fallback 模型")
-                for fb_params in fallback_list:
-                    try:
-                        fb_p = copy.deepcopy(fb_params)
-                        fb_p.pop("fallbacks", None)
-                        fb_response, fb_response_time, fb_result = _try_single_params(fb_p)
-                        if not fb_result:
-                            continue
-                        self.last_used_model = self._resolve_actual_model(fb_response, model_config)
-                        token_usage = self._extract_token_usage(fb_response)
-                        self._record_stats(plugin_name, call_type, primary_model_id, fb_response, fb_response_time, token_usage=token_usage)
-                        self._record_cache_diagnostics(
-                            plugin_name=plugin_name,
-                            call_type=call_type,
-                            model_id=primary_model_id,
-                            actual_model=self.last_used_model,
-                            messages=messages,
-                            response_time=fb_response_time,
-                            token_usage=token_usage,
-                            success=True,
-                        )
-                        self._record_call_history(
-                            plugin_name,
-                            call_type,
-                            primary_model_id,
-                            messages,
-                            fb_result,
-                            fb_response_time,
-                            self.last_used_model,
-                            token_usage.get("total_tokens", 0),
-                            success=True,
-                            reasoning_text=self._extract_reasoning_from_response(fb_response),
-                            token_usage=token_usage,
-                            metadata=history_metadata,
-                        )
-                        logger.info(f"✅ Fallback 成功: {len(fb_result)} 字符 ({fb_response_time:.2f}s) [实际模型: {self.last_used_model}]")
-                        return fb_result
-                    except Exception as fb_exc:
-                        logger.warning(f"⚠️ Local Codex fallback 调用失败: {fb_params.get('model')} -> {fb_exc}")
+                fallback_result = _attempt_managed_fallbacks(fallback_entries)
+                if fallback_result is not None:
+                    return fallback_result
                 raise local_exc
 
         try:
             # 1. 尝试主模型（内部已包含 LiteLLM 针对 API 异常的 fallback）
-            response, response_time, result = _try_single_params(primary_params)
+            try:
+                response, response_time, result = _try_single_params(primary_params)
+            except Exception:
+                # LiteLLM 不认识项目内部的 local_codex_cli provider。
+                # 只要链上含本地 Codex，就由应用层按配置顺序调度全部 fallback。
+                if has_local_codex_fallback:
+                    fallback_result = _attempt_managed_fallbacks(fallback_entries)
+                    if fallback_result is not None:
+                        return fallback_result
+                raise
             
             # 2. 如果结果依然为空，说明 API 成功但没有内容或返回了可重试错误文本，手动执行一次 fallback
             if not result:
                 actual_model = self._resolve_actual_model(response, model_config)
                 logger.warning(f"⚠️ LLM 成功返回但内容不可用 [{actual_model}]，准备执行手动 fallback...")
                 
-                fallback_success = False
-                fallback_list_local = locals().get("fallback_list", [])
-                if fallback_list_local:
-                    for fb_params in fallback_list_local:
-                        logger.info(f"🔄 手动 Fallback 重试: {fb_params.get('model')}")
-                        try:
-                            # 为防止嵌套 fallback，移除内部的 fallbacks 键
-                            fb_p = copy.deepcopy(fb_params)
-                            fb_p.pop("fallbacks", None)
-                            fb_response, fb_response_time, fb_result = _try_single_params(fb_p)
-                            if fb_result:
-                                response = fb_response
-                                response_time = fb_response_time
-                                result = fb_result
-                                fallback_success = True
-                                break
-                            else:
-                                logger.warning(f"⚠️ Fallback 模型 {fb_params.get('model')} 同样返回空内容")
-                        except Exception as e:
-                            logger.warning(f"⚠️ Fallback 模型 {fb_params.get('model')} 调用失败: {e}")
-                            continue
-                            
-                if not fallback_success:
-                    self.last_used_model = self._resolve_actual_model(response, model_config)
-                    error_msg = (
-                        f"LLM 返回空响应/失败内容且所有 Fallback 均失效 "
-                        f"[实际模型: {self.last_used_model}]"
-                    )
-                    self._record_cache_diagnostics(
-                        plugin_name=plugin_name,
-                        call_type=call_type,
-                        model_id=primary_model_id,
-                        actual_model=self.last_used_model,
-                        messages=messages,
-                        response_time=response_time,
-                        token_usage=self._extract_token_usage(response),
-                        success=False,
-                        error=error_msg,
-                    )
-                    raise ValueError(
-                        error_msg
-                    )
+                fallback_result = _attempt_managed_fallbacks(fallback_entries)
+                if fallback_result is not None:
+                    return fallback_result
+
+                self.last_used_model = self._resolve_actual_model(response, model_config)
+                error_msg = (
+                    f"LLM 返回空响应/失败内容且所有 Fallback 均失效 "
+                    f"[实际模型: {self.last_used_model}]"
+                )
+                self._record_cache_diagnostics(
+                    plugin_name=plugin_name,
+                    call_type=call_type,
+                    model_id=primary_model_id,
+                    actual_model=self.last_used_model,
+                    messages=messages,
+                    response_time=response_time,
+                    token_usage=self._extract_token_usage(response),
+                    success=False,
+                    error=error_msg,
+                )
+                raise ValueError(error_msg)
 
             # 记录实际使用的模型名（fallback 时 resp.model 是真正生效的模型）
             self.last_used_model = self._resolve_actual_model(response, model_config)

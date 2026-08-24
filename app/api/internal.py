@@ -152,7 +152,10 @@ async def receive_wechat_message(
         event_type = EventType.PERSONAL_CARD_MESSAGE_RECEIVED
     elif message.mtype == 'note':
         event_type = EventType.NOTE_MESSAGE_RECEIVED
-    elif message.mtype == 'other':
+    elif message.mtype in {'other', 'miniapp', 'official', 'time', 'system'}:
+        # wxautox4 的公开类型集合比业务事件集合更细。当前没有这些类型的
+        # 专用插件事件，显式归一化为 OTHER，避免把“已识别但暂无专用消费者”误报为
+        # 未知类型；原始 message_type 仍保留在 event.data 中供后续升级使用。
         event_type = EventType.OTHER_MESSAGE_RECEIVED
     else:
         # 对于未知类型，发布通用OTHER事件而不是默认为TEXT

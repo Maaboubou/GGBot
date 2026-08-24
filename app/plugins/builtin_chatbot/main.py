@@ -40,6 +40,52 @@ from app.utils.plugin_config import get_config
 logger = logging.getLogger(__name__)
 
 
+_FOLLOWUP_POSITIVE_RELATIONS = frozenset(
+    {
+        "answer",
+        "requested_update",
+        "followup_question",
+        "correction",
+        "clarification",
+        "elaboration",
+    }
+)
+_FOLLOWUP_NEGATIVE_RELATIONS = frozenset(
+    {
+        "new_topic",
+        "side_chat",
+        "acknowledgement",
+        "reaction",
+        "already_answered",
+        "unclear",
+    }
+)
+_FOLLOWUP_RELATION_ALIASES = {
+    "direct_answer": "answer",
+    "response": "answer",
+    "回答": "answer",
+    "补充回答": "answer",
+    "status_update": "requested_update",
+    "result_update": "requested_update",
+    "信息反馈": "requested_update",
+    "结果反馈": "requested_update",
+    "状态更新": "requested_update",
+    "question": "followup_question",
+    "追问": "followup_question",
+    "纠正": "correction",
+    "澄清": "clarification",
+    "补充": "elaboration",
+    "unrelated": "side_chat",
+    "other": "side_chat",
+    "旁聊": "side_chat",
+    "新话题": "new_topic",
+    "致谢": "acknowledgement",
+    "附和": "acknowledgement",
+    "表情": "reaction",
+    "不明确": "unclear",
+}
+
+
 class ChatBotPlugin:
     """ChatBot 插件主类"""
 
@@ -704,8 +750,13 @@ class ChatBotPlugin:
             if automatic
             else 0
         )
+        anchor_sender = str(event.data.get("sender") or "")
+        anchor_content = self._build_quote_augmented_content(
+            str(event.data.get("message") or ""),
+            str(event.data.get("quote_content") or ""),
+        )
         context_before = []
-        for message in (context_messages or [])[-2:]:
+        for message in (context_messages or [])[-6:]:
             context_before.append(
                 {
                     "sender": str(message.get("sender") or ""),
@@ -727,6 +778,11 @@ class ChatBotPlugin:
                 "role_name": role_name,
                 "reply_text": reply_text,
                 "context_before": context_before,
+                "anchor_message": {
+                    "sender": anchor_sender,
+                    "content": anchor_content,
+                    "time": str(event.data.get("time") or ""),
+                },
                 "window_seconds": config["window_seconds"],
                 "merge_seconds": config["merge_seconds"],
                 "max_turns": config["max_turns"],
@@ -919,6 +975,7 @@ class ChatBotPlugin:
                 "snapshot_sequence": snapshot_sequence,
                 "role_name": str(session.get("role_name") or self.default_role),
                 "context_before": list(session.get("context_before") or []),
+                "anchor_message": dict(session.get("anchor_message") or {}),
                 "reply_text": str(session.get("reply_text") or ""),
                 "pending": pending,
                 "automatic_turns": int(session.get("automatic_turns") or 0),
@@ -944,15 +1001,19 @@ class ChatBotPlugin:
     ) -> None:
         should_reply = False
         reason = ""
+        relation = "unclear"
+        target_index = 0
         try:
             judge_text = self._build_followup_judge_text(snapshot)
             messages = [
                 {
                     "role": "system",
                     "content": (
-                        "你是群聊连续对话分类器，只判断最新一小段消息是否明确在继续和机器人对话。"
-                        "判断必须保守。只输出 JSON："
-                        '{"should_reply":true/false,"target_message_index":整数,"reason":"简短原因"}。'
+                        "你是群聊连续对话的对话行为分类器。判断机器人回复后的候选消息中，"
+                        "是否有消息在语义上承接当前人机话题。不要用是否有问号、是否再次@机器人，"
+                        "或是否为陈述句来代替语义判断。只输出 JSON："
+                        '{"relation":"分类","target_message_index":整数,'
+                        '"reason":"简短原因"}。是否回复由 relation 唯一确定，不要另设决定字段。'
                     ),
                 },
                 {"role": "user", "content": judge_text},
@@ -965,15 +1026,17 @@ class ChatBotPlugin:
                 _wxautox_role_name=str(snapshot.get("role_name") or ""),
             )
             parsed = self._extract_first_json_object(raw)
-            should_reply = bool(
-                isinstance(parsed, dict)
-                and self._normalize_judge_result(parsed)["should_reply"]
-            )
-            reason = (
-                str(parsed.get("reason") or "")
-                if isinstance(parsed, dict)
-                else "invalid_json"
-            )
+            if isinstance(parsed, dict):
+                decision = self._normalize_followup_judge_result(
+                    parsed,
+                    pending_count=len(snapshot.get("pending") or []),
+                )
+                should_reply = decision["should_reply"]
+                target_index = decision["target_message_index"]
+                relation = decision["relation"]
+                reason = decision["reason"]
+            else:
+                reason = "invalid_json"
         except Exception as exc:
             reason = f"judge_error: {exc}"
             logger.warning("🔗 Follow-up Judge failed for %s: %s", chat_name, exc)
@@ -983,6 +1046,8 @@ class ChatBotPlugin:
             {
                 "should_reply": should_reply,
                 "reason": reason,
+                "relation": relation,
+                "target_message_index": target_index,
                 "atmosphere": "续聊判定",
                 "role_name": str(snapshot.get("role_name") or ""),
                 "judge_name": "followup_judge",
@@ -1009,7 +1074,7 @@ class ChatBotPlugin:
                         and not self._ingress_mentions_bot(chat_name, ingress)
                     )
                     if should_reply and is_current and snapshot.get("pending"):
-                        target = snapshot["pending"][-1]
+                        target = snapshot["pending"][target_index - 1]
                         event_data = dict(target.get("event_data") or {})
                         event_data.update(
                             {
@@ -1017,6 +1082,7 @@ class ChatBotPlugin:
                                 "_followup_anchor_id": snapshot["anchor_id"],
                                 "_followup_snapshot_seq": snapshot["snapshot_sequence"],
                                 "_followup_auto_turns": snapshot["automatic_turns"],
+                                "_followup_relation": relation,
                             }
                         )
                         approved_event = Event(
@@ -1033,41 +1099,118 @@ class ChatBotPlugin:
                 self.event_bus.publish(approved_event)
 
     def _build_followup_judge_text(self, snapshot: Dict[str, Any]) -> str:
+        def clipped(value: Any, token_budget: int) -> str:
+            return self.context_manager.truncate_text_to_budget(
+                str(value or ""),
+                token_budget,
+                notice="该消息过长，已截断",
+            )
+
         lines = [
             f"机器人名称：{self.bot_name}",
             f"角色：{snapshot.get('role_name') or self.default_role}",
             "",
-            "机器人回复前的少量上下文：",
+            "当前话题更早的少量上下文（只用于消歧）：",
         ]
         for message in snapshot.get("context_before") or []:
             lines.append(
-                f"[{message.get('sender') or '未知'}] {message.get('content') or ''}"
+                f"[{message.get('sender') or '未知'}] "
+                f"{clipped(message.get('content'), 80)}"
             )
+        anchor_message = snapshot.get("anchor_message") or {}
         lines.extend(
             [
                 "",
+                "直接触发机器人本轮回复的消息：",
+                f"[{anchor_message.get('sender') or '未知'}] "
+                f"{clipped(anchor_message.get('content'), 220)}",
+                "",
                 "机器人刚刚的回复：",
-                f"[{self.bot_name}] {snapshot.get('reply_text') or ''}",
+                f"[{self.bot_name}] {clipped(snapshot.get('reply_text'), 360)}",
                 "",
                 "回复后收到的新消息：",
             ]
         )
         for index, message in enumerate(snapshot.get("pending") or [], start=1):
             lines.append(
-                f"{index}. [{message.get('sender') or '未知'}] {message.get('content') or ''}"
+                f"{index}. [{message.get('sender') or '未知'}] "
+                f"{clipped(message.get('content'), 120)}"
             )
         lines.extend(
             [
                 "",
-                "仅当最后一条消息或最后一组紧密相关消息明显是在追问、回答、纠正或继续回应机器人时才回复。",
-                "群友之间聊天、新话题、礼貌致谢、简单附和、表情、信息不明确，或已经有人充分回答时不回复。",
+                "逐条判断候选消息与上述当前话题的关系，不要假定相邻消息都属于同一话题。",
+                "以下关系算承接，应回复：answer（回答机器人）、requested_update（给出机器人刚要求或建议核实的结果/状态）、",
+                "followup_question（继续追问）、correction（纠正）、clarification（澄清）、elaboration（补充实质信息）。",
+                "直接回答、报告测量/尝试结果、补充机器人分析所需条件，即使是陈述句、没有问号、没有@，也属于承接；",
+                "原提问者继续补充是强线索但不是硬条件，其他群友也可能直接回答机器人。",
+                "中间夹入无关消息不会自动切断当前话题。分别判断每条候选消息；若有多条承接，选择序号最大的那条。",
+                "以下关系不回复：new_topic（新话题）、side_chat（群友旁聊或引用别处话题）、acknowledgement（纯致谢/附和）、",
+                "reaction（表情或纯情绪）、already_answered（群友已充分回答用户且没有留给机器人处理的内容）、unclear（确实无法判定）。",
+                "群友回答机器人的问题或请求不属于 already_answered。",
+                "relation 必须从上述分类中选一个。若存在承接消息，relation 填该消息的关系，target_message_index 填其序号；",
+                "若不存在，relation 填一种不回复关系，target_message_index 填 0。",
             ]
         )
         return self.context_manager.truncate_text_to_budget(
             "\n".join(lines),
-            1800,
+            3000,
             notice="续聊判定上下文达到预算上限",
         )
+
+    def _normalize_followup_judge_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        pending_count: int,
+    ) -> Dict[str, Any]:
+        """Normalize follow-up dialogue acts and make the decision internally consistent."""
+        normalized = self._normalize_judge_result(result)
+        raw_relation = str(
+            result.get("relation")
+            or result.get("dialogue_act")
+            or result.get("message_relation")
+            or ""
+        ).strip().lower()
+        relation = _FOLLOWUP_RELATION_ALIASES.get(raw_relation, raw_relation)
+
+        if relation in _FOLLOWUP_POSITIVE_RELATIONS:
+            should_reply = True
+        elif relation in _FOLLOWUP_NEGATIVE_RELATIONS:
+            should_reply = False
+        else:
+            # Backwards-compatible fallback for a provider that omits the new
+            # relation field. New prompts always request a controlled value.
+            relation = "unclear"
+            should_reply = bool(normalized["should_reply"])
+
+        raw_target = result.get(
+            "target_message_index",
+            result.get("target_index", result.get("message_index", 0)),
+        )
+        try:
+            target_index = int(raw_target)
+        except (TypeError, ValueError):
+            target_index = 0
+
+        pending_count = max(0, int(pending_count or 0))
+        if should_reply:
+            if not 1 <= target_index <= pending_count:
+                # A single candidate is unambiguous. With interleaved messages,
+                # never guess which event should own the generated reply.
+                target_index = 1 if pending_count == 1 else 0
+            if target_index == 0:
+                should_reply = False
+                relation = "unclear"
+        else:
+            target_index = 0
+
+        return {
+            "should_reply": should_reply,
+            "target_message_index": target_index,
+            "relation": relation,
+            "reason": str(normalized["reason"]),
+        }
 
     def _followup_approval_is_current(self, event: Event) -> bool:
         chat_name = str(event.data.get("chat_name") or "")

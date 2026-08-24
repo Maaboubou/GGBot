@@ -128,6 +128,9 @@ LISTENER_ADD_RETRY_DELAY_SEC = 1.0
 LISTENER_ADD_VERIFY_ATTEMPTS = 5
 LISTENER_ADD_VERIFY_DELAY_SEC = 0.3
 LISTENER_ZOMBIE_FAILURE_THRESHOLD = 2
+# 主会话和 listener callback 来自不同线程。第一次看到时间差只记录候选，
+# 至少两个独立 watchdog 周期仍无法由 callback/outbound/dispatcher 解释时才重建。
+LISTENER_SESSION_CONFIRMATION_PROBES = 2
 # 单个监听窗口恢复失败时只做退避，避免每 20 秒重复抢 UI 并刷屏。
 # 某个聊天的窗口/UIA 异常不代表微信连接失效，不能因此重启全部正常监听。
 LISTENER_RECOVERY_MIN_COOLDOWN_SEC = 60
@@ -806,22 +809,206 @@ def _message_preview(content, limit: int = 120) -> str:
     return text[:limit] + "..."
 
 
-def _record_listener_callback_activity(chat_name: str, msg, content_str: str) -> None:
+def _listener_normalized_text(value) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _listener_session_candidate_parts(preview) -> tuple[str, str, str]:
+    raw = _listener_normalized_text(preview)
+    raw = re.sub(r"^\[\d+[^\]]{1,4}\]\s*", "", raw, count=1)
+    raw = re.sub(r"^\[(?:有人@我|有人@你|@我)\]\s*", "", raw, count=1)
+    match = re.match(r"^([^:：\r\n]{1,80})[:：]\s*(.+)$", raw)
+    if match is None:
+        return "", raw, raw
+    sender = _listener_normalized_text(match.group(1))
+    if not sender or sender.lower() in {"http", "https"}:
+        return "", raw, raw
+    return sender, _listener_normalized_text(match.group(2)), raw
+
+
+def _listener_session_candidate_key(session_gap: dict) -> str:
+    """Build a stable identity so one stale session row cannot rebuild forever."""
+    payload = {
+        "session_time": _listener_normalized_text(session_gap.get("session_time")),
+        "session_at": session_gap.get("session_at"),
+        "content_preview": _listener_normalized_text(
+            session_gap.get("content_preview")
+        ),
+        "new_count": int(session_gap.get("new_count", 0) or 0),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
+
+
+def _listener_semantic_text_matches(left, right) -> bool:
+    left_text = _listener_normalized_text(left)
+    right_text = _listener_normalized_text(right)
+    if not left_text or not right_text:
+        return False
+
+    def canonical(value: str) -> str:
+        return re.sub(r"^(\[[^\]]{1,12}\])\s*", r"\1", value, count=1)
+
+    left_text = canonical(left_text)
+    right_text = canonical(right_text)
+    if left_text == right_text:
+        return True
+    for shorter, longer in ((left_text, right_text), (right_text, left_text)):
+        truncated = shorter
+        if truncated.endswith("…"):
+            truncated = truncated[:-1].rstrip()
+        elif truncated.endswith("..."):
+            truncated = truncated[:-3].rstrip()
+        if truncated != shorter and len(truncated) >= 8 and longer.startswith(truncated):
+            return True
+        if len(shorter) < 4 or not longer.startswith(shorter):
+            continue
+        if len(longer) == len(shorter) or longer[len(shorter)].isspace():
+            return True
+    return False
+
+
+def _listener_candidate_kind_matches(candidate_content, activity_kind) -> bool:
+    normalized = _listener_normalized_text(candidate_content)
+    marker_types = {
+        "[图片]": "image",
+        "[视频]": "video",
+        "[文件]": "file",
+        "[语音]": "voice",
+        "[链接]": "link",
+        "[位置]": "location",
+        "[合并转发]": "merge",
+        "[小程序]": "miniapp",
+    }
+    expected = next(
+        (kind for marker, kind in marker_types.items() if normalized.startswith(marker)),
+        "",
+    )
+    return not expected or _listener_normalized_text(activity_kind).lower() == expected
+
+
+def _listener_event_matches_session_preview(
+    preview,
+    sender,
+    kind,
+    content,
+    *,
+    outbound: bool = False,
+) -> bool:
+    candidate_sender, candidate_content, raw = _listener_session_candidate_parts(
+        preview
+    )
+    if not candidate_content or not _listener_candidate_kind_matches(
+        candidate_content,
+        kind,
+    ):
+        return False
+    activity_sender = _listener_normalized_text(sender)
+    if candidate_sender:
+        if outbound:
+            if candidate_sender not in {"你", "我", "self"}:
+                return False
+        elif activity_sender == candidate_sender and _listener_semantic_text_matches(
+            candidate_content,
+            content,
+        ):
+            return True
+    return _listener_semantic_text_matches(raw, content)
+
+
+def _listener_meta_activity_matches_candidate(
+    meta: dict,
+    prefix: str,
+    candidate_preview,
+    candidate_activity_at: float,
+) -> bool:
+    try:
+        activity_at = float(meta.get(f"last_{prefix}_at", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if activity_at <= candidate_activity_at + 0.001:
+        return False
+    if prefix == "callback":
+        return _listener_event_matches_session_preview(
+            candidate_preview,
+            meta.get("last_callback_sender"),
+            meta.get("last_callback_type"),
+            meta.get("last_callback_preview"),
+        )
+    if prefix == "outbound":
+        return _listener_event_matches_session_preview(
+            candidate_preview,
+            "self",
+            meta.get("last_outbound_type"),
+            meta.get("last_outbound_preview"),
+            outbound=True,
+        )
+    return False
+
+
+def _record_listener_callback_activity(chat_name: str, msg, content_str: str) -> bool:
     if not chat_name:
-        return
+        return False
 
     now = time.time()
+    recovery_replay = False
     with desired_listeners_lock:
         meta = desired_listeners.get(chat_name)
         if meta is None:
-            return
+            return False
         meta["last_callback_at"] = now
         meta["last_callback_sender"] = str(getattr(msg, "sender", "") or "")
         meta["last_callback_type"] = str(getattr(msg, "type", "") or "")
         meta["last_callback_message_id"] = str(getattr(msg, "id", "") or "")
         meta["last_callback_preview"] = _message_preview(content_str)
         meta["last_callback_stage"] = "received"
-        meta["session_callback_gap"] = False
+        matches_pending_gap = bool(
+            meta.get("session_callback_gap")
+            and int(meta.get("session_gap_confirmation_count", 0) or 0) > 0
+            and _listener_event_matches_session_preview(
+                meta.get("session_gap_candidate_preview"),
+                getattr(msg, "sender", ""),
+                getattr(msg, "type", ""),
+                content_str,
+            )
+        )
+        if matches_pending_gap:
+            recovery_status = str(meta.get("recovery_status") or "")
+            if recovery_status in {"rebuilding", "awaiting_replay", "replaying"}:
+                recovery_replay = True
+                meta["recovery_status"] = "replaying"
+                meta["recovery_replayed_count"] = int(
+                    meta.get("recovery_replayed_count", 0) or 0
+                ) + 1
+                meta["last_recovery_replayed_at"] = now
+                meta["last_recovery_replayed_message_id"] = str(
+                    getattr(msg, "id", "") or ""
+                )
+                meta["last_recovery_replayed_sender"] = str(
+                    getattr(msg, "sender", "") or ""
+                )
+                meta["last_recovery_replayed_type"] = str(
+                    getattr(msg, "type", "") or ""
+                )
+                meta["last_recovery_replayed_preview"] = _message_preview(content_str)
+            elif recovery_status == "detected":
+                # 只有同一候选的晚到回调才能取消已确认的重建。
+                meta["recovery_status"] = "completed"
+                meta["recovery_completed_at"] = now
+                meta["recovery_completed_reason"] = "callback_before_rebuild"
+            _clear_listener_session_gap_state_locked(
+                chat_name,
+                meta,
+                now,
+                "matching_listener_callback_activity",
+            )
+    return recovery_replay
 
 
 def _record_listener_outbound_activity(chat_name: str, kind: str, content="") -> None:
@@ -837,7 +1024,28 @@ def _record_listener_outbound_activity(chat_name: str, kind: str, content="") ->
         meta["last_outbound_at"] = now
         meta["last_outbound_type"] = str(kind or "")
         meta["last_outbound_preview"] = _message_preview(content)
-        meta["session_callback_gap"] = False
+        matches_pending_gap = bool(
+            meta.get("session_callback_gap")
+            and int(meta.get("session_gap_confirmation_count", 0) or 0) > 0
+            and _listener_event_matches_session_preview(
+                meta.get("session_gap_candidate_preview"),
+                "self",
+                kind,
+                content,
+                outbound=True,
+            )
+        )
+        if matches_pending_gap:
+            if meta.get("recovery_status") == "detected":
+                meta["recovery_status"] = "completed"
+                meta["recovery_completed_at"] = now
+                meta["recovery_completed_reason"] = "outbound_before_rebuild"
+            _clear_listener_session_gap_state_locked(
+                chat_name,
+                meta,
+                now,
+                "matching_listener_outbound_activity",
+            )
 
 
 def _record_listener_dropped_message(chat_name: str, reason: str, msg, content_str: str) -> None:
@@ -873,6 +1081,8 @@ def _record_listener_forwarded_message(chat_name: str, msg, content_str: str) ->
         meta["last_forwarded_message_id"] = str(getattr(msg, "id", "") or "")
         meta["last_forwarded_preview"] = _message_preview(content_str)
         meta["last_callback_stage"] = "forwarded"
+        if meta.get("recovery_status") == "replaying":
+            meta["recovery_forwarded_count"] = int(meta.get("recovery_forwarded_count", 0) or 0) + 1
 
 
 def _listener_callback_state(meta: dict, now: float) -> str:
@@ -921,6 +1131,231 @@ def _listener_activity_reference_at(meta: dict) -> float:
         float(meta.get("last_callback_at", 0.0) or 0.0),
         float(meta.get("last_outbound_at", 0.0) or 0.0),
     )
+
+
+def _clear_listener_session_gap_state_locked(
+    who: str,
+    meta: dict,
+    now: float,
+    reason: str,
+) -> None:
+    """Clear only session-gap state. Caller must hold desired_listeners_lock."""
+    was_session_health_failure = (
+        str(meta.get("last_error") or "")
+        == "listener_health:main_session_advanced_without_callback"
+    )
+    meta["session_callback_gap"] = False
+    meta["session_callback_gap_sec"] = 0.0
+    meta["session_gap_confirmation_count"] = 0
+    meta["session_gap_candidate_activity_at"] = 0.0
+    meta["session_gap_candidate_first_seen_at"] = 0.0
+    meta["session_gap_candidate_last_seen_at"] = 0.0
+    meta["session_gap_candidate_session_at"] = None
+    meta["session_gap_candidate_session_time"] = None
+    meta["session_gap_candidate_preview"] = None
+    meta["session_gap_candidate_new_count"] = 0
+    meta["session_gap_candidate_is_new"] = False
+    meta["session_gap_candidate_checked_at"] = 0.0
+    meta["session_gap_candidate_key"] = None
+    meta["last_session_gap_reconciled_at"] = now
+    meta["last_session_gap_reconciled_reason"] = reason
+    if was_session_health_failure:
+        listener_health_failures.pop(who, None)
+        meta["active"] = True
+        meta["status"] = "active"
+        meta["last_error"] = None
+        meta["health_failure_count"] = 0
+
+
+def _record_listener_session_gap_candidate(
+    who: str,
+    session_gap: dict,
+    health: dict,
+) -> dict:
+    """Reconcile one oldest unresolved session candidate by exact identity."""
+    now = time.time()
+    with desired_listeners_lock:
+        meta = desired_listeners.get(who)
+        if meta is None:
+            return {"state": "ignored", "reason": "listener_removed"}
+
+        previous_count = int(meta.get("session_gap_confirmation_count", 0) or 0)
+        candidate_gap = dict(session_gap)
+        if previous_count > 0 and meta.get("session_gap_candidate_preview"):
+            candidate_gap.update(
+                {
+                    "session_time": meta.get("session_gap_candidate_session_time"),
+                    "session_at": meta.get("session_gap_candidate_session_at"),
+                    "content_preview": meta.get("session_gap_candidate_preview"),
+                    "new_count": meta.get("session_gap_candidate_new_count", 0),
+                    "is_new": meta.get("session_gap_candidate_is_new", False),
+                    "listener_activity_at": meta.get(
+                        "session_gap_candidate_activity_at", 0.0
+                    ),
+                    "gap_sec": meta.get("session_callback_gap_sec", 0.0),
+                    "checked_at": meta.get("session_gap_candidate_checked_at", 0.0),
+                    "advanced_without_listener_activity": True,
+                }
+            )
+        try:
+            initial_activity_at = float(
+                candidate_gap.get("listener_activity_at", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            initial_activity_at = 0.0
+        try:
+            session_at = float(candidate_gap.get("session_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            session_at = 0.0
+        candidate_preview = candidate_gap.get("content_preview")
+        candidate_key = _listener_session_candidate_key(candidate_gap)
+
+        resolution = ""
+        if _listener_meta_activity_matches_candidate(
+            meta,
+            "callback",
+            candidate_preview,
+            initial_activity_at,
+        ):
+            resolution = "matching_listener_callback"
+        elif _listener_meta_activity_matches_candidate(
+            meta,
+            "outbound",
+            candidate_preview,
+            initial_activity_at,
+        ):
+            resolution = "matching_listener_outbound"
+        if resolution:
+            if meta.get("recovery_status") == "detected":
+                meta["recovery_status"] = "completed"
+                meta["recovery_completed_at"] = now
+                meta["recovery_completed_reason"] = f"{resolution}_before_rebuild"
+            _clear_listener_session_gap_state_locked(who, meta, now, resolution)
+            resolved_health = dict(health)
+            resolved_health["healthy"] = True
+            resolved_health["reason"] = resolution
+            resolved_health["main_session"] = dict(candidate_gap)
+            last_listener_health_snapshot[who] = resolved_health
+            return {"state": "resolved", "reason": resolution, "failures": 0}
+
+        recovery_status = str(meta.get("recovery_status") or "")
+        if (
+            candidate_key
+            and candidate_key == meta.get("recovery_candidate_key")
+            and recovery_status
+            in {"rebuilding", "awaiting_replay", "failed", "circuit_open"}
+        ):
+            # A rebuild attempt owns this exact main-session row. Re-detecting the
+            # unchanged row must never turn awaiting/failed recovery back into a
+            # fresh destructive rebuild generation.
+            suppressed_health = dict(health)
+            suppressed_health["healthy"] = recovery_status == "awaiting_replay"
+            suppressed_health["reason"] = f"recovery_{recovery_status}"
+            suppressed_health["main_session"] = dict(candidate_gap)
+            last_listener_health_snapshot[who] = suppressed_health
+            return {
+                "state": "suppressed",
+                "reason": f"same_candidate_{recovery_status}",
+                "failures": 0,
+            }
+
+        confirmations = previous_count + 1 if previous_count > 0 else 1
+
+        meta["session_callback_gap"] = True
+        meta["session_callback_gap_sec"] = candidate_gap.get("gap_sec", 0.0)
+        meta["session_gap_confirmation_count"] = confirmations
+        meta["session_gap_candidate_last_seen_at"] = now
+        if confirmations == 1:
+            meta["session_gap_candidate_first_seen_at"] = now
+            meta["session_gap_candidate_activity_at"] = initial_activity_at
+            meta["session_gap_candidate_session_at"] = session_at or None
+            meta["session_gap_candidate_session_time"] = candidate_gap.get(
+                "session_time"
+            )
+            meta["session_gap_candidate_preview"] = candidate_preview
+            meta["session_gap_candidate_new_count"] = candidate_gap.get("new_count", 0)
+            meta["session_gap_candidate_is_new"] = candidate_gap.get("is_new", False)
+            meta["session_gap_candidate_checked_at"] = candidate_gap.get(
+                "checked_at", 0.0
+            )
+            meta["session_gap_candidate_key"] = candidate_key
+
+        if confirmations < LISTENER_SESSION_CONFIRMATION_PROBES:
+            pending_health = dict(health)
+            pending_health["healthy"] = True
+            pending_health["reason"] = "main_session_callback_pending_confirmation"
+            pending_health["main_session"] = dict(candidate_gap)
+            last_listener_health_snapshot[who] = pending_health
+            return {
+                "state": "pending",
+                "reason": "awaiting_independent_confirmation",
+                "failures": 0,
+                "confirmations": confirmations,
+            }
+
+        failures = LISTENER_ZOMBIE_FAILURE_THRESHOLD
+        listener_health_failures[who] = failures
+        confirmed_health = dict(health)
+        confirmed_health["healthy"] = False
+        confirmed_health["reason"] = "main_session_advanced_without_callback"
+        confirmed_health["main_session"] = dict(candidate_gap)
+        last_listener_health_snapshot[who] = confirmed_health
+        meta["active"] = False
+        meta["status"] = "zombie"
+        meta["last_error"] = "listener_health:main_session_advanced_without_callback"
+        meta["last_health_failed_at"] = now
+        meta["health_failure_count"] = failures
+        if meta.get("recovery_status") != "detected":
+            meta["recovery_generation"] = int(meta.get("recovery_generation", 0) or 0) + 1
+            meta["recovery_status"] = "detected"
+            meta["recovery_rebuild_attempts"] = 0
+            meta["recovery_detected_at"] = now
+            meta["recovery_candidate_key"] = candidate_key
+            meta["recovery_session_at"] = session_at or None
+            meta["recovery_session_time"] = candidate_gap.get("session_time")
+            meta["recovery_session_preview"] = candidate_preview
+            meta["recovery_session_new_count"] = candidate_gap.get("new_count", 0)
+            meta["recovery_anchor_message_id"] = meta.get("last_forwarded_message_id")
+            meta["recovery_anchor_preview"] = meta.get("last_forwarded_preview")
+            meta["recovery_replayed_count"] = 0
+            meta["recovery_forwarded_count"] = 0
+        return {
+            "state": "confirmed",
+            "reason": "persistent_unexplained_session_progress",
+            "failures": failures,
+            "confirmations": confirmations,
+        }
+
+
+def _listener_session_rebuild_still_required_locked(meta: dict | None) -> bool:
+    """Evaluate rebuild evidence while the caller owns desired_listeners_lock."""
+    if meta is None:
+        return False
+    if meta.get("recovery_status") == "circuit_open":
+        return False
+    if (
+        str(meta.get("last_error") or "")
+        != "listener_health:main_session_advanced_without_callback"
+    ):
+        return bool(
+            meta.get("status") == "zombie"
+            and int(meta.get("health_failure_count", 0) or 0)
+            >= LISTENER_ZOMBIE_FAILURE_THRESHOLD
+        )
+    return bool(
+        meta.get("session_callback_gap")
+        and meta.get("recovery_status") == "detected"
+        and int(meta.get("session_gap_confirmation_count", 0) or 0)
+        >= LISTENER_SESSION_CONFIRMATION_PROBES
+    )
+
+
+def _listener_session_rebuild_still_required(who: str) -> bool:
+    """Lock-coordinated read-only preflight for watchdog diagnostics."""
+    with desired_listeners_lock:
+        return _listener_session_rebuild_still_required_locked(
+            desired_listeners.get(who)
+        )
 
 
 def _probe_main_session_listener_gaps(expected: list[str]) -> dict[str, dict]:
@@ -995,13 +1430,45 @@ def _probe_main_session_listener_gaps(expected: list[str]) -> dict[str, dict]:
             "checked_at": observed_at,
         }
         snapshot[name] = row
-        if advanced_without_activity:
+        listener_meta = meta_snapshot.get(name, {})
+        pending_candidate = bool(
+            listener_meta.get("session_callback_gap")
+            and int(listener_meta.get("session_gap_confirmation_count", 0) or 0) > 0
+            and listener_meta.get("session_gap_candidate_preview")
+        )
+        if pending_candidate:
+            gaps[name] = {
+                "name": name,
+                "session_time": listener_meta.get(
+                    "session_gap_candidate_session_time"
+                ),
+                "session_at": listener_meta.get("session_gap_candidate_session_at"),
+                "content_preview": listener_meta.get(
+                    "session_gap_candidate_preview"
+                ),
+                "new_count": listener_meta.get(
+                    "session_gap_candidate_new_count", 0
+                ),
+                "is_new": listener_meta.get("session_gap_candidate_is_new", False),
+                "listener_activity_at": listener_meta.get(
+                    "session_gap_candidate_activity_at"
+                ),
+                "gap_sec": listener_meta.get("session_callback_gap_sec", 0.0),
+                "advanced_without_listener_activity": True,
+                "checked_at": listener_meta.get(
+                    "session_gap_candidate_checked_at", observed_at
+                ),
+                "current_session_checked_at": observed_at,
+                "oldest_unresolved_candidate": True,
+            }
+        elif advanced_without_activity:
             gaps[name] = row
 
     last_listener_session_snapshot = snapshot
     last_listener_session_probe_at = observed_at
     last_listener_session_probe_error = ""
 
+    completed_recoveries = []
     with desired_listeners_lock:
         for name, row in snapshot.items():
             meta = desired_listeners.get(name)
@@ -1013,8 +1480,43 @@ def _probe_main_session_listener_gaps(expected: list[str]) -> dict[str, dict]:
             meta["last_main_session_time"] = row.get("session_time")
             meta["last_main_session_preview"] = row.get("content_preview")
             meta["last_main_session_new_count"] = row.get("new_count", 0)
-            meta["session_callback_gap"] = bool(row.get("advanced_without_listener_activity"))
-            meta["session_callback_gap_sec"] = row.get("gap_sec", 0.0)
+            pending_candidate = bool(
+                meta.get("session_callback_gap")
+                and int(meta.get("session_gap_confirmation_count", 0) or 0) > 0
+                and meta.get("session_gap_candidate_preview")
+            )
+            if row.get("advanced_without_listener_activity"):
+                meta["session_callback_gap"] = True
+                meta["session_callback_gap_sec"] = row.get("gap_sec", 0.0)
+            elif not pending_candidate:
+                _clear_listener_session_gap_state_locked(
+                    name,
+                    meta,
+                    observed_at,
+                    "main_session_gap_closed",
+                )
+            if (
+                not row.get("advanced_without_listener_activity")
+                and not pending_candidate
+                and meta.get("recovery_status") in {"detected", "awaiting_replay", "replaying"}
+            ):
+                meta["recovery_status"] = "completed"
+                meta["recovery_completed_at"] = observed_at
+                completed_recoveries.append(
+                    (
+                        name,
+                        int(meta.get("recovery_replayed_count", 0) or 0),
+                        int(meta.get("recovery_forwarded_count", 0) or 0),
+                    )
+                )
+
+    for name, replayed, forwarded in completed_recoveries:
+        logger.info(
+            "✅ 假活恢复补扫已收敛: who=%s replayed=%s forwarded=%s",
+            name,
+            replayed,
+            forwarded,
+        )
 
     return gaps
 
@@ -1422,10 +1924,17 @@ def _record_listener_health(who: str, health: dict) -> int:
         listener_health_failures.pop(who, None)
         with desired_listeners_lock:
             meta = desired_listeners.get(who)
-            if meta and meta.get("status") in ("suspect", "zombie"):
-                meta["status"] = "active"
-                meta["active"] = True
-                meta["last_error"] = None
+            if meta:
+                if meta.get("status") in ("suspect", "zombie") or meta.get(
+                    "recovery_status"
+                ) == "circuit_open":
+                    meta["status"] = "active"
+                    meta["active"] = True
+                    meta["last_error"] = None
+                if meta.get("recovery_status") == "circuit_open":
+                    meta["recovery_status"] = "completed"
+                    meta["recovery_completed_at"] = time.time()
+                    meta["recovery_completed_reason"] = "health_probe_recovered"
         return 0
 
     failures = _listener_health_failure_count(who) + 1
@@ -1459,12 +1968,35 @@ def _find_zombie_listener_windows(expected: list[str]) -> list[str]:
                     "name": who,
                     "checked_at": time.time(),
                 }
-            health["healthy"] = False
-            health["reason"] = "main_session_advanced_without_callback"
-            health["main_session"] = dict(session_gap)
-            failures = _record_listener_health(who, health)
+            health["window_reason"] = health.get("window_reason") or health.get("reason")
+            decision = _record_listener_session_gap_candidate(
+                who,
+                session_gap,
+                health,
+            )
+            state = decision.get("state")
+            if state in {"resolved", "ignored", "suppressed"}:
+                logger.debug(
+                    "主会话推进无需再次重建: who=%s reason=%s",
+                    who,
+                    decision.get("reason"),
+                )
+                continue
+            if state == "pending":
+                logger.info(
+                    "⏳ 主会话已推进，等待下一轮确认回调缺口: who=%s "
+                    "confirmations=%s/%s session_time=%s preview=%r",
+                    who,
+                    decision.get("confirmations"),
+                    LISTENER_SESSION_CONFIRMATION_PROBES,
+                    session_gap.get("session_time"),
+                    session_gap.get("content_preview"),
+                )
+                continue
+
+            failures = int(decision.get("failures", 0) or 0)
             logger.warning(
-                "⚠️ 主会话已推进但监听无回调: who=%s failures=%s/%s "
+                "⚠️ 主会话连续两轮推进但仍无回调证据: who=%s failures=%s/%s "
                 "session_time=%s gap_sec=%s new_count=%s preview=%r",
                 who,
                 failures,
@@ -1778,6 +2310,10 @@ def _mark_desired_listener_success(who: str, *, reactivated: bool = False) -> No
         meta["last_error"] = None
         meta["failure_count"] = 0
         meta["health_failure_count"] = 0
+        if meta.get("recovery_status") in {"failed", "circuit_open"}:
+            meta["recovery_status"] = "completed"
+            meta["recovery_completed_at"] = now
+            meta["recovery_completed_reason"] = "listener_activation_succeeded"
         if reactivated:
             meta["last_reactivated_at"] = now
             meta["reactivation_count"] = int(meta.get("reactivation_count", 0)) + 1
@@ -1859,7 +2395,10 @@ def _add_listen_chat_verified(who: str, *, reactivated: bool = False, force_new:
                 _mark_desired_listener_success(who, reactivated=reactivated)
                 return
 
-            _activate_wechat_main_window(f"add_listener:{who}")
+            if not _activate_wechat_main_window(f"add_listener:{who}"):
+                raise RuntimeError(
+                    f"未能确认微信主窗口位于前台，取消添加监听: {who}"
+                )
             native_error = None
             try:
                 # 正常增加和管理面板恢复始终优先走 wxautox4 原生接口。
@@ -1981,8 +2520,9 @@ def _recover_listeners_after_browser(
         )
 
         if not last_actual:
-            _reset_wx_listener_state("browser_recovery_all_missing")
-            _activate_wechat_main_window("browser_recovery_all_missing")
+            logger.warning(
+                "⚠️ 浏览器操作后所有监听均不可见；禁止自动清空全局监听状态，改为逐个定向恢复"
+            )
 
         for who in problems:
             try:
@@ -2117,18 +2657,85 @@ def _run_scheduled_listener_restart(expected: list[str]) -> list[str]:
         raise
 
 
-def _force_rebuild_listener(who: str, reason: str) -> None:
+def _force_rebuild_listener(who: str, reason: str) -> bool:
     """强制重建单个监听窗口，避免复用已经假活的子窗口。"""
+    with desired_listeners_lock:
+        meta = desired_listeners.get(who)
+        if reason == "watchdog_zombie" and not _listener_session_rebuild_still_required_locked(meta):
+            logger.info(
+                "✅ 原子重建闸门发现回调证据已收敛，取消监听窗口重建: who=%s",
+                who,
+            )
+            return False
+        if meta is not None:
+            meta["recovery_status"] = "rebuilding"
+            meta["recovery_rebuild_started_at"] = time.time()
+            meta["recovery_rebuild_reason"] = reason
+            meta["recovery_rebuild_attempts"] = int(meta.get("recovery_rebuild_attempts", 0) or 0) + 1
+
     logger.warning("⚠️ 准备强制重建监听窗口: who=%s reason=%s", who, reason)
-    _remove_listener_registration(who, reason)
-    _activate_wechat_main_window(f"force_rebuild_listener:{who}")
-    _add_listen_chat_verified(who, reactivated=False, force_new=True)
+
+    try:
+        rebuild_listen_chat = getattr(wx, "RebuildListenChat", None)
+        if callable(rebuild_listen_chat):
+            if not _activate_wechat_main_window(f"force_rebuild_listener:{who}"):
+                raise RuntimeError(
+                    f"未能确认微信主窗口位于前台，取消重建监听: {who}"
+                )
+            rebuild_listen_chat(who)
+            _ensure_wx_listener_loop_started(f"force_rebuild_listener:{who}")
+            logger.warning(
+                "♻️ 已保留监听游标重建窗口，将由正常回调链补投缺失尾部: who=%s",
+                who,
+            )
+        else:
+            logger.warning(
+                "⚠️ 当前微信驱动不支持保留游标重建，将使用旧式重建且无法保证补投: who=%s",
+                who,
+            )
+            # Destructive legacy fallback must prove the main window is controllable
+            # before removing a currently registered child window.
+            if not _activate_wechat_main_window(f"force_rebuild_listener:{who}"):
+                raise RuntimeError(
+                    f"未能确认微信主窗口位于前台，保留原监听窗口: {who}"
+                )
+            _remove_listener_registration(who, reason)
+            _add_listen_chat_verified(who, reactivated=False, force_new=True)
+    except Exception as e:
+        with desired_listeners_lock:
+            meta = desired_listeners.get(who)
+            if meta is not None:
+                failed_at = time.time()
+                meta["recovery_status"] = (
+                    "circuit_open" if reason == "watchdog_zombie" else "failed"
+                )
+                meta["recovery_failed_at"] = failed_at
+                meta["recovery_last_error"] = str(e)
+                if reason == "watchdog_zombie" and meta.get(
+                    "session_gap_candidate_key"
+                ):
+                    meta["recovery_candidate_key"] = meta.get(
+                        "session_gap_candidate_key"
+                    )
+                    _clear_listener_session_gap_state_locked(
+                        who,
+                        meta,
+                        failed_at,
+                        "rebuild_failed_circuit_open",
+                    )
+        raise
+
+    with desired_listeners_lock:
+        meta = desired_listeners.get(who)
+        if meta is not None and meta.get("recovery_status") == "rebuilding":
+            meta["recovery_status"] = "awaiting_replay"
+            meta["recovery_rebuild_completed_at"] = time.time()
 
     chat = _get_actual_listener_chat(who)
     health = _probe_listener_chat_health(who, chat)
     if not health.get("healthy"):
-        reason = str(health.get("reason") or "")
-        if reason in ("suspect_native_window_ok_no_uia_handle", "suspect_no_uia_handle"):
+        health_reason = str(health.get("reason") or "")
+        if health_reason in ("suspect_native_window_ok_no_uia_handle", "suspect_no_uia_handle"):
             # wxautox4 有时仍不给监听子窗口 UIA 句柄；重建已经完成，先保留 suspect 状态，
             # 让后续真实消息/下一轮探针验证，不把刚重建的窗口立即判为失败。
             last_listener_health_snapshot[who] = dict(health)
@@ -2137,23 +2744,62 @@ def _force_rebuild_listener(who: str, reason: str) -> None:
                 if meta is not None:
                     meta["active"] = True
                     meta["status"] = "suspect"
-                    meta["last_error"] = f"listener_health:{reason}"
+                    meta["last_error"] = f"listener_health:{health_reason}"
                     meta["health_failure_count"] = _listener_health_failure_count(who)
+                    if meta.get("session_callback_gap"):
+                        _clear_listener_session_gap_state_locked(
+                            who,
+                            meta,
+                            time.time(),
+                            "rebuild_completed_suspect_health",
+                        )
             logger.warning(
                 "⚠️ 已强制重建监听窗口，但仍缺少 UIA 句柄，暂标记 suspect: who=%s reason=%s",
                 who,
-                reason,
+                health_reason,
             )
-            return
+            return True
 
         failures = _record_listener_health(who, health)
-        raise RuntimeError(
+        error = RuntimeError(
             f"强制重建后监听窗口仍不可用: who={who} "
             f"reason={health.get('reason')} failures={failures}"
         )
+        with desired_listeners_lock:
+            meta = desired_listeners.get(who)
+            if meta is not None:
+                failed_at = time.time()
+                meta["recovery_status"] = (
+                    "circuit_open"
+                    if reason == "watchdog_zombie"
+                    else "failed"
+                )
+                meta["recovery_failed_at"] = failed_at
+                meta["recovery_last_error"] = str(error)
+                if meta.get("session_gap_candidate_key"):
+                    meta["recovery_candidate_key"] = meta.get(
+                        "session_gap_candidate_key"
+                    )
+                    _clear_listener_session_gap_state_locked(
+                        who,
+                        meta,
+                        failed_at,
+                        "rebuild_health_failed_circuit_open",
+                    )
+        raise error
 
     _mark_desired_listener_success(who, reactivated=True)
+    with desired_listeners_lock:
+        meta = desired_listeners.get(who)
+        if meta is not None and meta.get("session_callback_gap"):
+            _clear_listener_session_gap_state_locked(
+                who,
+                meta,
+                time.time(),
+                "rebuild_completed",
+            )
     logger.info("✅ 已强制重建监听窗口: who=%s handle=%s", who, health.get("handle"))
+    return True
 
 
 def _describe_control(control) -> str:
@@ -2181,6 +2827,10 @@ def _control_class_name(control) -> str:
 
 def _is_wechat_embedded_browser_top(control) -> bool:
     return _control_class_name(control) == "Chrome_WidgetWin_0"
+
+
+def _is_wechat_main_window_control(control) -> bool:
+    return _control_class_name(control) == "mmui::MainWindow"
 
 
 def _activate_wechat_main_window(reason: str = "") -> bool:
@@ -2217,11 +2867,19 @@ def _activate_wechat_main_window(reason: str = "") -> bool:
         logger.debug("通过 UIA 激活微信主窗口失败: reason=%s error=%s", reason, e)
 
     try:
-        logger.info("🔄 激活微信主窗口[%s] foreground=%s", reason, _describe_control(_current_top_control()))
+        foreground = _current_top_control()
     except Exception:
-        pass
-
-    return focused
+        foreground = None
+    verified = _is_wechat_main_window_control(foreground)
+    log = logger.info if verified else logger.warning
+    log(
+        "🔄 激活微信主窗口[%s] verified=%s focus_attempted=%s foreground=%s",
+        reason,
+        verified,
+        focused,
+        _describe_control(foreground),
+    )
+    return verified
 
 
 def _log_listener_snapshot(reason: str) -> list:
@@ -2339,8 +2997,9 @@ def _ensure_listener_watchdog_started() -> None:
                         )
 
                     if not actual_retry:
-                        _reset_wx_listener_state("watchdog_all_missing")
-                        _activate_wechat_main_window("watchdog_all_missing")
+                        logger.warning(
+                            "⚠️ watchdog 复查仍未看到任何监听窗口；禁止自动清空全局监听状态，改为逐个定向恢复"
+                        )
 
                     for who in missing_retry:
                         try:
@@ -2353,19 +3012,20 @@ def _ensure_listener_watchdog_started() -> None:
 
                     for who in zombies:
                         try:
+                            if not _listener_session_rebuild_still_required(who):
+                                logger.info(
+                                    "✅ 重建前回调证据已收敛，取消监听窗口重建: who=%s",
+                                    who,
+                                )
+                                continue
                             _force_rebuild_listener(who, "watchdog_zombie")
                         except Exception as e:
                             _mark_desired_listener_failure(who, e)
                             logger.error(f"❌ 强制重建假活监听窗口失败: {who}, {e}")
-                            try:
-                                logger.warning("⚠️ 单个监听重建失败，准备全量重置监听状态: failed=%s", who)
-                                _reset_wx_listener_state("watchdog_zombie_rebuild_failed")
-                                _activate_wechat_main_window("watchdog_zombie_rebuild_failed")
-                                for target in expected:
-                                    _add_listen_chat_verified(target, reactivated=True, force_new=True)
-                                break
-                            except Exception as reset_e:
-                                logger.error("❌ 全量重置监听状态失败: failed=%s error=%s", who, reset_e)
+                            logger.error(
+                                "⛔ 单个监听重建失败，已打开该监听恢复熔断；保留其他监听且不执行全量重置: failed=%s",
+                                who,
+                            )
 
                     _ensure_wx_listener_loop_started("watchdog_after_recovery")
             except Exception as e:
@@ -3807,7 +4467,15 @@ def message_callback(msg, chat):
         except Exception:
             content_str = ""
 
-        _record_listener_callback_activity(chat_name, msg, content_str)
+        is_recovery_replay = _record_listener_callback_activity(chat_name, msg, content_str)
+        if is_recovery_replay:
+            logger.warning(
+                "♻️ 假活恢复补投消息，进入正常业务处理链: sender=%r chat=%r type=%r content=%r",
+                sender_name,
+                chat_name,
+                getattr(msg, "type", ""),
+                _message_preview(content_str),
+            )
 
         if _is_sender_blacklisted_for_chat(chat_name, sender_name):
             _record_listener_dropped_message(chat_name, "sender_blacklist", msg, content_str)

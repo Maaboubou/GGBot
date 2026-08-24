@@ -1778,6 +1778,9 @@ class LLMManager:
             stream_params["drop_params"] = True
             stream_params["stream"] = True
             stream_params.pop("fallbacks", None)
+            # primary_params 仍包含仅供 wxautox 内部路由使用的元数据；正常
+            # 非流式调用会在 _do_call 中清理，流式补救也必须遵循同一边界。
+            self._strip_internal_provider_params(stream_params)
 
             chunks = litellm.completion(**stream_params)
             parts = []

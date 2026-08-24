@@ -47,7 +47,10 @@ class WeeklyPlugin:
         if migrated_state.exists() and not self.state_path.exists():
             os.replace(migrated_state, self.state_path)
             migration_notes.append(f"{migrated_state} -> {self.state_path}")
-        self.task_lock_path = context.storage.temp_path("weekly_task.lock")
+        # 任务可能跨越插件热重载继续运行。临时目录会在运行时上下文关闭时被
+        # 自动清理，锁文件放在那里会让新插件实例误以为没有任务在执行。
+        # machine_bound 存储不会随热重载清空，同时也不会进入可迁移备份。
+        self.task_lock_path = context.storage.machine_bound_path("weekly_task.lock")
         self.output_root.mkdir(parents=True, exist_ok=True)
         if migration_notes:
             context.audit.record(
@@ -408,15 +411,21 @@ def _has_scheduler_run(state_path: Path, run_key: tuple[str, int, int, int]) -> 
         return isinstance(runs, dict) and _scheduler_run_key_text(run_key) in runs
 
 
-def _mark_scheduler_run(state_path: Path, run_key: tuple[str, int, int, int]) -> None:
+def _claim_scheduler_run(state_path: Path, run_key: tuple[str, int, int, int]) -> bool:
+    """在提交托管任务前登记本次调度，避免等待任务结束期间重复提交。"""
+
     with _state_lock:
         state = _load_state(state_path)
         runs = state.setdefault("scheduler_runs", {})
-        runs[_scheduler_run_key_text(run_key)] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        key = _scheduler_run_key_text(run_key)
+        if key in runs:
+            return False
+        runs[key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if len(runs) > 50:
-            for key in sorted(runs.keys())[:-50]:
-                runs.pop(key, None)
+            for old_key in sorted(runs.keys())[:-50]:
+                runs.pop(old_key, None)
         _save_state(state_path, state)
+        return True
 
 
 def _acquire_task_file_lock(lock_path: Path) -> bool:
@@ -1311,17 +1320,20 @@ def _start_weekly_scheduler(event_bus, context) -> None:
                 active_plugin = plugin
                 if active_plugin is None:
                     continue
+                if not _claim_scheduler_run(active_plugin.state_path, execution_run_key):
+                    logger.info("🗞️ Weekly: 本次调度已登记，跳过重复提交 run_key=%s", execution_run_key)
+                    continue
 
                 def _managed_push(operation):
                     if not _execution_lock.acquire(blocking=False):
-                        raise WeeklyGenerationError("已有 Weekly 任务正在执行")
+                        logger.warning("🗞️ Weekly: 已有任务执行，跳过重复的托管调度 run_key=%s", execution_run_key)
+                        return {"run_key": execution_run_key[0], "skipped": True}
                     try:
                         operation.progress(5, "读取周报推送范围")
                         _execute_weekly_task(event_bus)
                         operation.progress(100, "每周周报推送完成")
                         return {"run_key": execution_run_key[0]}
                     finally:
-                        _mark_scheduler_run(active_plugin.state_path, execution_run_key)
                         _execution_lock.release()
 
                 active_plugin.context.tasks.submit(

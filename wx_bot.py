@@ -888,7 +888,7 @@ def _listener_callback_state(meta: dict, now: float) -> str:
 
 
 def _parse_main_session_timestamp(value, now: float | None = None) -> float:
-    """解析 wxautox 会话时间；当前版本通常返回 YYYY-MM-DD HH:MM:SS。"""
+    """解析 wxautox 会话时间；无时区值是微信所在机器的本地时间。"""
     text = str(value or "").strip()
     if not text:
         return 0.0
@@ -901,15 +901,16 @@ def _parse_main_session_timestamp(value, now: float | None = None) -> float:
             try:
                 parsed = datetime.strptime(text, fmt)
                 if fmt.startswith("%H"):
-                    today = datetime.fromtimestamp(now or time.time(), BEIJING_TIMEZONE)
+                    reference_at = time.time() if now is None else now
+                    today = datetime.fromtimestamp(reference_at)
                     parsed = parsed.replace(year=today.year, month=today.month, day=today.day)
                 break
             except ValueError:
                 continue
     if parsed is None:
         return 0.0
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=BEIJING_TIMEZONE)
+    # GetSession 返回 Windows/微信界面上的本地墙上时间。让 naive datetime
+    # 直接按宿主机时区（含 DST）换算；只有输入自带 offset 时才沿用显式时区。
     return parsed.timestamp()
 
 

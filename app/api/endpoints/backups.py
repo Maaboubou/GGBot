@@ -30,6 +30,10 @@ class RestorePrepareRequest(BaseModel):
     confirmation: str
 
 
+class BackupDeleteRequest(BaseModel):
+    confirmation: str
+
+
 @router.get("/")
 def overview() -> Dict[str, Any]:
     return get_backup_service().overview()
@@ -90,6 +94,21 @@ def prepare_restore(archive_name: str, request: RestorePrepareRequest) -> Dict[s
         ),
     )
     return {"operation": operation}
+
+
+@router.delete("/{archive_name}")
+def delete_backup(archive_name: str, request: BackupDeleteRequest) -> Dict[str, Any]:
+    service = get_backup_service()
+    try:
+        service.archive_path(archive_name)
+    except BackupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if request.confirmation.strip() != "删除备份":
+        raise HTTPException(status_code=422, detail="请输入“删除备份”确认操作")
+    try:
+        return service.delete_archive(archive_name, confirmation=request.confirmation)
+    except BackupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/import")

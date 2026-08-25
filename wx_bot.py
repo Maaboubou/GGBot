@@ -48,18 +48,49 @@ def _ensure_localhost_bypasses_proxy() -> None:
 load_dotenv()
 _ensure_localhost_bypasses_proxy()
 
+def _bounded_env_float(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(float(minimum), float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _bounded_env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(int(minimum), int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# 唯一的监听窗口看护方案：只读 Win32 几何信息，命中已确认的异常位置后
+# 原位复位；不运行 UIA 探针、不切换聊天、不关闭或重建窗口。
+LISTENER_WINDOW_AUTO_REPAIR_INTERVAL_SEC = _bounded_env_float(
+    "WECHAT_LISTENER_WINDOW_AUTO_REPAIR_INTERVAL_SEC", 5.0, 1.0
+)
+LISTENER_WINDOW_AUTO_REPAIR_CONFIRMATION_PROBES = _bounded_env_int(
+    "WECHAT_LISTENER_WINDOW_AUTO_REPAIR_CONFIRMATION_PROBES", 2, 2
+)
+LISTENER_WINDOW_AUTO_REPAIR_RETRY_COOLDOWN_SEC = _bounded_env_float(
+    "WECHAT_LISTENER_WINDOW_AUTO_REPAIR_RETRY_COOLDOWN_SEC", 30.0, 5.0
+)
+
 # 添加项目根目录到Python路径，以便导入配置工具
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.models.base import SessionLocal
 from app.models.user_permission import WeChatUser
-from app.utils.daily_schedule import BEIJING_TIMEZONE, next_daily_run_at
 from app.utils.inflight_deduplicator import InFlightDeduplicator
 from app.utils.health_state import OnlineProbeTracker
 from app.utils.logging_utils import create_rotating_file_handler
 from app.utils.wechat_media import image_file_fingerprint, is_probable_wechat_media_window
 from app.utils.wechat_listener_recovery import open_listener_from_existing_session
-from app.utils.wechat_outbound import send_text_with_retry
-from app.utils.window_health import is_offscreen_sentinel_rect, is_unrecoverable_offscreen_window
+from app.utils.wechat_outbound import send_text_with_exact_mentions, send_text_with_retry
+from app.utils.window_health import (
+    advance_window_repair_confirmation,
+    choose_window_recovery_rect,
+    is_offscreen_sentinel_rect,
+    is_unrecoverable_offscreen_window,
+    is_usable_window_rect,
+)
 
 # --- 全局变量 ---
 wx = None
@@ -121,43 +152,24 @@ wx_ui_lock = threading.RLock()
 # 这样可以区分“主动暂停监听”和“监听窗口异常关闭”。
 desired_listeners: dict = {}
 desired_listeners_lock = threading.RLock()
-listener_watchdog_thread = None
-LISTENER_WATCHDOG_INTERVAL_SEC = 20
+listener_window_auto_repair_thread = None
+listener_window_repair_suspicions: dict[str, dict] = {}
+listener_window_last_valid_rect: dict[str, dict] = {}
+listener_window_auto_repair_last_check_at: float = 0.0
+listener_window_auto_repair_last_repair_at: float = 0.0
+listener_window_auto_repair_last_result: dict = {}
 LISTENER_ADD_ATTEMPTS = 3
 LISTENER_ADD_RETRY_DELAY_SEC = 1.0
 LISTENER_ADD_VERIFY_ATTEMPTS = 5
 LISTENER_ADD_VERIFY_DELAY_SEC = 0.3
-LISTENER_ZOMBIE_FAILURE_THRESHOLD = 2
-# 主会话和 listener callback 来自不同线程。第一次看到时间差只记录候选，
-# 至少两个独立 watchdog 周期仍无法由 callback/outbound/dispatcher 解释时才重建。
-LISTENER_SESSION_CONFIRMATION_PROBES = 2
-# 单个监听窗口恢复失败时只做退避，避免每 20 秒重复抢 UI 并刷屏。
-# 某个聊天的窗口/UIA 异常不代表微信连接失效，不能因此重启全部正常监听。
-LISTENER_RECOVERY_MIN_COOLDOWN_SEC = 60
-LISTENER_RECOVERY_MAX_COOLDOWN_SEC = 300
-LISTENER_CALLBACK_STALE_SEC = 6 * 60 * 60
-# 主会话列表与监听回调是两条独立数据链。主会话时间明显晚于最近一次
-# 监听成功/回调/主动发送时，说明微信已收到新消息但监听窗口没有上报。
-LISTENER_SESSION_CLOCK_SKEW_SEC = 2
-LISTENER_DAILY_RESTART_HOUR = 3
+LISTENER_STATUS_SNAPSHOT_MAX_AGE_SEC = 60
 # 打开微信内置浏览器会间歇性地让一个或多个监听子窗口退出 wxautox 的
 # 子窗口/监听注册表。链接解析结束后先给微信少量自恢复时间，再在仍缺失时
-# 于同一把 UI 锁内同步恢复，避免 watchdog 与后续发消息/发文件争抢前台窗口。
+# 于同一把 UI 锁内同步恢复，避免与后续发消息/发文件争抢前台窗口。
 LISTENER_BROWSER_RECOVERY_VERIFY_ATTEMPTS = 5
 LISTENER_BROWSER_RECOVERY_VERIFY_DELAY_SEC = 0.4
 last_listener_actual_snapshot: list = []
 last_listener_actual_snapshot_at: float = 0.0
-listener_health_failures: dict[str, int] = {}
-listener_last_rebind_at: dict[str, float] = {}
-last_listener_health_snapshot: dict[str, dict] = {}
-last_listener_session_snapshot: dict[str, dict] = {}
-last_listener_session_probe_at: float = 0.0
-last_listener_session_probe_error: str = ""
-listener_no_uia_notice_logged: set[str] = set()
-listener_daily_restart_last_at: float = 0.0
-listener_daily_restart_next_at: float = next_daily_run_at(hour=LISTENER_DAILY_RESTART_HOUR)
-listener_daily_restart_last_targets: list[str] = []
-listener_daily_restart_last_error: str = ""
 ONLINE_PROBE_INTERVAL_SEC = 5
 ONLINE_PROBE_LOCK_TIMEOUT_SEC = 0.25
 ONLINE_PROBE_FAILURE_THRESHOLD = 3
@@ -802,725 +814,6 @@ def _mark_seen_message(message_identity: str, message_fingerprint: str = "") -> 
     _save_seen_message_ids()
 
 
-def _message_preview(content, limit: int = 120) -> str:
-    text = " ".join(str(content or "").split())
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "..."
-
-
-def _listener_normalized_text(value) -> str:
-    return " ".join(str(value or "").split()).strip()
-
-
-def _listener_session_candidate_parts(preview) -> tuple[str, str, str]:
-    raw = _listener_normalized_text(preview)
-    raw = re.sub(r"^\[\d+[^\]]{1,4}\]\s*", "", raw, count=1)
-    raw = re.sub(r"^\[(?:有人@我|有人@你|@我)\]\s*", "", raw, count=1)
-    match = re.match(r"^([^:：\r\n]{1,80})[:：]\s*(.+)$", raw)
-    if match is None:
-        return "", raw, raw
-    sender = _listener_normalized_text(match.group(1))
-    if not sender or sender.lower() in {"http", "https"}:
-        return "", raw, raw
-    return sender, _listener_normalized_text(match.group(2)), raw
-
-
-def _listener_session_candidate_key(session_gap: dict) -> str:
-    """Build a stable identity so one stale session row cannot rebuild forever."""
-    payload = {
-        "session_time": _listener_normalized_text(session_gap.get("session_time")),
-        "session_at": session_gap.get("session_at"),
-        "content_preview": _listener_normalized_text(
-            session_gap.get("content_preview")
-        ),
-        "new_count": int(session_gap.get("new_count", 0) or 0),
-    }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
-
-
-def _listener_semantic_text_matches(left, right) -> bool:
-    left_text = _listener_normalized_text(left)
-    right_text = _listener_normalized_text(right)
-    if not left_text or not right_text:
-        return False
-
-    def canonical(value: str) -> str:
-        return re.sub(r"^(\[[^\]]{1,12}\])\s*", r"\1", value, count=1)
-
-    left_text = canonical(left_text)
-    right_text = canonical(right_text)
-    if left_text == right_text:
-        return True
-    for shorter, longer in ((left_text, right_text), (right_text, left_text)):
-        truncated = shorter
-        if truncated.endswith("…"):
-            truncated = truncated[:-1].rstrip()
-        elif truncated.endswith("..."):
-            truncated = truncated[:-3].rstrip()
-        if truncated != shorter and len(truncated) >= 8 and longer.startswith(truncated):
-            return True
-        if len(shorter) < 4 or not longer.startswith(shorter):
-            continue
-        if len(longer) == len(shorter) or longer[len(shorter)].isspace():
-            return True
-    return False
-
-
-def _listener_candidate_kind_matches(candidate_content, activity_kind) -> bool:
-    normalized = _listener_normalized_text(candidate_content)
-    marker_types = {
-        "[图片]": "image",
-        "[视频]": "video",
-        "[文件]": "file",
-        "[语音]": "voice",
-        "[链接]": "link",
-        "[位置]": "location",
-        "[合并转发]": "merge",
-        "[小程序]": "miniapp",
-    }
-    expected = next(
-        (kind for marker, kind in marker_types.items() if normalized.startswith(marker)),
-        "",
-    )
-    return not expected or _listener_normalized_text(activity_kind).lower() == expected
-
-
-def _listener_event_matches_session_preview(
-    preview,
-    sender,
-    kind,
-    content,
-    *,
-    outbound: bool = False,
-) -> bool:
-    candidate_sender, candidate_content, raw = _listener_session_candidate_parts(
-        preview
-    )
-    if not candidate_content or not _listener_candidate_kind_matches(
-        candidate_content,
-        kind,
-    ):
-        return False
-    activity_sender = _listener_normalized_text(sender)
-    if candidate_sender:
-        if outbound:
-            if candidate_sender not in {"你", "我", "self"}:
-                return False
-        elif activity_sender == candidate_sender and _listener_semantic_text_matches(
-            candidate_content,
-            content,
-        ):
-            return True
-    return _listener_semantic_text_matches(raw, content)
-
-
-def _listener_meta_activity_matches_candidate(
-    meta: dict,
-    prefix: str,
-    candidate_preview,
-    candidate_activity_at: float,
-) -> bool:
-    try:
-        activity_at = float(meta.get(f"last_{prefix}_at", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return False
-    if activity_at <= candidate_activity_at + 0.001:
-        return False
-    if prefix == "callback":
-        return _listener_event_matches_session_preview(
-            candidate_preview,
-            meta.get("last_callback_sender"),
-            meta.get("last_callback_type"),
-            meta.get("last_callback_preview"),
-        )
-    if prefix == "outbound":
-        return _listener_event_matches_session_preview(
-            candidate_preview,
-            "self",
-            meta.get("last_outbound_type"),
-            meta.get("last_outbound_preview"),
-            outbound=True,
-        )
-    return False
-
-
-def _record_listener_callback_activity(chat_name: str, msg, content_str: str) -> bool:
-    if not chat_name:
-        return False
-
-    now = time.time()
-    recovery_replay = False
-    with desired_listeners_lock:
-        meta = desired_listeners.get(chat_name)
-        if meta is None:
-            return False
-        meta["last_callback_at"] = now
-        meta["last_callback_sender"] = str(getattr(msg, "sender", "") or "")
-        meta["last_callback_type"] = str(getattr(msg, "type", "") or "")
-        meta["last_callback_message_id"] = str(getattr(msg, "id", "") or "")
-        meta["last_callback_preview"] = _message_preview(content_str)
-        meta["last_callback_stage"] = "received"
-        matches_pending_gap = bool(
-            meta.get("session_callback_gap")
-            and int(meta.get("session_gap_confirmation_count", 0) or 0) > 0
-            and _listener_event_matches_session_preview(
-                meta.get("session_gap_candidate_preview"),
-                getattr(msg, "sender", ""),
-                getattr(msg, "type", ""),
-                content_str,
-            )
-        )
-        if matches_pending_gap:
-            recovery_status = str(meta.get("recovery_status") or "")
-            if recovery_status in {"rebuilding", "awaiting_replay", "replaying"}:
-                recovery_replay = True
-                meta["recovery_status"] = "replaying"
-                meta["recovery_replayed_count"] = int(
-                    meta.get("recovery_replayed_count", 0) or 0
-                ) + 1
-                meta["last_recovery_replayed_at"] = now
-                meta["last_recovery_replayed_message_id"] = str(
-                    getattr(msg, "id", "") or ""
-                )
-                meta["last_recovery_replayed_sender"] = str(
-                    getattr(msg, "sender", "") or ""
-                )
-                meta["last_recovery_replayed_type"] = str(
-                    getattr(msg, "type", "") or ""
-                )
-                meta["last_recovery_replayed_preview"] = _message_preview(content_str)
-            elif recovery_status == "detected":
-                # 只有同一候选的晚到回调才能取消已确认的重建。
-                meta["recovery_status"] = "completed"
-                meta["recovery_completed_at"] = now
-                meta["recovery_completed_reason"] = "callback_before_rebuild"
-            _clear_listener_session_gap_state_locked(
-                chat_name,
-                meta,
-                now,
-                "matching_listener_callback_activity",
-            )
-    return recovery_replay
-
-
-def _record_listener_outbound_activity(chat_name: str, kind: str, content="") -> None:
-    """记录主动发送，避免主会话预览因机器人自己的消息变化而误报漏监听。"""
-    if not chat_name:
-        return
-
-    now = time.time()
-    with desired_listeners_lock:
-        meta = desired_listeners.get(chat_name)
-        if meta is None:
-            return
-        meta["last_outbound_at"] = now
-        meta["last_outbound_type"] = str(kind or "")
-        meta["last_outbound_preview"] = _message_preview(content)
-        matches_pending_gap = bool(
-            meta.get("session_callback_gap")
-            and int(meta.get("session_gap_confirmation_count", 0) or 0) > 0
-            and _listener_event_matches_session_preview(
-                meta.get("session_gap_candidate_preview"),
-                "self",
-                kind,
-                content,
-                outbound=True,
-            )
-        )
-        if matches_pending_gap:
-            if meta.get("recovery_status") == "detected":
-                meta["recovery_status"] = "completed"
-                meta["recovery_completed_at"] = now
-                meta["recovery_completed_reason"] = "outbound_before_rebuild"
-            _clear_listener_session_gap_state_locked(
-                chat_name,
-                meta,
-                now,
-                "matching_listener_outbound_activity",
-            )
-
-
-def _record_listener_dropped_message(chat_name: str, reason: str, msg, content_str: str) -> None:
-    if not chat_name:
-        return
-
-    now = time.time()
-    with desired_listeners_lock:
-        meta = desired_listeners.get(chat_name)
-        if meta is None:
-            return
-        meta["last_dropped_at"] = now
-        meta["last_dropped_reason"] = reason
-        meta["last_dropped_sender"] = str(getattr(msg, "sender", "") or "")
-        meta["last_dropped_type"] = str(getattr(msg, "type", "") or "")
-        meta["last_dropped_message_id"] = str(getattr(msg, "id", "") or "")
-        meta["last_dropped_preview"] = _message_preview(content_str)
-        meta["last_callback_stage"] = f"dropped:{reason}"
-
-
-def _record_listener_forwarded_message(chat_name: str, msg, content_str: str) -> None:
-    if not chat_name:
-        return
-
-    now = time.time()
-    with desired_listeners_lock:
-        meta = desired_listeners.get(chat_name)
-        if meta is None:
-            return
-        meta["last_forwarded_at"] = now
-        meta["last_forwarded_sender"] = str(getattr(msg, "sender", "") or "")
-        meta["last_forwarded_type"] = str(getattr(msg, "type", "") or "")
-        meta["last_forwarded_message_id"] = str(getattr(msg, "id", "") or "")
-        meta["last_forwarded_preview"] = _message_preview(content_str)
-        meta["last_callback_stage"] = "forwarded"
-        if meta.get("recovery_status") == "replaying":
-            meta["recovery_forwarded_count"] = int(meta.get("recovery_forwarded_count", 0) or 0) + 1
-
-
-def _listener_callback_state(meta: dict, now: float) -> str:
-    last_callback_at = float(meta.get("last_callback_at", 0.0) or 0.0)
-    if last_callback_at <= 0:
-        added_at = float(meta.get("added_at", 0.0) or 0.0)
-        if added_at > 0 and now - added_at >= LISTENER_CALLBACK_STALE_SEC:
-            return "never_seen_stale"
-        return "never_seen"
-    if now - last_callback_at >= LISTENER_CALLBACK_STALE_SEC:
-        return "stale"
-    return "recent"
-
-
-def _parse_main_session_timestamp(value, now: float | None = None) -> float:
-    """解析 wxautox 会话时间；无时区值是微信所在机器的本地时间。"""
-    text = str(value or "").strip()
-    if not text:
-        return 0.0
-
-    parsed = None
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
-            try:
-                parsed = datetime.strptime(text, fmt)
-                if fmt.startswith("%H"):
-                    reference_at = time.time() if now is None else now
-                    today = datetime.fromtimestamp(reference_at)
-                    parsed = parsed.replace(year=today.year, month=today.month, day=today.day)
-                break
-            except ValueError:
-                continue
-    if parsed is None:
-        return 0.0
-    # GetSession 返回 Windows/微信界面上的本地墙上时间。让 naive datetime
-    # 直接按宿主机时区（含 DST）换算；只有输入自带 offset 时才沿用显式时区。
-    return parsed.timestamp()
-
-
-def _listener_activity_reference_at(meta: dict) -> float:
-    """最近一次足以解释主会话变化的监听/发送活动时间。"""
-    return max(
-        float(meta.get("last_success_at", 0.0) or 0.0),
-        float(meta.get("last_callback_at", 0.0) or 0.0),
-        float(meta.get("last_outbound_at", 0.0) or 0.0),
-    )
-
-
-def _clear_listener_session_gap_state_locked(
-    who: str,
-    meta: dict,
-    now: float,
-    reason: str,
-) -> None:
-    """Clear only session-gap state. Caller must hold desired_listeners_lock."""
-    was_session_health_failure = (
-        str(meta.get("last_error") or "")
-        == "listener_health:main_session_advanced_without_callback"
-    )
-    meta["session_callback_gap"] = False
-    meta["session_callback_gap_sec"] = 0.0
-    meta["session_gap_confirmation_count"] = 0
-    meta["session_gap_candidate_activity_at"] = 0.0
-    meta["session_gap_candidate_first_seen_at"] = 0.0
-    meta["session_gap_candidate_last_seen_at"] = 0.0
-    meta["session_gap_candidate_session_at"] = None
-    meta["session_gap_candidate_session_time"] = None
-    meta["session_gap_candidate_preview"] = None
-    meta["session_gap_candidate_new_count"] = 0
-    meta["session_gap_candidate_is_new"] = False
-    meta["session_gap_candidate_checked_at"] = 0.0
-    meta["session_gap_candidate_key"] = None
-    meta["last_session_gap_reconciled_at"] = now
-    meta["last_session_gap_reconciled_reason"] = reason
-    if was_session_health_failure:
-        listener_health_failures.pop(who, None)
-        meta["active"] = True
-        meta["status"] = "active"
-        meta["last_error"] = None
-        meta["health_failure_count"] = 0
-
-
-def _record_listener_session_gap_candidate(
-    who: str,
-    session_gap: dict,
-    health: dict,
-) -> dict:
-    """Reconcile one oldest unresolved session candidate by exact identity."""
-    now = time.time()
-    with desired_listeners_lock:
-        meta = desired_listeners.get(who)
-        if meta is None:
-            return {"state": "ignored", "reason": "listener_removed"}
-
-        previous_count = int(meta.get("session_gap_confirmation_count", 0) or 0)
-        candidate_gap = dict(session_gap)
-        if previous_count > 0 and meta.get("session_gap_candidate_preview"):
-            candidate_gap.update(
-                {
-                    "session_time": meta.get("session_gap_candidate_session_time"),
-                    "session_at": meta.get("session_gap_candidate_session_at"),
-                    "content_preview": meta.get("session_gap_candidate_preview"),
-                    "new_count": meta.get("session_gap_candidate_new_count", 0),
-                    "is_new": meta.get("session_gap_candidate_is_new", False),
-                    "listener_activity_at": meta.get(
-                        "session_gap_candidate_activity_at", 0.0
-                    ),
-                    "gap_sec": meta.get("session_callback_gap_sec", 0.0),
-                    "checked_at": meta.get("session_gap_candidate_checked_at", 0.0),
-                    "advanced_without_listener_activity": True,
-                }
-            )
-        try:
-            initial_activity_at = float(
-                candidate_gap.get("listener_activity_at", 0.0) or 0.0
-            )
-        except (TypeError, ValueError):
-            initial_activity_at = 0.0
-        try:
-            session_at = float(candidate_gap.get("session_at", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            session_at = 0.0
-        candidate_preview = candidate_gap.get("content_preview")
-        candidate_key = _listener_session_candidate_key(candidate_gap)
-
-        resolution = ""
-        if _listener_meta_activity_matches_candidate(
-            meta,
-            "callback",
-            candidate_preview,
-            initial_activity_at,
-        ):
-            resolution = "matching_listener_callback"
-        elif _listener_meta_activity_matches_candidate(
-            meta,
-            "outbound",
-            candidate_preview,
-            initial_activity_at,
-        ):
-            resolution = "matching_listener_outbound"
-        if resolution:
-            if meta.get("recovery_status") == "detected":
-                meta["recovery_status"] = "completed"
-                meta["recovery_completed_at"] = now
-                meta["recovery_completed_reason"] = f"{resolution}_before_rebuild"
-            _clear_listener_session_gap_state_locked(who, meta, now, resolution)
-            resolved_health = dict(health)
-            resolved_health["healthy"] = True
-            resolved_health["reason"] = resolution
-            resolved_health["main_session"] = dict(candidate_gap)
-            last_listener_health_snapshot[who] = resolved_health
-            return {"state": "resolved", "reason": resolution, "failures": 0}
-
-        recovery_status = str(meta.get("recovery_status") or "")
-        if (
-            candidate_key
-            and candidate_key == meta.get("recovery_candidate_key")
-            and recovery_status
-            in {"rebuilding", "awaiting_replay", "failed", "circuit_open"}
-        ):
-            # A rebuild attempt owns this exact main-session row. Re-detecting the
-            # unchanged row must never turn awaiting/failed recovery back into a
-            # fresh destructive rebuild generation.
-            suppressed_health = dict(health)
-            suppressed_health["healthy"] = recovery_status == "awaiting_replay"
-            suppressed_health["reason"] = f"recovery_{recovery_status}"
-            suppressed_health["main_session"] = dict(candidate_gap)
-            last_listener_health_snapshot[who] = suppressed_health
-            return {
-                "state": "suppressed",
-                "reason": f"same_candidate_{recovery_status}",
-                "failures": 0,
-            }
-
-        confirmations = previous_count + 1 if previous_count > 0 else 1
-
-        meta["session_callback_gap"] = True
-        meta["session_callback_gap_sec"] = candidate_gap.get("gap_sec", 0.0)
-        meta["session_gap_confirmation_count"] = confirmations
-        meta["session_gap_candidate_last_seen_at"] = now
-        if confirmations == 1:
-            meta["session_gap_candidate_first_seen_at"] = now
-            meta["session_gap_candidate_activity_at"] = initial_activity_at
-            meta["session_gap_candidate_session_at"] = session_at or None
-            meta["session_gap_candidate_session_time"] = candidate_gap.get(
-                "session_time"
-            )
-            meta["session_gap_candidate_preview"] = candidate_preview
-            meta["session_gap_candidate_new_count"] = candidate_gap.get("new_count", 0)
-            meta["session_gap_candidate_is_new"] = candidate_gap.get("is_new", False)
-            meta["session_gap_candidate_checked_at"] = candidate_gap.get(
-                "checked_at", 0.0
-            )
-            meta["session_gap_candidate_key"] = candidate_key
-
-        if confirmations < LISTENER_SESSION_CONFIRMATION_PROBES:
-            pending_health = dict(health)
-            pending_health["healthy"] = True
-            pending_health["reason"] = "main_session_callback_pending_confirmation"
-            pending_health["main_session"] = dict(candidate_gap)
-            last_listener_health_snapshot[who] = pending_health
-            return {
-                "state": "pending",
-                "reason": "awaiting_independent_confirmation",
-                "failures": 0,
-                "confirmations": confirmations,
-            }
-
-        failures = LISTENER_ZOMBIE_FAILURE_THRESHOLD
-        listener_health_failures[who] = failures
-        confirmed_health = dict(health)
-        confirmed_health["healthy"] = False
-        confirmed_health["reason"] = "main_session_advanced_without_callback"
-        confirmed_health["main_session"] = dict(candidate_gap)
-        last_listener_health_snapshot[who] = confirmed_health
-        meta["active"] = False
-        meta["status"] = "zombie"
-        meta["last_error"] = "listener_health:main_session_advanced_without_callback"
-        meta["last_health_failed_at"] = now
-        meta["health_failure_count"] = failures
-        if meta.get("recovery_status") != "detected":
-            meta["recovery_generation"] = int(meta.get("recovery_generation", 0) or 0) + 1
-            meta["recovery_status"] = "detected"
-            meta["recovery_rebuild_attempts"] = 0
-            meta["recovery_detected_at"] = now
-            meta["recovery_candidate_key"] = candidate_key
-            meta["recovery_session_at"] = session_at or None
-            meta["recovery_session_time"] = candidate_gap.get("session_time")
-            meta["recovery_session_preview"] = candidate_preview
-            meta["recovery_session_new_count"] = candidate_gap.get("new_count", 0)
-            meta["recovery_anchor_message_id"] = meta.get("last_forwarded_message_id")
-            meta["recovery_anchor_preview"] = meta.get("last_forwarded_preview")
-            meta["recovery_replayed_count"] = 0
-            meta["recovery_forwarded_count"] = 0
-        return {
-            "state": "confirmed",
-            "reason": "persistent_unexplained_session_progress",
-            "failures": failures,
-            "confirmations": confirmations,
-        }
-
-
-def _listener_session_rebuild_still_required_locked(meta: dict | None) -> bool:
-    """Evaluate rebuild evidence while the caller owns desired_listeners_lock."""
-    if meta is None:
-        return False
-    if meta.get("recovery_status") == "circuit_open":
-        return False
-    if (
-        str(meta.get("last_error") or "")
-        != "listener_health:main_session_advanced_without_callback"
-    ):
-        return bool(
-            meta.get("status") == "zombie"
-            and int(meta.get("health_failure_count", 0) or 0)
-            >= LISTENER_ZOMBIE_FAILURE_THRESHOLD
-        )
-    return bool(
-        meta.get("session_callback_gap")
-        and meta.get("recovery_status") == "detected"
-        and int(meta.get("session_gap_confirmation_count", 0) or 0)
-        >= LISTENER_SESSION_CONFIRMATION_PROBES
-    )
-
-
-def _listener_session_rebuild_still_required(who: str) -> bool:
-    """Lock-coordinated read-only preflight for watchdog diagnostics."""
-    with desired_listeners_lock:
-        return _listener_session_rebuild_still_required_locked(
-            desired_listeners.get(who)
-        )
-
-
-def _probe_main_session_listener_gaps(expected: list[str]) -> dict[str, dict]:
-    """交叉核对主会话最新时间与监听活动，返回疑似漏回调的聊天。"""
-    global last_listener_session_snapshot, last_listener_session_probe_at
-    global last_listener_session_probe_error
-
-    if not wx or not expected:
-        return {}
-
-    expected_set = set(expected)
-    observed_at = time.time()
-    try:
-        sessions = wx.GetSession() or []
-    except Exception as e:
-        last_listener_session_probe_at = observed_at
-        last_listener_session_probe_error = str(e)
-        logger.debug("读取微信主会话列表失败，跳过监听交叉探针: %s", e)
-        return {}
-
-    with desired_listeners_lock:
-        meta_snapshot = {
-            name: dict(desired_listeners.get(name) or {})
-            for name in expected_set
-        }
-
-    snapshot: dict[str, dict] = {}
-    gaps: dict[str, dict] = {}
-    for session in sessions:
-        try:
-            name = str(getattr(session, "name", "") or "").strip()
-        except Exception:
-            continue
-        if name not in expected_set:
-            continue
-
-        try:
-            session_time_text = str(getattr(session, "time", "") or "").strip()
-        except Exception:
-            session_time_text = ""
-        try:
-            content = str(getattr(session, "content", "") or "").strip()
-        except Exception:
-            content = ""
-        try:
-            new_count = int(getattr(session, "new_count", 0) or 0)
-        except Exception:
-            new_count = 0
-        try:
-            is_new = bool(getattr(session, "isnew", False))
-        except Exception:
-            is_new = False
-
-        session_at = _parse_main_session_timestamp(session_time_text, observed_at)
-        activity_at = _listener_activity_reference_at(meta_snapshot.get(name, {}))
-        gap_sec = session_at - activity_at if session_at > 0 and activity_at > 0 else 0.0
-        advanced_without_activity = bool(
-            session_at > 0
-            and activity_at > 0
-            and gap_sec > LISTENER_SESSION_CLOCK_SKEW_SEC
-        )
-        row = {
-            "name": name,
-            "session_time": session_time_text,
-            "session_at": session_at or None,
-            "content_preview": _message_preview(content, 200),
-            "new_count": new_count,
-            "is_new": is_new,
-            "listener_activity_at": activity_at or None,
-            "gap_sec": round(gap_sec, 1) if gap_sec > 0 else 0.0,
-            "advanced_without_listener_activity": advanced_without_activity,
-            "checked_at": observed_at,
-        }
-        snapshot[name] = row
-        listener_meta = meta_snapshot.get(name, {})
-        pending_candidate = bool(
-            listener_meta.get("session_callback_gap")
-            and int(listener_meta.get("session_gap_confirmation_count", 0) or 0) > 0
-            and listener_meta.get("session_gap_candidate_preview")
-        )
-        if pending_candidate:
-            gaps[name] = {
-                "name": name,
-                "session_time": listener_meta.get(
-                    "session_gap_candidate_session_time"
-                ),
-                "session_at": listener_meta.get("session_gap_candidate_session_at"),
-                "content_preview": listener_meta.get(
-                    "session_gap_candidate_preview"
-                ),
-                "new_count": listener_meta.get(
-                    "session_gap_candidate_new_count", 0
-                ),
-                "is_new": listener_meta.get("session_gap_candidate_is_new", False),
-                "listener_activity_at": listener_meta.get(
-                    "session_gap_candidate_activity_at"
-                ),
-                "gap_sec": listener_meta.get("session_callback_gap_sec", 0.0),
-                "advanced_without_listener_activity": True,
-                "checked_at": listener_meta.get(
-                    "session_gap_candidate_checked_at", observed_at
-                ),
-                "current_session_checked_at": observed_at,
-                "oldest_unresolved_candidate": True,
-            }
-        elif advanced_without_activity:
-            gaps[name] = row
-
-    last_listener_session_snapshot = snapshot
-    last_listener_session_probe_at = observed_at
-    last_listener_session_probe_error = ""
-
-    completed_recoveries = []
-    with desired_listeners_lock:
-        for name, row in snapshot.items():
-            meta = desired_listeners.get(name)
-            if meta is None:
-                continue
-            meta["last_main_session_probe_at"] = observed_at
-            if row.get("session_at"):
-                meta["last_main_session_at"] = row["session_at"]
-            meta["last_main_session_time"] = row.get("session_time")
-            meta["last_main_session_preview"] = row.get("content_preview")
-            meta["last_main_session_new_count"] = row.get("new_count", 0)
-            pending_candidate = bool(
-                meta.get("session_callback_gap")
-                and int(meta.get("session_gap_confirmation_count", 0) or 0) > 0
-                and meta.get("session_gap_candidate_preview")
-            )
-            if row.get("advanced_without_listener_activity"):
-                meta["session_callback_gap"] = True
-                meta["session_callback_gap_sec"] = row.get("gap_sec", 0.0)
-            elif not pending_candidate:
-                _clear_listener_session_gap_state_locked(
-                    name,
-                    meta,
-                    observed_at,
-                    "main_session_gap_closed",
-                )
-            if (
-                not row.get("advanced_without_listener_activity")
-                and not pending_candidate
-                and meta.get("recovery_status") in {"detected", "awaiting_replay", "replaying"}
-            ):
-                meta["recovery_status"] = "completed"
-                meta["recovery_completed_at"] = observed_at
-                completed_recoveries.append(
-                    (
-                        name,
-                        int(meta.get("recovery_replayed_count", 0) or 0),
-                        int(meta.get("recovery_forwarded_count", 0) or 0),
-                    )
-                )
-
-    for name, replayed, forwarded in completed_recoveries:
-        logger.info(
-            "✅ 假活恢复补扫已收敛: who=%s replayed=%s forwarded=%s",
-            name,
-            replayed,
-            forwarded,
-        )
-
-    return gaps
-
-
 def _listener_status_meta_snapshot(desired_snapshot: dict) -> dict:
     now = time.time()
     result = {}
@@ -1532,19 +825,11 @@ def _listener_status_meta_snapshot(desired_snapshot: dict) -> dict:
             "last_success_at",
             "last_reactivated_at",
             "last_failed_at",
-            "last_health_failed_at",
-            "last_callback_at",
-            "last_outbound_at",
-            "last_main_session_at",
-            "last_main_session_probe_at",
-            "last_dropped_at",
-            "last_forwarded_at",
             "last_rebind_at",
         ):
             value = float(enriched.get(key, 0.0) or 0.0)
             if value > 0:
                 enriched[f"{key}_age_sec"] = round(now - value, 1)
-        enriched["callback_state"] = _listener_callback_state(enriched, now)
         result[name] = enriched
     return result
 
@@ -1713,7 +998,7 @@ def _native_window_geometry(hwnd: int) -> dict:
             "offscreen_sentinel": offscreen_sentinel,
             "normal_offscreen_sentinel": normal_offscreen_sentinel,
             # 正常最小化窗口也位于 -32000，但 IsIconic=True 且保存着有效恢复位置。
-            # 本次现场的假活窗口 IsIconic=False、showCmd=normal，当前和恢复位置却都为 -32000。
+            # 异常窗口 IsIconic=False、showCmd=normal，当前和恢复位置却都为 -32000。
             "unrecoverable_offscreen": is_unrecoverable_offscreen_window(
                 window_rect=rect,
                 normal_rect=normal_rect,
@@ -1725,27 +1010,35 @@ def _native_window_geometry(hwnd: int) -> dict:
     return result
 
 
-def _find_listener_native_windows(who: str) -> list[dict]:
-    if not who or not _native_windows_available():
+def _is_wechat_native_window_class(class_name: str) -> bool:
+    value = str(class_name or "")
+    return value.startswith("Qt") and value.endswith("QWindowIcon")
+
+
+def _enumerate_wechat_native_windows() -> list[dict]:
+    """单次 EnumWindows 读取微信 Qt 顶层窗口；不访问 UIA 或切换前台。"""
+    if not _native_windows_available():
         return []
 
     user32 = ctypes.windll.user32
-    matches: list[dict] = []
+    windows: list[dict] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def _enum_proc(hwnd, _lparam):
         try:
-            if not user32.IsWindowVisible(hwnd):
+            native_hwnd = int(hwnd)
+            class_name = _native_window_class(native_hwnd)
+            if not _is_wechat_native_window_class(class_name):
                 return True
-            title = _native_window_text(int(hwnd))
-            if not title or (title != who and who not in title):
+            title = _native_window_text(native_hwnd)
+            if not title:
                 return True
-            matches.append({
-                "hwnd": int(hwnd),
+            windows.append({
+                "hwnd": native_hwnd,
                 "title": title,
-                "class_name": _native_window_class(int(hwnd)),
-                "pid": _native_window_pid(int(hwnd)),
-                **_native_window_geometry(int(hwnd)),
+                "class_name": class_name,
+                "pid": _native_window_pid(native_hwnd),
+                **_native_window_geometry(native_hwnd),
             })
         except Exception:
             return True
@@ -1754,296 +1047,310 @@ def _find_listener_native_windows(who: str) -> list[dict]:
     try:
         user32.EnumWindows(_enum_proc, 0)
     except Exception as e:
-        logger.debug("枚举监听原生窗口失败: who=%s error=%s", who, e)
-    return matches
+        logger.debug("枚举微信原生窗口失败: %s", e)
+    return windows
 
 
-def _probe_listener_native_window_health(who: str) -> dict:
-    windows = _find_listener_native_windows(who)
-    if not windows:
-        return {"checked": _native_windows_available(), "status": "unknown", "windows": []}
-
-    if all(window.get("unrecoverable_offscreen") for window in windows):
-        return {"checked": True, "status": "unrecoverable_offscreen", "windows": windows}
-    return {"checked": True, "status": "healthy", "windows": windows}
-
-
-def _close_listener_native_windows(who: str, reason: str) -> None:
+def _primary_work_area_recovery_rect() -> dict:
+    """返回主屏工作区内的保守聊天窗口矩形，供无健康同伴时兜底。"""
     if not _native_windows_available():
-        return
+        return {}
+    try:
+        work_area = wintypes.RECT()
+        if not ctypes.windll.user32.SystemParametersInfoW(
+            0x0030,  # SPI_GETWORKAREA
+            0,
+            ctypes.byref(work_area),
+            0,
+        ):
+            return {}
+        available_width = max(0, int(work_area.right) - int(work_area.left))
+        available_height = max(0, int(work_area.bottom) - int(work_area.top))
+        width = min(1200, available_width)
+        height = min(1040, available_height)
+        if width <= 0 or height <= 0:
+            return {}
+        return {
+            "left": int(work_area.left),
+            "top": int(work_area.top),
+            "right": int(work_area.left) + width,
+            "bottom": int(work_area.top) + height,
+        }
+    except Exception:
+        return {}
+
+
+def _cache_valid_native_window_rects(windows: list[dict]) -> None:
+    for window in windows:
+        title = str(window.get("title") or "").strip()
+        if not title:
+            continue
+        normal_rect = window.get("normal_rect") or {}
+        window_rect = window.get("window_rect") or {}
+        candidate = normal_rect if is_usable_window_rect(normal_rect) else window_rect
+        if is_usable_window_rect(candidate):
+            listener_window_last_valid_rect[title] = dict(candidate)
+
+
+def _listener_window_recovery_rect(
+    who: str,
+    target: dict,
+    wechat_windows: list[dict],
+) -> dict:
+    target_pid = int(target.get("pid") or 0)
+    peer_rects = []
+    for window in wechat_windows:
+        if int(window.get("pid") or 0) != target_pid:
+            continue
+        if int(window.get("hwnd") or 0) == int(target.get("hwnd") or 0):
+            continue
+        normal_rect = window.get("normal_rect") or {}
+        window_rect = window.get("window_rect") or {}
+        peer_rects.append(normal_rect if is_usable_window_rect(normal_rect) else window_rect)
+
+    return choose_window_recovery_rect(
+        listener_window_last_valid_rect.get(who),
+        peer_rects,
+        _primary_work_area_recovery_rect(),
+    )
+
+
+def _repair_listener_native_window_position(
+    who: str,
+    target: dict,
+    recovery_rect: dict,
+) -> dict:
+    """仅复位一个已再次确认异常的 HWND，不激活、不置顶、不重建窗口。"""
+    hwnd = int(target.get("hwnd") or 0)
+    result = {
+        "who": who,
+        "hwnd": hwnd,
+        "pid": int(target.get("pid") or 0),
+        "recovery_rect": dict(recovery_rect or {}),
+        "success": False,
+        "reason": "",
+    }
+    if not _native_windows_available() or not hwnd:
+        result["reason"] = "native_window_unavailable"
+        return result
+    if not is_usable_window_rect(recovery_rect):
+        result["reason"] = "missing_recovery_rect"
+        return result
 
     user32 = ctypes.windll.user32
-    for window in _find_listener_native_windows(who):
-        hwnd = int(window.get("hwnd") or 0)
-        if not hwnd:
-            continue
-        try:
-            logger.warning(
-                "⚠️ 准备关闭监听原生窗口: who=%s reason=%s hwnd=%s title=%r class=%s rect=%s iconic=%s",
-                who,
-                reason,
-                hwnd,
-                window.get("title"),
-                window.get("class_name"),
-                window.get("window_rect"),
-                window.get("iconic"),
-            )
-            user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
-            time.sleep(0.5)
-        except Exception as e:
-            logger.debug("关闭疑似假活原生窗口失败: who=%s hwnd=%s error=%s", who, hwnd, e)
-
-
-def _listener_health_failure_count(who: str) -> int:
-    return int(listener_health_failures.get(who, 0))
-
-
-def _listener_control_probe_target(chat) -> tuple[object | None, str]:
-    """返回监听 Chat 对应的 UIA 顶层控件及命中路径。"""
-    candidates = []
-
-    # wxautox4 40.x 的 Chat 是一层包装：实际 UIA 控件通常位于
-    # chat._api.control 或 chat.ChatBox.control，而不是 Chat 自身。
-    for parent_attr in ("_api", "ChatBox"):
-        try:
-            parent = getattr(chat, parent_attr, None)
-            candidates.append((f"chat.{parent_attr}.control", getattr(parent, "control", None)))
-            candidates.append((f"chat.{parent_attr}", parent))
-        except Exception:
-            continue
-
-    for attr in ("control", "window", "chat", "ChatWnd", "EditBox", "MainControl"):
-        try:
-            candidate = getattr(chat, attr, None)
-            if callable(candidate):
-                candidate = candidate()
-            candidates.append((f"chat.{attr}", candidate))
-        except Exception:
-            continue
-    candidates.append(("chat", chat))
-
-    for source, candidate in candidates:
-        try:
-            top = _top_control_for(candidate)
-            if _control_handle(top):
-                return top, source
-        except Exception:
-            continue
-    return None, ""
-
-
-def _probe_listener_chat_health(who: str, chat) -> dict:
-    """检查监听窗口是否存在，并识别无法从任务栏恢复的 -32000 假活状态。"""
-    health = {
-        "who": who,
-        "healthy": False,
-        "native_window_checked": False,
-        "native_windows": [],
-        "reason": "",
-        "handle": 0,
-        "control_source": "",
-        "name": "",
-        "checked_at": time.time(),
-    }
-
-    if not chat:
-        health["reason"] = "missing_chat"
-        return health
-
+    native_hwnd = wintypes.HWND(hwnd)
     try:
-        name = _chat_info_name(chat)
-        health["name"] = name
-        if name != who:
-            health["reason"] = f"name_mismatch:{name}"
-            return health
-    except Exception as e:
-        health["reason"] = f"chat_info_error:{e}"
-        return health
+        if not user32.IsWindow(native_hwnd):
+            result["reason"] = "window_disappeared"
+            return result
+        if _native_window_text(hwnd) != who:
+            result["reason"] = "title_changed"
+            return result
+        if not _is_wechat_native_window_class(_native_window_class(hwnd)):
+            result["reason"] = "class_changed"
+            return result
+        if _native_window_pid(hwnd) != result["pid"]:
+            result["reason"] = "pid_changed"
+            return result
+        if bool(user32.IsHungAppWindow(native_hwnd)):
+            result["reason"] = "window_message_thread_hung"
+            return result
 
-    native_health = _probe_listener_native_window_health(who)
-    health["native_window_checked"] = bool(native_health.get("checked"))
-    health["native_windows"] = native_health.get("windows", [])
-    if native_health.get("status") == "unrecoverable_offscreen":
-        health["reason"] = "native_window_unrecoverable_offscreen"
-        return health
+        before = _native_window_geometry(hwnd)
+        result["before"] = before
+        if not before.get("unrecoverable_offscreen"):
+            result["success"] = True
+            result["reason"] = "already_recovered"
+            result["after"] = before
+            return result
 
-    top, control_source = _listener_control_probe_target(chat)
-    if not top and native_health.get("status") == "healthy":
-        # 包装对象未暴露控件时，用几何状态正常的原生 HWND 反向构造 UIA 控件。
-        control_from_handle = getattr(uia, "ControlFromHandle", None)
-        if callable(control_from_handle):
-            for window in native_health.get("windows", []):
-                if window.get("unrecoverable_offscreen"):
-                    continue
-                hwnd = int(window.get("hwnd") or 0)
-                if not hwnd:
-                    continue
-                try:
-                    candidate = control_from_handle(hwnd)
-                    candidate_top = _top_control_for(candidate)
-                    if _control_handle(candidate_top):
-                        top = candidate_top
-                        control_source = f"native_hwnd:{hwnd}"
-                        break
-                except Exception as e:
-                    logger.debug("通过原生句柄构造监听 UIA 控件失败: who=%s hwnd=%s error=%s", who, hwnd, e)
+        placement = _NativeWindowPlacement()
+        placement.length = ctypes.sizeof(_NativeWindowPlacement)
+        if not user32.GetWindowPlacement(native_hwnd, ctypes.byref(placement)):
+            result["reason"] = "get_window_placement_failed"
+            return result
 
-    if not top:
-        # wxautox4 的 Chat 对象不总是暴露 UIA 句柄；当前实测所有监听窗口都可能 handle=0。
-        # 因此 no_uia_handle 只能表示“无法通过 UIA 验证”，不能单独判定假活。
-        # 已提供 /api/listeners/rebuild 用于人工确认假活后的定向强制重建。
-        health["healthy"] = True
-        health["reason"] = (
-            "native_window_ok_no_uia_handle"
-            if native_health.get("status") == "healthy"
-            else "ok_no_uia_handle"
+        foreground_before = int(user32.GetForegroundWindow() or 0)
+        placement.flags = 0
+        placement.show_cmd = 4  # SW_SHOWNOACTIVATE
+        placement.normal_position.left = int(recovery_rect["left"])
+        placement.normal_position.top = int(recovery_rect["top"])
+        placement.normal_position.right = int(recovery_rect["right"])
+        placement.normal_position.bottom = int(recovery_rect["bottom"])
+        placement_ok = bool(user32.SetWindowPlacement(native_hwnd, ctypes.byref(placement)))
+
+        width = int(recovery_rect["right"]) - int(recovery_rect["left"])
+        height = int(recovery_rect["bottom"]) - int(recovery_rect["top"])
+        position_ok = bool(user32.SetWindowPos(
+            native_hwnd,
+            wintypes.HWND(0),
+            int(recovery_rect["left"]),
+            int(recovery_rect["top"]),
+            width,
+            height,
+            0x0254,  # NOZORDER | NOACTIVATE | SHOWWINDOW | NOOWNERZORDER
+        ))
+        result["set_window_placement"] = placement_ok
+        result["set_window_pos"] = position_ok
+
+        time.sleep(0.1)
+        after = _native_window_geometry(hwnd)
+        result["after"] = after
+        result["foreground_before"] = foreground_before
+        result["foreground_after"] = int(user32.GetForegroundWindow() or 0)
+        result["foreground_unchanged"] = bool(
+            result["foreground_before"] == result["foreground_after"]
         )
-        return health
-
-    try:
-        health["control_source"] = control_source
-        health["handle"] = _control_handle(top)
-        if not _control_exists(top, 0.2):
-            health["reason"] = "control_not_exists"
-            return health
-        if _control_rect(top) is None:
-            health["reason"] = "invalid_rect"
-            return health
+        result["success"] = bool(
+            position_ok
+            and not after.get("unrecoverable_offscreen")
+            and is_usable_window_rect(after.get("window_rect") or {})
+            and is_usable_window_rect(after.get("normal_rect") or {})
+        )
+        result["reason"] = "recovered" if result["success"] else "verification_failed"
+        return result
     except Exception as e:
-        health["reason"] = f"uia_probe_error:{e}"
-        return health
-
-    health["healthy"] = True
-    health["reason"] = "ok"
-    return health
+        result["reason"] = f"repair_exception:{e}"
+        return result
 
 
-def _record_listener_health(who: str, health: dict) -> int:
-    last_listener_health_snapshot[who] = dict(health)
-    if health.get("healthy"):
-        listener_health_failures.pop(who, None)
-        with desired_listeners_lock:
-            meta = desired_listeners.get(who)
-            if meta:
-                if meta.get("status") in ("suspect", "zombie") or meta.get(
-                    "recovery_status"
-                ) == "circuit_open":
-                    meta["status"] = "active"
-                    meta["active"] = True
-                    meta["last_error"] = None
-                if meta.get("recovery_status") == "circuit_open":
-                    meta["recovery_status"] = "completed"
-                    meta["recovery_completed_at"] = time.time()
-                    meta["recovery_completed_reason"] = "health_probe_recovered"
-        return 0
+def _run_listener_window_auto_repair_cycle() -> dict:
+    """运行一次 Win32-only 检查；同一 HWND 连续命中后才进入修复。"""
+    global listener_window_auto_repair_last_check_at
+    global listener_window_auto_repair_last_repair_at
+    global listener_window_auto_repair_last_result
 
-    failures = _listener_health_failure_count(who) + 1
-    listener_health_failures[who] = failures
+    now = time.time()
+    listener_window_auto_repair_last_check_at = now
     with desired_listeners_lock:
-        meta = desired_listeners.get(who)
-        if meta is not None:
-            meta["active"] = False
-            meta["status"] = "zombie" if failures >= LISTENER_ZOMBIE_FAILURE_THRESHOLD else "suspect"
-            meta["last_error"] = f"listener_health:{health.get('reason')}"
-            meta["last_health_failed_at"] = health.get("checked_at", time.time())
-            meta["health_failure_count"] = failures
-    return failures
+        expected = list(desired_listeners.keys())
 
+    cycle_result = {
+        "checked_at": now,
+        "expected": expected,
+        "window_count": 0,
+        "suspected": [],
+        "repairs": [],
+        "status": "idle" if not expected else "checked",
+    }
+    if not expected or not _native_windows_available():
+        listener_window_auto_repair_last_result = cycle_result
+        return cycle_result
 
-def _find_zombie_listener_windows(expected: list[str]) -> list[str]:
-    zombies = []
-    session_gaps = _probe_main_session_listener_gaps(expected)
+    enumerated = _enumerate_wechat_native_windows()
+    expected_set = set(expected)
+    main_titles = {"微信", "WeChat", "Weixin"}
+    wechat_pids = {
+        int(window.get("pid") or 0)
+        for window in enumerated
+        if window.get("title") in main_titles and int(window.get("pid") or 0) > 0
+    }
+    if not wechat_pids:
+        expected_pids = {
+            int(window.get("pid") or 0)
+            for window in enumerated
+            if window.get("title") in expected_set and int(window.get("pid") or 0) > 0
+        }
+        if len(expected_pids) == 1:
+            wechat_pids = expected_pids
+
+    wechat_windows = [
+        window for window in enumerated
+        if int(window.get("pid") or 0) in wechat_pids
+    ]
+    cycle_result["window_count"] = len(wechat_windows)
+    if not wechat_pids:
+        cycle_result["status"] = "wechat_pid_unknown"
+        listener_window_auto_repair_last_result = cycle_result
+        return cycle_result
+
+    _cache_valid_native_window_rects(wechat_windows)
+    by_title: dict[str, list[dict]] = {}
+    for window in wechat_windows:
+        by_title.setdefault(str(window.get("title") or ""), []).append(window)
 
     for who in expected:
-        chat = _get_actual_listener_chat(who)
-        session_gap = session_gaps.get(who)
-        if session_gap:
-            if chat:
-                health = _probe_listener_chat_health(who, chat)
-                health["window_reason"] = health.get("reason")
-            else:
-                health = {
-                    "who": who,
-                    "handle": 0,
-                    "name": who,
-                    "checked_at": time.time(),
-                }
-            health["window_reason"] = health.get("window_reason") or health.get("reason")
-            decision = _record_listener_session_gap_candidate(
-                who,
-                session_gap,
-                health,
-            )
-            state = decision.get("state")
-            if state in {"resolved", "ignored", "suppressed"}:
-                logger.debug(
-                    "主会话推进无需再次重建: who=%s reason=%s",
-                    who,
-                    decision.get("reason"),
-                )
-                continue
-            if state == "pending":
-                logger.info(
-                    "⏳ 主会话已推进，等待下一轮确认回调缺口: who=%s "
-                    "confirmations=%s/%s session_time=%s preview=%r",
-                    who,
-                    decision.get("confirmations"),
-                    LISTENER_SESSION_CONFIRMATION_PROBES,
-                    session_gap.get("session_time"),
-                    session_gap.get("content_preview"),
-                )
-                continue
-
-            failures = int(decision.get("failures", 0) or 0)
-            logger.warning(
-                "⚠️ 主会话连续两轮推进但仍无回调证据: who=%s failures=%s/%s "
-                "session_time=%s gap_sec=%s new_count=%s preview=%r",
-                who,
-                failures,
-                LISTENER_ZOMBIE_FAILURE_THRESHOLD,
-                session_gap.get("session_time"),
-                session_gap.get("gap_sec"),
-                session_gap.get("new_count"),
-                session_gap.get("content_preview"),
-            )
-            if failures >= LISTENER_ZOMBIE_FAILURE_THRESHOLD:
-                zombies.append(who)
+        matches = [
+            window for window in by_title.get(who, [])
+            if bool(window.get("visible"))
+        ]
+        if len(matches) != 1:
+            listener_window_repair_suspicions.pop(who, None)
             continue
 
-        if not chat:
-            health = {
-                "who": who,
-                "healthy": True,
-                "reason": "registered_only_no_sub_window",
-                "handle": 0,
-                "name": "",
-                "checked_at": time.time(),
-            }
-            _record_listener_health(who, health)
-            logger.debug(
-                "监听注册存在但未找到实际子窗口，跳过假活判定: who=%s",
-                who,
-            )
+        target = matches[0]
+        unhealthy = bool(target.get("unrecoverable_offscreen"))
+        previous = listener_window_repair_suspicions.get(who)
+        state, repair_due = advance_window_repair_confirmation(
+            previous,
+            hwnd=int(target.get("hwnd") or 0),
+            unhealthy=unhealthy,
+            now=now,
+            threshold=LISTENER_WINDOW_AUTO_REPAIR_CONFIRMATION_PROBES,
+        )
+        if not state:
+            listener_window_repair_suspicions.pop(who, None)
             continue
 
-        health = _probe_listener_chat_health(who, chat)
-        failures = _record_listener_health(who, health)
-        if health.get("healthy"):
-            _maybe_repair_listener_registration(who, chat, health)
-        if not health.get("healthy"):
-            logger.warning(
-                "⚠️ 监听窗口健康探针失败: who=%s failures=%s/%s reason=%s handle=%s native_windows=%s",
-                who,
-                failures,
-                LISTENER_ZOMBIE_FAILURE_THRESHOLD,
-                health.get("reason"),
-                health.get("handle"),
-                health.get("native_windows"),
-            )
-            if failures >= LISTENER_ZOMBIE_FAILURE_THRESHOLD:
-                zombies.append(who)
+        if previous and int(previous.get("hwnd") or 0) == int(state.get("hwnd") or 0):
+            for key in ("next_attempt_at", "last_attempt_at", "last_error"):
+                if key in previous:
+                    state[key] = previous[key]
+        listener_window_repair_suspicions[who] = state
+        cycle_result["suspected"].append({"who": who, **state})
 
-    return zombies
+        if int(state.get("count") or 0) == 1:
+            logger.warning(
+                "⚠️ 原生窗口位置首次异常，等待下一轮确认: who=%s hwnd=%s rect=%s normal=%s",
+                who,
+                target.get("hwnd"),
+                target.get("window_rect"),
+                target.get("normal_rect"),
+            )
+        if not repair_due or float(state.get("next_attempt_at") or 0) > now:
+            continue
+
+        recovery_rect = _listener_window_recovery_rect(who, target, wechat_windows)
+        acquired = wx_ui_lock.acquire(timeout=0.1)
+        if not acquired:
+            state["last_error"] = "wx_ui_busy"
+            continue
+        try:
+            repair = _repair_listener_native_window_position(who, target, recovery_rect)
+        finally:
+            wx_ui_lock.release()
+
+        state["last_attempt_at"] = time.time()
+        cycle_result["repairs"].append(repair)
+        if repair.get("success"):
+            listener_window_repair_suspicions.pop(who, None)
+            after_rect = (repair.get("after") or {}).get("normal_rect") or recovery_rect
+            if is_usable_window_rect(after_rect):
+                listener_window_last_valid_rect[who] = dict(after_rect)
+            listener_window_auto_repair_last_repair_at = time.time()
+            cycle_result["status"] = "recovered"
+            logger.warning(
+                "✅ 已自动恢复监听窗口位置: who=%s hwnd=%s before=%s after=%s foreground_unchanged=%s",
+                who,
+                repair.get("hwnd"),
+                (repair.get("before") or {}).get("window_rect"),
+                (repair.get("after") or {}).get("window_rect"),
+                repair.get("foreground_unchanged"),
+            )
+        else:
+            state["last_error"] = repair.get("reason")
+            state["next_attempt_at"] = time.time() + LISTENER_WINDOW_AUTO_REPAIR_RETRY_COOLDOWN_SEC
+            cycle_result["status"] = "repair_failed"
+            logger.error(
+                "❌ 自动恢复监听窗口位置失败: who=%s hwnd=%s reason=%s retry_in=%ss",
+                who,
+                repair.get("hwnd"),
+                repair.get("reason"),
+                LISTENER_WINDOW_AUTO_REPAIR_RETRY_COOLDOWN_SEC,
+            )
+
+    listener_window_auto_repair_last_result = cycle_result
+    return cycle_result
 
 
 def _is_wx_listener_loop_running() -> bool:
@@ -2081,35 +1388,6 @@ def _ensure_wx_listener_loop_started(reason: str) -> None:
         logger.debug("StartListening 调用失败/可能已在运行: reason=%s error=%s", reason, e)
 
 
-def _reset_wx_listener_state(reason: str) -> None:
-    """清理 wxautox 监听注册表，处理子窗口全丢后的坏状态。"""
-    if not wx:
-        return
-
-    try:
-        stop_listening = getattr(wx, "StopListening", None)
-        if callable(stop_listening):
-            stop_listening()
-            time.sleep(0.2)
-    except Exception as e:
-        logger.debug("StopListening 失败，可忽略: reason=%s error=%s", reason, e)
-
-    try:
-        listen = getattr(wx, "listen", None)
-        if isinstance(listen, dict):
-            listen.clear()
-            logger.info("已清空 wx.listen 注册表: reason=%s", reason)
-    except Exception as e:
-        logger.debug("清空 wx.listen 注册表失败: reason=%s error=%s", reason, e)
-
-    for attr in ("_listener_is_listening",):
-        try:
-            if hasattr(wx, attr):
-                setattr(wx, attr, False)
-        except Exception:
-            pass
-
-
 def _bind_existing_listener_chat(who: str, chat, *, reason: str = "bind_existing_listener") -> bool:
     """把已存在的监听子窗口重新注册到当前进程的 wx.listen，确保回调可触发。"""
     if not wx or not chat:
@@ -2123,7 +1401,6 @@ def _bind_existing_listener_chat(who: str, chat, *, reason: str = "bind_existing
     listen[who] = (chat, message_callback)
     _ensure_wx_listener_loop_started(f"bind_existing_listener:{who}")
     now = time.time()
-    listener_last_rebind_at[who] = now
     with desired_listeners_lock:
         meta = desired_listeners.get(who)
         if meta is not None:
@@ -2181,57 +1458,49 @@ def _listener_registration_health(who: str) -> dict:
     return result
 
 
-def _maybe_repair_listener_registration(who: str, chat, health: dict) -> bool:
-    """只在注册表/回调确实异常时修复；UIA 句柄缺失本身不再触发重绑。"""
-    if not health.get("healthy"):
-        return False
-
-    health_reason = str(health.get("reason") or "")
-    no_uia_handle = health_reason in ("native_window_ok_no_uia_handle", "ok_no_uia_handle")
-    if no_uia_handle:
-        if who not in listener_no_uia_notice_logged:
-            logger.info(
-                "监听窗口暂未取得 UIA 句柄；将以原生窗口和回调注册校验，不做周期重绑: who=%s reason=%s",
-                who,
-                health_reason,
-            )
-            listener_no_uia_notice_logged.add(who)
-    else:
-        listener_no_uia_notice_logged.discard(who)
-
-    registration = _listener_registration_health(who)
-    if registration.get("healthy"):
-        _ensure_wx_listener_loop_started(f"watchdog_registration_ok:{who}")
-        return False
-
-    registration_reason = str(registration.get("reason") or "unknown")
-    if _bind_existing_listener_chat(
-        who,
-        chat,
-        reason=f"watchdog_registration_repair:{registration_reason}",
-    ):
-        logger.warning(
-            "⚠️ 检测到监听回调注册异常，已定向修复: who=%s registration_reason=%s health_reason=%s",
-            who,
-            registration_reason,
-            health_reason,
-        )
-        return True
-    return False
+def _listener_window_auto_repair_status() -> dict:
+    now = time.time()
+    pending_snapshot = dict(listener_window_repair_suspicions)
+    return {
+        "enabled": _native_windows_available(),
+        "always_on": True,
+        "running": bool(
+            listener_window_auto_repair_thread
+            and listener_window_auto_repair_thread.is_alive()
+        ),
+        "mode": "win32_geometry_only",
+        "interval_sec": LISTENER_WINDOW_AUTO_REPAIR_INTERVAL_SEC,
+        "confirmation_probes": LISTENER_WINDOW_AUTO_REPAIR_CONFIRMATION_PROBES,
+        "expected_recovery_latency_sec": {
+            "min": LISTENER_WINDOW_AUTO_REPAIR_INTERVAL_SEC,
+            "max": (
+                LISTENER_WINDOW_AUTO_REPAIR_INTERVAL_SEC
+                * LISTENER_WINDOW_AUTO_REPAIR_CONFIRMATION_PROBES
+            ),
+        },
+        "last_check_at": listener_window_auto_repair_last_check_at or None,
+        "last_check_age_sec": (
+            round(max(0.0, now - listener_window_auto_repair_last_check_at), 1)
+            if listener_window_auto_repair_last_check_at
+            else None
+        ),
+        "last_repair_at": listener_window_auto_repair_last_repair_at or None,
+        "pending": {
+            name: dict(state)
+            for name, state in pending_snapshot.items()
+        },
+        "last_result": dict(listener_window_auto_repair_last_result),
+    }
 
 
 def _listener_status_payload(desired_snapshot: dict, actual: list, *, probe_skipped: bool = False) -> dict:
     actual_set = set(actual)
     missing = [] if probe_skipped else [name for name in desired_snapshot.keys() if name not in actual_set]
-    zombies = [] if probe_skipped else [
-        name for name in desired_snapshot.keys()
-        if _listener_health_failure_count(name) >= LISTENER_ZOMBIE_FAILURE_THRESHOLD
-    ]
     if not desired_snapshot:
         listener_status = "empty"
     elif probe_skipped:
         listener_status = "unknown"
-    elif missing or zombies:
+    elif missing:
         listener_status = "degraded"
     else:
         listener_status = "healthy"
@@ -2241,38 +1510,11 @@ def _listener_status_payload(desired_snapshot: dict, actual: list, *, probe_skip
         "desired": list(desired_snapshot.keys()),
         "actual": actual,
         "missing": missing,
-        "zombies": zombies,
         "desired_meta": _listener_status_meta_snapshot(desired_snapshot),
         "probe_skipped": probe_skipped,
         "actual_snapshot_at": last_listener_actual_snapshot_at,
-        "health_snapshot": dict(last_listener_health_snapshot),
-        "main_session_probe": {
-            "checked_at": last_listener_session_probe_at or None,
-            "last_error": last_listener_session_probe_error or None,
-            "snapshot": dict(last_listener_session_snapshot),
-        },
-        "watchdog_running": bool(listener_watchdog_thread and listener_watchdog_thread.is_alive()),
+        "window_auto_repair": _listener_window_auto_repair_status(),
         "listener_loop_running": _is_wx_listener_loop_running(),
-        "daily_restart": _listener_daily_restart_status(),
-    }
-
-
-def _listener_daily_restart_status() -> dict:
-    def _beijing_iso(timestamp: float) -> str | None:
-        if timestamp <= 0:
-            return None
-        return datetime.fromtimestamp(timestamp, BEIJING_TIMEZONE).isoformat()
-
-    return {
-        "enabled": True,
-        "hour": LISTENER_DAILY_RESTART_HOUR,
-        "timezone": "Asia/Shanghai",
-        "last_run_at": listener_daily_restart_last_at or None,
-        "last_run_at_beijing": _beijing_iso(listener_daily_restart_last_at),
-        "next_run_at": listener_daily_restart_next_at,
-        "next_run_at_beijing": _beijing_iso(listener_daily_restart_next_at),
-        "last_targets": list(listener_daily_restart_last_targets),
-        "last_error": listener_daily_restart_last_error or None,
     }
 
 
@@ -2295,7 +1537,6 @@ def _mark_desired_listener_attempt(who: str) -> None:
 
 def _mark_desired_listener_success(who: str, *, reactivated: bool = False) -> None:
     now = time.time()
-    listener_health_failures.pop(who, None)
     with desired_listeners_lock:
         meta = desired_listeners.setdefault(who, {
             "added_at": now,
@@ -2309,11 +1550,6 @@ def _mark_desired_listener_success(who: str, *, reactivated: bool = False) -> No
         meta["last_success_at"] = now
         meta["last_error"] = None
         meta["failure_count"] = 0
-        meta["health_failure_count"] = 0
-        if meta.get("recovery_status") in {"failed", "circuit_open"}:
-            meta["recovery_status"] = "completed"
-            meta["recovery_completed_at"] = now
-            meta["recovery_completed_reason"] = "listener_activation_succeeded"
         if reactivated:
             meta["last_reactivated_at"] = now
             meta["reactivation_count"] = int(meta.get("reactivation_count", 0)) + 1
@@ -2333,27 +1569,6 @@ def _mark_desired_listener_failure(who: str, error: Exception | str) -> None:
         meta["last_error"] = str(error)
         meta["last_failed_at"] = now
         meta["failure_count"] = int(meta.get("failure_count", 0)) + 1
-
-
-def _listener_recovery_cooldown_remaining(who: str, now: float | None = None) -> float:
-    """恢复失败后退避，避免 watchdog 每轮都抢占微信 UI。"""
-    now = time.time() if now is None else now
-    with desired_listeners_lock:
-        meta = desired_listeners.get(who, {})
-        failure_count = int(meta.get("failure_count", 0) or 0)
-        last_failed_at = float(meta.get("last_failed_at", 0.0) or 0.0)
-    if failure_count <= 0 or last_failed_at <= 0:
-        return 0.0
-    cooldown = min(
-        LISTENER_RECOVERY_MAX_COOLDOWN_SEC,
-        max(LISTENER_RECOVERY_MIN_COOLDOWN_SEC, failure_count * LISTENER_WATCHDOG_INTERVAL_SEC),
-    )
-    return max(0.0, last_failed_at + cooldown - now)
-
-
-def _listener_failure_count(who: str) -> int:
-    with desired_listeners_lock:
-        return int(desired_listeners.get(who, {}).get("failure_count", 0) or 0)
 
 
 def _open_listener_from_main_session(who: str, client):
@@ -2380,7 +1595,7 @@ def _open_listener_from_main_session(who: str, client):
     return chat
 
 
-def _add_listen_chat_verified(who: str, *, reactivated: bool = False, force_new: bool = False) -> None:
+def _add_listen_chat_verified(who: str, *, reactivated: bool = False) -> None:
     """添加监听并确认独立监听窗口真的出现在 wxautox 子窗口列表中。"""
     client = wx
     if client is None:
@@ -2390,7 +1605,7 @@ def _add_listen_chat_verified(who: str, *, reactivated: bool = False, force_new:
     for attempt in range(1, LISTENER_ADD_ATTEMPTS + 1):
         _mark_desired_listener_attempt(who)
         try:
-            existing_chat = None if force_new else _get_actual_listener_chat(who, client)
+            existing_chat = _get_actual_listener_chat(who, client)
             if existing_chat and _bind_existing_listener_chat(who, existing_chat, reason="add_listener_existing_window"):
                 _mark_desired_listener_success(who, reactivated=reactivated)
                 return
@@ -2544,7 +1759,7 @@ def _recover_listeners_after_browser(
             except Exception as e:
                 result["failed"][who] = str(e)
                 logger.error(
-                    "❌ 浏览器操作后同步恢复监听失败，将交由 watchdog 重试: source=%s who=%s error=%s",
+                    "❌ 浏览器操作后同步恢复监听失败: source=%s who=%s error=%s",
                     source_chat_name,
                     who,
                     e,
@@ -2566,240 +1781,6 @@ def _recover_listeners_after_browser(
             result["final_actual"],
         )
     return result
-
-
-def _remove_listener_registration(who: str, reason: str) -> None:
-    """Best-effort 移除单个监听及 wx.listen 注册，供假活窗口重建使用。"""
-    if not wx:
-        return
-
-    try:
-        remove_listen_chat = getattr(wx, "RemoveListenChat", None)
-        if callable(remove_listen_chat):
-            remove_listen_chat(who)
-            time.sleep(0.3)
-            logger.info("已调用 RemoveListenChat 移除监听: who=%s reason=%s", who, reason)
-    except Exception as e:
-        logger.debug("RemoveListenChat 失败，可忽略: who=%s reason=%s error=%s", who, reason, e)
-
-    try:
-        listen = getattr(wx, "listen", None)
-        if isinstance(listen, dict) and who in listen:
-            listen.pop(who, None)
-            logger.info("已从 wx.listen 删除监听注册: who=%s reason=%s", who, reason)
-    except Exception as e:
-        logger.debug("删除 wx.listen 注册失败: who=%s reason=%s error=%s", who, reason, e)
-
-    listener_last_rebind_at.pop(who, None)
-    _close_listener_native_windows(who, reason)
-
-
-def _run_scheduled_listener_restart(expected: list[str]) -> list[str]:
-    """关闭全部监听窗口，保留期望列表，交给下一轮 watchdog 自动恢复。"""
-    global last_listener_actual_snapshot, last_listener_actual_snapshot_at
-    global listener_daily_restart_last_at, listener_daily_restart_next_at
-    global listener_daily_restart_last_targets, listener_daily_restart_last_error
-
-    run_at = time.time()
-    scheduled_for = listener_daily_restart_next_at
-    listener_daily_restart_last_error = ""
-
-    try:
-        actual = _get_actual_listener_names()
-        targets = list(dict.fromkeys([*expected, *actual]))
-        listener_daily_restart_last_targets = list(targets)
-        logger.warning(
-            "⏰ 北京时间凌晨 %s 点定时重置监听窗口: scheduled_for=%s expected=%s actual=%s targets=%s",
-            LISTENER_DAILY_RESTART_HOUR,
-            datetime.fromtimestamp(scheduled_for, BEIJING_TIMEZONE).isoformat(),
-            expected,
-            actual,
-            targets,
-        )
-
-        for who in targets:
-            _remove_listener_registration(who, "daily_scheduled_restart")
-
-        _reset_wx_listener_state("daily_scheduled_restart")
-        last_listener_actual_snapshot = []
-        last_listener_actual_snapshot_at = time.time()
-
-        with desired_listeners_lock:
-            for who in expected:
-                meta = desired_listeners.get(who)
-                if meta is None:
-                    continue
-                meta["active"] = False
-                meta["status"] = "scheduled_restart_pending"
-                meta["last_error"] = None
-                meta["failure_count"] = 0
-                meta["health_failure_count"] = 0
-                meta["last_scheduled_restart_at"] = run_at
-
-        for who in expected:
-            listener_health_failures.pop(who, None)
-            last_listener_health_snapshot.pop(who, None)
-
-        listener_daily_restart_last_at = run_at
-        listener_daily_restart_next_at = next_daily_run_at(
-            hour=LISTENER_DAILY_RESTART_HOUR,
-            now=run_at,
-        )
-        logger.warning(
-            "⏰ 定时监听窗口重置完成；保留期望监听列表，下一轮 watchdog 将自动恢复: targets=%s next_run=%s",
-            targets,
-            datetime.fromtimestamp(listener_daily_restart_next_at, BEIJING_TIMEZONE).isoformat(),
-        )
-        return targets
-    except Exception as e:
-        listener_daily_restart_last_error = str(e)
-        logger.error("❌ 定时重置监听窗口失败: %s", e, exc_info=True)
-        raise
-
-
-def _force_rebuild_listener(who: str, reason: str) -> bool:
-    """强制重建单个监听窗口，避免复用已经假活的子窗口。"""
-    with desired_listeners_lock:
-        meta = desired_listeners.get(who)
-        if reason == "watchdog_zombie" and not _listener_session_rebuild_still_required_locked(meta):
-            logger.info(
-                "✅ 原子重建闸门发现回调证据已收敛，取消监听窗口重建: who=%s",
-                who,
-            )
-            return False
-        if meta is not None:
-            meta["recovery_status"] = "rebuilding"
-            meta["recovery_rebuild_started_at"] = time.time()
-            meta["recovery_rebuild_reason"] = reason
-            meta["recovery_rebuild_attempts"] = int(meta.get("recovery_rebuild_attempts", 0) or 0) + 1
-
-    logger.warning("⚠️ 准备强制重建监听窗口: who=%s reason=%s", who, reason)
-
-    try:
-        rebuild_listen_chat = getattr(wx, "RebuildListenChat", None)
-        if callable(rebuild_listen_chat):
-            if not _activate_wechat_main_window(f"force_rebuild_listener:{who}"):
-                raise RuntimeError(
-                    f"未能确认微信主窗口位于前台，取消重建监听: {who}"
-                )
-            rebuild_listen_chat(who)
-            _ensure_wx_listener_loop_started(f"force_rebuild_listener:{who}")
-            logger.warning(
-                "♻️ 已保留监听游标重建窗口，将由正常回调链补投缺失尾部: who=%s",
-                who,
-            )
-        else:
-            logger.warning(
-                "⚠️ 当前微信驱动不支持保留游标重建，将使用旧式重建且无法保证补投: who=%s",
-                who,
-            )
-            # Destructive legacy fallback must prove the main window is controllable
-            # before removing a currently registered child window.
-            if not _activate_wechat_main_window(f"force_rebuild_listener:{who}"):
-                raise RuntimeError(
-                    f"未能确认微信主窗口位于前台，保留原监听窗口: {who}"
-                )
-            _remove_listener_registration(who, reason)
-            _add_listen_chat_verified(who, reactivated=False, force_new=True)
-    except Exception as e:
-        with desired_listeners_lock:
-            meta = desired_listeners.get(who)
-            if meta is not None:
-                failed_at = time.time()
-                meta["recovery_status"] = (
-                    "circuit_open" if reason == "watchdog_zombie" else "failed"
-                )
-                meta["recovery_failed_at"] = failed_at
-                meta["recovery_last_error"] = str(e)
-                if reason == "watchdog_zombie" and meta.get(
-                    "session_gap_candidate_key"
-                ):
-                    meta["recovery_candidate_key"] = meta.get(
-                        "session_gap_candidate_key"
-                    )
-                    _clear_listener_session_gap_state_locked(
-                        who,
-                        meta,
-                        failed_at,
-                        "rebuild_failed_circuit_open",
-                    )
-        raise
-
-    with desired_listeners_lock:
-        meta = desired_listeners.get(who)
-        if meta is not None and meta.get("recovery_status") == "rebuilding":
-            meta["recovery_status"] = "awaiting_replay"
-            meta["recovery_rebuild_completed_at"] = time.time()
-
-    chat = _get_actual_listener_chat(who)
-    health = _probe_listener_chat_health(who, chat)
-    if not health.get("healthy"):
-        health_reason = str(health.get("reason") or "")
-        if health_reason in ("suspect_native_window_ok_no_uia_handle", "suspect_no_uia_handle"):
-            # wxautox4 有时仍不给监听子窗口 UIA 句柄；重建已经完成，先保留 suspect 状态，
-            # 让后续真实消息/下一轮探针验证，不把刚重建的窗口立即判为失败。
-            last_listener_health_snapshot[who] = dict(health)
-            with desired_listeners_lock:
-                meta = desired_listeners.get(who)
-                if meta is not None:
-                    meta["active"] = True
-                    meta["status"] = "suspect"
-                    meta["last_error"] = f"listener_health:{health_reason}"
-                    meta["health_failure_count"] = _listener_health_failure_count(who)
-                    if meta.get("session_callback_gap"):
-                        _clear_listener_session_gap_state_locked(
-                            who,
-                            meta,
-                            time.time(),
-                            "rebuild_completed_suspect_health",
-                        )
-            logger.warning(
-                "⚠️ 已强制重建监听窗口，但仍缺少 UIA 句柄，暂标记 suspect: who=%s reason=%s",
-                who,
-                health_reason,
-            )
-            return True
-
-        failures = _record_listener_health(who, health)
-        error = RuntimeError(
-            f"强制重建后监听窗口仍不可用: who={who} "
-            f"reason={health.get('reason')} failures={failures}"
-        )
-        with desired_listeners_lock:
-            meta = desired_listeners.get(who)
-            if meta is not None:
-                failed_at = time.time()
-                meta["recovery_status"] = (
-                    "circuit_open"
-                    if reason == "watchdog_zombie"
-                    else "failed"
-                )
-                meta["recovery_failed_at"] = failed_at
-                meta["recovery_last_error"] = str(error)
-                if meta.get("session_gap_candidate_key"):
-                    meta["recovery_candidate_key"] = meta.get(
-                        "session_gap_candidate_key"
-                    )
-                    _clear_listener_session_gap_state_locked(
-                        who,
-                        meta,
-                        failed_at,
-                        "rebuild_health_failed_circuit_open",
-                    )
-        raise error
-
-    _mark_desired_listener_success(who, reactivated=True)
-    with desired_listeners_lock:
-        meta = desired_listeners.get(who)
-        if meta is not None and meta.get("session_callback_gap"):
-            _clear_listener_session_gap_state_locked(
-                who,
-                meta,
-                time.time(),
-                "rebuild_completed",
-            )
-    logger.info("✅ 已强制重建监听窗口: who=%s handle=%s", who, health.get("handle"))
-    return True
 
 
 def _describe_control(control) -> str:
@@ -2898,145 +1879,38 @@ def _log_listener_snapshot(reason: str) -> list:
     return actual
 
 
-def _ensure_listener_watchdog_started() -> None:
-    """启动监听窗口看护线程，异常关闭监听窗口时自动恢复。"""
-    global listener_watchdog_thread
+def _ensure_listener_window_auto_repair_started() -> None:
+    """启动固定启用的 Win32 几何看护。"""
+    global listener_window_auto_repair_thread
 
-    if listener_watchdog_thread and listener_watchdog_thread.is_alive():
+    if not _native_windows_available():
+        logger.info("当前平台不支持 Win32 窗口位置自动恢复")
+        return
+    if listener_window_auto_repair_thread and listener_window_auto_repair_thread.is_alive():
         return
 
-    def _watchdog_loop():
+    def _auto_repair_loop():
         logger.info(
-            "🔍 监听窗口看护线程已启动；下次定时重置=%s",
-            datetime.fromtimestamp(listener_daily_restart_next_at, BEIJING_TIMEZONE).isoformat(),
+            "🩹 监听窗口 Win32 位置自动恢复已启动: interval=%ss confirmations=%s "
+            "mode=geometry_only foreground_unchanged=true",
+            LISTENER_WINDOW_AUTO_REPAIR_INTERVAL_SEC,
+            LISTENER_WINDOW_AUTO_REPAIR_CONFIRMATION_PROBES,
         )
         while True:
+            time.sleep(LISTENER_WINDOW_AUTO_REPAIR_INTERVAL_SEC)
+            if not wx:
+                continue
             try:
-                time.sleep(LISTENER_WATCHDOG_INTERVAL_SEC)
-
-                with desired_listeners_lock:
-                    expected = list(desired_listeners.keys())
-
-                with wx_ui_lock:
-                    # wx 会在重连时被替换。必须在 UI 锁内检查，
-                    # 避免锁外看到旧对象，进锁后却对 None/新对象操作。
-                    if not wx:
-                        continue
-                    # IsOnline 只能由连接监控线程主动探测。watchdog 复用确认缓存，
-                    # 避免两个 5/20 秒循环并发访问同一 UIA 对象。
-                    if not _online_probe_snapshot().get("online"):
-                        continue
-
-                    if time.time() >= listener_daily_restart_next_at:
-                        _run_scheduled_listener_restart(expected)
-                        # 本轮只负责关闭；让下一轮 watchdog 通过缺失检测走统一恢复链路。
-                        continue
-
-                    if not expected:
-                        continue
-
-                    actual = set(_get_actual_listener_names())
-                    missing = [name for name in expected if name not in actual]
-                    zombies = [] if missing else _find_zombie_listener_windows(expected)
-                    if not missing and not zombies:
-                        _ensure_wx_listener_loop_started("watchdog_healthy")
-                        continue
-
-                    if missing:
-                        _log_listener_snapshot("watchdog_missing_first_check")
-                        time.sleep(1.0)
-                        actual_retry = set(_get_actual_listener_names())
-                        missing_retry = [name for name in expected if name not in actual_retry]
-                        if not missing_retry and not zombies:
-                            logger.warning(
-                                "⚠️ 监听窗口首次检查缺失但复查恢复，跳过自动恢复: first_missing=%s first_actual=%s retry_actual=%s",
-                                missing,
-                                sorted(actual),
-                                sorted(actual_retry),
-                            )
-                            continue
-                    else:
-                        actual_retry = actual
-                        missing_retry = []
-
-                    if missing_retry:
-                        now = time.time()
-                        ready_missing = []
-                        cooling_missing = []
-                        for name in missing_retry:
-                            failures = _listener_failure_count(name)
-                            remaining = _listener_recovery_cooldown_remaining(name, now)
-                            if remaining > 0:
-                                cooling_missing.append((name, round(remaining, 1), failures))
-                            else:
-                                ready_missing.append(name)
-
-                        if cooling_missing:
-                            logger.warning(
-                                "⚠️ 监听窗口缺失但仍在恢复退避期，暂不抢占 UI: cooling=%s actual=%s expected=%s",
-                                cooling_missing,
-                                sorted(actual_retry),
-                                expected,
-                            )
-                        missing_retry = ready_missing
-
-                    if missing_retry:
-                        logger.warning(
-                            "⚠️ 检测到监听窗口缺失，准备自动恢复: missing=%s actual=%s expected=%s",
-                            missing_retry,
-                            sorted(actual_retry),
-                            expected,
-                        )
-
-                    if zombies:
-                        logger.warning(
-                            "⚠️ 检测到监听窗口假活，准备强制重建: zombies=%s actual=%s expected=%s",
-                            zombies,
-                            sorted(actual_retry),
-                            expected,
-                        )
-
-                    if not actual_retry:
-                        logger.warning(
-                            "⚠️ watchdog 复查仍未看到任何监听窗口；禁止自动清空全局监听状态，改为逐个定向恢复"
-                        )
-
-                    for who in missing_retry:
-                        try:
-                            _add_listen_chat_verified(who, reactivated=True)
-                            logger.info(f"✅ 已自动恢复监听窗口: {who}")
-                        except Exception as e:
-                            # _add_listen_chat_verified 已按真实尝试次数记录失败，
-                            # 这里不再重复累加，否则退避时间会被平白翻倍。
-                            logger.error(f"❌ 自动恢复监听窗口失败: {who}, {e}")
-
-                    for who in zombies:
-                        try:
-                            if not _listener_session_rebuild_still_required(who):
-                                logger.info(
-                                    "✅ 重建前回调证据已收敛，取消监听窗口重建: who=%s",
-                                    who,
-                                )
-                                continue
-                            _force_rebuild_listener(who, "watchdog_zombie")
-                        except Exception as e:
-                            _mark_desired_listener_failure(who, e)
-                            logger.error(f"❌ 强制重建假活监听窗口失败: {who}, {e}")
-                            logger.error(
-                                "⛔ 单个监听重建失败，已打开该监听恢复熔断；保留其他监听且不执行全量重置: failed=%s",
-                                who,
-                            )
-
-                    _ensure_wx_listener_loop_started("watchdog_after_recovery")
+                _run_listener_window_auto_repair_cycle()
             except Exception as e:
-                logger.error(f"监听窗口看护线程异常: {e}", exc_info=True)
+                logger.error("监听窗口 Win32 位置自动恢复线程异常: %s", e, exc_info=True)
 
-    listener_watchdog_thread = threading.Thread(
-        target=_watchdog_loop,
-        name="listener_window_watchdog",
+    listener_window_auto_repair_thread = threading.Thread(
+        target=_auto_repair_loop,
+        name="listener_window_auto_repair",
         daemon=True,
     )
-    listener_watchdog_thread.start()
+    listener_window_auto_repair_thread.start()
 
 # --- 日志配置 ---
 import os
@@ -3114,14 +1988,15 @@ MAIN_APP_URL = os.getenv("MAIN_APP_URL", "").strip() or f"http://127.0.0.1:{_web
 
 # --- 微信核心逻辑 ---
 def _reset_listener_recovery_after_connection() -> None:
-    """新连接不继承旧 UI 对象的失败计数，允许所有目标重新尝试一次。"""
+    """新连接不继承旧窗口位置和监听注册状态。"""
+    listener_window_repair_suspicions.clear()
+    listener_window_last_valid_rect.clear()
     with desired_listeners_lock:
         for meta in desired_listeners.values():
             meta["active"] = False
             meta["status"] = "connection_ready_pending"
             meta["last_error"] = None
             meta["failure_count"] = 0
-            meta["health_failure_count"] = 0
 
 
 def _stop_wechat_client(client, reason: str) -> None:
@@ -3156,7 +2031,7 @@ def start_wechat_logic():
 
             logger.info(f"Initializing WeChat... (attempt {retry_count + 1})")
             # 初始化、发布和销毁 wx 对象都与真实 UI 操作共用一把锁。
-            # 这样 API/watchdog 不会在对象切换到 None 的中途继续 AddListenChat。
+            # 这样 API 不会在对象切换到 None 的中途继续 AddListenChat。
             with wx_ui_lock:
                 current_client = WeChat(start_listener=True)
                 wx = current_client
@@ -3168,7 +2043,7 @@ def start_wechat_logic():
                 wechat_service_instance_id,
                 wechat_connection_generation,
             )
-            _ensure_listener_watchdog_started()
+            _ensure_listener_window_auto_repair_started()
 
             # 重置重试计数
             retry_count = 0
@@ -3762,34 +2637,38 @@ def _run_media_download_with_preview_guard(msg, operation, *, trace_id: str):
             expected_process_id = _control_process_id(current_top)
 
     before = _wechat_top_level_snapshot()
-    logger.info(
-        "🔎 媒体下载窗口快照[before]: trace=%s message_top=%s windows=%s",
-        trace_id,
-        _describe_control(message_top),
-        _format_top_level_snapshot(before),
-    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "🔎 媒体下载窗口快照[before]: trace=%s message_top=%s windows=%s",
+            trace_id,
+            _describe_control(message_top),
+            _format_top_level_snapshot(before),
+        )
 
     # Before an operation, close only explicitly recognizable media windows.
     # Passing every existing handle as baseline disables the generic-new-window
     # rule, so unrelated pre-existing WeChat windows are left untouched.
-    _close_probable_media_windows(
+    closed_before = _close_probable_media_windows(
         before,
         expected_process_id=expected_process_id,
         baseline_handles=set(before),
         trace_id=trace_id,
         stage="before",
     )
-    baseline = _wechat_top_level_snapshot()
+    # The common path has nothing to clean, so the first snapshot is already a
+    # valid baseline. Re-scan only after Esc was actually sent to an old preview.
+    baseline = _wechat_top_level_snapshot() if closed_before else before
 
     try:
         return operation()
     finally:
         after = _wechat_top_level_snapshot()
-        logger.info(
-            "🔎 媒体下载窗口快照[after]: trace=%s windows=%s",
-            trace_id,
-            _format_top_level_snapshot(after),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "🔎 媒体下载窗口快照[after]: trace=%s windows=%s",
+                trace_id,
+                _format_top_level_snapshot(after),
+            )
         closed = _close_probable_media_windows(
             after,
             expected_process_id=expected_process_id,
@@ -3797,13 +2676,21 @@ def _run_media_download_with_preview_guard(msg, operation, *, trace_id: str):
             trace_id=trace_id,
             stage="after",
         )
-        final_snapshot = _wechat_top_level_snapshot()
-        logger.info(
-            "🧹 媒体下载窗口收尾完成: trace=%s closed=%s windows=%s",
-            trace_id,
-            closed,
-            _format_top_level_snapshot(final_snapshot),
-        )
+        if closed:
+            # Only a real cleanup needs a verification scan. The normal path
+            # avoids both this extra UIA enumeration and an empty INFO record.
+            final_snapshot = _wechat_top_level_snapshot()
+            logger.info(
+                "🧹 媒体下载窗口收尾完成: trace=%s closed=%s",
+                trace_id,
+                closed,
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "🔎 媒体下载窗口快照[final]: trace=%s windows=%s",
+                    trace_id,
+                    _format_top_level_snapshot(final_snapshot),
+                )
 
 
 def _log_image_download_audit(kind: str, chat_name: str, message_id: str, file_path: str) -> dict:
@@ -4399,9 +3286,9 @@ def resolve_link_url_from_browser(msg, timeout: int = 30, source_chat_name: str 
                     baseline_actual=baseline_actual,
                 )
             except Exception as e:
-                # URL 解析结果不应被恢复流程覆盖；失败项仍会由 watchdog 接管。
+                # URL 解析结果不应被监听校验结果覆盖。
                 logger.error(
-                    "❌ 浏览器操作后的监听校验异常，将交由 watchdog 重试: source=%s error=%s",
+                    "❌ 浏览器操作后的监听校验异常: source=%s error=%s",
                     source_chat_name,
                     e,
                     exc_info=True,
@@ -4467,24 +3354,12 @@ def message_callback(msg, chat):
         except Exception:
             content_str = ""
 
-        is_recovery_replay = _record_listener_callback_activity(chat_name, msg, content_str)
-        if is_recovery_replay:
-            logger.warning(
-                "♻️ 假活恢复补投消息，进入正常业务处理链: sender=%r chat=%r type=%r content=%r",
-                sender_name,
-                chat_name,
-                getattr(msg, "type", ""),
-                _message_preview(content_str),
-            )
-
         if _is_sender_blacklisted_for_chat(chat_name, sender_name):
-            _record_listener_dropped_message(chat_name, "sender_blacklist", msg, content_str)
             logger.info("🚫 Sender 命中群/用户级黑名单，跳过所有插件处理: chat='%s' sender='%s'", chat_name, sender_name)
             return
 
         message_identity = _message_identity(chat_name, msg)
         if _has_seen_message_id(message_identity):
-            _record_listener_dropped_message(chat_name, "seen_message_id", msg, content_str)
             logger.warning(
                 "⚠️ 检测到 wxautox4 短时间重复/回放消息，已忽略: id=%s sender='%s' chat='%s' content='%s'",
                 message_identity,
@@ -4496,7 +3371,6 @@ def message_callback(msg, chat):
 
         message_fingerprint = _link_message_fingerprint(chat_name, msg, content_str)
         if _has_seen_link_message_fingerprint(message_fingerprint):
-            _record_listener_dropped_message(chat_name, "seen_link_fingerprint", msg, content_str)
             logger.warning(
                 "⚠️ 检测到 wxautox4 回放已处理链接内容，已忽略: fingerprint=%s id=%s sender='%s' chat='%s' content='%s'",
                 message_fingerprint[:24],
@@ -4511,7 +3385,6 @@ def message_callback(msg, chat):
         _dedup_key = (msg.sender, chat_name, str(msg.content))
         _now = time.time()
         if _dedup_key in _dedup_cache and _now - _dedup_cache[_dedup_key] < _DEDUP_WINDOW_SEC:
-            _record_listener_dropped_message(chat_name, "dedup_window", msg, content_str)
             logger.warning(f"⚠️ 检测到重复消息，已忽略: sender='{msg.sender}', chat='{chat_name}', content='{str(msg.content)[:30]}'")
             return
         _dedup_cache[_dedup_key] = _now
@@ -4655,7 +3528,6 @@ def message_callback(msg, chat):
             )
             response.raise_for_status() # 如果请求失败则抛出异常
             _mark_seen_message(message_identity, message_fingerprint)
-            _record_listener_forwarded_message(chat_name, msg, content_str)
             logger.debug(f"Message forwarded to main app, status: {response.status_code}")
         except requests.RequestException as e:
             logger.error(f"Failed to forward message to main app: {e}")
@@ -4678,6 +3550,14 @@ def send_message():
     data = request.json or {}
     who = data.get('who')
     msg = data.get('message')
+    raw_at_users = data.get('at_users')
+    if isinstance(raw_at_users, str):
+        raw_at_users = [raw_at_users]
+    at_users = [
+        str(user).strip().lstrip('@').strip()
+        for user in (raw_at_users or [])
+        if str(user).strip().lstrip('@').strip()
+    ]
     request_id = str(data.get('request_id') or "").strip()[:128]
     if not request_id:
         request_id = uuid.uuid4().hex
@@ -4697,14 +3577,25 @@ def send_message():
         lock_wait_started_at = time.monotonic()
         with wx_ui_lock:
             lock_wait_seconds = time.monotonic() - lock_wait_started_at
-            outcome = send_text_with_retry(
-                wx,
-                who,
-                msg,
-                get_listener_chat=_get_actual_listener_chat,
-                activate_main_window=_activate_wechat_main_window,
-                logger=logger,
-            )
+            if at_users:
+                outcome = send_text_with_exact_mentions(
+                    wx,
+                    who,
+                    msg,
+                    at_users,
+                    uia_module=uia,
+                    activate_main_window=_activate_wechat_main_window,
+                    logger=logger,
+                )
+            else:
+                outcome = send_text_with_retry(
+                    wx,
+                    who,
+                    msg,
+                    get_listener_chat=_get_actual_listener_chat,
+                    activate_main_window=_activate_wechat_main_window,
+                    logger=logger,
+                )
 
         result = outcome.to_dict()
         result["lock_wait_ms"] = round(lock_wait_seconds * 1000, 1)
@@ -4760,7 +3651,6 @@ def send_message():
     }
 
     if result.get("success"):
-        _record_listener_outbound_activity(who, "text", msg)
         logger.info(
             "Text send completed: request_id=%s chat=%s route=%s attempts=%s "
             "lock_wait_ms=%s send_ms=%s total_ms=%s",
@@ -4850,7 +3740,6 @@ def quote_message():
             result = quote(reply_text)
 
         if result:
-            _record_listener_outbound_activity(chat_name, "quote", reply_text)
             return jsonify({"status": "success", "message": "Quoted message sent"})
 
         result_message = result.get('message') if isinstance(result, dict) else str(result)
@@ -4895,11 +3784,6 @@ def remove_listener():
 
     with desired_listeners_lock:
         desired_listeners.pop(who, None)
-    listener_health_failures.pop(who, None)
-    listener_last_rebind_at.pop(who, None)
-    last_listener_health_snapshot.pop(who, None)
-    last_listener_session_snapshot.pop(who, None)
-    listener_no_uia_notice_logged.discard(who)
 
     if not wx:
         return jsonify({
@@ -5004,7 +3888,6 @@ def send_url_card():
         with wx_ui_lock:
             success = wx.SendUrlCard(url=url, friends=who, timeout=timeout)
         if success:
-            _record_listener_outbound_activity(who, "url_card", url)
             return jsonify({"status": "success", "message": "URL card sent"})
         else:
             return jsonify({"status": "error", "message": "Failed to send URL card"}), 500
@@ -5037,7 +3920,6 @@ def send_files():
             success = wx.SendFiles(file_paths, who)
             _log_listener_snapshot(f"after_send_files:{who}")
         if success:
-            _record_listener_outbound_activity(who, "files", ", ".join(map(str, file_paths)))
             return jsonify({"status": "success", "message": f"Sent {len(file_paths)} files"})
         else:
             return jsonify({"status": "error", "message": "Failed to send files"}), 500
@@ -5209,7 +4091,7 @@ def health_check():
         not last_listener_actual_snapshot_at
         or (
             listener_snapshot_age_sec is not None
-            and listener_snapshot_age_sec > LISTENER_WATCHDOG_INTERVAL_SEC * 3
+            and listener_snapshot_age_sec > LISTENER_STATUS_SNAPSHOT_MAX_AGE_SEC
         )
     )
     listener_payload = _listener_status_payload(
@@ -5257,7 +4139,7 @@ def listeners_status():
             "desired": [],
             "actual": [],
             "missing": [],
-            "watchdog_running": bool(listener_watchdog_thread and listener_watchdog_thread.is_alive()),
+            "window_auto_repair": _listener_window_auto_repair_status(),
         }), 503
 
     try:
@@ -5284,98 +4166,6 @@ def listeners_status():
         })
     except Exception as e:
         logger.error(f"Error getting listener status: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/api/listeners/probe', methods=['POST'])
-def probe_listener():
-    """立即探测单个监听窗口，便于验证假活判定。"""
-    if not wx:
-        return jsonify({"status": "error", "message": "WeChat not connected"}), 503
-
-    data = request.json or {}
-    who = data.get("who")
-    record = bool(data.get("record", False))
-    if not who:
-        return jsonify({"status": "error", "message": "Missing 'who'"}), 400
-
-    try:
-        with wx_ui_lock:
-            chat = _get_actual_listener_chat(who)
-            health = _probe_listener_chat_health(who, chat)
-            failures = _record_listener_health(who, health) if record else _listener_health_failure_count(who)
-        return jsonify({
-            "status": "success",
-            "who": who,
-            "health": health,
-            "failure_count": failures,
-            "timestamp": time.time(),
-        })
-    except Exception as e:
-        logger.error("Error probing listener: %s", e, exc_info=True)
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/api/listeners/rebind', methods=['POST'])
-def rebind_listener():
-    """低风险重绑单个监听窗口回调，不关闭窗口。"""
-    if not wx:
-        return jsonify({"status": "error", "message": "WeChat not connected"}), 503
-
-    data = request.json or {}
-    who = data.get("who")
-    if not who:
-        return jsonify({"status": "error", "message": "Missing 'who'"}), 400
-
-    try:
-        with wx_ui_lock:
-            chat = _get_actual_listener_chat(who)
-            if not chat:
-                return jsonify({
-                    "status": "error",
-                    "message": f"Listener window not found: {who}",
-                    "who": who,
-                    "timestamp": time.time(),
-                }), 404
-            rebound = _bind_existing_listener_chat(who, chat, reason="api_manual_rebind")
-            health = _probe_listener_chat_health(who, chat)
-            _record_listener_health(who, health)
-        return jsonify({
-            "status": "success",
-            "who": who,
-            "rebound": rebound,
-            "health": health,
-            "timestamp": time.time(),
-        })
-    except Exception as e:
-        logger.error("Error rebinding listener: %s", e, exc_info=True)
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/api/listeners/rebuild', methods=['POST'])
-def rebuild_listener():
-    """强制重建单个监听窗口。"""
-    if not wx:
-        return jsonify({"status": "error", "message": "WeChat not connected"}), 503
-
-    data = request.json or {}
-    who = data.get("who")
-    if not who:
-        return jsonify({"status": "error", "message": "Missing 'who'"}), 400
-
-    try:
-        with wx_ui_lock:
-            _force_rebuild_listener(who, "api_manual_rebuild")
-            chat = _get_actual_listener_chat(who)
-            health = _probe_listener_chat_health(who, chat)
-        return jsonify({
-            "status": "success",
-            "who": who,
-            "health": health,
-            "timestamp": time.time(),
-        })
-    except Exception as e:
-        logger.error("Error rebuilding listener: %s", e, exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/is_online', methods=['GET'])

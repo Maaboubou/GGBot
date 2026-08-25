@@ -31,3 +31,4 @@ app/plugins/menu_translator/pdfs/
 # Local Codex artifacts
 .codex/
 wxautox文件下载/
+/projects/

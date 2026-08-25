@@ -78,6 +78,14 @@ const API = {
             `/api/backups/${encodeURIComponent(name)}/prepare-restore`,
             { confirmation }
         ),
+        delete: (name, confirmation) => API.request(
+            `/api/backups/${encodeURIComponent(name)}`,
+            {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ confirmation })
+            }
+        ),
         downloadUrl: name => `/api/backups/${encodeURIComponent(name)}/download`,
         importFile: async file => {
             const response = await fetch(

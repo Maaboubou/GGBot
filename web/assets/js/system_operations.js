@@ -292,42 +292,39 @@ const SystemOperations = {
             ]);
             const backups = overview.backups || [];
             const active = (operationData.operations || []).find(item => ['queued', 'running', 'cancelling'].includes(item.status));
+            const pendingRestoreName = overview.pending_restore?.archive_name || null;
             if (requestId !== this.backupRequestId || !document.body.contains(container)) return;
             container.innerHTML = `
-                <div class="system-platform-heading">
-                    <div><h3>备份与迁移</h3><p>在一台机器上打包，在另一台机器上恢复</p></div>
-                    <button class="btn btn-sm btn-light border" onclick="SystemOperations.loadBackups()"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
-                </div>
-                <div class="backup-summary-bar">
-                    <span class="backup-security-inline" title="${this.esc(overview.security?.warning || '')}"><i class="bi bi-shield-exclamation"></i>当前迁移包尚未加密</span>
-                    <span><strong>${backups.length}</strong> 个备份</span>
-                    <span>${backups[0] ? `最近 ${this.formatTime(backups[0].created_at)}` : '尚无备份'}</span>
-                </div>
-                <div id="backupActiveOperation" class="backup-operation-slot">${this.renderBackupOperation(active)}</div>
-                <section class="backup-compose">
-                    <div class="backup-compose-main">
-                        <label class="backup-profile-control"><span>新建</span><select id="backupProfile" class="form-select form-select-sm" onchange="SystemOperations.updateBackupProfileCopy()"><option value="state">状态备份</option><option value="migration">完整迁移</option></select></label>
-                        <span class="backup-profile-copy" id="backupProfileCopy">配置、数据库与插件数据</span>
-                        <div class="backup-compose-actions">
-                            <button class="btn btn-primary btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="SystemOperations.createBackup()"><i class="bi bi-archive me-1"></i>创建</button>
-                            <button class="btn btn-light border btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="document.getElementById('backupImportFile').click()"><i class="bi bi-upload me-1"></i>导入</button>
-                            <input id="backupImportFile" class="d-none" type="file" accept=".zip,.ggbot-backup.zip" onchange="SystemOperations.importBackup(this)">
-                        </div>
+                <header class="backup-command-bar">
+                    <div class="backup-command-title">
+                        <h3>备份与迁移</h3>
+                        <span><strong>${backups.length}</strong> 个${backups[0] ? ` · 最近 ${this.formatTime(backups[0].created_at)}` : ' · 尚无备份'}</span>
                     </div>
-                    <details class="backup-options">
-                        <summary><span>包含范围</span><small>默认包含生成内容</small><i class="bi bi-chevron-down"></i></summary>
-                        <div class="backup-option-list">
-                            <label class="form-check"><input id="backupGenerated" class="form-check-input" type="checkbox" checked><span>生成内容</span></label>
-                            <label class="form-check"><input id="backupDiagnostics" class="form-check-input" type="checkbox"><span>调用诊断</span></label>
-                            <label class="form-check"><input id="backupModels" class="form-check-input" type="checkbox"><span>本地模型</span></label>
-                            <label class="form-check"><input id="backupMachineBound" class="form-check-input" type="checkbox"><span>机器绑定数据</span></label>
-                        </div>
-                    </details>
-                </section>
+                    <div class="backup-command-actions">
+                        <span class="backup-security-chip" title="${this.esc(overview.security?.warning || '')}"><i class="bi bi-shield-exclamation"></i>未加密</span>
+                        <label class="backup-profile-control"><span class="visually-hidden">备份类型</span><select id="backupProfile" class="form-select form-select-sm" onchange="SystemOperations.updateBackupProfileCopy()"><option value="state">状态备份</option><option value="migration">完整迁移</option></select></label>
+                        <span class="backup-profile-copy" id="backupProfileCopy">配置、数据库与插件数据</span>
+                        <details class="backup-options-menu">
+                            <summary class="btn btn-light border btn-sm"><i class="bi bi-sliders me-1"></i>范围<i class="bi bi-chevron-down backup-options-chevron"></i></summary>
+                            <div class="backup-options-popover">
+                                <strong>额外包含</strong>
+                                <label class="form-check"><input id="backupGenerated" class="form-check-input" type="checkbox" checked><span>生成内容</span></label>
+                                <label class="form-check"><input id="backupDiagnostics" class="form-check-input" type="checkbox"><span>调用诊断</span></label>
+                                <label class="form-check"><input id="backupModels" class="form-check-input" type="checkbox"><span>本地模型</span></label>
+                                <label class="form-check"><input id="backupMachineBound" class="form-check-input" type="checkbox"><span>机器绑定数据</span></label>
+                            </div>
+                        </details>
+                        <button class="btn btn-primary btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="SystemOperations.createBackup()"><i class="bi bi-archive me-1"></i>创建</button>
+                        <button class="btn btn-light border btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="document.getElementById('backupImportFile').click()"><i class="bi bi-upload me-1"></i>导入</button>
+                        <button class="btn btn-light border btn-sm backup-refresh-button" onclick="SystemOperations.loadBackups()" title="刷新" aria-label="刷新备份列表"><i class="bi bi-arrow-clockwise"></i></button>
+                        <input id="backupImportFile" class="d-none" type="file" accept=".zip,.ggbot-backup.zip" onchange="SystemOperations.importBackup(this)">
+                    </div>
+                </header>
+                <div id="backupActiveOperation" class="backup-operation-slot">${this.renderBackupOperation(active)}</div>
                 <div id="backupRestorePanel">${this.renderRestorePanel()}</div>
                 <section class="backup-history-list">
-                    <div class="system-platform-block-head"><div><h4>备份记录</h4><p>下载、校验或准备恢复</p></div></div>
-                    ${this.renderBackupsTable(backups)}
+                    <div class="backup-list-heading"><h4>备份记录</h4><span>下载、校验、恢复或删除</span></div>
+                    ${this.renderBackupsTable(backups, pendingRestoreName, Boolean(active))}
                 </section>`;
             container.dataset.ready = 'true';
             container.removeAttribute('aria-busy');
@@ -357,8 +354,9 @@ const SystemOperations = {
     updateBackupOperation(operation) {
         const slot = document.getElementById('backupActiveOperation');
         if (slot) slot.innerHTML = this.renderBackupOperation(operation);
+        const active = Boolean(operation && ['queued', 'running', 'cancelling'].includes(operation.status));
         document.querySelectorAll('[data-backup-action]').forEach(button => {
-            button.disabled = Boolean(operation && ['queued', 'running', 'cancelling'].includes(operation.status));
+            button.disabled = active || button.dataset.backupLocked === 'true';
         });
     },
 
@@ -370,20 +368,25 @@ const SystemOperations = {
             : '配置、数据库与插件数据';
     },
 
-    renderBackupsTable(backups) {
+    renderBackupsTable(backups, pendingRestoreName = null, actionsDisabled = false) {
         if (!backups.length) return '<div class="system-empty-row">尚未创建备份。</div>';
         return `<div class="table-responsive"><table class="table system-compact-table backup-history-table align-middle mb-0">
             <thead><tr><th>备份</th><th>类型</th><th>数据</th><th>创建时间</th><th></th></tr></thead>
-            <tbody>${backups.map(item => `<tr>
-                <td><strong>${this.esc(item.name)}</strong><small>${item.imported ? '已导入' : '本机创建'} · v${this.esc(item.app_version || '-')} · ${item.valid ? '结构正常' : '结构异常'}</small>${item.error ? `<small class="text-danger">${this.esc(item.error)}</small>` : ''}</td>
+            <tbody>${backups.map(item => {
+                const pending = item.name === pendingRestoreName;
+                const disabled = actionsDisabled ? 'disabled' : '';
+                return `<tr>
+                <td><strong>${this.esc(item.name)}</strong><small>${item.imported ? '已导入' : '本机创建'} · v${this.esc(item.app_version || '-')} · ${item.valid ? '结构正常' : '结构异常'}${pending ? ' · 待恢复' : ''}</small>${item.error ? `<small class="text-danger">${this.esc(item.error)}</small>` : ''}</td>
                 <td><span class="system-state-pill ${item.profile === 'migration' ? 'primary' : 'muted'}">${item.profile === 'migration' ? '完整迁移' : '状态备份'}</span></td>
                 <td>${Number(item.file_count || 0)} 个文件 · ${this.formatBytes(item.bytes)}${item.contains_plaintext_env ? '<small class="text-warning">包含明文 .env</small>' : ''}</td>
                 <td>${this.formatTime(item.created_at)}</td>
                 <td><div class="backup-row-actions">
                     <a class="btn btn-sm btn-light border" href="${API.backups.downloadUrl(item.name)}" title="下载"><i class="bi bi-download"></i></a>
-                    <button class="btn btn-sm btn-light border" onclick="SystemOperations.validateBackup('${this.esc(item.name)}')" title="完整校验"><i class="bi bi-check2-circle"></i></button>
-                    <button class="btn btn-sm btn-light border" ${item.valid ? '' : 'disabled'} onclick="SystemOperations.selectRestore('${this.esc(item.name)}')" title="恢复"><i class="bi bi-arrow-counterclockwise"></i></button>
-                </div></td></tr>`).join('')}</tbody></table></div>`;
+                    <button class="btn btn-sm btn-light border" data-backup-action ${disabled} onclick="SystemOperations.validateBackup('${this.esc(item.name)}')" title="完整校验"><i class="bi bi-check2-circle"></i></button>
+                    <button class="btn btn-sm btn-light border" data-backup-action ${item.valid ? '' : 'data-backup-locked="true" disabled'} ${disabled} onclick="SystemOperations.selectRestore('${this.esc(item.name)}')" title="恢复"><i class="bi bi-arrow-counterclockwise"></i></button>
+                    <button class="btn btn-sm btn-light border text-danger" data-backup-action ${pending ? 'data-backup-locked="true" disabled' : ''} ${disabled} onclick="SystemOperations.deleteBackup('${this.esc(item.name)}')" title="${pending ? '待恢复计划正在使用此备份' : '永久删除'}"><i class="bi bi-trash3"></i></button>
+                </div></td></tr>`;
+            }).join('')}</tbody></table></div>`;
     },
 
     renderRestorePanel() {
@@ -439,6 +442,21 @@ const SystemOperations = {
             this.loadBackups();
         } catch (error) {
             UI.showError(`导入失败：${error.message}`);
+        }
+    },
+
+    async deleteBackup(name) {
+        if (!await UI.confirm(
+            `确定永久删除备份“${name}”吗？\n删除后无法恢复，并会立即释放该归档占用的空间。`,
+            { title: '删除备份', confirmText: '永久删除', variant: 'danger' }
+        )) return;
+        try {
+            const result = await API.backups.delete(name, '删除备份');
+            if (this.restoreSelection === name) this.restoreSelection = null;
+            UI.showSuccess(`已删除 ${result.name}，释放 ${this.formatBytes(result.bytes)}`);
+            await this.loadBackups();
+        } catch (error) {
+            UI.showError(`删除失败：${error.message}`);
         }
     },
 

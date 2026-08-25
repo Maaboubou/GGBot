@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -101,6 +102,7 @@ class BackupService:
         "cookies.txt",
     }
     MIGRATION_GENERATED_ROOTS = {"wxautox文件下载"}
+    PPT_MASTER_ARCHIVE_ROOT = PurePosixPath(".codex/skills/ppt-master")
     SKIP_PARTS = {
         "__pycache__",
         ".pytest_cache",
@@ -111,7 +113,12 @@ class BackupService:
     }
     SKIP_SUFFIXES = {".pyc", ".pyo", ".tmp", ".temp", ".log"}
 
-    def __init__(self, project_root: Optional[Path] = None, backup_root: Optional[Path] = None):
+    def __init__(
+        self,
+        project_root: Optional[Path] = None,
+        backup_root: Optional[Path] = None,
+        ppt_master_dir: Optional[Path] = None,
+    ):
         self.project_root = (project_root or Path(__file__).resolve().parents[2]).resolve()
         configured = backup_root or Path(os.getenv("SYSTEM_BACKUP_DIR") or "data/system_backups")
         if not configured.is_absolute():
@@ -120,7 +127,69 @@ class BackupService:
         self.incoming_root = self.backup_root / "incoming"
         self.backup_root.mkdir(parents=True, exist_ok=True)
         self.incoming_root.mkdir(parents=True, exist_ok=True)
+        configured_skill = str(
+            ppt_master_dir or os.getenv("SYSTEM_BACKUP_PPT_MASTER_DIR") or ""
+        ).strip()
+        self.ppt_master_dir: Optional[Path] = None
+        self.ppt_master_config_error: Optional[str] = None
+        self._ppt_master_requested = bool(configured_skill)
+        if configured_skill:
+            try:
+                self.ppt_master_dir = self._resolve_ppt_master_dir(configured_skill)
+            except BackupError as exc:
+                self.ppt_master_config_error = str(exc)
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _resolve_ppt_master_dir(configured: str) -> Path:
+        """Resolve the configured global PPT Master directory.
+
+        ``wsl`` is a portable marker for the Codex installation used by this
+        project: on Windows it resolves the default WSL user's Codex home; when
+        the service itself runs in WSL it resolves the current Linux home.
+        """
+        if configured.strip().lower() != "wsl":
+            return Path(configured).expanduser().resolve()
+
+        if os.name != "nt":
+            codex_home = Path(os.getenv("CODEX_HOME") or (Path.home() / ".codex"))
+            return (codex_home / "skills" / "ppt-master").expanduser().resolve()
+
+        try:
+            locate = subprocess.run(
+                [
+                    "wsl.exe",
+                    "bash",
+                    "-lic",
+                    'printf "%s" "${CODEX_HOME:-$HOME/.codex}/skills/ppt-master"',
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+            linux_path = (locate.stdout or "").strip()
+            if locate.returncode != 0 or not linux_path:
+                detail = (locate.stderr or locate.stdout or "无法定位 WSL Codex 目录").strip()
+                raise BackupError(detail[-1000:])
+            convert = subprocess.run(
+                ["wsl.exe", "wslpath", "-w", linux_path],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+            windows_path = (convert.stdout or "").strip()
+            if convert.returncode != 0 or not windows_path:
+                detail = (convert.stderr or convert.stdout or "无法转换 WSL Codex 目录").strip()
+                raise BackupError(detail[-1000:])
+            return Path(windows_path).resolve()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BackupError(f"无法访问 WSL 中的 PPT Master 技能: {exc}") from exc
 
     @staticmethod
     def _utc_now() -> str:
@@ -154,10 +223,18 @@ class BackupService:
         raise BackupError("备份文件不存在")
 
     def _relative(self, path: Path) -> str:
+        resolved = path.resolve()
         try:
-            return path.resolve().relative_to(self.project_root).as_posix()
-        except ValueError as exc:
-            raise BackupError(f"备份源不在项目目录内: {path}") from exc
+            return resolved.relative_to(self.project_root).as_posix()
+        except ValueError:
+            pass
+        if self.ppt_master_dir is not None:
+            try:
+                skill_relative = resolved.relative_to(self.ppt_master_dir.resolve())
+                return (self.PPT_MASTER_ARCHIVE_ROOT / skill_relative.as_posix()).as_posix()
+            except ValueError:
+                pass
+        raise BackupError(f"备份源不在允许的项目或 Codex 技能目录内: {path}")
 
     def _is_backup_internal(self, path: Path) -> bool:
         try:
@@ -293,6 +370,17 @@ class BackupService:
                     root = self.project_root / name
                     if root.exists():
                         add(self._iter_tree(root))
+            if self._ppt_master_requested:
+                if self.ppt_master_config_error:
+                    raise BackupError(
+                        f"PPT Master 备份目录配置无效: {self.ppt_master_config_error}"
+                    )
+                skill_root = self.ppt_master_dir
+                if skill_root is None or not (skill_root / "SKILL.md").is_file():
+                    raise BackupError(
+                        f"PPT Master 技能目录不存在或缺少 SKILL.md: {skill_root}"
+                    )
+                add(self._iter_tree(skill_root))
 
         return [sources[key] for key in sorted(sources)]
 
@@ -331,7 +419,12 @@ class BackupService:
 
     @staticmethod
     def _classification(relative: str) -> Dict[str, Any]:
-        sensitive = relative == ".env" or "cookie" in relative.lower() or "secret" in relative.lower()
+        relative_path = PurePosixPath(relative)
+        sensitive = (
+            relative_path.name == ".env"
+            or "cookie" in relative.lower()
+            or "secret" in relative.lower()
+        )
         parts = PurePosixPath(relative).parts
         machine_bound = relative.startswith(("data/chrome_profile/", "data/asr_cache/")) or (
             len(parts) >= 4
@@ -350,6 +443,8 @@ class BackupService:
             owner = f"plugin-storage:{parts[2]}"
         elif len(parts) >= 3 and parts[:2] == ("app", "plugins"):
             owner = f"plugin:{parts[2]}"
+        elif parts[:3] == (".codex", "skills", "ppt-master"):
+            owner = "codex-skill:ppt-master"
         return {
             "sensitive": sensitive,
             "portable": not machine_bound,
@@ -428,7 +523,10 @@ class BackupService:
                             },
                             "security": {
                                 "encrypted": False,
-                                "contains_plaintext_env": any(item["path"] == ".env" for item in records),
+                                "contains_plaintext_env": any(
+                                    PurePosixPath(item["path"]).name == ".env"
+                                    for item in records
+                                ),
                                 "warning": "此备份格式未加密，包含的 .env、Cookie 和插件密钥均为明文。",
                             },
                             "consistency": {
@@ -580,6 +678,65 @@ class BackupService:
     def pending_path(self) -> Path:
         return self.backup_root / self.PENDING_NAME
 
+    def delete_archive(self, archive_name: str, *, confirmation: str) -> Dict[str, Any]:
+        """Permanently remove one managed backup archive.
+
+        A backup referenced by the pending offline-restore plan is protected so
+        the next application start cannot be left with a broken restore target.
+        """
+        if confirmation.strip() != "删除备份":
+            raise BackupError("请输入“删除备份”确认操作")
+
+        with self._lock:
+            archive = self.archive_path(archive_name)
+            pending_path = self.pending_path()
+            if pending_path.exists():
+                try:
+                    pending = json.loads(pending_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise BackupError("待恢复计划无法读取，已阻止删除备份") from exc
+                pending_name = str(pending.get("archive_name") or "")
+                if not pending_name:
+                    pending_name = Path(str(pending.get("archive") or "")).name
+                if pending_name == archive.name:
+                    raise BackupError("该备份正在用于待执行的恢复计划，不能删除")
+
+            imported = archive.parent == self.incoming_root
+            size = archive.stat().st_size
+            profile = None
+            try:
+                profile = self.read_manifest(archive).get("profile")
+            except BackupError:
+                # Invalid archives must remain deletable from the management UI.
+                pass
+            archive.unlink()
+
+        result = {
+            "deleted": True,
+            "name": archive.name,
+            "bytes": size,
+            "profile": profile,
+            "imported": imported,
+        }
+        try:
+            from app.services.runtime_operations import get_runtime_operation_service
+
+            get_runtime_operation_service().record_audit(
+                category="backup",
+                action="delete_backup",
+                target=archive.name,
+                summary="永久删除备份",
+                before={
+                    "profile": profile,
+                    "bytes": size,
+                    "imported": imported,
+                },
+                after={"exists": False},
+            )
+        except Exception:
+            pass
+        return result
+
     def prepare_restore(self, archive_name: str, *, confirmation: str) -> Dict[str, Any]:
         if confirmation.strip() != "恢复备份":
             raise BackupError("请输入“恢复备份”确认操作")
@@ -633,6 +790,31 @@ class BackupService:
                 restored.append(relative)
         return manifest, restored
 
+    def _restore_target(self, relative: str) -> Path:
+        member = PurePosixPath(self._safe_member(relative))
+        prefix = self.PPT_MASTER_ARCHIVE_ROOT.parts
+        if member.parts[: len(prefix)] == prefix:
+            if self.ppt_master_dir is None:
+                detail = self.ppt_master_config_error or "未配置 SYSTEM_BACKUP_PPT_MASTER_DIR"
+                raise BackupError(f"无法恢复 PPT Master 技能: {detail}")
+            suffix = member.parts[len(prefix) :]
+            if not suffix:
+                raise BackupError("PPT Master 恢复条目缺少文件路径")
+            skill_root = self.ppt_master_dir.resolve()
+            target = (skill_root / Path(*suffix)).resolve()
+            try:
+                target.relative_to(skill_root)
+            except ValueError as exc:
+                raise BackupError(f"PPT Master 恢复目标越界: {relative}") from exc
+            return target
+
+        target = (self.project_root / Path(*member.parts)).resolve()
+        try:
+            target.relative_to(self.project_root)
+        except ValueError as exc:
+            raise BackupError(f"恢复目标越过项目目录: {relative}") from exc
+        return target
+
     def restore_archive(self, archive_path: Path, *, create_safety_backup: bool = True) -> Dict[str, Any]:
         """Restore an archive while the application is stopped.
 
@@ -659,11 +841,7 @@ class BackupService:
             try:
                 for relative in relatives:
                     source = stage / Path(*PurePosixPath(relative).parts)
-                    target = (self.project_root / Path(*PurePosixPath(relative).parts)).resolve()
-                    try:
-                        target.relative_to(self.project_root)
-                    except ValueError as exc:
-                        raise BackupError(f"恢复目标越过项目目录: {relative}") from exc
+                    target = self._restore_target(relative)
                     if target.exists():
                         previous = rollback / Path(*PurePosixPath(relative).parts)
                         previous.parent.mkdir(parents=True, exist_ok=True)
@@ -678,7 +856,7 @@ class BackupService:
                     applied.append(relative)
             except Exception:
                 for relative in reversed(applied):
-                    target = self.project_root / Path(*PurePosixPath(relative).parts)
+                    target = self._restore_target(relative)
                     previous = rollback / Path(*PurePosixPath(relative).parts)
                     if relative in existing and previous.exists():
                         shutil.copy2(previous, target)
@@ -750,7 +928,7 @@ class BackupService:
             },
             "profiles": [
                 {"id": "state", "title": "状态备份", "description": "数据库、配置、聊天与插件状态"},
-                {"id": "migration", "title": "完整迁移", "description": "状态、当前代码、插件和生成内容"},
+                {"id": "migration", "title": "完整迁移", "description": "状态、当前代码、插件、Codex 技能和生成内容"},
             ],
         }
 

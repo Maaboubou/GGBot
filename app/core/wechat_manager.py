@@ -374,9 +374,11 @@ class WeChatManager:
     
     def send_message(self, chat_name: str, message: str, at_users: List[str] = None) -> bool:
         """发送消息 - 通过API"""
-        if at_users:
-            at_str = " ".join([f"@{user}" for user in at_users])
-            message = f"{at_str} {message}"
+        normalized_at_users = [
+            str(user).strip().lstrip("@").strip()
+            for user in (at_users or [])
+            if str(user).strip().lstrip("@").strip()
+        ]
 
         request_id = uuid.uuid4().hex
         try:
@@ -385,6 +387,7 @@ class WeChatManager:
                 {
                     "who": chat_name,
                     "message": message,
+                    "at_users": normalized_at_users,
                     "request_id": request_id,
                 },
                 timeout=TEXT_SEND_API_TIMEOUT_SEC,

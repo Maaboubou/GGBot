@@ -628,7 +628,7 @@
     "codex_reasoning_effort": "inherit",
     "codex_reasoning_summary": "inherit",
     "codex_web_search_mode": "inherit",
-    "codex_turn_timeout_seconds": 0,
+    "codex_turn_timeout_seconds": 1800,
     "codex_max_turns_per_thread": 0,
     "codex_exec_fallback_enabled": true,
     "context_limit": 20,

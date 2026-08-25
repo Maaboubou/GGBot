@@ -20,6 +20,7 @@ class WeChatMonitorService:
     """
     微信掉线监控服务
     - 定期检查微信是否在线
+    - 监听窗口缺失时自动调用聊天恢复入口
     - 掉线时发送邮件通知
     - 恢复时可选发送恢复通知
     """
@@ -41,6 +42,15 @@ class WeChatMonitorService:
         self.last_online_status = None
         self.last_listener_status = None
         self.last_missing_listeners = []
+
+        # 缺失监听使用与管理页“恢复监听”相同的 add_listen_chat 入口恢复。
+        # 单个聊天失败后独立退避，避免持续故障时每 30 秒反复抢占微信 UI。
+        self.listener_auto_recovery_enabled = True
+        self.listener_recovery_base_cooldown = 60
+        self.listener_recovery_max_cooldown = 300
+        self.listener_recovery_state = {}
+        self.last_listener_recovery = None
+        self._listener_recovery_lock = threading.RLock()
         
         # 从配置获取机器人名称
         self.bot_name = get_setting("WECHAT_BOT_NAME", "微信助手")
@@ -101,15 +111,7 @@ class WeChatMonitorService:
                 if is_online:
                     listener_status = self._check_listener_status()
                     if listener_status:
-                        missing = listener_status.get("missing") or []
-                        self.last_missing_listeners = missing
-                        current_listener_status = "degraded" if missing else "healthy"
-                        if self.last_listener_status != current_listener_status:
-                            if missing:
-                                self.logger.warning("⚠️ 监听健康检查发现缺失监听: %s", missing)
-                            else:
-                                self.logger.info("✅ 监听健康检查正常")
-                            self.last_listener_status = current_listener_status
+                        self._handle_listener_status(listener_status)
 
                     # 微信在线：清零连续离线计数
                     if self.offline_failure_count:
@@ -215,9 +217,143 @@ class WeChatMonitorService:
         except Exception as e:
             self.logger.debug(f"监听健康检查异常: {e}")
             return None
+
+    @staticmethod
+    def _normalized_listener_names(names) -> list[str]:
+        """保持桥接返回顺序并过滤空值、重复值。"""
+        normalized = []
+        seen = set()
+        for value in names or []:
+            name = str(value or "").strip()
+            if not name or name in seen:
+                continue
+            normalized.append(name)
+            seen.add(name)
+        return normalized
+
+    def _listener_recovery_delay(self, failure_count: int) -> float:
+        exponent = max(0, int(failure_count) - 1)
+        return float(min(
+            self.listener_recovery_max_cooldown,
+            self.listener_recovery_base_cooldown * (2 ** exponent),
+        ))
+
+    def _recover_missing_listeners(self, missing: list[str]) -> dict:
+        """通过管理页同款入口恢复缺失监听，并对单个聊天独立退避。"""
+        result = {"recovered": [], "failed": [], "deferred": []}
+        if not self.listener_auto_recovery_enabled or not self.wechat_manager:
+            return result
+
+        for chat_name in self._normalized_listener_names(missing):
+            now = time.time()
+            with self._listener_recovery_lock:
+                state = dict(self.listener_recovery_state.get(chat_name) or {})
+                next_attempt_at = float(state.get("next_attempt_at") or 0)
+                if next_attempt_at > now:
+                    result["deferred"].append(chat_name)
+                    continue
+                attempt_count = int(state.get("attempt_count") or 0) + 1
+                state.update({
+                    "chat_name": chat_name,
+                    "status": "recovering",
+                    "attempt_count": attempt_count,
+                    "last_attempt_at": now,
+                    "last_error": None,
+                })
+                self.listener_recovery_state[chat_name] = state
+
+            self.logger.warning(
+                "🔧 检测到监听窗口缺失，正在自动恢复: chat=%s attempt=%s",
+                chat_name,
+                attempt_count,
+            )
+            error = None
+            try:
+                recovered = bool(self.wechat_manager.add_listen_chat(chat_name))
+                if not recovered:
+                    error = "add_listen_chat returned false"
+            except Exception as exc:
+                recovered = False
+                error = str(exc)
+
+            completed_at = time.time()
+            with self._listener_recovery_lock:
+                state = dict(self.listener_recovery_state.get(chat_name) or state)
+                if recovered:
+                    state.update({
+                        "status": "recovered",
+                        "failure_count": 0,
+                        "last_success_at": completed_at,
+                        "last_error": None,
+                        "next_attempt_at": completed_at + self.listener_recovery_base_cooldown,
+                    })
+                else:
+                    failure_count = int(state.get("failure_count") or 0) + 1
+                    state.update({
+                        "status": "failed",
+                        "failure_count": failure_count,
+                        "last_failed_at": completed_at,
+                        "last_error": error,
+                        "next_attempt_at": completed_at + self._listener_recovery_delay(failure_count),
+                    })
+                self.listener_recovery_state[chat_name] = state
+                self.last_listener_recovery = dict(state)
+
+            if recovered:
+                result["recovered"].append(chat_name)
+                self.logger.info("✅ 已自动恢复监听: chat=%s", chat_name)
+            else:
+                result["failed"].append(chat_name)
+                self.logger.error(
+                    "❌ 自动恢复监听失败，将在退避后重试: chat=%s error=%s next_attempt_at=%s",
+                    chat_name,
+                    error,
+                    state.get("next_attempt_at"),
+                )
+
+        return result
+
+    def _handle_listener_status(self, status: dict) -> None:
+        """消费一次可信监听快照，并自动修复其中的缺失监听。"""
+        if status.get("status") != "success" or status.get("probe_skipped"):
+            return
+
+        missing = self._normalized_listener_names(status.get("missing"))
+        missing_set = set(missing)
+        with self._listener_recovery_lock:
+            for chat_name in list(self.listener_recovery_state):
+                if chat_name not in missing_set:
+                    self.listener_recovery_state.pop(chat_name, None)
+
+        recovery = self._recover_missing_listeners(missing) if missing else {
+            "recovered": [],
+            "failed": [],
+            "deferred": [],
+        }
+        recovered = set(recovery["recovered"])
+        unresolved = [chat_name for chat_name in missing if chat_name not in recovered]
+        self.last_missing_listeners = unresolved
+        current_listener_status = "degraded" if unresolved else "healthy"
+
+        if self.last_listener_status != current_listener_status:
+            if unresolved:
+                self.logger.warning("⚠️ 监听健康检查发现缺失监听: %s", unresolved)
+            else:
+                self.logger.info("✅ 监听健康检查正常")
+            self.last_listener_status = current_listener_status
     
     def get_status(self) -> dict:
         """获取监控服务状态"""
+        with self._listener_recovery_lock:
+            recovery_state = {
+                name: dict(state)
+                for name, state in self.listener_recovery_state.items()
+            }
+            last_listener_recovery = (
+                dict(self.last_listener_recovery)
+                if self.last_listener_recovery
+                else None
+            )
         return {
             "monitoring": self.is_monitoring,
             "bot_name": self.bot_name,
@@ -228,6 +364,11 @@ class WeChatMonitorService:
             "last_online_status": self.last_online_status,
             "last_listener_status": self.last_listener_status,
             "last_missing_listeners": self.last_missing_listeners,
+            "listener_auto_recovery_enabled": self.listener_auto_recovery_enabled,
+            "listener_recovery_base_cooldown": self.listener_recovery_base_cooldown,
+            "listener_recovery_max_cooldown": self.listener_recovery_max_cooldown,
+            "listener_recovery_state": recovery_state,
+            "last_listener_recovery": last_listener_recovery,
             "wechat_manager_available": self.wechat_manager is not None
         }
     

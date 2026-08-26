@@ -3190,12 +3190,13 @@ const LLMManager = {
                 webSearch: '搜索中', mcpToolCall: '调用工具', fileChange: '处理文件',
                 imageGeneration: '生成图片', dynamicToolCall: '调用工具',
             };
-            if (labels[item]) return labels[item];
-            return {
+            const base = labels[item] || {
                 queued: '等待执行', turn_started: '开始处理', item_started: '处理中',
                 token_usage: '整理结果', process_started: '进程运行中', process_completed: '读取结果',
                 response_ready: '结果就绪', error: '执行失败',
             }[event] || statusMeta(job?.status).label;
+            const summary = String(job?.current_item_summary || '').trim();
+            return summary ? `${base} · ${summary}` : base;
         };
 
         const pools = runtime.pools || {};
@@ -3310,6 +3311,7 @@ const LLMManager = {
                                 <button class="btn codex-session-toggle" data-chat-id="${this.escapeHtml(chatId)}" title="${expanded ? '收起详情' : '查看详情'}"><i class="bi bi-${expanded ? 'chevron-up' : 'chevron-down'}"></i></button>
                                 ${activeJob ? `<button class="btn text-danger codex-session-interrupt" data-chat-id="${this.escapeHtml(chatId)}" title="中断当前任务"><i class="bi bi-stop-circle"></i></button>` : ''}
                                 <button class="btn codex-session-reset" data-chat-id="${this.escapeHtml(chatId)}" title="开启新上下文"><i class="bi bi-arrow-repeat"></i></button>
+                                <button class="btn text-danger codex-session-delete" data-chat-id="${this.escapeHtml(chatId)}" title="${activeJob ? '请先中断当前任务' : '删除会话'}" ${activeJob ? 'disabled' : ''}><i class="bi bi-trash3"></i></button>
                             </div>
                         </td>
                     </tr>${detailHtml}`;
@@ -3328,11 +3330,12 @@ const LLMManager = {
             const rows = jobs.map(job => {
                 const requestId = String(job.request_id || '');
                 const status = statusMeta(job.status);
-                const identity = job.chat_id || job.profile || job.backend || '-';
+                const identity = job.chat_name || job.chat_id || '未知来源';
+                const sourceType = job.chat_type === 'group' ? '群聊' : (job.chat_type === 'private' ? '私聊' : '');
                 const error = job.error ? `<div class="codex-cell-sub text-danger" title="${this.escapeHtml(job.error)}">${this.escapeHtml(job.error)}</div>` : '';
                 return `
                     <tr>
-                        <td><div class="codex-cell-main">${this.escapeHtml(identity)}</div><div class="codex-cell-sub codex-mono" title="${this.escapeHtml(requestId)}">${this.escapeHtml(requestId.slice(0, 12))}</div></td>
+                        <td><div class="codex-cell-main">${this.escapeHtml(identity)}</div><div class="codex-cell-sub">${this.escapeHtml(sourceType || '来源未记录')} · <span class="codex-mono" title="${this.escapeHtml(requestId)}">${this.escapeHtml(requestId.slice(0, 12))}</span></div></td>
                         <td><span class="codex-inline-badge ${status.className}">${this.escapeHtml(status.label)}</span><div class="codex-cell-sub">${this.escapeHtml(activityLabel(job))}</div></td>
                         <td><div class="codex-cell-main">${this.escapeHtml(job.model || '-')}</div><div class="codex-cell-sub">${this.escapeHtml(job.pool_worker || job.backend || '')}</div></td>
                         <td><span class="codex-mono">${formatK(job.total_tokens || 0)}</span></td>
@@ -3396,6 +3399,9 @@ const LLMManager = {
         container.querySelectorAll('.codex-session-reset').forEach(button => {
             button.addEventListener('click', () => this.resetCodexSession(button.dataset.chatId));
         });
+        container.querySelectorAll('.codex-session-delete').forEach(button => {
+            button.addEventListener('click', () => this.deleteCodexSession(button.dataset.chatId));
+        });
         container.querySelectorAll('.codex-session-interrupt').forEach(button => {
             button.addEventListener('click', () => this.interruptCodexSession(button.dataset.chatId));
         });
@@ -3432,16 +3438,102 @@ const LLMManager = {
                 item_completed: '完成步骤', token_usage: '更新 Token', process_started: '进程启动',
                 process_completed: '进程结束', response_ready: '结果就绪', error: '发生错误',
                 cancel_requested: '请求中断', turn_completed: 'Turn 完成', job_finished: '任务结束',
+                thread_identified: '识别任务线程', image_generation_completed: '首张图片生成完成',
+                single_image_limit_reached: '停止后续图片生成', image_artifact_validated: '图片文件校验通过',
             };
             const itemLabels = {
                 userMessage: '提交输入', reasoning: '分析', agentMessage: '生成回复', commandExecution: '执行命令',
                 webSearch: '网页搜索', mcpToolCall: '调用工具', fileChange: '处理文件',
-                imageGeneration: '生成图片', dynamicToolCall: '调用工具',
+                imageGeneration: '生成图片', dynamicToolCall: '调用工具', imageView: '查看图片',
+                contextCompaction: '压缩上下文', plan: '更新计划',
             };
-            const eventRows = events.length ? events.map(event => {
+            const statusLabels = {
+                inProgress: '进行中', in_progress: '进行中', completed: '完成', failed: '失败',
+                declined: '已拒绝', cancelled: '已取消', running: '运行中',
+            };
+            const formatEventDuration = milliseconds => {
+                const value = Number(milliseconds);
+                if (!Number.isFinite(value) || value < 0) return '';
+                if (value < 1000) return `${Math.round(value)} ms`;
+                if (value < 60000) return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)} 秒`;
+                return `${Math.floor(value / 60000)} 分 ${Math.round(value % 60000 / 1000)} 秒`;
+            };
+            const timeline = [];
+            const startedItems = new Map();
+            events.forEach(source => {
+                const event = { ...source };
+                const itemId = String(event.item_id || '');
+                if (event.type === 'item_started' && itemId) {
+                    event._started_at = Number(event.created_at || 0);
+                    timeline.push(event);
+                    startedItems.set(itemId, event);
+                } else if (event.type === 'item_completed' && itemId && startedItems.has(itemId)) {
+                    const started = startedItems.get(itemId);
+                    const startedAt = Number(started._started_at || started.created_at || 0);
+                    Object.assign(started, event, {
+                        _started_at: startedAt,
+                        _elapsed_ms: event.duration_ms ?? Math.max(0, (Number(event.created_at || 0) - startedAt) * 1000),
+                    });
+                    startedItems.delete(itemId);
+                } else {
+                    timeline.push(event);
+                }
+            });
+
+            const eventRows = timeline.length ? timeline.map(event => {
                 const item = itemLabels[event.item_type] || event.item_type || '';
-                const detail = event.message || item || event.status || '';
-                return `<div class="codex-event"><strong>${this.escapeHtml(labels[event.type] || event.type || '-')}</strong><small>${this.formatJobTime(event.created_at)}${detail ? ` · ${this.escapeHtml(detail)}` : ''}</small></div>`;
+                const title = event.item_type
+                    ? `${event.type === 'item_started' ? '开始' : event.type === 'item_completed' ? '完成' : ''}${item ? ` ${item}` : ''}`.trim()
+                    : labels[event.type] || event.type || '-';
+                let detail = String(event.summary || event.message || '').trim();
+                const meta = [];
+                const elapsed = formatEventDuration(event.duration_ms ?? event._elapsed_ms);
+                if (elapsed) meta.push(`耗时 ${elapsed}`);
+                if (event.item_type === 'commandExecution') {
+                    if (!detail) detail = String(event.command || '').trim();
+                    if (event.cwd) meta.push(`目录 ${event.cwd}`);
+                    if (event.exit_code !== undefined) meta.push(`退出码 ${event.exit_code}`);
+                } else if (event.item_type === 'fileChange') {
+                    meta.push(`${Number(event.change_count || 0)} 个文件`);
+                    meta.push(`+${Number(event.additions || 0)} / -${Number(event.deletions || 0)}`);
+                } else if (event.item_type === 'mcpToolCall' || event.item_type === 'dynamicToolCall') {
+                    if (!detail) detail = [event.server || event.namespace, event.tool].filter(Boolean).join(' / ');
+                    if (event.read_only !== undefined) meta.push(event.read_only ? '只读调用' : '可能修改数据');
+                    if (event.result_items !== undefined) meta.push(`${event.result_items} 项结果`);
+                    if (event.success !== undefined) meta.push(event.success ? '调用成功' : '调用失败');
+                    if (event.error) meta.push(`错误：${event.error}`);
+                } else if (event.item_type === 'webSearch') {
+                    if (!detail) detail = String(event.query || '').trim();
+                    if (event.action) meta.push(`动作 ${event.action}`);
+                    if (event.result_count !== undefined) meta.push(`${event.result_count} 条结果`);
+                } else if (event.item_type === 'agentMessage') {
+                    detail = event.phase === 'final_answer' ? '正在整理最终答复' : '正在生成阶段性消息';
+                    if (event.text_chars) meta.push(`${Number(event.text_chars).toLocaleString()} 字符`);
+                } else if (event.item_type === 'reasoning') {
+                    detail = '模型正在分析（内部推理内容不展示）';
+                } else if (event.item_type === 'userMessage') {
+                    detail = `已提交 ${Number(event.content_items || 0)} 项输入`;
+                } else if (event.type === 'token_usage') {
+                    detail = `输入 ${Number(event.prompt_tokens || 0).toLocaleString()} · 输出 ${Number(event.completion_tokens || 0).toLocaleString()} · 合计 ${Number(event.total_tokens || 0).toLocaleString()} Token`;
+                } else if (event.type === 'queued') {
+                    detail = [event.profile, event.backend].filter(Boolean).join(' · ');
+                } else if (event.type === 'process_started' && event.pid) {
+                    detail = `进程 PID ${event.pid}`;
+                } else if (event.type === 'process_completed') {
+                    detail = `进程退出码 ${event.returncode ?? '-'}`;
+                } else if (event.type === 'response_ready') {
+                    detail = `回复 ${Number(event.text_chars || 0).toLocaleString()} 字符 · ${Number(event.attachment_count || 0)} 个附件`;
+                } else if (event.type === 'job_finished' || event.type === 'turn_completed') {
+                    detail = statusLabels[event.status] || event.status || detail;
+                }
+                const status = statusLabels[event.status] || event.status || '';
+                if (status && !meta.includes(status) && !detail.includes(status)) meta.push(status);
+                return `
+                    <div class="codex-event">
+                        <div class="codex-event-head"><strong>${this.escapeHtml(title)}</strong><time>${this.formatJobTime(event.created_at)}</time></div>
+                        ${detail ? `<div class="codex-event-summary${event.item_type === 'commandExecution' ? ' codex-event-command' : ''}">${this.escapeHtml(detail)}</div>` : ''}
+                        ${meta.length ? `<div class="codex-event-meta">${meta.map(value => `<span>${this.escapeHtml(value)}</span>`).join('')}</div>` : ''}
+                    </div>`;
             }).join('') : '<div class="text-muted small">暂无过程记录</div>';
 
             let modal = document.getElementById('codexJobEventModal');
@@ -3451,7 +3543,7 @@ const LLMManager = {
                 modal.className = 'modal fade';
                 modal.tabIndex = -1;
                 modal.innerHTML = `
-                    <div class="modal-dialog modal-dialog-scrollable">
+                    <div class="modal-dialog modal-lg modal-dialog-scrollable">
                         <div class="modal-content">
                             <div class="modal-header py-2"><h6 class="modal-title">任务过程</h6><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
                             <div class="modal-body" id="codexJobEventBody"></div>
@@ -3462,9 +3554,20 @@ const LLMManager = {
             modal.querySelector('#codexJobEventBody').innerHTML = `
                 <div class="d-flex flex-wrap gap-3 pb-3 mb-3 border-bottom small text-muted">
                     <span>状态 <strong class="text-body">${this.escapeHtml(job.status || '-')}</strong></span>
+                    <span>来源 <strong class="text-body">${this.escapeHtml(job.chat_name || job.chat_id || '未知来源')}</strong></span>
+                    ${job.chat_type ? `<span>类型 <strong class="text-body">${this.escapeHtml(job.chat_type === 'group' ? '群聊' : (job.chat_type === 'private' ? '私聊' : job.chat_type))}</strong></span>` : ''}
                     <span>模型 <strong class="text-body">${this.escapeHtml(job.model || '-')}</strong></span>
+                    <span>Worker <strong class="text-body">${this.escapeHtml(job.pool_worker || job.backend || '-')}</strong></span>
                     <span>耗时 <strong class="text-body">${this.formatJobDuration(job)}</strong></span>
                     <span>Token <strong class="text-body">${Number(job.total_tokens || 0).toLocaleString()}</strong></span>
+                </div>
+                <div class="codex-job-input-summary">
+                    <span>消息 <strong>${Number(job.message_count || 0).toLocaleString()}</strong></span>
+                    <span>提示字符 <strong>${Number(job.prompt_chars || 0).toLocaleString()}</strong></span>
+                    <span>输入文件 <strong>${Number(job.input_file_count || 0)}</strong></span>
+                    <span>输入图片 <strong>${Number(job.image_count || 0)}</strong></span>
+                    <span>输出附件 <strong>${Number(job.attachment_count || 0)}</strong></span>
+                    <span class="codex-mono" title="${this.escapeHtml(requestId)}">ID ${this.escapeHtml(requestId.slice(0, 12))}</span>
                 </div>
                 ${job.error ? `<div class="alert alert-danger py-2 small">${this.escapeHtml(job.error)}</div>` : ''}
                 <div class="codex-event-list">${eventRows}</div>`;
@@ -3535,6 +3638,23 @@ const LLMManager = {
             await this.loadCodexJobs({ quiet: true });
         } catch (error) {
             UI.showError(`操作失败：${error.message}`);
+        }
+    },
+
+    async deleteCodexSession(chatId) {
+        if (!chatId) return;
+        if (!await UI.confirm(`确定永久删除“${chatId}”的 Codex 会话吗？\n\n持久上下文及 Codex 线程会被删除；微信聊天记录和任务历史不会受影响。`, {
+            title: '删除 Codex 会话',
+            confirmText: '删除会话',
+            variant: 'danger',
+        })) return;
+        try {
+            await API.codexJobs.deleteSession(chatId);
+            this.codexExpandedSessions?.delete(chatId);
+            UI.showSuccess('Codex 会话已删除');
+            await this.loadCodexJobs({ quiet: true });
+        } catch (error) {
+            UI.showError(`删除失败：${error.message}`);
         }
     },
 

@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -28,13 +29,17 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.services.codex_job_manager import codex_job_manager
 from app.services.codex_proxy.client import (
+    CODEX_APPROVAL_POLICY,
+    CODEX_APPROVALS_REVIEWER,
     CodexProxyError,
+    _auto_review_config_args,
     _as_bool,
     _as_runtime_path,
     _collect_artifact_attachments,
     _cleanup_expired_artifacts,
     _content_to_text,
     _default_text_for_attachments,
+    _stage_input_files,
     _write_image_url_to_file,
     _write_artifact_manifest,
     estimate_codex_usage,
@@ -359,12 +364,13 @@ class CodexThreadStateStore:
                 ),
             )
 
-    def delete(self, chat_id: str) -> None:
+    def delete(self, chat_id: str) -> bool:
         with self._lock, closing(self._connect()) as connection, connection:
-            connection.execute(
+            cursor = connection.execute(
                 "DELETE FROM codex_thread_state WHERE chat_id = ?",
                 (str(chat_id),),
             )
+        return bool(cursor.rowcount)
 
 
 class CodexAppServerManager:
@@ -420,6 +426,7 @@ class CodexAppServerManager:
     def _command(self) -> List[str]:
         executable = os.getenv("CODEX_PROXY_WSL_BIN", "codex") if self.use_wsl else self.codex_bin
         args = [executable, "app-server", "--listen", "stdio://"]
+        args.extend(_auto_review_config_args())
         if self.use_wsl:
             return ["wsl.exe", "bash", "-lic", " ".join(shlex.quote(str(arg)) for arg in args)]
         return args
@@ -442,6 +449,8 @@ class CodexAppServerManager:
             "codex_version": self.codex_version,
             "schema_hash": self.schema_hash,
             "api_surface": "experimental" if self.experimental_api else "stable",
+            "approval_policy": CODEX_APPROVAL_POLICY,
+            "approvals_reviewer": CODEX_APPROVALS_REVIEWER,
             "last_error": self._last_error or None,
             "last_diagnostic": self._stderr_tail[-1] if self._stderr_tail else None,
         }
@@ -449,6 +458,18 @@ class CodexAppServerManager:
     def invalidate_chat(self, chat_id: str) -> None:
         """Forget a chat mapping so the next call starts a clean thread."""
         self.state_store.delete(str(chat_id or ""))
+
+    def delete_thread(self, thread_id: str, *, timeout: int = 30) -> None:
+        """Permanently delete a persisted Codex thread from the local runtime."""
+        normalized = str(thread_id or "").strip()
+        if not normalized:
+            return
+        self._request("thread/delete", {"threadId": normalized}, timeout=timeout)
+        self._loaded_threads.pop(normalized, None)
+
+    def forget_loaded_thread(self, thread_id: str) -> None:
+        """Drop a deleted thread from this worker's local resume cache."""
+        self._loaded_threads.pop(str(thread_id or ""), None)
 
     def session_snapshot(
         self,
@@ -744,7 +765,15 @@ class CodexAppServerManager:
     def _handle_server_request(self, message: Dict[str, Any]) -> None:
         method = str(message.get("method") or "")
         request_id = message.get("id")
+        # Eligible escalation requests are handled by Codex Auto-review before
+        # they reach this client. Anything still surfaced here requires a
+        # client or human decision, so keep the fallback fail-closed instead of
+        # turning Auto-review into unconditional approval.
         if method.endswith("/requestApproval") or "approval" in method.lower():
+            logger.warning(
+                "Codex approval request reached the client after Auto-review; declining: %s",
+                method,
+            )
             response = {"id": request_id, "result": {"decision": "decline"}}
         elif "elicitation" in method.lower():
             response = {"id": request_id, "result": {"action": "decline"}}
@@ -795,11 +824,133 @@ class CodexAppServerManager:
 
     @staticmethod
     def _public_item_event(item: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        item_type = str(item.get("type") or "unknown")
+        payload: Dict[str, Any] = {
             "item_id": str(item.get("id") or ""),
-            "item_type": str(item.get("type") or "unknown"),
+            "item_type": item_type,
             "status": str(item.get("status") or ""),
         }
+
+        def text(value: Any, limit: int = 600) -> str:
+            normalized = " ".join(str(value or "").split())
+            if len(normalized) > limit:
+                return normalized[: limit - 1] + "…"
+            return normalized
+
+        def public_command(value: Any) -> str:
+            command = text(value)
+            # Commands are useful operational telemetry, but common inline
+            # credential forms must never be persisted in the public timeline.
+            command = re.sub(
+                r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|secret)\b\s*[=:]\s*)([^\s]+)",
+                r"\1[已隐藏]",
+                command,
+            )
+            command = re.sub(
+                r"(?i)(--(?:api[_-]?key|token|password|secret)\s+)([^\s]+)",
+                r"\1[已隐藏]",
+                command,
+            )
+            command = re.sub(r"(?i)(authorization:\s*bearer\s+)([^\s]+)", r"\1[已隐藏]", command)
+            return command
+
+        duration = item.get("durationMs")
+        if isinstance(duration, (int, float)):
+            payload["duration_ms"] = max(0, int(duration))
+
+        if item_type == "commandExecution":
+            command = public_command(item.get("command"))
+            if command:
+                payload["command"] = command
+                payload["summary"] = command
+            if item.get("cwd"):
+                payload["cwd"] = text(item.get("cwd"), 300)
+            if isinstance(item.get("exitCode"), int):
+                payload["exit_code"] = int(item["exitCode"])
+            actions = item.get("commandActions") if isinstance(item.get("commandActions"), list) else []
+            action_types = [str(action.get("type")) for action in actions if isinstance(action, dict) and action.get("type")]
+            if action_types:
+                payload["action_types"] = action_types[:10]
+        elif item_type == "fileChange":
+            changes = item.get("changes") if isinstance(item.get("changes"), list) else []
+            public_changes: List[Dict[str, Any]] = []
+            additions = 0
+            deletions = 0
+            for change in changes[:30]:
+                if not isinstance(change, dict):
+                    continue
+                diff = str(change.get("diff") or "")
+                additions += sum(1 for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++"))
+                deletions += sum(1 for line in diff.splitlines() if line.startswith("-") and not line.startswith("---"))
+                public_changes.append(
+                    {
+                        "path": text(change.get("path"), 300),
+                        "kind": str(change.get("kind") or "update"),
+                    }
+                )
+            payload.update(
+                {
+                    "changes": public_changes,
+                    "change_count": len(changes),
+                    "additions": additions,
+                    "deletions": deletions,
+                }
+            )
+            paths = [change["path"] for change in public_changes if change.get("path")]
+            if paths:
+                payload["summary"] = "、".join(paths[:3]) + (f" 等 {len(changes)} 个文件" if len(changes) > 3 else "")
+        elif item_type == "mcpToolCall":
+            server = text(item.get("server"), 120)
+            tool = text(item.get("tool"), 160)
+            payload.update({"server": server, "tool": tool})
+            payload["summary"] = " / ".join(part for part in (server, tool) if part)
+            if isinstance(item.get("readOnlyHint"), bool):
+                payload["read_only"] = item["readOnlyHint"]
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            content = result.get("content") if isinstance(result.get("content"), list) else []
+            if result:
+                payload["result_items"] = len(content)
+            error = item.get("error") if isinstance(item.get("error"), dict) else {}
+            if error.get("message"):
+                payload["error"] = text(error["message"], 500)
+        elif item_type == "dynamicToolCall":
+            namespace = text(item.get("namespace"), 120)
+            tool = text(item.get("tool"), 160)
+            payload.update({"namespace": namespace, "tool": tool})
+            payload["summary"] = " / ".join(part for part in (namespace, tool) if part)
+            if isinstance(item.get("success"), bool):
+                payload["success"] = item["success"]
+            content_items = item.get("contentItems") if isinstance(item.get("contentItems"), list) else []
+            if item.get("contentItems") is not None:
+                payload["result_items"] = len(content_items)
+        elif item_type == "webSearch":
+            query = text(item.get("query"), 500)
+            if query:
+                payload["query"] = query
+                payload["summary"] = query
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            if action.get("type"):
+                payload["action"] = str(action["type"])
+            results = item.get("results") if isinstance(item.get("results"), list) else []
+            if item.get("results") is not None:
+                payload["result_count"] = len(results)
+        elif item_type == "imageGeneration":
+            if item.get("savedPath"):
+                payload["saved_path"] = text(item.get("savedPath"), 300)
+                payload["summary"] = payload["saved_path"]
+            payload["transparent_background"] = bool(item.get("transparentBackground"))
+        elif item_type == "imageView":
+            if item.get("path"):
+                payload["path"] = text(item.get("path"), 300)
+                payload["summary"] = payload["path"]
+        elif item_type == "agentMessage":
+            payload["phase"] = str(item.get("phase") or "")
+            payload["text_chars"] = len(str(item.get("text") or ""))
+        elif item_type == "userMessage":
+            content = item.get("content") if isinstance(item.get("content"), list) else []
+            payload["content_items"] = len(content)
+
+        return payload
 
     def _record_turn_event(
         self,
@@ -844,6 +995,7 @@ class CodexAppServerManager:
                 public_item,
                 current_item_type=public_item["item_type"],
                 current_item_status="in_progress",
+                current_item_summary=public_item.get("summary"),
             )
         elif method == "item/completed":
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
@@ -855,6 +1007,7 @@ class CodexAppServerManager:
                 public_item,
                 current_item_type=public_item["item_type"],
                 current_item_status=public_item.get("status") or "completed",
+                current_item_summary=public_item.get("summary"),
             )
         elif method == "thread/tokenUsage/updated":
             tracker.usage = params.get("tokenUsage") if isinstance(params.get("tokenUsage"), dict) else {}
@@ -973,6 +1126,7 @@ class CodexAppServerManager:
         config: Dict[str, Any] = {
             "model_reasoning_effort": reasoning_effort,
             "web_search": web_search_mode,
+            "approvals_reviewer": CODEX_APPROVALS_REVIEWER,
         }
         if reasoning_summary != "inherit":
             config["model_reasoning_summary"] = reasoning_summary
@@ -982,6 +1136,23 @@ class CodexAppServerManager:
     @staticmethod
     def _thread_config_signature(config: Dict[str, Any]) -> str:
         return json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _runtime_config_signature(
+        self,
+        config: Dict[str, Any],
+        *,
+        workdir: Path,
+        permission_profile: str,
+        approval_policy: str,
+    ) -> str:
+        return "|".join(
+            (
+                self._thread_config_signature(config),
+                str(workdir.resolve()),
+                permission_profile,
+                approval_policy,
+            )
+        )
 
     def _start_thread(
         self,
@@ -993,22 +1164,36 @@ class CodexAppServerManager:
         timeout: int,
         ephemeral: bool = False,
         sandbox: str = "workspace-write",
+        workdir: Optional[Path] = None,
+        permission_profile: str = "",
+        approval_policy: str = CODEX_APPROVAL_POLICY,
+        runtime_workspace_roots: Optional[List[Path]] = None,
     ) -> str:
-        runtime_workdir = _as_runtime_path(Path(self.workdir), self.use_wsl)
+        runtime_workdir = _as_runtime_path(Path(workdir or self.workdir), self.use_wsl)
         thread_config = self._thread_config(
             reasoning_effort,
             web_search_mode,
             reasoning_summary,
         )
+        execution_policy: Dict[str, Any]
+        if permission_profile:
+            execution_policy = {"permissions": permission_profile}
+            if runtime_workspace_roots:
+                execution_policy["runtimeWorkspaceRoots"] = [
+                    _as_runtime_path(Path(path), self.use_wsl)
+                    for path in runtime_workspace_roots
+                ]
+        else:
+            execution_policy = {"sandbox": sandbox}
         result = self._request(
             "thread/start",
             {
                 "model": model,
                 "cwd": runtime_workdir,
-                "approvalPolicy": "never",
-                "sandbox": sandbox,
+                "approvalPolicy": approval_policy,
                 "ephemeral": bool(ephemeral),
                 "config": thread_config,
+                **execution_policy,
             },
             timeout=min(timeout, 120),
         )
@@ -1016,7 +1201,12 @@ class CodexAppServerManager:
         thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
         if not thread_id:
             raise CodexAppServerError("Codex App Server thread/start returned no thread id")
-        self._loaded_threads[thread_id] = self._thread_config_signature(thread_config)
+        self._loaded_threads[thread_id] = self._runtime_config_signature(
+            thread_config,
+            workdir=Path(workdir or self.workdir),
+            permission_profile=permission_profile,
+            approval_policy=approval_policy,
+        )
         return thread_id
 
     def _resume_thread(
@@ -1029,16 +1219,35 @@ class CodexAppServerManager:
         reasoning_summary: str,
         timeout: int,
         sandbox: str = "workspace-write",
+        workdir: Optional[Path] = None,
+        permission_profile: str = "",
+        approval_policy: str = CODEX_APPROVAL_POLICY,
+        runtime_workspace_roots: Optional[List[Path]] = None,
     ) -> None:
         thread_config = self._thread_config(
             reasoning_effort,
             web_search_mode,
             reasoning_summary,
         )
-        config_signature = self._thread_config_signature(thread_config)
+        config_signature = self._runtime_config_signature(
+            thread_config,
+            workdir=Path(workdir or self.workdir),
+            permission_profile=permission_profile,
+            approval_policy=approval_policy,
+        )
         if self._loaded_threads.get(thread_id) == config_signature:
             return
-        runtime_workdir = _as_runtime_path(Path(self.workdir), self.use_wsl)
+        runtime_workdir = _as_runtime_path(Path(workdir or self.workdir), self.use_wsl)
+        execution_policy: Dict[str, Any]
+        if permission_profile:
+            execution_policy = {"permissions": permission_profile}
+            if runtime_workspace_roots:
+                execution_policy["runtimeWorkspaceRoots"] = [
+                    _as_runtime_path(Path(path), self.use_wsl)
+                    for path in runtime_workspace_roots
+                ]
+        else:
+            execution_policy = {"sandbox": sandbox}
         try:
             result = self._request(
                 "thread/resume",
@@ -1046,9 +1255,9 @@ class CodexAppServerManager:
                     "threadId": thread_id,
                     "model": model,
                     "cwd": runtime_workdir,
-                    "approvalPolicy": "never",
-                    "sandbox": sandbox,
+                    "approvalPolicy": approval_policy,
                     "config": thread_config,
+                    **execution_policy,
                 },
                 timeout=min(timeout, 120),
             )
@@ -1165,8 +1374,34 @@ class CodexAppServerManager:
             or extra_body.get("codex_sandbox")
             or "workspace-write"
         ).strip().lower()
-        if sandbox not in {"read-only", "workspace-write"}:
+        if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
             sandbox = "workspace-write"
+        permission_profile = str(
+            request.get("codex_permission_profile")
+            or extra_body.get("codex_permission_profile")
+            or ""
+        ).strip()
+        approval_policy = str(
+            request.get("codex_approval_policy")
+            or extra_body.get("codex_approval_policy")
+            or CODEX_APPROVAL_POLICY
+        ).strip().lower()
+        if approval_policy not in {"never", "on-request"}:
+            approval_policy = CODEX_APPROVAL_POLICY
+        workdir = Path(
+            request.get("codex_workdir")
+            or extra_body.get("codex_workdir")
+            or self.workdir
+        ).resolve()
+        roots_value = request.get(
+            "codex_runtime_workspace_roots",
+            extra_body.get("codex_runtime_workspace_roots"),
+        )
+        runtime_workspace_roots = [
+            Path(item).resolve()
+            for item in (roots_value if isinstance(roots_value, list) else [])
+            if str(item or "").strip()
+        ]
         output_schema = request.get("output_schema")
         if not isinstance(output_schema, dict):
             output_schema = extra_body.get("output_schema")
@@ -1205,6 +1440,10 @@ class CodexAppServerManager:
                     reasoning_summary=reasoning_summary,
                     timeout=timeout,
                     sandbox=sandbox,
+                    workdir=workdir,
+                    permission_profile=permission_profile,
+                    approval_policy=approval_policy,
+                    runtime_workspace_roots=runtime_workspace_roots,
                 )
             except _ResumeThreadError as exc:
                 logger.warning(
@@ -1231,6 +1470,10 @@ class CodexAppServerManager:
                 timeout=timeout,
                 ephemeral=ephemeral,
                 sandbox=sandbox,
+                workdir=workdir,
+                permission_profile=permission_profile,
+                approval_policy=approval_policy,
+                runtime_workspace_roots=runtime_workspace_roots,
             )
             logger.info(
                 "Codex persistent thread started: chat=%s thread=%s reason=%s",
@@ -1242,13 +1485,23 @@ class CodexAppServerManager:
             raise CodexAppServerError("No new chatbot messages to send to the persistent Codex thread")
 
         request_id = uuid.uuid4().hex
-        artifact_root = Path(os.getenv("CODEX_PROXY_ARTIFACT_ROOT") or "tmp/images/codex")
+        artifact_root = Path(
+            request.get("codex_artifact_root")
+            or extra_body.get("codex_artifact_root")
+            or os.getenv("CODEX_PROXY_ARTIFACT_ROOT")
+            or "tmp/images/codex"
+        )
         if not artifact_root.is_absolute():
             artifact_root = Path(self.workdir) / artifact_root
         _cleanup_expired_artifacts(artifact_root)
         request_dir = artifact_root / request_id
         output_dir = request_dir / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
+        staged_input_files = _stage_input_files(
+            request.get("wxautox_input_files", extra_body.get("wxautox_input_files")),
+            request_dir=request_dir,
+            use_wsl=self.use_wsl,
+        )
         runtime_output_dir = _as_runtime_path(output_dir, self.use_wsl)
 
         image_urls = extract_image_urls(delta.messages, allow_image_input=allow_image_input)
@@ -1265,6 +1518,7 @@ class CodexAppServerManager:
             artifact_output_dir=runtime_output_dir,
             native_web_search_enabled=web_search_enabled,
             input_image_count=len(runtime_image_paths),
+            input_files=staged_input_files,
         )
         if delta.resume:
             prompt = (
@@ -1295,10 +1549,19 @@ class CodexAppServerManager:
                 "max_turns": max_turns,
                 "timeout": timeout,
                 "chat_id": chat_id,
+                "chat_name": str(request.get("codex_source_chat_name") or chat_id),
+                "chat_type": str(request.get("codex_source_chat_type") or ""),
                 "thread_id": thread_id,
+                "workdir": str(workdir),
+                "sandbox": None if permission_profile else sandbox,
+                "permission_profile": permission_profile or None,
+                "access_mode": request.get("codex_access_mode"),
+                "approval_policy": approval_policy,
+                "approvals_reviewer": CODEX_APPROVALS_REVIEWER,
                 "message_count": len(delta.messages),
                 "prompt_chars": len(prompt),
                 "image_count": len(runtime_image_paths),
+                "input_file_count": len(staged_input_files),
                 "request_dir": str(request_dir),
                 "output_dir": str(output_dir),
                 "started_at": started_at,
@@ -1319,8 +1582,25 @@ class CodexAppServerManager:
                     "input": turn_input,
                     "model": model,
                     "effort": reasoning_effort,
-                    "cwd": _as_runtime_path(Path(self.workdir), self.use_wsl),
-                    "approvalPolicy": "never",
+                    "cwd": _as_runtime_path(workdir, self.use_wsl),
+                    "approvalPolicy": approval_policy,
+                    **(
+                        {
+                            "permissions": permission_profile,
+                        }
+                        if permission_profile
+                        else {}
+                    ),
+                    **(
+                        {
+                            "runtimeWorkspaceRoots": [
+                                _as_runtime_path(path, self.use_wsl)
+                                for path in runtime_workspace_roots
+                            ]
+                        }
+                        if runtime_workspace_roots
+                        else {}
+                    ),
                     **({"outputSchema": output_schema} if output_schema else {}),
                     **(
                         {"summary": reasoning_summary}
@@ -1413,9 +1693,13 @@ class CodexAppServerManager:
                 "last_turn_id": turn_id,
                 "codex_version": self.codex_version,
                 "schema_hash": self.schema_hash,
-                "config_signature": self._thread_config_signature(
-                    self._thread_config(reasoning_effort, web_search_mode, reasoning_summary)
+                "config_signature": self._runtime_config_signature(
+                    self._thread_config(reasoning_effort, web_search_mode, reasoning_summary),
+                    workdir=workdir,
+                    permission_profile=permission_profile,
+                    approval_policy=approval_policy,
                 ),
+                "access_signature": request.get("codex_access_signature"),
                 "updated_at": datetime.now().isoformat(),
             }
             if not ephemeral:

@@ -1560,11 +1560,14 @@ const App = {
         UI.renderManagedChatPending(selectedChatName);
 
         try {
-            const [capabilitiesData, userDetail] = await Promise.all([
+            const [capabilitiesData, userDetail, codexAccessResponse] = await Promise.all([
                 API.capabilities.getAll(),
                 userId
                     ? API.request(`/api/permissions/users/${userId}`)
-                    : Promise.resolve({ chat_name: selectedChatName, permissions: [] })
+                    : Promise.resolve({ chat_name: selectedChatName, permissions: [] }),
+                userId
+                    ? API.users.getCodexAccess(userId)
+                    : Promise.resolve({ data: null })
             ]);
 
             // A slower response for a previously selected chat must never
@@ -1574,12 +1577,43 @@ const App = {
 
             UI.renderChatCapabilities(
                 userDetail,
-                capabilitiesData.capabilities || []
+                capabilitiesData.capabilities || [],
+                codexAccessResponse?.data || null
             );
         } catch (e) {
             if (requestId !== this.managedChatSelectionRequest) return;
             UI.renderManagedChatError(selectedChatName);
             UI.showError('加载用户详情失败：' + e.message);
+        }
+    },
+
+    async saveCodexAccess(userId) {
+        const modeInput = document.getElementById('codexAccessMode');
+        if (!userId || !modeInput) return;
+        const mode = modeInput.value;
+        if (mode === 'owner_full') {
+            const approved = await UI.confirm(
+                '管理员模式允许此私聊中的 Codex 访问本机文件，并自动处理执行审批。只应授予你本人可控的私聊。',
+                {
+                    title: '授予本机最大权限',
+                    confirmText: '确认授予',
+                    variant: 'warning'
+                }
+            );
+            if (!approved) return;
+        }
+
+        const button = document.getElementById('saveCodexAccessBtn');
+        if (button) button.disabled = true;
+        try {
+            await API.users.updateCodexAccess(userId, mode);
+            UI.showSuccess(mode === 'owner_full' ? '已设为管理员私聊' : '已启用聊天隔离空间');
+            await this.loadUsers();
+            await this.selectUser(this.currentThreadName, userId);
+        } catch (e) {
+            UI.showError('保存 Codex 访问范围失败：' + e.message);
+        } finally {
+            if (button) button.disabled = false;
         }
     },
 

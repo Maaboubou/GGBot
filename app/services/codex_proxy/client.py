@@ -7,19 +7,28 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
+import zlib
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional
 
 from app.services.codex_job_manager import codex_job_manager
+from app.services.wechat_file_store import (
+    DEFAULT_DOWNLOAD_ROOT,
+    PROJECT_ROOT,
+    local_path_from_external,
+    safe_file_name,
+)
 
 try:
     import tiktoken
@@ -33,10 +42,62 @@ class CodexProxyError(RuntimeError):
 
 logger = logging.getLogger(__name__)
 
+CODEX_APPROVAL_POLICY = "on-request"
+CODEX_APPROVALS_REVIEWER = "auto_review"
 _RUNNING_REQUESTS_LOCK = threading.Lock()
 _RUNNING_REQUESTS: Dict[str, Dict[str, Any]] = {}
 _ARTIFACT_CLEANUP_LOCK = threading.Lock()
 _ARTIFACT_CLEANUP_LAST_RUN = 0.0
+
+_BLOCKED_INPUT_FILE_SUFFIXES = {
+    ".bat", ".cmd", ".com", ".cpl", ".dll", ".exe", ".hta", ".inf",
+    ".ins", ".isp", ".jse", ".lnk", ".msc", ".msi", ".msp", ".mst",
+    ".pif", ".ps1", ".reg", ".scr", ".sct", ".sys", ".vb", ".vbe",
+    ".vbs", ".ws", ".wsc", ".wsf", ".wsh",
+}
+
+
+def _auto_review_config_args(
+    approval_policy: str = CODEX_APPROVAL_POLICY,
+    approvals_reviewer: str = CODEX_APPROVALS_REVIEWER,
+) -> List[str]:
+    """Return CLI overrides for policy-bounded automatic approval review."""
+    return [
+        "-c",
+        f'approval_policy="{approval_policy}"',
+        "-c",
+        f'approvals_reviewer="{approvals_reviewer}"',
+    ]
+
+
+def _permission_profile_config_args(profile: str) -> List[str]:
+    """Return a fail-closed profile without inheriting machine-wide read access."""
+    normalized = str(profile or "").strip()
+    if not normalized:
+        return []
+    args = ["-c", f'default_permissions="{normalized}"']
+    if normalized != "wxautox-chat-isolated":
+        return args
+
+    # Root deny is intentional: :workspace alone permits broad reads. Narrow
+    # skill roots are reopened read-only so skills remain discoverable while
+    # their commands still execute inside this profile.
+    args.extend(
+        [
+            "-c",
+            'permissions.wxautox-chat-isolated.extends=":workspace"',
+            "-c",
+            'permissions.wxautox-chat-isolated.filesystem={":root"="deny",'
+            '":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny",'
+            '"/tmp/codex-bwrap-synthetic-mount-targets-1000"="write",'
+            '"~/.nvm/versions/node"="read",'
+            '"~/.codex/skills"="read","~/.agents/skills"="read",'
+            '"~/.codex/plugins/cache"="read"}',
+            "-c",
+            "permissions.wxautox-chat-isolated.network.enabled=false",
+        ]
+    )
+    return args
 
 
 def get_running_codex_requests() -> List[Dict[str, Any]]:
@@ -258,7 +319,80 @@ def _as_runtime_path(path: Path, use_wsl: bool) -> str:
     return str(path.resolve())
 
 
-def _write_image_url_to_file(image_url: str) -> Path:
+def _stage_input_files(
+    raw_files: Any,
+    *,
+    request_dir: Path,
+    use_wsl: bool,
+) -> List[Dict[str, Any]]:
+    """Validate managed inbound files and copy immutable request-local inputs."""
+    if not isinstance(raw_files, list) or not raw_files:
+        return []
+    if len(raw_files) > 5:
+        raise CodexProxyError("A Codex request may include at most 5 input files")
+
+    configured_root = str(os.getenv("WECHAT_FILE_DOWNLOAD_ROOT") or "").strip()
+    allowed_root = local_path_from_external(configured_root) if configured_root else DEFAULT_DOWNLOAD_ROOT
+    if not allowed_root.is_absolute():
+        allowed_root = PROJECT_ROOT / allowed_root
+    allowed_root = allowed_root.resolve()
+    try:
+        max_bytes = max(1, int(os.getenv("CODEX_INPUT_FILE_MAX_BYTES") or 256 * 1024 * 1024))
+    except (TypeError, ValueError):
+        max_bytes = 256 * 1024 * 1024
+
+    input_dir = request_dir / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    staged: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw_files, start=1):
+        if not isinstance(item, dict) or not item.get("path"):
+            raise CodexProxyError("Every Codex input file must include a managed path")
+        source = local_path_from_external(str(item["path"])).expanduser()
+        source_was_symlink = source.is_symlink()
+        try:
+            source = source.resolve(strict=True)
+        except OSError as exc:
+            raise CodexProxyError(f"Input file does not exist: {item.get('name') or source.name}") from exc
+        if not _is_within_path(source, allowed_root):
+            raise CodexProxyError("Input file is outside the managed WeChat download directory")
+        if source_was_symlink or not source.is_file():
+            raise CodexProxyError("Input attachment must be a regular file")
+        if source.suffix.casefold() in _BLOCKED_INPUT_FILE_SUFFIXES:
+            raise CodexProxyError(f"Blocked executable input file type: {source.suffix}")
+
+        actual_size = source.stat().st_size
+        if actual_size > max_bytes:
+            raise CodexProxyError(
+                f"Input file exceeds the {max_bytes // (1024 * 1024)} MB processing limit"
+            )
+        expected_size = item.get("size")
+        if expected_size is not None and int(expected_size) != actual_size:
+            raise CodexProxyError("Input file size no longer matches its download record")
+        expected_sha256 = str(item.get("sha256") or "").strip().casefold()
+        if expected_sha256 and _sha256_file(source).casefold() != expected_sha256:
+            raise CodexProxyError("Input file checksum no longer matches its download record")
+
+        display_name = safe_file_name(str(item.get("name") or source.name), fallback=source.name)
+        destination = input_dir / f"{index:02d}_{display_name}"
+        shutil.copy2(source, destination)
+        staged.append(
+            {
+                "file_id": str(item.get("file_id") or ""),
+                "name": display_name,
+                "path": str(destination.resolve()),
+                "runtime_path": _as_runtime_path(destination, use_wsl),
+                "size": actual_size,
+                "sha256": expected_sha256 or _sha256_file(destination),
+            }
+        )
+    return staged
+
+
+def _write_image_url_to_file(
+    image_url: str,
+    *,
+    destination_dir: Optional[Path] = None,
+) -> Path:
     if image_url.startswith("data:"):
         header, separator, payload = image_url.partition(",")
         if not separator or ";base64" not in header:
@@ -272,13 +406,21 @@ def _write_image_url_to_file(image_url: str) -> Path:
         if not image_bytes:
             raise CodexProxyError("Empty image payload")
 
-        path = Path(tempfile.gettempdir()) / f"codex_proxy_input_{uuid.uuid4().hex}{_suffix_for_mime(mime_type)}"
+        target_dir = Path(destination_dir) if destination_dir is not None else Path(tempfile.gettempdir())
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"codex_proxy_input_{uuid.uuid4().hex}{_suffix_for_mime(mime_type)}"
         path.write_bytes(image_bytes)
         return path
 
     local_path = Path(image_url)
     if local_path.exists() and local_path.is_file():
-        return local_path
+        if destination_dir is None:
+            return local_path
+        target_dir = Path(destination_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        destination = target_dir / f"codex_proxy_input_{uuid.uuid4().hex}{local_path.suffix or '.jpg'}"
+        shutil.copy2(local_path, destination)
+        return destination
 
     raise CodexProxyError("Image input must be a base64 data URL or an existing local file path")
 
@@ -297,6 +439,317 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_valid_png(path: Path) -> bool:
+    """Validate PNG chunk boundaries and CRCs without optional image libraries."""
+    try:
+        with path.open("rb") as stream:
+            if stream.read(8) != b"\x89PNG\r\n\x1a\n":
+                return False
+            saw_ihdr = False
+            saw_idat = False
+            while True:
+                length_bytes = stream.read(4)
+                if len(length_bytes) != 4:
+                    return False
+                length = struct.unpack(">I", length_bytes)[0]
+                # A corrupt length must not cause an unbounded allocation.
+                if length > 128 * 1024 * 1024:
+                    return False
+                chunk_type = stream.read(4)
+                if len(chunk_type) != 4:
+                    return False
+                crc = zlib.crc32(chunk_type)
+                remaining = length
+                while remaining:
+                    block = stream.read(min(remaining, 1024 * 1024))
+                    if not block:
+                        return False
+                    crc = zlib.crc32(block, crc)
+                    remaining -= len(block)
+                expected_crc = stream.read(4)
+                if len(expected_crc) != 4 or struct.unpack(">I", expected_crc)[0] != (crc & 0xFFFFFFFF):
+                    return False
+                if chunk_type == b"IHDR":
+                    if saw_ihdr or length != 13:
+                        return False
+                    saw_ihdr = True
+                elif chunk_type == b"IDAT":
+                    saw_idat = True
+                elif chunk_type == b"IEND":
+                    return saw_ihdr and saw_idat and length == 0 and stream.read(1) == b""
+    except (OSError, struct.error):
+        return False
+
+
+def _is_valid_image_file(path: Path) -> bool:
+    """Reject structurally broken image artifacts before they reach WeChat."""
+    suffix = path.suffix.casefold()
+    if suffix == ".png":
+        return _is_valid_png(path)
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return False
+        with path.open("rb") as stream:
+            head = stream.read(16)
+            if suffix in {".jpg", ".jpeg"}:
+                if not head.startswith(b"\xff\xd8\xff") or size < 4:
+                    return False
+                stream.seek(-2, os.SEEK_END)
+                return stream.read(2) == b"\xff\xd9"
+            if suffix == ".gif":
+                return head.startswith((b"GIF87a", b"GIF89a"))
+            if suffix == ".webp":
+                return len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+            if suffix == ".bmp":
+                return head.startswith(b"BM")
+            if suffix in {".tif", ".tiff"}:
+                return head.startswith((b"II*\x00", b"MM\x00*"))
+    except OSError:
+        return False
+    return False
+
+
+def _normalized_event_type(value: Any) -> str:
+    return "".join(character for character in str(value or "").casefold() if character.isalnum())
+
+
+def _successful_generated_image_paths(event: Any) -> List[str]:
+    """Extract successful image-generation saved paths from a Codex JSON event."""
+    paths: List[str] = []
+    seen = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, dict):
+            return
+
+        item_type = _normalized_event_type(value.get("type") or value.get("event"))
+        if "imagegeneration" in item_type:
+            saved_path = value.get("savedPath") or value.get("saved_path")
+            status = _normalized_event_type(value.get("status"))
+            failure = value.get("failure") or value.get("error")
+            failed = bool(failure) or status in {"failed", "failure", "cancelled", "canceled"}
+            if isinstance(saved_path, str) and saved_path.strip() and not failed:
+                cleaned = saved_path.strip()
+                if cleaned not in seen:
+                    seen.add(cleaned)
+                    paths.append(cleaned)
+
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                visit(child)
+
+    visit(event)
+    return paths
+
+
+def parse_codex_generated_image_paths(stdout: str) -> List[str]:
+    """Extract unique successful image-generation paths from Codex JSONL output."""
+    paths: List[str] = []
+    seen = set()
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for path in _successful_generated_image_paths(event):
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths
+
+
+_DIRECT_IMAGE_ACTION_RE = re.compile(
+    r"(?:生成|画|绘制|出|来|做|制作|创建|设计|编辑|修改|改成|修图|美化|换成).{0,16}"
+    r"(?:图片|图像|照片|海报|插画|头像|壁纸|封面|自拍|表情包|一张|[1１]张)"
+    r"|(?:图片|图像|照片|海报|插画|头像|壁纸|封面|自拍|表情包).{0,16}"
+    r"(?:生成|画|绘制|做|制作|创建|设计|编辑|修改|改成|修图|美化|换成)"
+    r"|(?:generate|create|draw|design|edit|retouch|transform|make).{0,32}"
+    r"(?:image|picture|photo|poster|illustration|avatar|wallpaper|cover)"
+    r"|(?:^|[，,。.!！?？\s])(?:请|麻烦)?(?:帮我)?(?:画|绘制|出图)(?:个|一个|一下)?",
+    re.IGNORECASE,
+)
+_MULTIPLE_IMAGE_RE = re.compile(
+    r"(?:多来|多生成|多画|多做|多张|几张|若干张|多版|几版|多个版本|几个版本|候选)"
+    r"|(?:[二两三四五六七八九十2-9２-９]|1[0-9]|[2-9][0-9])\s*(?:张|幅|版)"
+    r"|\b(?:multiple|several|variants?|versions?|two|three|four|five|six|seven|eight|nine|ten)\b",
+    re.IGNORECASE,
+)
+_IMAGE_EDIT_ACTION_RE = re.compile(
+    r"(?:改|修改|编辑|修|美化|换|去掉|去除|删除|添加|加上|抠图|扩图|重绘|变成)"
+    r"|\b(?:edit|change|modify|retouch|remove|add|replace|transform)\b",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_IMAGE_FOLLOWUP_RE = re.compile(
+    r"^(?:你|麻烦你|让你|叫你)?(?:来|去|直接)?(?:给我)?(?:生成|画|出图|做图)(?:啊|呀|吧|嘛|呢)?[！!。.]?$",
+    re.IGNORECASE,
+)
+_DOCUMENT_DELIVERABLE_RE = re.compile(
+    r"(?:做|来|制作|创建|生成|输出|整理).{0,10}(?:PPTX?|幻灯片|演示文稿|Word|DOCX?|文档|Excel|XLSX?|表格|PDF)"
+    r"|(?:PPTX?|幻灯片|演示文稿|Word|DOCX?|文档|Excel|XLSX?|表格|PDF).{0,10}(?:做|来|制作|创建|生成|输出|整理)",
+    re.IGNORECASE,
+)
+def _latest_user_text(messages: Iterable[Dict[str, Any]]) -> str:
+    latest = ""
+    for message in messages:
+        if str(message.get("role") or "user") == "user":
+            latest = _content_to_text(message.get("content"))
+    return latest.strip()
+
+
+def _direct_image_request_mode(
+    messages: Iterable[Dict[str, Any]],
+    *,
+    has_image_input: bool = False,
+) -> Optional[str]:
+    """Classify direct raster-image requests for post-run artifact recovery."""
+    message_list = list(messages)
+    text = _latest_user_text(message_list)
+    if not text:
+        return None
+    text = re.sub(r"\s+@\S+\s*$", "", text).strip()
+    # Document/slide deliverables may legitimately generate embedded images as
+    # intermediate assets; they are not direct raster-image requests.
+    if _DOCUMENT_DELIVERABLE_RE.search(text):
+        return None
+    is_direct_image_request = bool(_DIRECT_IMAGE_ACTION_RE.search(text))
+    if not is_direct_image_request and _CONTEXTUAL_IMAGE_FOLLOWUP_RE.fullmatch(text.strip()):
+        is_direct_image_request = True
+    if has_image_input and _IMAGE_EDIT_ACTION_RE.search(text):
+        is_direct_image_request = True
+    if not is_direct_image_request and _MULTIPLE_IMAGE_RE.search(text):
+        earlier_messages = message_list[:-1]
+        is_direct_image_request = any(
+            _DIRECT_IMAGE_ACTION_RE.search(_content_to_text(message.get("content")))
+            for message in earlier_messages
+            if str(message.get("role") or "user") == "user"
+        )
+    if not is_direct_image_request:
+        return None
+    return "multiple" if _MULTIPLE_IMAGE_RE.search(text) else "single"
+
+
+_CODEX_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _codex_thread_id_from_event(event: Any) -> str:
+    """Extract a validated Codex thread id from a thread.started JSONL event."""
+    if not isinstance(event, dict):
+        return ""
+    event_type = re.sub(r"[^a-z]", "", str(event.get("type") or "").lower())
+    if event_type != "threadstarted":
+        return ""
+    candidates = [event.get("thread_id"), event.get("threadId")]
+    thread = event.get("thread")
+    if isinstance(thread, dict):
+        candidates.extend((thread.get("id"), thread.get("thread_id"), thread.get("threadId")))
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if _CODEX_THREAD_ID_RE.fullmatch(normalized):
+            return normalized
+    return ""
+
+
+def parse_codex_thread_id(stdout: str) -> str:
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            thread_id = _codex_thread_id_from_event(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        if thread_id:
+            return thread_id
+    return ""
+
+
+def _default_wsl_distribution_name() -> str:
+    configured = str(os.getenv("CODEX_PROXY_WSL_DISTRO") or "").strip()
+    if configured:
+        return configured
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        root_path = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, root_path) as root_key:
+            distribution_id = str(winreg.QueryValueEx(root_key, "DefaultDistribution")[0])
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, root_path + "\\" + distribution_id) as distro_key:
+            return str(winreg.QueryValueEx(distro_key, "DistributionName")[0]).strip()
+    except (ImportError, OSError, ValueError):
+        return "Ubuntu"
+
+
+def _default_wsl_user_home() -> str:
+    configured = str(os.getenv("CODEX_PROXY_WSL_HOME") or "").strip()
+    if configured:
+        return configured
+    if os.name != "nt":
+        return str(Path.home())
+    try:
+        import winreg
+
+        root_path = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, root_path) as root_key:
+            distribution_id = str(winreg.QueryValueEx(root_key, "DefaultDistribution")[0])
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, root_path + "\\" + distribution_id) as distro_key:
+            uid = int(winreg.QueryValueEx(distro_key, "DefaultUid")[0])
+        passwd_path = Path(
+            rf"\\wsl.localhost\{_default_wsl_distribution_name()}\etc\passwd"
+        )
+        for line in passwd_path.read_text(encoding="utf-8").splitlines():
+            fields = line.split(":")
+            if len(fields) >= 6 and int(fields[2]) == uid:
+                home = fields[5].strip()
+                if PurePosixPath(home).is_absolute():
+                    return home
+    except (ImportError, OSError, UnicodeError, ValueError):
+        pass
+    return ""
+
+
+def _windows_path_for_wsl(linux_path: str) -> Path:
+    path = PurePosixPath(str(linux_path or ""))
+    if not path.is_absolute():
+        raise ValueError("WSL artifact path must be absolute")
+    distro = _default_wsl_distribution_name()
+    if not distro:
+        raise ValueError("WSL distribution is unavailable")
+    return Path(rf"\\wsl.localhost\{distro}").joinpath(*path.parts[1:])
+
+
+def _is_trusted_generated_image_path(saved_path: str) -> bool:
+    """Accept only imagegen files located inside a Codex generated_images tree."""
+    if not isinstance(saved_path, str) or "\x00" in saved_path:
+        return False
+    normalized = saved_path.strip().replace("\\", "/")
+    suffix = Path(normalized).suffix.casefold()
+    if suffix not in _IMAGE_ATTACHMENT_SUFFIXES:
+        return False
+    if normalized.startswith("/"):
+        parts = [part for part in normalized.split("/") if part]
+    elif re.match(r"^[A-Za-z]:/", normalized):
+        parts = [part for part in normalized[3:].split("/") if part]
+    else:
+        return False
+    if any(part in {".", ".."} for part in parts):
+        return False
+    folded = [part.casefold() for part in parts]
+    return any(
+        folded[index] == ".codex" and folded[index + 1] == "generated_images"
+        for index in range(max(0, len(folded) - 1))
+    )
+
+
 def _default_text_for_attachments(attachments: List[Dict[str, Any]]) -> str:
     if attachments and all(item.get("type") == "image" for item in attachments):
         return "已生成图片"
@@ -305,6 +758,7 @@ def _default_text_for_attachments(attachments: List[Dict[str, Any]]) -> str:
 
 def _collect_artifact_attachments(output_dir: Path) -> List[Dict[str, Any]]:
     attachments: List[Dict[str, Any]] = []
+    seen_hashes = set()
     if not output_dir.exists():
         return attachments
 
@@ -323,6 +777,12 @@ def _collect_artifact_attachments(output_dir: Path) -> List[Dict[str, Any]]:
             continue
         if stat.st_size <= 0:
             continue
+        if suffix in _IMAGE_ATTACHMENT_SUFFIXES and not _is_valid_image_file(path):
+            logger.warning("Skipping structurally invalid image artifact: %s", path)
+            continue
+        if sha256 in seen_hashes:
+            continue
+        seen_hashes.add(sha256)
 
         mime_type = _ATTACHMENT_MIME_TYPES.get(suffix, "application/octet-stream")
         attachments.append(
@@ -420,6 +880,7 @@ def render_chat_prompt(
     artifact_output_dir: Optional[str] = None,
     native_web_search_enabled: bool = False,
     input_image_count: int = 0,
+    input_files: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Render OpenAI chat messages into a single Codex exec prompt."""
     rendered: List[str] = [
@@ -473,7 +934,7 @@ def render_chat_prompt(
                 "- Do not return a success message such as done/finished/created unless the final requested file exists in the output directory.",
                 "- For image requests, your answer is incomplete unless at least one final image file exists in the output directory.",
                 "- For image generation or image editing, only use the available real image generation/editing capability, including the imagegen skill or image_gen tool.",
-                "- Apply the imagegen skill workflow for raster image generation/editing: use the built-in image_gen tool by default; treat user-supplied images as edit/reference inputs; preserve requested subject identity/style constraints; inspect/select the generated result; then copy or move the final raster output into the output directory.",
+                "- Apply the imagegen skill workflow for raster image generation/editing: use the built-in image_gen tool by default; treat user-supplied images as edit/reference inputs; preserve requested subject identity/style constraints; then copy or move the final raster output into the output directory.",
                 "- If such a tool saves the image outside the output directory, copy or move the final user-facing raster image into the output directory before your final assistant message.",
                 "- Final image attachments must be raster image files: .png, .jpg, .jpeg, .webp, .gif, .bmp, .tif, or .tiff.",
                 "- Final non-image attachments may be common office, text/data, archive, audio, or video files such as .pdf, .docx, .xlsx, .pptx, .txt, .md, .csv, .json, .zip, .mp3, or .mp4.",
@@ -497,6 +958,26 @@ def render_chat_prompt(
                 "- Inspect the attached image(s) before answering; do not answer from earlier images or earlier topics unless the latest user explicitly asks for that history.",
             ]
         )
+    if input_files:
+        rendered.extend(
+            [
+                "",
+                "Attached file instructions:",
+                f"- The latest user request includes {len(input_files)} managed input file(s).",
+                "- These files belong only to the latest user message; do not substitute files from earlier turns or elsewhere in the workspace.",
+                "- Treat the staged inputs as read-only. Never overwrite or delete them.",
+                "- Inspect the actual file contents before answering.",
+                "- If the user asks for an edited or converted file, write the finished user-facing file under the output directory specified above.",
+                "- Managed input files:",
+            ]
+        )
+        for item in input_files:
+            rendered.append(
+                "  - name="
+                + json.dumps(str(item.get("name") or "file"), ensure_ascii=False)
+                + " path="
+                + json.dumps(str(item.get("runtime_path") or ""), ensure_ascii=False)
+            )
     rendered.append("")
     rendered.append("Return only the assistant reply text.")
     return "\n\n".join(rendered)
@@ -840,6 +1321,7 @@ class CodexCliClient:
         self.workdir = str(Path(workdir or os.getenv("CODEX_PROXY_WORKDIR") or Path.cwd()).resolve())
         self.timeout_seconds = timeout_seconds
         self.use_wsl = os.name == "nt" and _as_bool(os.getenv("CODEX_PROXY_USE_WSL"), True)
+        self._generated_images_root_cache: Optional[str] = None
 
     @staticmethod
     def _resolve_codex_bin(configured: Optional[str]) -> str:
@@ -850,12 +1332,27 @@ class CodexCliClient:
             return resolved
         return "codex"
 
-    async def _terminate_process_tree(self, proc: asyncio.subprocess.Process, runtime_output_path: str, request_id: str) -> None:
+    async def _terminate_process_tree(
+        self,
+        proc: asyncio.subprocess.Process,
+        runtime_output_path: str,
+        request_id: str,
+        *,
+        reason: str = "timeout",
+    ) -> None:
         """Best-effort termination for Codex CLI and children, including WSL children."""
-        _update_running_request(request_id, status="terminating", terminating_at=time.time())
-        logger.warning(
-            "Codex request %s timed out; terminating process tree pid=%s marker=%s",
+        stopping_after_image = reason == "first_image_complete"
+        _update_running_request(
             request_id,
+            status="stopping_after_first_image" if stopping_after_image else "terminating",
+            terminating_at=time.time(),
+            termination_reason=reason,
+        )
+        log = logger.info if stopping_after_image else logger.warning
+        log(
+            "Codex request %s terminating process tree: reason=%s pid=%s marker=%s",
+            request_id,
+            reason,
             getattr(proc, "pid", None),
             runtime_output_path,
         )
@@ -879,7 +1376,12 @@ class CodexCliClient:
                 # wsl.exe can exit while the Linux-side codex child remains. Match the unique
                 # per-request output path embedded in the codex command line and kill both
                 # wrapper and native binary processes.
-                marker = shlex.quote(runtime_output_path)
+                marker_pattern = re.escape(runtime_output_path)
+                if runtime_output_path.startswith("/"):
+                    # The bracketed first character keeps pkill from matching its own
+                    # cleanup shell command while still matching the Codex command line.
+                    marker_pattern = "[/]" + re.escape(runtime_output_path[1:])
+                marker = shlex.quote(marker_pattern)
                 kill_cmd = (
                     f"pkill -TERM -f {marker} 2>/dev/null || true; "
                     f"sleep 1; "
@@ -921,6 +1423,148 @@ class CodexCliClient:
         except Exception:
             pass
 
+    async def _copy_generated_image(
+        self,
+        saved_path: str,
+        *,
+        output_dir: Path,
+        index: int,
+    ) -> Optional[Path]:
+        """Copy an imagegen result byte-for-byte into the managed artifact directory."""
+        if not _is_trusted_generated_image_path(saved_path):
+            logger.warning("Rejected untrusted Codex generated-image path")
+            return None
+
+        suffix = Path(saved_path.replace("\\", "/")).suffix.casefold()
+        file_name = "generated-image" + (f"-{index}" if index > 1 else "") + suffix
+        destination = output_dir / file_name
+        temp_path = output_dir / f".{file_name}.{uuid.uuid4().hex}.tmp{suffix}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if self.use_wsl and os.name == "nt":
+                source = _windows_path_for_wsl(saved_path)
+                await asyncio.wait_for(
+                    asyncio.to_thread(shutil.copyfile, source, temp_path),
+                    timeout=30,
+                )
+            else:
+                source = Path(saved_path).expanduser()
+                source_was_symlink = source.is_symlink()
+                try:
+                    source = source.resolve(strict=True)
+                except OSError:
+                    return None
+                if source_was_symlink or not source.is_file() or not _is_trusted_generated_image_path(str(source)):
+                    return None
+                shutil.copyfile(source, temp_path)
+
+            try:
+                max_bytes = max(
+                    1,
+                    int(os.getenv("CODEX_GENERATED_IMAGE_MAX_BYTES") or 64 * 1024 * 1024),
+                )
+            except (TypeError, ValueError):
+                max_bytes = 64 * 1024 * 1024
+            if not temp_path.is_file() or temp_path.stat().st_size > max_bytes:
+                logger.warning("Rejected missing or oversized Codex generated image")
+                return None
+            if not _is_valid_image_file(temp_path):
+                logger.warning("Rejected structurally invalid Codex generated image")
+                return None
+            os.replace(temp_path, destination)
+            return destination
+        except (OSError, asyncio.TimeoutError):
+            logger.exception("Failed to materialize Codex generated image")
+            return None
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    async def _generated_images_root(self) -> str:
+        """Resolve the generated_images root in the same runtime as Codex."""
+        if self._generated_images_root_cache:
+            return self._generated_images_root_cache
+        if self.use_wsl and os.name == "nt":
+            codex_home = str(os.getenv("CODEX_PROXY_WSL_CODEX_HOME") or "").strip()
+            if not codex_home:
+                codex_home = await asyncio.to_thread(_default_wsl_user_home)
+                if codex_home:
+                    codex_home = f"{codex_home.rstrip('/')}/.codex"
+            root = f"{codex_home.rstrip('/')}/generated_images" if codex_home else ""
+        else:
+            root = str(
+                Path(os.getenv("CODEX_HOME") or (Path.home() / ".codex"))
+                / "generated_images"
+            )
+        if root:
+            self._generated_images_root_cache = root
+        return root
+
+    async def _thread_generated_images(self, thread_id: str) -> List[str]:
+        """List image files created for one Codex thread, oldest first."""
+        if not _CODEX_THREAD_ID_RE.fullmatch(str(thread_id or "")):
+            return []
+        root = await self._generated_images_root()
+        if not root:
+            return []
+        thread_dir = f"{root.rstrip('/')}/{thread_id}"
+        if self.use_wsl and os.name == "nt":
+            directory = _windows_path_for_wsl(thread_dir)
+
+            def list_wsl_images() -> List[tuple[float, str]]:
+                found: List[tuple[float, str]] = []
+                for path in directory.iterdir():
+                    if not path.is_file() or path.suffix.casefold() not in _IMAGE_ATTACHMENT_SUFFIXES:
+                        continue
+                    linux_path = f"{thread_dir}/{path.name}"
+                    found.append((path.stat().st_mtime, linux_path))
+                return sorted(found)
+
+            try:
+                found = await asyncio.wait_for(
+                    asyncio.to_thread(list_wsl_images),
+                    timeout=10,
+                )
+            except (OSError, asyncio.TimeoutError):
+                return []
+            return [path for _modified_at, path in sorted(found)]
+
+        directory = Path(thread_dir)
+        try:
+            found_paths = [
+                path.resolve()
+                for path in directory.iterdir()
+                if path.is_file() and path.suffix.casefold() in _IMAGE_ATTACHMENT_SUFFIXES
+            ]
+            return [str(path) for path in sorted(found_paths, key=lambda item: item.stat().st_mtime)]
+        except OSError:
+            return []
+
+    async def _recover_thread_images(
+        self,
+        thread_id: str,
+        *,
+        output_dir: Path,
+        request_mode: str,
+    ) -> List[Path]:
+        """Recover valid originals after Codex has completed normally."""
+        saved_paths = await self._thread_generated_images(thread_id)
+        if not saved_paths:
+            return []
+        selected = saved_paths if request_mode == "multiple" else saved_paths[-1:]
+        recovered: List[Path] = []
+        for index, saved_path in enumerate(selected, start=1):
+            materialized = await self._copy_generated_image(
+                saved_path,
+                output_dir=output_dir,
+                index=index,
+            )
+            if materialized is not None:
+                recovered.append(materialized)
+        return recovered
+
     async def chat(self, request: Dict[str, Any]) -> Dict[str, Any]:
         model = str(request.get("model") or os.getenv("CODEX_PROXY_MODEL") or "gpt-5.6-sol")
         extra_body = request.get("extra_body") if isinstance(request.get("extra_body"), dict) else {}
@@ -958,6 +1602,24 @@ class CodexCliClient:
         messages = request.get("messages") or []
         if not isinstance(messages, list):
             raise CodexProxyError("messages must be a list")
+        permission_profile = str(
+            request.get("codex_permission_profile")
+            or extra_body.get("codex_permission_profile")
+            or ""
+        ).strip()
+        approval_policy = str(
+            request.get("codex_approval_policy")
+            or extra_body.get("codex_approval_policy")
+            or CODEX_APPROVAL_POLICY
+        ).strip().lower()
+        if approval_policy not in {"never", "on-request"}:
+            approval_policy = "never" if permission_profile == "wxautox-chat-isolated" else CODEX_APPROVAL_POLICY
+        config_policy = str(
+            request.get("codex_config_policy")
+            or extra_body.get("codex_config_policy")
+            or os.getenv("CODEX_CONFIG_POLICY")
+            or "inherit"
+        ).strip().lower()
         sandbox_mode = str(
             request.get("codex_sandbox")
             or extra_body.get("codex_sandbox")
@@ -983,15 +1645,39 @@ class CodexCliClient:
             output_schema = None
 
         image_urls = extract_image_urls(messages, allow_image_input=allow_image_input)
+        image_request_mode = _direct_image_request_mode(
+            messages,
+            has_image_input=bool(image_urls),
+        )
+        source_chat_name = str(
+            request.get("codex_source_chat_name")
+            or extra_body.get("codex_source_chat_name")
+            or ""
+        ).strip()
+        source_chat_type = str(
+            request.get("codex_source_chat_type")
+            or extra_body.get("codex_source_chat_type")
+            or ""
+        ).strip()
 
         request_id = uuid.uuid4().hex
-        artifact_root = Path(os.getenv("CODEX_PROXY_ARTIFACT_ROOT") or "tmp/images/codex")
+        artifact_root = Path(
+            request.get("codex_artifact_root")
+            or extra_body.get("codex_artifact_root")
+            or os.getenv("CODEX_PROXY_ARTIFACT_ROOT")
+            or "tmp/images/codex"
+        )
         if not artifact_root.is_absolute():
             artifact_root = Path(self.workdir) / artifact_root
         _cleanup_expired_artifacts(artifact_root)
         request_dir = artifact_root / request_id
         output_dir = request_dir / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
+        staged_input_files = _stage_input_files(
+            request.get("wxautox_input_files", extra_body.get("wxautox_input_files")),
+            request_dir=request_dir,
+            use_wsl=self.use_wsl,
+        )
         runtime_output_dir = _as_runtime_path(output_dir, self.use_wsl)
         runtime_output_path = _as_runtime_path(output_path := request_dir / "last_message.txt", self.use_wsl)
         isolated_workdir_path: Optional[Path] = None
@@ -1001,7 +1687,11 @@ class CodexCliClient:
             ).resolve()
             workdir_path = isolated_workdir_path
         else:
-            workdir_path = Path(self.workdir)
+            workdir_path = Path(
+                request.get("codex_workdir")
+                or extra_body.get("codex_workdir")
+                or self.workdir
+            ).resolve()
         runtime_workdir = _as_runtime_path(workdir_path, self.use_wsl)
         output_schema_path: Optional[Path] = None
         runtime_output_schema_path = ""
@@ -1021,6 +1711,7 @@ class CodexCliClient:
             runtime_output_dir,
             native_web_search_enabled=web_search_enabled,
             input_image_count=len(image_urls),
+            input_files=staged_input_files,
         )
         image_paths: List[Path] = []
         temporary_image_paths: List[Path] = []
@@ -1034,10 +1725,14 @@ class CodexCliClient:
         elif allow_image_input:
             logger.debug("Codex proxy image input enabled but no image_url parts found in latest user message")
 
+        image_staging_dir = request_dir / "inputs" if permission_profile == "wxautox-chat-isolated" else None
         for image_url in image_urls:
-            image_path = _write_image_url_to_file(image_url)
+            image_path = _write_image_url_to_file(
+                image_url,
+                destination_dir=image_staging_dir,
+            )
             image_paths.append(image_path)
-            if image_url.startswith("data:"):
+            if image_staging_dir is None and image_url.startswith("data:"):
                 temporary_image_paths.append(image_path)
             runtime_image_paths.append(_as_runtime_path(image_path, self.use_wsl))
 
@@ -1054,6 +1749,8 @@ class CodexCliClient:
             "-c",
             f'web_search="{web_search_mode}"',
         ])
+        args.extend(_auto_review_config_args(approval_policy))
+        args.extend(_permission_profile_config_args(permission_profile))
         args.extend(_reasoning_summary_config_args(reasoning_summary))
         for image_path in runtime_image_paths:
             args.extend(["-i", image_path])
@@ -1065,18 +1762,9 @@ class CodexCliClient:
             )
         if runtime_output_schema_path:
             args.extend(["--output-schema", runtime_output_schema_path])
-        args.extend([
-            "-s",
-            sandbox_mode,
-            "--skip-git-repo-check",
-            "--ephemeral",
-        ])
-        config_policy = str(
-            request.get("codex_config_policy")
-            or extra_body.get("codex_config_policy")
-            or os.getenv("CODEX_CONFIG_POLICY")
-            or "inherit"
-        ).strip().lower()
+        if not permission_profile:
+            args.extend(["-s", sandbox_mode])
+        args.extend(["--skip-git-repo-check", "--ephemeral"])
         if config_policy in {"isolated", "managed"}:
             args.extend(["--ignore-user-config", "--ignore-rules"])
         args.extend([
@@ -1097,6 +1785,10 @@ class CodexCliClient:
             {
                 "request_id": request_id,
                 "status": "starting",
+                "backend": "codex_exec",
+                "chat_id": source_chat_name or None,
+                "chat_name": source_chat_name or None,
+                "chat_type": source_chat_type or None,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
                 "web_search": web_search_enabled,
@@ -1104,7 +1796,11 @@ class CodexCliClient:
                 "reasoning_summary": reasoning_summary,
                 "timeout": timeout,
                 "workdir": str(workdir_path),
-                "sandbox": sandbox_mode,
+                "sandbox": None if permission_profile else sandbox_mode,
+                "permission_profile": permission_profile or None,
+                "access_mode": request.get("codex_access_mode"),
+                "approval_policy": approval_policy,
+                "approvals_reviewer": CODEX_APPROVALS_REVIEWER,
                 "isolated_workdir": isolated_workdir,
                 "structured_output": bool(output_schema),
                 "request_dir": str(request_dir),
@@ -1112,6 +1808,9 @@ class CodexCliClient:
                 "prompt_chars": len(prompt),
                 "message_count": len(messages),
                 "image_count": len(image_urls),
+                "image_request_mode": image_request_mode,
+                "image_generation_limit": None,
+                "input_file_count": len(staged_input_files),
                 "started_at": started_at,
             },
         )
@@ -1121,7 +1820,7 @@ class CodexCliClient:
             {"backend": "codex_exec"},
         )
         logger.info(
-            "Codex request %s starting: model=%s timeout=%ss search=%s messages=%s prompt_chars=%s images=%s output_dir=%s",
+            "Codex request %s starting: model=%s timeout=%ss search=%s messages=%s prompt_chars=%s images=%s files=%s output_dir=%s",
             request_id,
             model,
             timeout,
@@ -1129,6 +1828,7 @@ class CodexCliClient:
             len(messages),
             len(prompt),
             len(image_urls),
+            len(staged_input_files),
             output_dir,
         )
 
@@ -1139,6 +1839,13 @@ class CodexCliClient:
                     subprocess_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                 else:
                     subprocess_kwargs["start_new_session"] = True
+                try:
+                    subprocess_kwargs["limit"] = max(
+                        1024 * 1024,
+                        int(os.getenv("CODEX_JSONL_LINE_LIMIT_BYTES") or 32 * 1024 * 1024),
+                    )
+                except (TypeError, ValueError):
+                    subprocess_kwargs["limit"] = 32 * 1024 * 1024
                 proc = await asyncio.create_subprocess_exec(
                     *proc_args,
                     stdin=asyncio.subprocess.PIPE,
@@ -1177,10 +1884,12 @@ class CodexCliClient:
 
             stdout = stdout_b.decode("utf-8", errors="replace")
             stderr = stderr_b.decode("utf-8", errors="replace")
+            codex_thread_id = parse_codex_thread_id(stdout)
             _update_running_request(
                 request_id,
                 status="completed_process",
                 returncode=proc.returncode,
+                codex_thread_id=codex_thread_id or None,
                 stdout_tail=_tail_text(stdout, 1200),
                 stderr_tail=_tail_text(stderr, 1200),
             )
@@ -1209,7 +1918,34 @@ class CodexCliClient:
             if proc.returncode != 0:
                 detail = (stderr or stdout).strip()
                 raise CodexProxyError(f"Codex CLI exited with {proc.returncode}: {detail[:1000]}")
+
             attachments = _collect_artifact_attachments(output_dir)
+            valid_images = [item for item in attachments if item.get("type") == "image"]
+            if image_request_mode and not valid_images:
+                recovered: List[Path] = []
+                json_paths = parse_codex_generated_image_paths(stdout)
+                selected_paths = json_paths if image_request_mode == "multiple" else json_paths[-1:]
+                for index, saved_path in enumerate(selected_paths, start=1):
+                    destination = await self._copy_generated_image(
+                        saved_path,
+                        output_dir=output_dir,
+                        index=index,
+                    )
+                    if destination is not None:
+                        recovered.append(destination)
+                if not recovered and codex_thread_id:
+                    recovered = await self._recover_thread_images(
+                        codex_thread_id,
+                        output_dir=output_dir,
+                        request_mode=image_request_mode,
+                    )
+                if recovered:
+                    codex_job_manager.record_event(
+                        request_id,
+                        "image_artifact_recovered",
+                        {"attachment_count": len(recovered)},
+                    )
+                    attachments = _collect_artifact_attachments(output_dir)
             _write_artifact_manifest(
                 request_dir,
                 request_id=request_id,

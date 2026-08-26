@@ -16,12 +16,17 @@ class WeChatUser(Base):
     remark = Column(String, nullable=True)
     is_group = Column(Boolean, default=False)
     listening_enabled = Column(Boolean, default=True, nullable=False)
+    # Codex access is administrator-owned. New and unknown chats fail closed.
+    # owner_full is valid only for an explicitly selected private chat.
+    codex_access_mode = Column(String, default="isolated", nullable=False)
     sender_blacklist = Column(Text, nullable=True)  # 当前群/私聊内全局 sender 黑名单（JSON array）
     # 群内 @ 名称与微信账号的全局显示名并不总是相同。手动值始终作为
     # 备用别名；自动值只从微信群详情的“我在本群的昵称”字段读取。
     bot_group_nickname = Column(String, nullable=True)
     bot_group_nickname_auto_enabled = Column(Boolean, default=True)
     bot_group_nickname_detected = Column(String, nullable=True)
+    # 自动校准发生变化时保留旧值，避免群成员继续使用旧 @ 名称时失联。
+    bot_group_nickname_aliases = Column(Text, nullable=True)  # JSON array
     bot_group_nickname_checked_at = Column(String, nullable=True)
 
     permissions = relationship("UserPermission", back_populates="user", cascade="all, delete-orphan")

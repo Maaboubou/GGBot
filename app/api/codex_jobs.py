@@ -146,6 +146,28 @@ async def reset_codex_session(request: Request) -> Dict[str, Any]:
     return {"status": "success", "data": {"chat_id": chat_id, "reset": True}}
 
 
+@router.post("/sessions/delete")
+async def delete_codex_session(request: Request) -> Dict[str, Any]:
+    normalized = await _read_chat_id(request)
+    active = [
+        job
+        for job in codex_job_manager.list_active()
+        if str(job.get("chat_id") or "") == normalized
+    ]
+    if active:
+        raise HTTPException(status_code=409, detail="该会话仍有运行中的任务，请先中断任务")
+
+    from app.services.agent_runtime import get_agent_runtime
+
+    try:
+        result = await asyncio.to_thread(get_agent_runtime().delete_chat, normalized)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"删除 Codex 会话失败：{exc}") from exc
+    if not result.get("deleted"):
+        raise HTTPException(status_code=404, detail="Codex 会话不存在或已删除")
+    return {"status": "success", "data": result}
+
+
 @router.post("/sessions/interrupt")
 async def interrupt_codex_session(request: Request) -> Dict[str, Any]:
     chat_id = await _read_chat_id(request)

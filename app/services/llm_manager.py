@@ -1105,6 +1105,12 @@ class LLMManager:
         # ── 2. 从 kwargs 中提取特殊参数（不修改原始 kwargs）──
         caller_tools        = kwargs.get("tools")       # 调用方 tools（如 google_search）
         attachment_capture  = kwargs.get("_wxautox_attachment_capture")
+        raw_input_files     = kwargs.get("_wxautox_input_files")
+        input_files         = [
+            copy.deepcopy(item)
+            for item in (raw_input_files or [])
+            if isinstance(item, dict) and item.get("path")
+        ] if isinstance(raw_input_files, list) else []
         allow_image_input   = bool(kwargs.get("_wxautox_allow_image_input"))
         require_image_input = bool(kwargs.get("_wxautox_require_image_input"))
         disable_model_web_search = bool(
@@ -1139,6 +1145,7 @@ class LLMManager:
                 else None
             ),
             "history_mode": history_mode,
+            "input_file_count": len(input_files),
             "_usage_capture": usage_capture,
         }
         codex_retry         = bool(kwargs.get("_wxautox_codex_retry"))
@@ -1169,6 +1176,7 @@ class LLMManager:
         _HANDLED_KEYS = frozenset({
             "tools",
             "_wxautox_attachment_capture",
+            "_wxautox_input_files",
             "_wxautox_allow_image_input",
             "_wxautox_require_image_input",
             "_wxautox_disable_model_web_search",
@@ -1469,6 +1477,12 @@ class LLMManager:
                 candidate_config = entry["model_config"]
                 candidate_params = copy.deepcopy(entry["params"])
                 candidate_params.pop("fallbacks", None)
+                if input_files and not self._is_local_codex_model(candidate_config):
+                    logger.warning(
+                        "⚠️ 文件输入请求跳过不支持本地文件的非 Codex fallback: %s",
+                        candidate_params.get("model") or entry["model_id"],
+                    )
+                    continue
                 logger.info(
                     "🔄 应用层 Fallback 重试: %s",
                     candidate_params.get("model") or entry["model_id"],
@@ -1494,6 +1508,7 @@ class LLMManager:
                             codex_max_turns=codex_max_turns,
                             codex_exec_fallback=codex_exec_fallback,
                             codex_output_schema=codex_output_schema,
+                            input_files=input_files,
                         )
                     else:
                         response, response_time, result = _try_single_params(
@@ -1536,6 +1551,7 @@ class LLMManager:
                     codex_max_turns=codex_max_turns,
                     codex_exec_fallback=codex_exec_fallback,
                     codex_output_schema=codex_output_schema,
+                    input_files=input_files,
                 )
                 if not result:
                     raise ValueError("Local Codex CLI returned empty response")
@@ -2111,6 +2127,7 @@ class LLMManager:
         codex_max_turns: int = 0,
         codex_exec_fallback: bool = True,
         codex_output_schema: Optional[dict] = None,
+        input_files: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple:
         """Call the shared Codex runtime using the appropriate workload profile."""
         from app.services.agent_runtime import get_agent_runtime
@@ -2141,6 +2158,8 @@ class LLMManager:
             )
         if codex_output_schema:
             payload["output_schema"] = copy.deepcopy(codex_output_schema)
+        if input_files:
+            payload["wxautox_input_files"] = copy.deepcopy(input_files)
         # Preserve direct top-level flags if present.
         for key in ("reasoning_effort", "web_search", "codex_web_search"):
             if key in params:

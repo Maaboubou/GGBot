@@ -254,6 +254,7 @@ def _ensure_wechat_user_bot_nickname_columns(db: SessionLocal):
             "bot_group_nickname": "TEXT",
             "bot_group_nickname_auto_enabled": "BOOLEAN NOT NULL DEFAULT 1",
             "bot_group_nickname_detected": "TEXT",
+            "bot_group_nickname_aliases": "TEXT",
             "bot_group_nickname_checked_at": "TEXT",
         }
         for name, ddl in columns.items():

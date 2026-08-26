@@ -1238,6 +1238,9 @@ const UI = {
                                             ? '<span class="badge bg-warning-subtle text-warning border border-warning-subtle rounded-pill" style="font-size: 0.7em;">等待恢复</span>'
                                             : '<span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle rounded-pill" style="font-size: 0.7em;">已暂停</span>'}
                                     ${isConfigured ? '<span class="badge bg-primary-subtle text-primary border border-primary-subtle rounded-pill" style="font-size: 0.7em;">已管理</span>' : ''}
+                                    ${u.codex_access_mode === 'owner_full' && !u.is_group
+                                        ? '<span class="badge bg-warning-subtle text-warning border border-warning-subtle rounded-pill" style="font-size: 0.7em;">管理员</span>'
+                                        : '<span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle rounded-pill" style="font-size: 0.7em;">Codex 隔离</span>'}
                                     ${blacklistCount > 0 ? `<span class="badge bg-danger-subtle text-danger border border-danger-subtle rounded-pill" style="font-size: 0.7em;">已屏蔽 ${blacklistCount} 人</span>` : ''}
                                 </div>
                             </div>
@@ -1505,7 +1508,7 @@ const UI = {
         }
     },
 
-    renderChatCapabilities(user, capabilities) {
+    renderChatCapabilities(user, capabilities, codexAccess = null) {
         const container = document.getElementById('userPermissionsPanelContainer');
         if (!container) return;
         container.removeAttribute('aria-busy');
@@ -1519,6 +1522,16 @@ const UI = {
         const enabledCount = (capabilities || []).filter(item => current.has(item.id)).length;
         const safeChatName = this.escapeHtml(user.chat_name || '');
         const userId = Number(user.id) || null;
+        const accessMode = user.is_group
+            ? 'isolated'
+            : String(codexAccess?.mode || user.codex_access_mode || 'isolated');
+        const ownerAccess = accessMode === 'owner_full';
+        const accessPath = this.escapeHtml(codexAccess?.scope_root || '保存后创建聊天专属目录');
+        const accessDescription = ownerAccess
+            ? '继承本机 Codex 配置与规则，可访问本机文件；执行审批由自动审查处理。'
+            : (user.is_group
+                ? '仅可读写该群的专属目录，所有群成员共享；不继承本机规则，Skill 只读可用。'
+                : '仅可读写此私聊的专属目录；不继承本机规则，Skill 只读可用。');
         const formatList = (raw) => {
             if (!raw) return '';
             try {
@@ -1613,9 +1626,45 @@ const UI = {
                         <button class="btn btn-sm btn-primary" onclick="App.saveUserPermissions(${userId || 'null'}, this.dataset.chatname)" data-chatname="${safeChatName}"><i class="bi bi-check-lg me-1"></i>保存能力</button>
                     </div>
                 </div>
+                <section class="chat-codex-access ${ownerAccess ? 'owner' : ''}" id="chatCodexAccess">
+                    <div class="chat-codex-access-icon"><i class="bi ${ownerAccess ? 'bi-key' : 'bi-folder2'}"></i></div>
+                    <div class="chat-codex-access-copy">
+                        <div class="chat-codex-access-title">
+                            <strong>Codex 访问范围</strong>
+                            <span id="codexAccessPill">${ownerAccess ? '管理员' : '隔离'}</span>
+                        </div>
+                        <p id="codexAccessDescription">${this.escapeHtml(accessDescription)}</p>
+                        <code title="${accessPath}">${accessPath}</code>
+                    </div>
+                    <div class="chat-codex-access-actions">
+                        <select class="form-select form-select-sm" id="codexAccessMode" data-current="${accessMode}"
+                            ${!userId || user.is_group ? 'disabled' : ''} aria-label="Codex 访问范围">
+                            <option value="isolated" ${ownerAccess ? '' : 'selected'}>隔离空间</option>
+                            ${user.is_group ? '' : `<option value="owner_full" ${ownerAccess ? 'selected' : ''}>管理员 · 最大权限</option>`}
+                        </select>
+                        ${userId && !user.is_group ? `<button type="button" class="btn btn-sm btn-light border" id="saveCodexAccessBtn" onclick="App.saveCodexAccess(${userId})" disabled>应用</button>` : ''}
+                    </div>
+                </section>
                 <div class="chat-detail-notice"><i class="bi bi-info-circle"></i><span>这里只决定“此聊天能用什么”。各能力的全局行为在“AI 助手”或“插件”页管理。</span></div>
                 <div class="chat-capability-grid">${cards || '<div class="assistant-empty-inline">尚未发现可用能力。</div>'}</div>
             </div>`;
+
+        const accessSelect = container.querySelector('#codexAccessMode');
+        accessSelect?.addEventListener('change', () => {
+            const selectingOwner = accessSelect.value === 'owner_full';
+            const accessSection = container.querySelector('#chatCodexAccess');
+            const accessPill = container.querySelector('#codexAccessPill');
+            const accessCopy = container.querySelector('#codexAccessDescription');
+            const accessButton = container.querySelector('#saveCodexAccessBtn');
+            accessSection?.classList.toggle('owner', selectingOwner);
+            if (accessPill) accessPill.textContent = selectingOwner ? '管理员' : '隔离';
+            if (accessCopy) {
+                accessCopy.textContent = selectingOwner
+                    ? '可访问本机文件并继承本机 Codex 配置；仅用于你本人可控的私聊。'
+                    : '仅可读写此私聊的专属目录；不继承本机规则，Skill 只读可用。';
+            }
+            if (accessButton) accessButton.disabled = accessSelect.value === accessSelect.dataset.current;
+        });
 
         container.querySelectorAll('.permission-check').forEach(toggle => {
             const update = () => {

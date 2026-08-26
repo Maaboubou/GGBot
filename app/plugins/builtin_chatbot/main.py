@@ -19,6 +19,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from app.core.event_bus import Event, EventType
 from app.services.config_service import get_setting
+from app.services.codex_access_service import codex_access_service
 from app.services.llm_manager import get_llm_manager
 from app.plugins.builtin_chatbot.web_search import WebSearchOutcome, WebSearchService
 from app.plugins.builtin_chatbot.chat_log import ChatLogManager
@@ -324,8 +325,20 @@ class ChatBotPlugin:
             sender = event.data.get("sender", "")
             chat_type = event.data.get("chat_type", "private")
             quote_content = event.data.get("quote_content", "") or ""
+            has_quote_file = bool(event.data.get("has_quote_file"))
+            quoted_file_status = str(event.data.get("quoted_file_status") or "").strip().lower()
+            quoted_file_path = str(event.data.get("quoted_file_path") or "").strip()
+            quoted_file_name = str(
+                event.data.get("quoted_file_name") or quote_content or ""
+            ).strip()
             followup_approved = bool(event.data.get("_followup_approved"))
-            llm_content = self._build_quote_augmented_content(content, quote_content)
+            if has_quote_file:
+                llm_content = self._build_quote_file_augmented_content(
+                    content,
+                    quoted_file_name,
+                )
+            else:
+                llm_content = self._build_quote_augmented_content(content, quote_content)
             if llm_content != content:
                 logger.info(
                     "🤖 Quote text context injected for %s: content='%s', quote='%s'",
@@ -384,6 +397,26 @@ class ChatBotPlugin:
 
             # 检查是否为@消息
             is_mention = self._event_mentions_bot(event)
+
+            if has_quote_file and (quoted_file_status != "ready" or not quoted_file_path):
+                if content and (
+                    chat_type in {"private", "friend", "user"}
+                    or is_mention
+                ):
+                    wx_manager = event.context.get("wx")
+                    if wx_manager:
+                        wx_manager.send_message(
+                            chat_name,
+                            "⚠️ 没有找到这条引用对应的可用文件，请重新发送文件后再引用一次",
+                            silent=True,
+                        )
+                logger.warning(
+                    "🤖 Quoted file unavailable: chat=%s name=%s status=%s",
+                    chat_name,
+                    quoted_file_name,
+                    quoted_file_status or "unknown",
+                )
+                return False
 
             if followup_approved:
                 if not self._followup_approval_is_current(event):
@@ -561,11 +594,44 @@ class ChatBotPlugin:
 
             # 调用 LLM Manager
             response_attachments: List[Dict[str, Any]] = []
+            input_files: List[Dict[str, Any]] = []
+            if has_quote_file and quoted_file_status == "ready" and quoted_file_path:
+                input_files.append(
+                    {
+                        "file_id": event.data.get("quoted_file_id"),
+                        "name": quoted_file_name,
+                        "path": quoted_file_path,
+                        "size": event.data.get("quoted_file_size"),
+                        "sha256": event.data.get("quoted_file_sha256"),
+                    }
+                )
+            if input_files:
+                try:
+                    file_capabilities = get_llm_manager().get_call_capabilities(
+                        "builtin_chatbot",
+                        "chat",
+                    )
+                except Exception:
+                    file_capabilities = {}
+                if not file_capabilities.get("local_codex"):
+                    wx_manager = event.context.get("wx")
+                    if wx_manager:
+                        wx_manager.send_message(
+                            chat_name,
+                            "⚠️ 当前聊天模型不能读取本地文件，请先切换到 Codex 模式",
+                            silent=True,
+                        )
+                    logger.warning(
+                        "🤖 Quoted file rejected because the active chat provider is not local Codex: %s",
+                        chat_name,
+                    )
+                    return False
             response = self._call_chat_llm(
                 chat_name,
                 role_name,
                 messages,
                 _wxautox_attachment_capture=response_attachments,
+                _wxautox_input_files=input_files,
                 _wxautox_memory_trace=verified_memory_trace,
             )
             if response_attachments:
@@ -1899,6 +1965,19 @@ class ChatBotPlugin:
             f"{content}"
         )
 
+    @staticmethod
+    def _build_quote_file_augmented_content(content: str, file_name: str) -> str:
+        """Bind the latest request to one managed file without exposing its host path."""
+        content = str(content or "").strip()
+        name = str(file_name or "").strip() or "未命名文件"
+        return (
+            "【当前引用文件】\n"
+            f"文件名：{name}\n"
+            "该文件作为本轮输入附件提供；必须以它为处理对象，不要使用历史文件。\n\n"
+            "【当前消息】\n"
+            f"{content}"
+        )
+
 
 
     def _format_chat_text(self, context_messages: List[Dict]) -> str:
@@ -2936,10 +3015,17 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         if not attachments:
             return True
 
-        artifact_root = Path(os.getenv("CODEX_PROXY_ARTIFACT_ROOT") or "tmp/images/codex")
-        if not artifact_root.is_absolute():
-            artifact_root = Path.cwd() / artifact_root
-        allowed_root = artifact_root.resolve()
+        try:
+            # The attachment collector writes into the artifact root selected by
+            # the same per-chat access policy.  Re-resolve that trusted policy
+            # here instead of accepting a root supplied by the model response.
+            # This permits the current chat's isolated output directory while
+            # still preventing one chat from sending another chat's files.
+            access_context = codex_access_service.for_chat(chat_name, ensure=False)
+            allowed_root = Path(access_context.artifact_root).resolve()
+        except Exception:
+            logger.exception("🤖 无法解析聊天附件的允许目录: %s", chat_name)
+            return False
         allowed_suffixes = {
             ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff",
             ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx",

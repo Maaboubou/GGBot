@@ -24,6 +24,7 @@ from app.services.codex_app_server import (
     CodexThreadStateStore,
 )
 from app.services.codex_proxy.client import CodexCliClient, CodexProxyError, _as_bool, _as_runtime_path
+from app.services.codex_access_service import codex_access_service
 
 
 logger = logging.getLogger(__name__)
@@ -617,7 +618,16 @@ class CodexAgentRuntime:
     ) -> Dict[str, Any]:
         profile = self._profile("chat")
         request = self._prepare_payload(payload, profile)
+        access = codex_access_service.for_chat(chat_id, ensure=True)
+        request = access.apply(request)
         fallback = profile.allow_exec_fallback if allow_exec_fallback is None else allow_exec_fallback
+
+        # Restricted chats deliberately use a fresh exec process. Unlike the
+        # shared App Server, exec can ignore user config and execpolicy rules,
+        # so a broad local allow rule cannot pierce the per-chat boundary.
+        if not access.persistent_thread:
+            return self._exec(request)
+
         pool = self._pool(profile.pool)
         if pool is None or self._circuit_open():
             if fallback:
@@ -681,6 +691,34 @@ class CodexAgentRuntime:
 
     def invalidate_chat(self, chat_id: str) -> None:
         self.state_store.delete(str(chat_id or ""))
+
+    def delete_chat(self, chat_id: str) -> Dict[str, Any]:
+        """Delete the managed session and its persisted Codex thread."""
+        normalized = str(chat_id or "").strip()
+        state = self.state_store.get(normalized)
+        if not state:
+            return {"chat_id": normalized, "deleted": False, "thread_deleted": False}
+
+        thread_id = str(state.get("thread_id") or "").strip()
+        if thread_id:
+            pool = self._pool("interactive") or self._pool("batch")
+            if pool is None:
+                raise CodexAppServerError("Codex 运行时未就绪，无法删除持久线程")
+            with pool.acquire(30, priority=1000) as manager:
+                manager.delete_thread(thread_id, timeout=30)
+
+        deleted = self.state_store.delete(normalized)
+        if thread_id:
+            with self._lock:
+                managers = [manager for pool in self._pools.values() for manager in pool.managers]
+            for manager in managers:
+                manager.forget_loaded_thread(thread_id)
+        return {
+            "chat_id": normalized,
+            "thread_id": thread_id or None,
+            "deleted": deleted,
+            "thread_deleted": bool(thread_id),
+        }
 
     def session_snapshot(self, active_jobs: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         pool = self._pool("interactive")

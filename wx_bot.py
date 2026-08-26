@@ -16,6 +16,8 @@ import json
 import hashlib
 import ctypes
 import uuid
+from collections import deque
+from copy import deepcopy
 from ctypes import wintypes
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -25,6 +27,7 @@ from wxautox4 import uia
 import comtypes
 import sys
 import os
+from pathlib import Path
 
 # 本机内部 API 调用必须绕过系统代理。
 # Windows/Sparkle/Mihomo 环境里常有 HTTP_PROXY=127.0.0.1:7890；
@@ -78,6 +81,12 @@ LISTENER_WINDOW_AUTO_REPAIR_RETRY_COOLDOWN_SEC = _bounded_env_float(
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.models.base import SessionLocal
 from app.models.user_permission import WeChatUser
+from app.services.wechat_file_store import (
+    extract_file_name_from_message,
+    get_wechat_file_store,
+    looks_like_file_quote,
+    sha256_file,
+)
 from app.utils.inflight_deduplicator import InFlightDeduplicator
 from app.utils.health_state import OnlineProbeTracker
 from app.utils.logging_utils import create_rotating_file_handler
@@ -86,10 +95,12 @@ from app.utils.wechat_listener_recovery import open_listener_from_existing_sessi
 from app.utils.wechat_outbound import send_text_with_exact_mentions, send_text_with_retry
 from app.utils.window_health import (
     advance_window_repair_confirmation,
+    build_window_observation,
     choose_window_recovery_rect,
     is_offscreen_sentinel_rect,
     is_unrecoverable_offscreen_window,
     is_usable_window_rect,
+    window_observation_fingerprint,
 )
 
 # --- 全局变量 ---
@@ -158,6 +169,12 @@ listener_window_last_valid_rect: dict[str, dict] = {}
 listener_window_auto_repair_last_check_at: float = 0.0
 listener_window_auto_repair_last_repair_at: float = 0.0
 listener_window_auto_repair_last_result: dict = {}
+listener_window_audit_lock = threading.RLock()
+listener_window_observations: dict[str, dict] = {}
+LISTENER_WINDOW_AUDIT_HISTORY_LIMIT = 100
+LISTENER_WINDOW_AUDIT_STATUS_LIMIT = 20
+listener_window_transition_history = deque(maxlen=LISTENER_WINDOW_AUDIT_HISTORY_LIMIT)
+listener_window_audit_sequence = 0
 LISTENER_ADD_ATTEMPTS = 3
 LISTENER_ADD_RETRY_DELAY_SEC = 1.0
 LISTENER_ADD_VERIFY_ATTEMPTS = 5
@@ -289,6 +306,22 @@ def _store_group_nickname_from_ui(chat_name: str, detected_nickname: str) -> boo
 
         previous = str(user.bot_group_nickname_detected or "").strip()
         changed = previous != nickname
+        if changed and previous:
+            try:
+                aliases = json.loads(str(user.bot_group_nickname_aliases or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                aliases = []
+            if not isinstance(aliases, list):
+                aliases = []
+            normalized_aliases = []
+            for value in [previous, *aliases]:
+                alias = str(value or "").strip().lstrip("@").strip()
+                if alias and alias != nickname and alias not in normalized_aliases:
+                    normalized_aliases.append(alias)
+            user.bot_group_nickname_aliases = json.dumps(
+                normalized_aliases[:8],
+                ensure_ascii=False,
+            )
         user.bot_group_nickname_detected = nickname
         user.bot_group_nickname_checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         db.commit()
@@ -583,6 +616,15 @@ def _message_identity(chat_name: str, msg) -> str:
     message_id = getattr(msg, "id", None)
     if not message_id:
         return ""
+    if str(getattr(msg, "type", "") or "").lower() == "file":
+        file_fingerprint = hashlib.sha256(
+            (
+                str(getattr(msg, "sender", "") or "")
+                + "\0"
+                + _normalize_message_content_for_fingerprint(getattr(msg, "content", ""))
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        return f"{chat_name}:{message_id}:file:{file_fingerprint}"
     return f"{chat_name}:{message_id}"
 
 
@@ -1051,6 +1093,114 @@ def _enumerate_wechat_native_windows() -> list[dict]:
     return windows
 
 
+def _record_listener_window_observations(
+    expected: list[str],
+    by_title: dict[str, list[dict]],
+    *,
+    observed_at: float,
+    observable: bool,
+) -> dict[str, dict]:
+    """Persist semantic Win32 state transitions without adding another probe."""
+    global listener_window_audit_sequence
+
+    transitions = []
+    current: dict[str, dict] = {}
+    with listener_window_audit_lock:
+        expected_set = set(expected)
+        for stale_name in list(listener_window_observations):
+            if stale_name not in expected_set:
+                previous = listener_window_observations.pop(stale_name)
+                listener_window_audit_sequence += 1
+                transition = {
+                    "event": "listener_window_state_transition",
+                    "sequence": listener_window_audit_sequence,
+                    "service_instance_id": wechat_service_instance_id,
+                    "at": float(observed_at),
+                    "who": stale_name,
+                    "from_state": previous.get("state"),
+                    "to_state": "not_expected",
+                    "previous_observed_at": previous.get("observed_at"),
+                    "previous": deepcopy(previous),
+                    "current": {
+                        "who": stale_name,
+                        "state": "not_expected",
+                        "observed_at": float(observed_at),
+                    },
+                }
+                listener_window_transition_history.append(transition)
+                transitions.append(transition)
+
+        for who in expected:
+            observation = {
+                "who": who,
+                "observed_at": float(observed_at),
+                **build_window_observation(
+                    by_title.get(who, []),
+                    observable=observable,
+                ),
+            }
+            previous = listener_window_observations.get(who)
+            changed = (
+                previous is None
+                or window_observation_fingerprint(previous)
+                != window_observation_fingerprint(observation)
+            )
+            listener_window_observations[who] = observation
+            current[who] = deepcopy(observation)
+            if not changed:
+                continue
+
+            listener_window_audit_sequence += 1
+            transition = {
+                "event": "listener_window_state_transition",
+                "sequence": listener_window_audit_sequence,
+                "service_instance_id": wechat_service_instance_id,
+                "at": float(observed_at),
+                "who": who,
+                "from_state": previous.get("state") if previous else None,
+                "to_state": observation.get("state"),
+                # This is updated on every 5-second scan, even when no log line is
+                # written.  A later transition therefore proves how recently the
+                # preceding state was actually observed.
+                "previous_observed_at": previous.get("observed_at") if previous else None,
+                "previous": deepcopy(previous) if previous else None,
+                "current": deepcopy(observation),
+            }
+            listener_window_transition_history.append(transition)
+            transitions.append(transition)
+
+    warning_states = {
+        "ambiguous",
+        "hidden",
+        "missing",
+        "partial_offscreen_sentinel",
+        "unobservable",
+        "unrecoverable_offscreen",
+    }
+    for transition in transitions:
+        log = logger.warning if transition.get("to_state") in warning_states else logger.info
+        log(
+            "🧾 监听窗口状态变化: %s",
+            json.dumps(transition, ensure_ascii=False, separators=(",", ":")),
+        )
+    return current
+
+
+def _listener_window_audit_status() -> dict:
+    """Return a bounded read-only audit snapshot for health diagnostics."""
+    with listener_window_audit_lock:
+        history = list(listener_window_transition_history)
+        return {
+            "mode": "semantic_state_changes_only",
+            "scan_reused": True,
+            "persistent_log": "logs/wx_bot.log",
+            "event": "listener_window_state_transition",
+            "history_limit": LISTENER_WINDOW_AUDIT_HISTORY_LIMIT,
+            "tracked": deepcopy(listener_window_observations),
+            "recent_transitions": deepcopy(history[-LISTENER_WINDOW_AUDIT_STATUS_LIMIT:]),
+        }
+
+
 def _primary_work_area_recovery_rect() -> dict:
     """返回主屏工作区内的保守聊天窗口矩形，供无健康同伴时兜底。"""
     if not _native_windows_available():
@@ -1233,7 +1383,22 @@ def _run_listener_window_auto_repair_cycle() -> dict:
         "repairs": [],
         "status": "idle" if not expected else "checked",
     }
-    if not expected or not _native_windows_available():
+    if not expected:
+        cycle_result["observations"] = _record_listener_window_observations(
+            [],
+            {},
+            observed_at=now,
+            observable=_native_windows_available(),
+        )
+        listener_window_auto_repair_last_result = cycle_result
+        return cycle_result
+    if not _native_windows_available():
+        cycle_result["observations"] = _record_listener_window_observations(
+            expected,
+            {},
+            observed_at=now,
+            observable=False,
+        )
         listener_window_auto_repair_last_result = cycle_result
         return cycle_result
 
@@ -1261,6 +1426,12 @@ def _run_listener_window_auto_repair_cycle() -> dict:
     cycle_result["window_count"] = len(wechat_windows)
     if not wechat_pids:
         cycle_result["status"] = "wechat_pid_unknown"
+        cycle_result["observations"] = _record_listener_window_observations(
+            expected,
+            {},
+            observed_at=now,
+            observable=False,
+        )
         listener_window_auto_repair_last_result = cycle_result
         return cycle_result
 
@@ -1268,6 +1439,12 @@ def _run_listener_window_auto_repair_cycle() -> dict:
     by_title: dict[str, list[dict]] = {}
     for window in wechat_windows:
         by_title.setdefault(str(window.get("title") or ""), []).append(window)
+    cycle_result["observations"] = _record_listener_window_observations(
+        expected,
+        by_title,
+        observed_at=now,
+        observable=True,
+    )
 
     for who in expected:
         matches = [
@@ -1485,6 +1662,7 @@ def _listener_window_auto_repair_status() -> dict:
             else None
         ),
         "last_repair_at": listener_window_auto_repair_last_repair_at or None,
+        "observation_audit": _listener_window_audit_status(),
         "pending": {
             name: dict(state)
             for name, state in pending_snapshot.items()
@@ -3325,6 +3503,155 @@ def download_quote_image(msg):
     
     return None
 
+
+def _download_inbound_file(msg, *, chat_name: str, sender: str, received_at: float) -> dict:
+    """Download one live FileMessage into managed per-message storage."""
+    store = get_wechat_file_store()
+    file_id = f"file_{uuid.uuid4().hex}"
+    source_message_id = _message_identity(chat_name, msg)
+    original_filename = extract_file_name_from_message(getattr(msg, "content", ""))
+    download_dir = store.prepare_download_dir(
+        chat_name=chat_name,
+        file_id=file_id,
+        received_at=received_at,
+    )
+    store.record(
+        file_id=file_id,
+        source_message_id=source_message_id,
+        chat_name=chat_name,
+        sender=sender,
+        original_filename=original_filename or f"{file_id}.bin",
+        received_at=received_at,
+        status="downloading",
+    )
+
+    try:
+        timeout = _bounded_env_int("WECHAT_FILE_DOWNLOAD_TIMEOUT_SEC", 60, 5)
+        with wx_ui_lock:
+            # FileMessage.download() temporarily replaces the Windows clipboard
+            # and clears it afterwards. Snapshot and restore ordinary text while
+            # still holding the same UI lock, so another operation cannot race
+            # with the restoration.
+            try:
+                clipboard_text = str(uia.GetClipboardText() or "")
+            except Exception:
+                clipboard_text = ""
+            try:
+                result = msg.download(dir_path=download_dir, timeout=timeout)
+            finally:
+                if clipboard_text:
+                    _set_clipboard_text(clipboard_text)
+
+        if not isinstance(result, (str, os.PathLike)):
+            message = getattr(result, "message", None) or str(result)
+            raise RuntimeError(f"wxautox4 file download failed: {message}")
+
+        downloaded_path = os.path.abspath(os.fspath(result))
+        managed_root = os.path.abspath(os.fspath(download_dir))
+        try:
+            is_managed = os.path.commonpath([downloaded_path, managed_root]) == managed_root
+        except ValueError:
+            is_managed = False
+        if not is_managed:
+            raise RuntimeError("wxautox4 returned a file outside the managed download directory")
+        if not os.path.isfile(downloaded_path):
+            raise FileNotFoundError(f"downloaded file does not exist: {downloaded_path}")
+
+        file_name = os.path.basename(downloaded_path) or original_filename or f"{file_id}.bin"
+        display_name = original_filename or file_name
+        file_size = os.path.getsize(downloaded_path)
+        digest = sha256_file(Path(downloaded_path))
+        record = store.record(
+            file_id=file_id,
+            source_message_id=source_message_id,
+            chat_name=chat_name,
+            sender=sender,
+            original_filename=display_name,
+            received_at=received_at,
+            status="ready",
+            saved_path=downloaded_path,
+            file_size=file_size,
+            sha256=digest,
+        )
+        logger.info(
+            "📁 微信文件已归档: chat=%s sender=%s file_id=%s name=%s bytes=%s",
+            chat_name,
+            sender,
+            file_id,
+            display_name,
+            file_size,
+        )
+        return record
+    except Exception as exc:
+        record = store.record(
+            file_id=file_id,
+            source_message_id=source_message_id,
+            chat_name=chat_name,
+            sender=sender,
+            original_filename=original_filename or f"{file_id}.bin",
+            received_at=received_at,
+            status="failed",
+            download_error=str(exc),
+        )
+        logger.error(
+            "❌ 微信文件自动下载失败: chat=%s sender=%s file_id=%s name=%s error=%s",
+            chat_name,
+            sender,
+            file_id,
+            original_filename,
+            exc,
+        )
+        return record
+
+
+def _resolve_quoted_file(*, chat_name: str, quote_content: str, received_at: float) -> dict:
+    """Resolve only an exact filename match from the current chat."""
+    if not looks_like_file_quote(quote_content):
+        return {}
+    try:
+        resolution = get_wechat_file_store().resolve_quote(
+            chat_name=chat_name,
+            quote_content=quote_content,
+            before_timestamp=received_at,
+        )
+    except Exception as exc:
+        logger.error("❌ 引用文件索引查询失败: chat=%s quote=%r error=%s", chat_name, quote_content, exc)
+        return {
+            "has_quote_file": True,
+            "quoted_file_name": str(quote_content or "").strip(),
+            "quoted_file_status": "index_error",
+            "quoted_file_error": str(exc),
+        }
+
+    record = resolution.record or {}
+    payload = {
+        "has_quote_file": resolution.status != "not_file",
+        "quoted_file_id": record.get("file_id"),
+        "quoted_file_name": resolution.file_name,
+        "quoted_file_path": record.get("saved_path") if resolution.status == "ready" else None,
+        "quoted_file_size": record.get("file_size"),
+        "quoted_file_sha256": record.get("sha256"),
+        "quoted_file_status": resolution.status,
+        "quoted_file_candidate_count": resolution.candidate_count,
+        "quoted_file_error": record.get("download_error"),
+    }
+    if resolution.status == "ready":
+        logger.info(
+            "📎 引用文件已精确绑定: chat=%s file_id=%s name=%s candidates=%s",
+            chat_name,
+            record.get("file_id"),
+            resolution.file_name,
+            resolution.candidate_count,
+        )
+    else:
+        logger.warning(
+            "⚠️ 引用内容像文件名但未找到可用归档: chat=%s name=%s status=%s",
+            chat_name,
+            resolution.file_name,
+            resolution.status,
+        )
+    return payload
+
 def message_callback(msg, chat):
     """
     处理收到的消息回调函数
@@ -3413,9 +3740,21 @@ def message_callback(msg, chat):
             
         )
         
+        received_at = time.time()
+
         # 初始化额外数据
         url = None
         quote_image_path = None
+        inbound_file = {}
+        quoted_file = {}
+
+        if msg.type == "file":
+            inbound_file = _download_inbound_file(
+                msg,
+                chat_name=chat_name,
+                sender=sender_name,
+                received_at=received_at,
+            )
         
         # 如果是链接或疑似链接消息，尝试获取URL（兼容部分客户端将链接标记为other/[链接]或link/[链接]）
         # 1) 直接从内容中提取 http(s) 链接
@@ -3463,6 +3802,11 @@ def message_callback(msg, chat):
                 normalized_quote_content = "[图片]"
             else:
                 normalized_quote_content = quote_content
+                quoted_file = _resolve_quoted_file(
+                    chat_name=chat_name,
+                    quote_content=quote_content,
+                    received_at=received_at,
+                )
 
         # 为所有图片消息缓存消息对象
         if msg.type == "image":
@@ -3488,6 +3832,8 @@ def message_callback(msg, chat):
             final_message_id = message_id
         elif has_quote_image:
             final_message_id = message_id
+        elif msg.type == "file" and inbound_file:
+            final_message_id = inbound_file.get("file_id")
         elif link_message_id:
             final_message_id = link_message_id
         elif resolved_mtype == "link" or _is_link_like_message(msg, content_str):
@@ -3516,7 +3862,23 @@ def message_callback(msg, chat):
             "quote_image_path": quote_image_path,  # 引用图片路径（延迟下载时为None）
             "quote_content": normalized_quote_content,  # 添加引用内容字段（已做引用图片标记归一化）
             "has_quote_image": has_quote_image,  # 标记是否有引用图片需要按需下载
-            "timestamp": time.time(),  # 使用当前时间作为时间戳
+            "file_id": inbound_file.get("file_id"),
+            "file_name": inbound_file.get("original_filename"),
+            "file_path": inbound_file.get("saved_path"),
+            "file_size": inbound_file.get("file_size"),
+            "file_sha256": inbound_file.get("sha256"),
+            "file_status": inbound_file.get("status"),
+            "file_error": inbound_file.get("download_error"),
+            "has_quote_file": bool(quoted_file.get("has_quote_file")),
+            "quoted_file_id": quoted_file.get("quoted_file_id"),
+            "quoted_file_name": quoted_file.get("quoted_file_name"),
+            "quoted_file_path": quoted_file.get("quoted_file_path"),
+            "quoted_file_size": quoted_file.get("quoted_file_size"),
+            "quoted_file_sha256": quoted_file.get("quoted_file_sha256"),
+            "quoted_file_status": quoted_file.get("quoted_file_status"),
+            "quoted_file_candidate_count": quoted_file.get("quoted_file_candidate_count", 0),
+            "quoted_file_error": quoted_file.get("quoted_file_error"),
+            "timestamp": received_at,
         }
         
         # 发送到主应用

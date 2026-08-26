@@ -7,6 +7,16 @@ from typing import Iterable, Mapping
 OFFSCREEN_SENTINEL = -30000
 
 
+def _normalized_rect(rect: Mapping[str, int] | None) -> dict:
+    value = rect or {}
+    return {
+        "left": int(value.get("left", 0) or 0),
+        "top": int(value.get("top", 0) or 0),
+        "right": int(value.get("right", 0) or 0),
+        "bottom": int(value.get("bottom", 0) or 0),
+    }
+
+
 def is_offscreen_sentinel_rect(
     rect: dict,
     *,
@@ -30,6 +40,110 @@ def is_unrecoverable_offscreen_window(
         not iconic
         and is_offscreen_sentinel_rect(window_rect)
         and is_offscreen_sentinel_rect(normal_rect)
+    )
+
+
+def build_window_observation(
+    matches: Iterable[Mapping[str, object]] | None,
+    *,
+    observable: bool = True,
+) -> dict:
+    """Build one compact, JSON-safe observation for an expected native window.
+
+    The result reuses data already collected by the Win32 geometry scan.  It
+    deliberately contains no UIA probe or foreground operation.
+    """
+    candidates = [dict(item) for item in (matches or [])]
+    if not observable:
+        return {
+            "state": "unobservable",
+            "match_count": 0,
+            "candidate_hwnds": [],
+        }
+    if not candidates:
+        return {
+            "state": "missing",
+            "match_count": 0,
+            "candidate_hwnds": [],
+        }
+
+    candidate_hwnds = sorted(int(item.get("hwnd") or 0) for item in candidates)
+    if len(candidates) != 1:
+        return {
+            "state": "ambiguous",
+            "match_count": len(candidates),
+            "candidate_hwnds": candidate_hwnds,
+        }
+
+    target = candidates[0]
+    window_rect = _normalized_rect(target.get("window_rect"))
+    normal_rect = _normalized_rect(target.get("normal_rect"))
+    visible = bool(target.get("visible"))
+    iconic = bool(target.get("iconic"))
+    offscreen_sentinel = bool(
+        target.get("offscreen_sentinel", is_offscreen_sentinel_rect(window_rect))
+    )
+    normal_offscreen_sentinel = bool(
+        target.get(
+            "normal_offscreen_sentinel",
+            is_offscreen_sentinel_rect(normal_rect),
+        )
+    )
+    unrecoverable_offscreen = bool(
+        target.get(
+            "unrecoverable_offscreen",
+            is_unrecoverable_offscreen_window(
+                window_rect=window_rect,
+                normal_rect=normal_rect,
+                iconic=iconic,
+            ),
+        )
+    )
+
+    if unrecoverable_offscreen:
+        state = "unrecoverable_offscreen"
+    elif not visible:
+        state = "hidden"
+    elif iconic:
+        state = "minimized"
+    elif offscreen_sentinel or normal_offscreen_sentinel:
+        state = "partial_offscreen_sentinel"
+    else:
+        state = "healthy"
+
+    return {
+        "state": state,
+        "match_count": 1,
+        "candidate_hwnds": candidate_hwnds,
+        "hwnd": int(target.get("hwnd") or 0),
+        "pid": int(target.get("pid") or 0),
+        "class_name": str(target.get("class_name") or ""),
+        "visible": visible,
+        "iconic": iconic,
+        "show_cmd": int(target.get("show_cmd") or 0),
+        "window_rect": window_rect,
+        "normal_rect": normal_rect,
+        "offscreen_sentinel": offscreen_sentinel,
+        "normal_offscreen_sentinel": normal_offscreen_sentinel,
+        "unrecoverable_offscreen": unrecoverable_offscreen,
+    }
+
+
+def window_observation_fingerprint(observation: Mapping[str, object] | None) -> tuple:
+    """Return the semantic fields that should create a transition audit line."""
+    value = observation or {}
+    return (
+        str(value.get("state") or ""),
+        int(value.get("match_count") or 0),
+        tuple(int(item or 0) for item in (value.get("candidate_hwnds") or [])),
+        int(value.get("hwnd") or 0),
+        int(value.get("pid") or 0),
+        bool(value.get("visible")),
+        bool(value.get("iconic")),
+        int(value.get("show_cmd") or 0),
+        bool(value.get("offscreen_sentinel")),
+        bool(value.get("normal_offscreen_sentinel")),
+        bool(value.get("unrecoverable_offscreen")),
     )
 
 

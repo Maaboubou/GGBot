@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Iterable, List, Optional
 
@@ -13,6 +14,19 @@ def _clean_name(value: Any) -> str:
     return str(value or "").strip().lstrip("@").strip()
 
 
+def _stored_aliases(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple)):
+        parsed = value
+    else:
+        try:
+            parsed = json.loads(str(value or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = []
+    if not isinstance(parsed, list):
+        return []
+    return [_clean_name(item) for item in parsed if _clean_name(item)]
+
+
 def bot_names_for_user(user: Any, global_name: str) -> List[str]:
     """返回当前群可接受的 @ 别名，按展示优先级排序。
 
@@ -21,9 +35,12 @@ def bot_names_for_user(user: Any, global_name: str) -> List[str]:
     """
     names: List[str] = []
     auto_enabled = bool(getattr(user, "bot_group_nickname_auto_enabled", True))
+    detected = getattr(user, "bot_group_nickname_detected", None) if auto_enabled else None
+    aliases = _stored_aliases(getattr(user, "bot_group_nickname_aliases", None)) if auto_enabled else []
     candidates: Iterable[Any] = (
-        getattr(user, "bot_group_nickname_detected", None) if auto_enabled else None,
+        detected,
         getattr(user, "bot_group_nickname", None),
+        *aliases,
         global_name,
     )
     for value in candidates:

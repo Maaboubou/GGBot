@@ -36,6 +36,7 @@ class WeChatUserBase(BaseModel):
     remark: Optional[str] = None
     is_group: bool = False
     listening_enabled: bool = True
+    codex_access_mode: str = "isolated"
     sender_blacklist: Optional[str] = None
     bot_group_nickname: Optional[str] = None
     bot_group_nickname_auto_enabled: bool = True

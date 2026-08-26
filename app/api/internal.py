@@ -70,6 +70,22 @@ class WeChatMessage(BaseModel):
     quote_image_path: Optional[str] = None
     quote_content: Optional[str] = None
     has_quote_image: Optional[bool] = False
+    file_id: Optional[str] = None
+    file_name: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+    file_sha256: Optional[str] = None
+    file_status: Optional[str] = None
+    file_error: Optional[str] = None
+    has_quote_file: Optional[bool] = False
+    quoted_file_id: Optional[str] = None
+    quoted_file_name: Optional[str] = None
+    quoted_file_path: Optional[str] = None
+    quoted_file_size: Optional[int] = None
+    quoted_file_sha256: Optional[str] = None
+    quoted_file_status: Optional[str] = None
+    quoted_file_candidate_count: Optional[int] = 0
+    quoted_file_error: Optional[str] = None
     timestamp: float
 
 @router.post("/wechat_message")
@@ -129,6 +145,15 @@ async def receive_wechat_message(
                 "url": message.url,
                 "quote_image_path": message.quote_image_path,
                 "quote_content": message.quote_content,
+                "has_quote_file": message.has_quote_file,
+                "quoted_file_id": message.quoted_file_id,
+                "quoted_file_name": message.quoted_file_name,
+                "quoted_file_path": message.quoted_file_path,
+                "quoted_file_size": message.quoted_file_size,
+                "quoted_file_sha256": message.quoted_file_sha256,
+                "quoted_file_status": message.quoted_file_status,
+                "quoted_file_candidate_count": message.quoted_file_candidate_count,
+                "quoted_file_error": message.quoted_file_error,
                 "timestamp": message.timestamp
             },
             context={
@@ -178,6 +203,22 @@ async def receive_wechat_message(
             "quote_image_path": message.quote_image_path,
             "quote_content": message.quote_content,
             "has_quote_image": message.has_quote_image,
+            "file_id": message.file_id,
+            "file_name": message.file_name,
+            "file_path": message.file_path,
+            "file_size": message.file_size,
+            "file_sha256": message.file_sha256,
+            "file_status": message.file_status,
+            "file_error": message.file_error,
+            "has_quote_file": message.has_quote_file,
+            "quoted_file_id": message.quoted_file_id,
+            "quoted_file_name": message.quoted_file_name,
+            "quoted_file_path": message.quoted_file_path,
+            "quoted_file_size": message.quoted_file_size,
+            "quoted_file_sha256": message.quoted_file_sha256,
+            "quoted_file_status": message.quoted_file_status,
+            "quoted_file_candidate_count": message.quoted_file_candidate_count,
+            "quoted_file_error": message.quoted_file_error,
             "timestamp": message.timestamp
         },
         context={

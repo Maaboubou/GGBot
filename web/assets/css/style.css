@@ -6907,12 +6907,20 @@ body.automation-pointer-sorting * {
 .codex-history > summary span { color: var(--text-secondary); font-size: 0.55rem; font-weight: 500; }
 .codex-history[open] > summary { border-bottom: 1px solid var(--border-soft); }
 
-.codex-event-list { position: relative; display: grid; gap: 0.55rem; padding-left: 0.8rem; }
+.codex-job-input-summary { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: -0.35rem 0 1rem; }
+.codex-job-input-summary span { padding: 0.22rem 0.42rem; border: 1px solid var(--border-soft); border-radius: 5px; background: var(--bg-soft); color: var(--text-secondary); font-size: 0.54rem; }
+.codex-job-input-summary strong { color: var(--text-main); }
+.codex-event-list { position: relative; display: grid; gap: 0.75rem; padding-left: 0.95rem; }
 .codex-event-list::before { position: absolute; top: 0.25rem; bottom: 0.25rem; left: 0.18rem; width: 1px; background: var(--border-color); content: ''; }
-.codex-event { position: relative; }
-.codex-event::before { position: absolute; top: 0.3rem; left: -0.79rem; width: 7px; height: 7px; border: 2px solid var(--bg-card); border-radius: 50%; background: var(--text-soft); content: ''; }
-.codex-event strong { display: block; color: var(--text-main); font-size: 0.64rem; }
-.codex-event small { color: var(--text-secondary); font-size: 0.54rem; }
+.codex-event { position: relative; min-width: 0; }
+.codex-event::before { position: absolute; top: 0.36rem; left: -0.94rem; width: 7px; height: 7px; border: 2px solid var(--bg-card); border-radius: 50%; background: var(--text-soft); content: ''; }
+.codex-event-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; }
+.codex-event-head strong { color: var(--text-main); font-size: 0.64rem; }
+.codex-event-head time { flex: 0 0 auto; color: var(--text-soft); font: 0.5rem var(--font-code); }
+.codex-event-summary { margin-top: 0.16rem; overflow-wrap: anywhere; color: var(--text-secondary); font-size: 0.57rem; line-height: 1.45; }
+.codex-event-command { padding: 0.32rem 0.42rem; border-radius: 4px; background: var(--bg-soft); color: var(--text-main); font-family: var(--font-code); }
+.codex-event-meta { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.25rem; }
+.codex-event-meta span { padding: 0.1rem 0.28rem; border-radius: 4px; background: var(--bg-subtle); color: var(--text-secondary); font-size: 0.49rem; }
 
 @media (max-width: 991.98px) {
     .codex-runtime-actions { width: 100%; margin-left: 0; }
@@ -7027,11 +7035,51 @@ body.automation-pointer-sorting * {
 .backup-restore-confirm strong { color: var(--text-main); font-size: 0.61rem; }
 .backup-restore-confirm span { color: var(--text-secondary); font-size: 0.53rem; }
 
+/* Per-chat Codex boundary: one compact row, aligned with the restrained chat UI. */
+.chat-codex-access {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.65rem;
+    margin: 0.65rem 0.75rem 0;
+    padding: 0.62rem 0.7rem;
+    border: 1px solid var(--border-soft);
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--primary) 2%, var(--bg-card));
+}
+.chat-codex-access.owner {
+    border-color: color-mix(in srgb, var(--warning) 24%, var(--border-soft));
+    background: color-mix(in srgb, var(--warning) 3%, var(--bg-card));
+}
+.chat-codex-access-icon {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border-radius: 8px;
+    color: var(--primary);
+    background: color-mix(in srgb, var(--primary) 9%, transparent);
+}
+.chat-codex-access.owner .chat-codex-access-icon { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
+.chat-codex-access-copy { min-width: 0; }
+.chat-codex-access-title { display: flex; align-items: center; gap: 0.35rem; }
+.chat-codex-access-title strong { color: var(--text-main); font-size: 0.64rem; }
+.chat-codex-access-title span { padding: 0.12rem 0.32rem; border-radius: 999px; color: var(--primary); background: color-mix(in srgb, var(--primary) 9%, transparent); font-size: 0.47rem; font-weight: 700; }
+.chat-codex-access.owner .chat-codex-access-title span { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
+.chat-codex-access-copy p { margin: 0.12rem 0 0.16rem; color: var(--text-secondary); font-size: 0.52rem; line-height: 1.45; }
+.chat-codex-access-copy code { display: block; overflow: hidden; max-width: 100%; color: var(--text-soft); background: none; font-size: 0.47rem; text-overflow: ellipsis; white-space: nowrap; }
+.chat-codex-access-actions { display: flex; align-items: center; gap: 0.35rem; }
+.chat-codex-access-actions .form-select { width: 150px; min-height: 30px; font-size: 0.54rem; }
+.chat-codex-access-actions .btn { min-height: 30px; font-size: 0.54rem; }
+
 @media (max-width: 1199.98px) {
     .backup-profile-copy { display: none; }
 }
 
 @media (max-width: 767.98px) {
+    .chat-codex-access { grid-template-columns: 30px minmax(0, 1fr); }
+    .chat-codex-access-actions { grid-column: 1 / -1; }
+    .chat-codex-access-actions .form-select { width: 100%; }
     .system-runtime-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .system-runtime-strip > div { min-width: 0; border-bottom: 1px solid var(--border-soft); }
     .backup-restore-confirm { grid-template-columns: 1fr; }

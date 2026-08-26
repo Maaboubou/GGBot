@@ -273,6 +273,13 @@ Install.bat
 | `require_mention = false` | 执行 | 执行 | 执行 |
 | `require_mention = true` | 执行 | 跳过 | 执行 |
 
+聊天管理页还提供独立的 **Codex 访问范围**：
+
+- 新聊天默认使用“隔离空间”，只能读写 `data/codex_chat_scopes/<聊天名--hash>/`；同一群内成员共享同一个目录。
+- 隔离调用使用一次性 Codex 进程，不继承用户 `config.toml` 与 `.rules`，本地命令网络关闭；已安装 Skill 的说明和资源目录保持只读可用。
+- 只有私聊可以由 Web 管理员显式切换为“管理员 · 最大权限”。该模式继承本机 Codex 配置与规则、使用自动审批并保留持久会话。
+- 访问模式保存在 `data/database.db`，聊天目录保存在 `data/codex_chat_scopes/`，服务重启不会丢失。模式切换会立即使旧 Codex 线程失效，避免跨权限复用。
+
 插件监听器按 `app/plugins/routing_order.json` 中的全局顺序执行，可在管理面板调整。Manifest v2 支持三种消息传播方式：
 
 - `observe`：只观察和记录，不阻止后续插件。
@@ -309,6 +316,8 @@ curl.exe http://127.0.0.1:5555/api/listeners/status
 ```
 
 `/live` 只表示桥接进程可响应；`/health` 返回微信连接、在线探针和监听器的缓存快照，不会在每次轮询时操作微信窗口。长期无人值守机器可先用 `/live` 区分进程故障，再查看 `/health` 中的 `health_status`、`online_probe`、`connection_id` 和监听器状态。桥接端口默认只监听本机，因此这些命令应在目标 Windows 主机中执行。
+
+窗口看护会复用同一次 Win32 扫描，在窗口语义状态、可见性、最小化状态或 HWND/PID 发生变化时向 `logs/wx_bot.log` 写入 `listener_window_state_transition` 审计；`/health` 与 `/api/listeners/status` 的 `window_auto_repair.observation_audit` 同时提供当前观察和最近 20 次变化。变化记录中的 `previous_observed_at` 表示上一轮实际看到旧状态的时间，可用于判断故障信号究竟何时出现。
 
 独立聊天窗口落入 Windows 的 `-32000` 无效位置时，微信桥接会用轻量 Win32 几何监测自动复位；该过程不激活、不关闭也不重建窗口。窗口真实缺失时，主应用会通过正常监听入口逐个恢复。
 

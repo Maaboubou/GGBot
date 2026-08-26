@@ -17,6 +17,12 @@ from app.models import user_permission as models_permission
 from app.schemas import permission as schemas_permission
 from app.core.wechat_manager import WeChatManager
 from app.dependencies import get_wechat_manager_instance
+from app.services.codex_access_service import (
+    ISOLATED_ACCESS,
+    OWNER_FULL_ACCESS,
+    CodexAccessService,
+    normalize_codex_access_mode,
+)
 
 router = APIRouter()
 
@@ -25,6 +31,10 @@ class ChatMemoryUpdate(BaseModel):
     stage_summary: Optional[str] = None
     stage_mode: Literal["auto", "manual"] = "manual"
     reason: str = Field(default="管理员编辑阶段记忆", min_length=2, max_length=1000)
+
+
+class CodexAccessUpdate(BaseModel):
+    mode: Literal["isolated", "owner_full"]
 
 
 class ChatMemoryEventCorrection(BaseModel):
@@ -130,6 +140,16 @@ def _invalidate_chatbot_memory_context(chat_name: str) -> None:
         pass
 
 
+def _invalidate_codex_thread(chat_name: str) -> None:
+    """Ensure an existing thread is never reused across a policy transition."""
+    try:
+        from app.services.agent_runtime import get_agent_runtime
+
+        get_agent_runtime().invalidate_chat(chat_name)
+    except Exception:
+        pass
+
+
 @router.post("/users", response_model=schemas_permission.WeChatUser)
 def create_wechat_user(
     user: schemas_permission.WeChatUserCreate, 
@@ -151,7 +171,12 @@ def create_wechat_user(
         return db_user
     
     # 用户不存在，创建新用户
-    new_user = models_permission.WeChatUser(**user.dict())
+    requested_mode = normalize_codex_access_mode(user.codex_access_mode)
+    if user.is_group and requested_mode == OWNER_FULL_ACCESS:
+        raise HTTPException(status_code=400, detail="群聊不能配置为管理员最大权限")
+    user_values = user.dict()
+    user_values["codex_access_mode"] = requested_mode
+    new_user = models_permission.WeChatUser(**user_values)
     new_user.listening_enabled = True
     new_user.sender_blacklist = _normalize_sender_blacklist(user.sender_blacklist)
     db.add(new_user)
@@ -180,6 +205,39 @@ def get_wechat_user(user_id: int, db: Session = Depends(models_base.get_db)):
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return db_user
+
+
+@router.get("/users/{user_id}/codex-access")
+def get_user_codex_access(
+    user_id: int,
+    db: Session = Depends(models_base.get_db),
+):
+    """Return the effective, administrator-owned Codex boundary for one chat."""
+    db_user = _get_user_or_404(db, user_id)
+    context = CodexAccessService().for_user(db_user, ensure=False)
+    return {"status": "success", "data": context.public()}
+
+
+@router.put("/users/{user_id}/codex-access")
+def update_user_codex_access(
+    user_id: int,
+    payload: CodexAccessUpdate,
+    db: Session = Depends(models_base.get_db),
+):
+    """Select isolated access or explicit owner access for a private chat."""
+    db_user = _get_user_or_404(db, user_id)
+    mode = normalize_codex_access_mode(payload.mode)
+    if db_user.is_group and mode == OWNER_FULL_ACCESS:
+        raise HTTPException(status_code=400, detail="群聊成员共享隔离空间，不能授予本机最大权限")
+
+    changed = normalize_codex_access_mode(db_user.codex_access_mode) != mode
+    db_user.codex_access_mode = mode
+    db.commit()
+    db.refresh(db_user)
+    if changed:
+        _invalidate_codex_thread(db_user.chat_name)
+    context = CodexAccessService().for_user(db_user, ensure=mode == ISOLATED_ACCESS)
+    return {"status": "success", "data": context.public()}
 
 
 @router.get("/users/{user_id}/memory")
@@ -793,8 +851,12 @@ def update_wechat_user(
     # 更新字段
     if user_update.remark is not None:
         db_user.remark = user_update.remark
+    access_changed = False
     if user_update.is_group is not None:
         db_user.is_group = user_update.is_group
+        if user_update.is_group and db_user.codex_access_mode == OWNER_FULL_ACCESS:
+            db_user.codex_access_mode = ISOLATED_ACCESS
+            access_changed = True
     if _field_was_set(user_update, "sender_blacklist"):
         db_user.sender_blacklist = _normalize_sender_blacklist(user_update.sender_blacklist)
     if _field_was_set(user_update, "bot_group_nickname"):
@@ -805,6 +867,8 @@ def update_wechat_user(
     
     db.commit()
     db.refresh(db_user)
+    if access_changed:
+        _invalidate_codex_thread(db_user.chat_name)
     return db_user
 
 @router.put("/users/{user_id}/permissions", response_model=schemas_permission.WeChatUser)

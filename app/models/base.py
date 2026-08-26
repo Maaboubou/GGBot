@@ -48,6 +48,30 @@ def drop_legacy_knowledge_base_columns(bind=None):
     return obsolete
 
 
+def ensure_wechat_user_access_columns(bind=None):
+    """Apply the small forward migration required by existing SQLite installs."""
+    active_engine = bind or engine
+    inspector = inspect(active_engine)
+    if not inspector.has_table("wechat_users"):
+        return []
+
+    existing = {column["name"] for column in inspector.get_columns("wechat_users")}
+    added = []
+    if "codex_access_mode" not in existing:
+        quote = active_engine.dialect.identifier_preparer.quote
+        with active_engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"ALTER TABLE {quote('wechat_users')} "
+                    f"ADD COLUMN {quote('codex_access_mode')} "
+                    "VARCHAR NOT NULL DEFAULT 'isolated'"
+                )
+            )
+        logger.info("已添加 Codex 聊天访问策略字段: wechat_users.codex_access_mode")
+        added.append("codex_access_mode")
+    return added
+
+
 def get_db():
     """获取数据库会话"""
     db = SessionLocal()
@@ -67,3 +91,4 @@ def create_tables():
     
     Base.metadata.create_all(bind=engine)
     drop_legacy_knowledge_base_columns(engine)
+    ensure_wechat_user_access_columns(engine)

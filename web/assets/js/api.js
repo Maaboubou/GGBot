@@ -261,6 +261,11 @@ const API = {
         getAll: () => API.get('/api/permissions/users'),
         delete: (id) => API.request(`/api/permissions/users/${id}`, { method: 'DELETE' }),
         updatePermissions: (userId, permissions) => API.put(`/api/permissions/users/${userId}/permissions`, permissions),
+        getCodexAccess: (userId) => API.get(`/api/permissions/users/${userId}/codex-access`),
+        updateCodexAccess: (userId, mode) => API.put(
+            `/api/permissions/users/${userId}/codex-access`,
+            { mode }
+        ),
         getMemory: (userId) => API.get(`/api/permissions/users/${userId}/memory`),
         getMemoryEvents: (userId, params = {}) => {
             const query = new URLSearchParams();
@@ -386,6 +391,7 @@ const API = {
         startUpdate: () => API.post('/api/codex/jobs/upgrade/start', {}),
         rollback: () => API.post('/api/codex/jobs/upgrade/rollback', {}),
         resetSession: (chatId) => API.post('/api/codex/jobs/sessions/reset', { chat_id: chatId }),
+        deleteSession: (chatId) => API.post('/api/codex/jobs/sessions/delete', { chat_id: chatId }),
         interruptSession: (chatId) => API.post('/api/codex/jobs/sessions/interrupt', { chat_id: chatId })
     },
 

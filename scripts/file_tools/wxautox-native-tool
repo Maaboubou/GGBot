@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+wxautox_user_home="${HOME:?HOME must be set}"
+wxautox_local_share="${wxautox_user_home}/.local/share"
+tool_prefix="${WXAUTOX_FILE_TOOLS_PREFIX:-${wxautox_local_share}/wxautox-file-tools}"
+tesseract_prefix="${WXAUTOX_TESSERACT_PREFIX:-${wxautox_local_share}/wxautox-tesseract}"
+tool_name="${0##*/}"
+
+if [[ "${tool_name}" == "wxautox-native-tool" ]]; then
+    if [[ "$#" -lt 1 ]]; then
+        echo "usage: wxautox-native-tool <command> [args...]" >&2
+        exit 2
+    fi
+    tool_name="$1"
+    shift
+fi
+
+tool_path="${tool_prefix}/bin/${tool_name}"
+if [[ "${tool_name}" == "tesseract" && -x "${tesseract_prefix}/bin/tesseract" ]]; then
+    tool_path="${tesseract_prefix}/bin/tesseract"
+fi
+if [[ ! -x "${tool_path}" ]]; then
+    echo "wxautox file tool is unavailable: ${tool_name}" >&2
+    exit 127
+fi
+
+export PATH="${tool_prefix}/bin${PATH:+:${PATH}}"
+export LD_LIBRARY_PATH="${tool_prefix}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+if [[ -d "${tool_prefix}/share/tessdata" ]]; then
+    export TESSDATA_PREFIX="${TESSDATA_PREFIX:-${tool_prefix}/share/tessdata}"
+fi
+if [[ -d "${tool_prefix}/etc/ImageMagick-7" ]]; then
+    export MAGICK_CONFIGURE_PATH="${MAGICK_CONFIGURE_PATH:-${tool_prefix}/etc/ImageMagick-7}"
+fi
+if [[ -f "${tool_prefix}/etc/fonts/wxautox-fonts.conf" ]]; then
+    export FONTCONFIG_FILE="${FONTCONFIG_FILE:-${tool_prefix}/etc/fonts/wxautox-fonts.conf}"
+fi
+if [[ -f "${tool_prefix}/share/misc/magic.mgc" ]]; then
+    export MAGIC="${MAGIC:-${tool_prefix}/share/misc/magic.mgc}"
+fi
+
+exec "${tool_path}" "$@"

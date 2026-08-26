@@ -1,0 +1,47 @@
+# Install in the WSL user environment used by the chatbot's Codex backend:
+# python3 -m pip install --user --break-system-packages -r requirements-file-tools.txt
+
+# PDF parsing, repair, OCR, and generation
+PyMuPDF
+PyMuPDF4LLM
+pdfplumber
+pypdf
+pikepdf
+ocrmypdf
+ReportLab
+fpdf2
+img2pdf
+
+# Office, conversion, legacy documents, and email
+python-docx
+openpyxl
+python-pptx
+xlrd
+pyxlsb
+XlsxWriter
+markitdown[docx,outlook,pdf,pptx,xls,xlsx]
+mammoth
+WeasyPrint
+pypandoc-binary
+striprtf
+docx2txt
+extract-msg
+msoffcrypto-tool
+oletools
+
+# E-books, archives, images, OCR fallback, and data files
+EbookLib
+odfpy
+py7zr
+rarfile
+Pillow
+opencv-python-headless>=4.11,<5
+rapidocr
+python-magic
+camelot-py
+pyarrow
+duckdb
+
+# Compatibility pins shared with the chatbot runtime
+requests>=2.32,<3
+chardet>=5,<6

@@ -36,6 +36,7 @@ from app.services.codex_proxy.client import (
     _as_bool,
     _as_runtime_path,
     _collect_artifact_attachments,
+    _detect_runtime_file_commands,
     _cleanup_expired_artifacts,
     _content_to_text,
     _default_text_for_attachments,
@@ -1519,6 +1520,7 @@ class CodexAppServerManager:
             native_web_search_enabled=web_search_enabled,
             input_image_count=len(runtime_image_paths),
             input_files=staged_input_files,
+            available_file_commands=_detect_runtime_file_commands(self.use_wsl),
         )
         if delta.resume:
             prompt = (

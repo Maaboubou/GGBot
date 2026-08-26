@@ -24,6 +24,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional
 
 from app.services.codex_job_manager import codex_job_manager
+from app.services.file_tools_runtime import (
+    build_codex_runtime_command,
+    get_codex_bin_selection,
+    get_file_tools_runtime,
+    runtime_command_names,
+    runtime_permission_roots,
+)
 from app.services.wechat_file_store import (
     DEFAULT_DOWNLOAD_ROOT,
     PROJECT_ROOT,
@@ -100,18 +107,8 @@ def _codex_runtime_uid(use_wsl: bool = False) -> Optional[int]:
     if configured.isdigit():
         return int(configured)
     if use_wsl and os.name == "nt":
-        try:
-            result = subprocess.run(
-                ["wsl.exe", "id", "-u"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            resolved = result.stdout.strip()
-            return int(resolved) if result.returncode == 0 and resolved.isdigit() else None
-        except (OSError, subprocess.SubprocessError):
-            return None
+        resolved = get_file_tools_runtime(use_wsl=True).get("uid")
+        return int(resolved) if isinstance(resolved, int) and resolved >= 0 else None
     getuid = getattr(os, "getuid", None)
     return int(getuid()) if callable(getuid) else None
 
@@ -120,12 +117,14 @@ def _permission_profile_config_args(
     profile: str,
     *,
     runtime_uid: Optional[int] = None,
+    runtime_read_roots: Optional[Iterable[str]] = None,
+    select_default: bool = True,
 ) -> List[str]:
     """Return a fail-closed profile without inheriting machine-wide read access."""
     normalized = str(profile or "").strip()
     if not normalized:
         return []
-    args = ["-c", f'default_permissions="{normalized}"']
+    args = ["-c", f'default_permissions="{normalized}"'] if select_default else []
     if normalized != "wxautox-chat-isolated":
         return args
 
@@ -149,40 +148,30 @@ def _permission_profile_config_args(
             ("~/.nvm/versions/node", "read"),
             ("~/.hermes/node/bin", "read"),
             ("~/.hermes/node/lib/node_modules/@openai/codex", "read"),
-            (os.getenv("WXAUTOX_LOCAL_BIN") or "~/.local/bin", "read"),
+            ("~/.local/bin", "read"),
             ("~/.local/lib", "read"),
-            (
-                os.getenv("WXAUTOX_FILE_TOOLS_PREFIX")
-                or "~/.local/share/wxautox-file-tools",
-                "read",
-            ),
-            (
-                os.getenv("WXAUTOX_TESSERACT_PREFIX")
-                or "~/.local/share/wxautox-tesseract",
-                "read",
-            ),
-            (
-                os.getenv("WXAUTOX_CLAMAV_ROOT")
-                or "~/.local/share/wxautox-clamav/usr/local",
-                "read",
-            ),
-            (
-                os.getenv("WXAUTOX_CLAMAV_DATABASE")
-                or "~/.local/share/wxautox-clamav-db",
-                "read",
-            ),
+            ("~/.local/share/wxautox-file-tools", "read"),
+            ("~/.local/share/wxautox-doc-tools", "read"),
+            ("~/.local/share/wxautox-tesseract", "read"),
+            ("~/.local/share/wxautox-clamav/usr/local", "read"),
+            ("~/.local/share/wxautox-clamav-db", "read"),
+            ("~/.local/share/wxautox/runtime", "read"),
+            ("~/.local/share/uv/tools", "read"),
             ("~/.local/share/fonts/wxautox", "read"),
             ("/usr/share/fonts", "read"),
-            (
-                os.getenv("WXAUTOX_CLAMAV_TEMP") or "/tmp/wxautox-clamav-tmp",
-                "write",
-            ),
+            ("/tmp/wxautox-clamav-tmp", "write"),
             ("/tmp/wxautox-fontconfig-cache", "write"),
             ("~/.codex/skills", "read"),
             ("~/.agents/skills", "read"),
             ("~/.codex/plugins/cache", "read"),
         ]
     )
+    existing_paths = {path for path, _ in filesystem_permissions}
+    for path in runtime_read_roots or ():
+        normalized_path = str(path or "").strip()
+        if normalized_path.startswith("/") and normalized_path not in existing_paths:
+            filesystem_permissions.append((normalized_path, "read"))
+            existing_paths.add(normalized_path)
     filesystem_config = ",".join(
         f"{json.dumps(path)}={json.dumps(access)}"
         for path, access in filesystem_permissions
@@ -200,44 +189,15 @@ def _permission_profile_config_args(
     return args
 
 
-def _wsl_codex_shell_command(args: Iterable[Any]) -> str:
-    """Render a portable login-shell command for the WSL Codex runtime."""
-    command = " ".join(shlex.quote(str(arg)) for arg in args)
-    return (
-        'wxautox_tool_prefix="${WXAUTOX_FILE_TOOLS_PREFIX:-${HOME}/.local/share/wxautox-file-tools}"; '
-        'if [ -d "${wxautox_tool_prefix}/share/tessdata" ]; then '
-        'export TESSDATA_PREFIX="${TESSDATA_PREFIX:-${wxautox_tool_prefix}/share/tessdata}"; '
-        "fi; "
-        'if [ -f "${wxautox_tool_prefix}/etc/fonts/wxautox-fonts.conf" ]; then '
-        'export FONTCONFIG_FILE="${FONTCONFIG_FILE:-${wxautox_tool_prefix}/etc/fonts/wxautox-fonts.conf}"; '
-        "fi; "
-        f"exec {command}"
-    )
-
-
 @lru_cache(maxsize=2)
 def _detect_runtime_file_commands(
     use_wsl: bool = False,
 ) -> Optional[tuple[str, ...]]:
     """Probe candidate commands in the same host or WSL runtime as Codex."""
     if use_wsl and os.name == "nt":
-        candidates = " ".join(shlex.quote(name) for name in _FILE_TOOL_COMMAND_CANDIDATES)
-        probe = (
-            f"for wxautox_command in {candidates}; do "
-            'command -v "$wxautox_command" >/dev/null 2>&1 && '
-            'printf "%s\\n" "$wxautox_command"; '
-            "done"
-        )
-        try:
-            result = subprocess.run(
-                ["wsl.exe", "bash", "-lic", probe],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            detected = set(result.stdout.splitlines()) if result.returncode == 0 else set()
-        except (OSError, subprocess.SubprocessError):
+        snapshot = get_file_tools_runtime(use_wsl=True)
+        detected = set(runtime_command_names(snapshot))
+        if snapshot.get("status") == "unavailable" and not detected:
             return None
     else:
         detected = {
@@ -1499,10 +1459,18 @@ class CodexCliClient:
         workdir: Optional[str] = None,
         timeout_seconds: int = 600,
     ) -> None:
-        self.codex_bin = self._resolve_codex_bin(codex_bin or os.getenv("CODEX_PROXY_BIN"))
         self.workdir = str(Path(workdir or os.getenv("CODEX_PROXY_WORKDIR") or Path.cwd()).resolve())
         self.timeout_seconds = timeout_seconds
         self.use_wsl = os.name == "nt" and _as_bool(os.getenv("CODEX_PROXY_USE_WSL"), True)
+        configured_bin = (
+            codex_bin
+            or (
+                get_codex_bin_selection(use_wsl=True)["configured"]
+                if self.use_wsl
+                else os.getenv("CODEX_PROXY_BIN")
+            )
+        )
+        self.codex_bin = self._resolve_codex_bin(configured_bin)
         self._generated_images_root_cache: Optional[str] = None
 
     @staticmethod
@@ -1861,6 +1829,14 @@ class CodexCliClient:
             use_wsl=self.use_wsl,
         )
         runtime_output_dir = _as_runtime_path(output_dir, self.use_wsl)
+        runtime_capabilities = (
+            get_file_tools_runtime(
+                use_wsl=True,
+                codex_bin=self.codex_bin,
+            )
+            if self.use_wsl
+            else None
+        )
         runtime_output_path = _as_runtime_path(output_path := request_dir / "last_message.txt", self.use_wsl)
         isolated_workdir_path: Optional[Path] = None
         if isolated_workdir:
@@ -1894,7 +1870,11 @@ class CodexCliClient:
             native_web_search_enabled=web_search_enabled,
             input_image_count=len(image_urls),
             input_files=staged_input_files,
-            available_file_commands=_detect_runtime_file_commands(self.use_wsl),
+            available_file_commands=(
+                runtime_command_names(runtime_capabilities)
+                if runtime_capabilities is not None
+                else _detect_runtime_file_commands(False)
+            ),
         )
         image_paths: List[Path] = []
         temporary_image_paths: List[Path] = []
@@ -1920,7 +1900,7 @@ class CodexCliClient:
             runtime_image_paths.append(_as_runtime_path(image_path, self.use_wsl))
 
         timeout = int(request.get("timeout") or self.timeout_seconds)
-        args = [os.getenv("CODEX_PROXY_WSL_BIN", "codex") if self.use_wsl else self.codex_bin]
+        args = [self.codex_bin]
         if web_search_mode == "live":
             args.append("--search")
         args.extend([
@@ -1936,7 +1916,12 @@ class CodexCliClient:
         args.extend(
             _permission_profile_config_args(
                 permission_profile,
-                runtime_uid=_codex_runtime_uid(self.use_wsl),
+                runtime_uid=(
+                    runtime_capabilities.get("uid")
+                    if runtime_capabilities is not None
+                    else _codex_runtime_uid(False)
+                ),
+                runtime_read_roots=runtime_permission_roots(runtime_capabilities),
             )
         )
         args.extend(_reasoning_summary_config_args(reasoning_summary))
@@ -1963,9 +1948,11 @@ class CodexCliClient:
             runtime_output_path,
             "-",
         ])
-        proc_args = args
-        if self.use_wsl:
-            proc_args = ["wsl.exe", "bash", "-lic", _wsl_codex_shell_command(args)]
+        proc_args = build_codex_runtime_command(
+            args,
+            use_wsl=self.use_wsl,
+            snapshot=runtime_capabilities,
+        )
 
         started_at = time.time()
         _register_running_request(

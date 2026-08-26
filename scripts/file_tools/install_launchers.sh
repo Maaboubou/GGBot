@@ -5,12 +5,28 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 wxautox_user_home="${HOME:?HOME must be set}"
 wxautox_local_share="${wxautox_user_home}/.local/share"
 local_bin="${WXAUTOX_LOCAL_BIN:-${wxautox_user_home}/.local/bin}"
-native_prefix="${WXAUTOX_FILE_TOOLS_PREFIX:-${wxautox_local_share}/wxautox-file-tools}"
+default_native_prefix="${wxautox_local_share}/wxautox-file-tools"
+native_prefix="${WXAUTOX_FILE_TOOLS_PREFIX:-}"
+if [[ -z "${native_prefix}" ]]; then
+    native_prefix="${default_native_prefix}"
+    if [[ ! -x "${native_prefix}/bin/pdftotext" ]]; then
+        detected_native_tool="$(command -v pdftotext 2>/dev/null || command -v qpdf 2>/dev/null || true)"
+        if [[ -n "${detected_native_tool}" ]]; then
+            detected_native_tool="$(readlink -f "${detected_native_tool}")"
+            detected_native_bin="$(dirname "${detected_native_tool}")"
+            detected_native_prefix="$(dirname "${detected_native_bin}")"
+            if [[ "${detected_native_prefix}" == "${wxautox_local_share}/"* ]]; then
+                native_prefix="${detected_native_prefix}"
+            fi
+        fi
+    fi
+fi
 tesseract_prefix="${WXAUTOX_TESSERACT_PREFIX:-${wxautox_local_share}/wxautox-tesseract}"
 clam_root="${WXAUTOX_CLAMAV_ROOT:-${wxautox_local_share}/wxautox-clamav/usr/local}"
 clam_database="${WXAUTOX_CLAMAV_DATABASE:-${wxautox_local_share}/wxautox-clamav-db}"
 clam_temp="${WXAUTOX_CLAMAV_TEMP:-/tmp/wxautox-clamav-tmp}"
 font_cache="/tmp/wxautox-fontconfig-cache"
+runtime_config_dir="${wxautox_local_share}/wxautox/runtime"
 
 install -d "${local_bin}" \
     "${native_prefix}/etc/ImageMagick-7" \
@@ -18,7 +34,18 @@ install -d "${local_bin}" \
     "${clam_root}/etc" \
     "${clam_database}" \
     "${clam_temp}" \
-    "${font_cache}"
+    "${font_cache}" \
+    "${runtime_config_dir}"
+chmod 0700 "${runtime_config_dir}"
+runtime_env_tmp="$(mktemp "${runtime_config_dir}/.file-tools-env.XXXXXX")"
+{
+    printf 'WXAUTOX_REGISTERED_FILE_TOOLS_PREFIX=%q\n' "${native_prefix}"
+    printf 'WXAUTOX_REGISTERED_TESSERACT_PREFIX=%q\n' "${tesseract_prefix}"
+    printf 'WXAUTOX_REGISTERED_CLAMAV_ROOT=%q\n' "${clam_root}"
+    printf 'WXAUTOX_REGISTERED_CLAMAV_DATABASE=%q\n' "${clam_database}"
+} >"${runtime_env_tmp}"
+chmod 0600 "${runtime_env_tmp}"
+mv -f "${runtime_env_tmp}" "${runtime_config_dir}/file-tools.env"
 install -m 0755 "${script_dir}/wxautox-native-tool" "${local_bin}/wxautox-native-tool"
 install -m 0755 "${script_dir}/wxautox-clamav" "${local_bin}/wxautox-clamav"
 install -m 0644 "${script_dir}/freshclam.conf" "${clam_root}/etc/freshclam.conf"
@@ -37,7 +64,11 @@ for tool_name in "${native_tools[@]}"; do
         tool_path="${tesseract_prefix}/bin/tesseract"
     fi
     if [[ -x "${tool_path}" ]]; then
-        ln -sfn wxautox-native-tool "${local_bin}/${tool_name}"
+        if [[ ! -e "${local_bin}/${tool_name}" ]] \
+            || { [[ -L "${local_bin}/${tool_name}" ]] \
+                && [[ "$(readlink "${local_bin}/${tool_name}")" == "wxautox-native-tool" ]]; }; then
+            ln -sfn wxautox-native-tool "${local_bin}/${tool_name}"
+        fi
     elif [[ -L "${local_bin}/${tool_name}" ]] \
         && [[ "$(readlink "${local_bin}/${tool_name}")" == "wxautox-native-tool" ]]; then
         unlink "${local_bin}/${tool_name}"
@@ -55,3 +86,16 @@ elif [[ -L "${local_bin}/freshclam" ]] \
     && [[ "$(readlink "${local_bin}/freshclam")" == "wxautox-clamav" ]]; then
     unlink "${local_bin}/freshclam"
 fi
+
+probe_args=(
+    --json
+    --write-manifest
+    --trusted-root "${native_prefix}"
+    --trusted-root "${tesseract_prefix}"
+    --trusted-root "${clam_root}"
+    --trusted-root "${clam_database}"
+)
+if ! python3 "${script_dir}/probe_runtime.py" "${probe_args[@]}" >/dev/null; then
+    echo "warning: launchers installed, but Codex CLI was not detected in this WSL user" >&2
+fi
+echo "wxautox file tools registered from ${native_prefix}"

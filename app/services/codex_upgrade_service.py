@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.services.agent_runtime import CodexAgentRuntime, get_agent_runtime
+from app.services.file_tools_runtime import get_file_tools_runtime
 
 
 logger = logging.getLogger(__name__)
@@ -233,13 +234,14 @@ class CodexUpgradeService:
         realpath = str(identity.get("realpath") or executable)
         try:
             if self.runtime.probe.use_wsl:
-                resolved = self._run_fixed_shell(
-                    'resolved="$(command -v codex)"; printf "%s\\n" "$resolved"; readlink -f "$resolved"',
-                    timeout=20,
-                ).stdout.splitlines()
-                if resolved:
-                    executable = resolved[0].strip() or executable
-                    realpath = resolved[-1].strip() or realpath
+                snapshot = get_file_tools_runtime(
+                    use_wsl=True,
+                    codex_bin=executable,
+                    force=force,
+                )
+                resolved = snapshot.get("codex") if isinstance(snapshot.get("codex"), dict) else {}
+                executable = str(resolved.get("path") or executable)
+                realpath = str(resolved.get("realpath") or realpath)
             elif executable:
                 realpath = str(Path(executable).resolve())
         except Exception:
@@ -271,6 +273,11 @@ class CodexUpgradeService:
             self._install_cache = dict(info)
             self._install_cache_at = time.monotonic()
         return info
+
+    def invalidate_installation_cache(self) -> None:
+        with self._lock:
+            self._install_cache = None
+            self._install_cache_at = 0.0
 
     def check_latest(self) -> Dict[str, Any]:
         installation = self.detect_installation(force=True)

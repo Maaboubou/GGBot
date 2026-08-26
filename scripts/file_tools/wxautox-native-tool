@@ -3,8 +3,15 @@ set -euo pipefail
 
 wxautox_user_home="${HOME:?HOME must be set}"
 wxautox_local_share="${wxautox_user_home}/.local/share"
-tool_prefix="${WXAUTOX_FILE_TOOLS_PREFIX:-${wxautox_local_share}/wxautox-file-tools}"
-tesseract_prefix="${WXAUTOX_TESSERACT_PREFIX:-${wxautox_local_share}/wxautox-tesseract}"
+runtime_env="${wxautox_local_share}/wxautox/runtime/file-tools.env"
+if [[ -f "${runtime_env}" && -O "${runtime_env}" ]] \
+    && [[ -z "$(find "${runtime_env}" -maxdepth 0 -perm /022 -print -quit 2>/dev/null)" ]]; then
+    # The installer writes only shell-escaped assignments and locks the file to
+    # the current user before this launcher will source it.
+    source "${runtime_env}"
+fi
+tool_prefix="${WXAUTOX_FILE_TOOLS_PREFIX:-${WXAUTOX_REGISTERED_FILE_TOOLS_PREFIX:-${wxautox_local_share}/wxautox-file-tools}}"
+tesseract_prefix="${WXAUTOX_TESSERACT_PREFIX:-${WXAUTOX_REGISTERED_TESSERACT_PREFIX:-${wxautox_local_share}/wxautox-tesseract}}"
 tool_name="${0##*/}"
 
 if [[ "${tool_name}" == "wxautox-native-tool" ]]; then

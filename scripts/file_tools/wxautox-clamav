@@ -3,8 +3,13 @@ set -euo pipefail
 
 wxautox_user_home="${HOME:?HOME must be set}"
 wxautox_local_share="${wxautox_user_home}/.local/share"
-clam_root="${WXAUTOX_CLAMAV_ROOT:-${wxautox_local_share}/wxautox-clamav/usr/local}"
-clam_database="${WXAUTOX_CLAMAV_DATABASE:-${wxautox_local_share}/wxautox-clamav-db}"
+runtime_env="${wxautox_local_share}/wxautox/runtime/file-tools.env"
+if [[ -f "${runtime_env}" && -O "${runtime_env}" ]] \
+    && [[ -z "$(find "${runtime_env}" -maxdepth 0 -perm /022 -print -quit 2>/dev/null)" ]]; then
+    source "${runtime_env}"
+fi
+clam_root="${WXAUTOX_CLAMAV_ROOT:-${WXAUTOX_REGISTERED_CLAMAV_ROOT:-${wxautox_local_share}/wxautox-clamav/usr/local}}"
+clam_database="${WXAUTOX_CLAMAV_DATABASE:-${WXAUTOX_REGISTERED_CLAMAV_DATABASE:-${wxautox_local_share}/wxautox-clamav-db}}"
 clam_config="${WXAUTOX_FRESHCLAM_CONFIG:-${clam_root}/etc/freshclam.conf}"
 clam_temp="${WXAUTOX_CLAMAV_TEMP:-/tmp/wxautox-clamav-tmp}"
 tool_name="${0##*/}"

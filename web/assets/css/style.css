@@ -6848,6 +6848,20 @@ body.automation-pointer-sorting * {
 .codex-runtime-actions { display: flex; margin-left: auto; align-items: center; gap: 0.35rem; }
 .codex-runtime-actions .btn { --bs-btn-padding-y: 0.25rem; --bs-btn-padding-x: 0.48rem; font-size: 0.61rem; }
 
+.codex-tool-details { border-top: 1px solid var(--border-soft); background: var(--bg-soft); }
+.codex-tool-details summary { display: flex; cursor: pointer; align-items: center; justify-content: space-between; padding: 0.38rem 0.78rem; color: var(--text-secondary); font-size: 0.58rem; list-style: none; }
+.codex-tool-details summary::-webkit-details-marker { display: none; }
+.codex-tool-details summary span { color: var(--text-soft); }
+.codex-tool-detail-grid { display: grid; grid-template-columns: minmax(180px, 0.8fr) minmax(260px, 1.5fr) minmax(220px, 1fr); gap: 0.55rem 1rem; padding: 0.25rem 0.78rem 0.65rem; border-top: 1px solid var(--border-soft); }
+.codex-tool-detail-grid > div { min-width: 0; }
+.codex-tool-detail-grid small { display: block; margin-bottom: 0.12rem; color: var(--text-soft); font-size: 0.51rem; }
+.codex-tool-detail-grid span { display: block; overflow: hidden; color: var(--text-secondary); font-size: 0.57rem; text-overflow: ellipsis; white-space: nowrap; }
+.codex-runtime-selector { grid-column: 1 / -1; }
+.codex-runtime-selector > div { display: flex; align-items: center; gap: 0.4rem; }
+.codex-runtime-selector .form-control { min-width: 0; height: 30px; flex: 1 1 auto; padding: 0.28rem 0.5rem; color: var(--text-main); border-color: var(--border-color); background: var(--bg-card); font: 0.58rem/1.2 var(--font-code); }
+.codex-runtime-selector .btn { flex: 0 0 auto; padding: 0.28rem 0.7rem; font-size: 0.59rem; }
+.codex-runtime-selector > span { margin-top: 0.2rem; color: var(--text-soft); }
+
 .codex-operation {
     display: grid;
     grid-template-columns: minmax(110px, 0.22fr) minmax(160px, 1fr) auto;

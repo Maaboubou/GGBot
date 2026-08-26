@@ -219,6 +219,9 @@ class OwnerTaskFacade:
             return {"success": False, "message": "操作不属于当前插件"}
         return self._service.cancel(operation_id)
 
+    def active_count(self) -> int:
+        return self._service.active_count(owner=f"plugin:{self.plugin_id}")
+
 
 class ManagedTimerHandle:
     def __init__(self, thread: threading.Thread, cancel_event: threading.Event):

@@ -1039,8 +1039,9 @@ def _native_window_geometry(hwnd: int) -> dict:
             "normal_rect": normal_rect,
             "offscreen_sentinel": offscreen_sentinel,
             "normal_offscreen_sentinel": normal_offscreen_sentinel,
-            # 正常最小化窗口也位于 -32000，但 IsIconic=True 且保存着有效恢复位置。
-            # 异常窗口 IsIconic=False、showCmd=normal，当前和恢复位置却都为 -32000。
+            # 正常最小化窗口的当前位置位于 -32000，但仍保存着有效恢复位置。
+            # 异常窗口的当前和恢复位置会同时落到 -32000；现场证明它可能一直
+            # 保持 IsIconic=True，直到任务栏点击后才变为 False，因此不能依赖 iconic。
             "unrecoverable_offscreen": is_unrecoverable_offscreen_window(
                 window_rect=rect,
                 normal_rect=normal_rect,

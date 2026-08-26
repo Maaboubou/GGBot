@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import os
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -25,6 +24,11 @@ from app.services.codex_app_server import (
 )
 from app.services.codex_proxy.client import CodexCliClient, CodexProxyError, _as_bool, _as_runtime_path
 from app.services.codex_access_service import codex_access_service
+from app.services.file_tools_runtime import (
+    build_codex_runtime_command,
+    get_codex_bin_selection,
+    get_file_tools_runtime,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -102,7 +106,7 @@ class CodexCompatibilityProbe:
         binary_policy = str(os.getenv("CODEX_BINARY_POLICY") or "global").strip().lower()
         configured = codex_bin or os.getenv("CODEX_PROXY_BIN")
         if self.use_wsl:
-            self.codex_bin = os.getenv("CODEX_PROXY_WSL_BIN", "codex")
+            self.codex_bin = codex_bin or get_codex_bin_selection(use_wsl=True)["configured"]
         elif codex_bin:
             self.codex_bin = codex_bin
         elif binary_policy == "configured" and configured:
@@ -111,17 +115,23 @@ class CodexCompatibilityProbe:
             self.codex_bin = shutil.which("codex") or "codex"
 
     def _command(self, args: List[str]) -> List[str]:
-        if not self.use_wsl:
-            return [self.codex_bin, *args]
         inner = [self.codex_bin, *args]
-        return ["wsl.exe", "bash", "-lic", " ".join(shlex.quote(str(arg)) for arg in inner)]
+        snapshot = (
+            get_file_tools_runtime(use_wsl=True, codex_bin=self.codex_bin)
+            if self.use_wsl
+            else None
+        )
+        return build_codex_runtime_command(
+            inner,
+            use_wsl=self.use_wsl,
+            snapshot=snapshot,
+        )
 
     def quick_signature(self) -> Tuple[str, str, int]:
         realpath = self.codex_bin
         mtime_ns = 0
         if self.use_wsl:
-            # Keep the known-good version invocation independent from path
-            # discovery. A path lookup failure must never take the runtime down.
+            runtime = get_file_tools_runtime(use_wsl=True, codex_bin=self.codex_bin)
             result = subprocess.run(
                 self._command(["--version"]),
                 cwd=self.workdir,
@@ -135,30 +145,8 @@ class CodexCompatibilityProbe:
                 detail = (result.stderr or result.stdout or "Codex CLI unavailable").strip()
                 raise RuntimeError(detail[-1500:])
             version = version_lines[-1]
-            try:
-                resolved_result = subprocess.run(
-                    ["wsl.exe", "bash", "-lic", f"command -v {shlex.quote(self.codex_bin)}"],
-                    cwd=self.workdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=20,
-                    check=False,
-                )
-                resolved_lines = (resolved_result.stdout or "").strip().splitlines()
-                resolved = resolved_lines[-1] if resolved_result.returncode == 0 and resolved_lines else ""
-                if resolved:
-                    realpath_result = subprocess.run(
-                        ["wsl.exe", "readlink", "-f", resolved],
-                        cwd=self.workdir,
-                        capture_output=True,
-                        text=True,
-                        timeout=20,
-                        check=False,
-                    )
-                    candidate = (realpath_result.stdout or "").strip().splitlines()
-                    realpath = candidate[-1] if realpath_result.returncode == 0 and candidate else resolved
-            except Exception:
-                logger.debug("Unable to resolve WSL Codex path", exc_info=True)
+            identity = runtime.get("codex") if isinstance(runtime.get("codex"), dict) else {}
+            realpath = str(identity.get("realpath") or identity.get("path") or self.codex_bin)
             return realpath, version, mtime_ns
         else:
             resolved = shutil.which(self.codex_bin) or self.codex_bin
@@ -502,7 +490,12 @@ class CodexAgentRuntime:
                     name="codex-runtime-drain",
                     daemon=True,
                 ).start()
-            logger.info("Codex runtime active: version=%s schema=%s", identity.version, identity.schema_hash[:12])
+            logger.info(
+                "Codex runtime active: executable=%s version=%s schema=%s",
+                identity.executable,
+                identity.version,
+                identity.schema_hash[:12],
+            )
             return True
         except Exception as exc:
             self._last_refresh_error = str(exc)
@@ -510,6 +503,37 @@ class CodexAgentRuntime:
             return False
         finally:
             self._refresh_lock.release()
+
+    def switch_codex_bin(self, codex_bin: str) -> bool:
+        """Activate a compatible Codex path without interrupting active pools."""
+        normalized = str(codex_bin or "").strip()
+        if not normalized:
+            raise ValueError("Codex path is required")
+        previous = self.probe.codex_bin
+        self.probe.codex_bin = normalized
+        activated = self.refresh(force=True)
+        discovered = self._discovered_identity
+        with self._lock:
+            active = self._identity
+            has_pools = bool(self._pools)
+        active_matches = bool(
+            active
+            and discovered
+            and active.compatible
+            and active.key == discovered.key
+            and has_pools
+        )
+        selected = bool(
+            discovered
+            and discovered.compatible
+            and discovered.executable == normalized
+            and (activated or active_matches)
+        )
+        if not selected:
+            self.probe.codex_bin = previous
+            with self._lock:
+                self._discovered_identity = self._identity
+        return selected
 
     def _stop_pools(self, pools: Dict[str, CodexProcessPool]) -> None:
         drain_timeout = _positive_int(os.getenv("CODEX_POOL_DRAIN_TIMEOUT_SECONDS"), 60)

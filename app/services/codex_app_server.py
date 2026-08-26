@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import signal
 import sqlite3
@@ -28,6 +27,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.services.codex_job_manager import codex_job_manager
+from app.services.file_tools_runtime import (
+    build_codex_runtime_command,
+    get_file_tools_runtime,
+    runtime_permission_roots,
+)
 from app.services.codex_proxy.client import (
     CODEX_APPROVAL_POLICY,
     CODEX_APPROVALS_REVIEWER,
@@ -37,6 +41,7 @@ from app.services.codex_proxy.client import (
     _as_runtime_path,
     _collect_artifact_attachments,
     _detect_runtime_file_commands,
+    _permission_profile_config_args,
     _cleanup_expired_artifacts,
     _content_to_text,
     _default_text_for_attachments,
@@ -425,12 +430,26 @@ class CodexAppServerManager:
         self._last_error = ""
 
     def _command(self) -> List[str]:
-        executable = os.getenv("CODEX_PROXY_WSL_BIN", "codex") if self.use_wsl else self.codex_bin
+        executable = self.codex_bin
         args = [executable, "app-server", "--listen", "stdio://"]
         args.extend(_auto_review_config_args())
-        if self.use_wsl:
-            return ["wsl.exe", "bash", "-lic", " ".join(shlex.quote(str(arg)) for arg in args)]
-        return args
+        runtime_capabilities = (
+            get_file_tools_runtime(use_wsl=True, codex_bin=executable)
+            if self.use_wsl
+            else None
+        )
+        args.extend(
+            _permission_profile_config_args(
+                "wxautox-chat-isolated",
+                runtime_uid=(runtime_capabilities or {}).get("uid"),
+                runtime_read_roots=runtime_permission_roots(runtime_capabilities),
+            )
+        )
+        return build_codex_runtime_command(
+            args,
+            use_wsl=self.use_wsl,
+            snapshot=runtime_capabilities,
+        )
 
     def is_running(self) -> bool:
         proc = self._proc

@@ -3,6 +3,7 @@
 """
 
 import json
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -47,7 +48,8 @@ class PluginInfo:
     last_loaded_at: Optional[float] = None
     last_failed_at: Optional[float] = None
     last_unloaded_at: Optional[float] = None
-    
+    source_fingerprint: str = ""
+
     def __post_init__(self):
         if self.config is None:
             self.config = {}
@@ -87,39 +89,97 @@ class PluginFileHandler(FileSystemEventHandler):
     def __init__(self, plugin_manager: 'PluginManager'):
         self.plugin_manager = plugin_manager
         self.logger = logging.getLogger(__name__)
-        self._last_reload_time = {}
-        self._reload_delay = 1.0  # 1秒防抖
-    
+        self._debounce_seconds = 0.75
+        self._pending: Dict[str, Dict[str, Any]] = {}
+        self._pending_lock = threading.Lock()
+
+    def _queue_source_event(self, file_path: Path, event_type: str) -> None:
+        if file_path.suffix.lower() != ".py":
+            return
+        
+        plugin_name = self.plugin_manager.plugin_for_source_path(file_path)
+        if plugin_name is None:
+            return
+        
+        with self.plugin_manager._lock:
+            plugin_info = self.plugin_manager.plugins.get(plugin_name)
+            if plugin_info is None or not plugin_info.enabled or not plugin_info.loaded:
+                return
+
+        with self._pending_lock:
+            previous = self._pending.get(plugin_name)
+            generation = int((previous or {}).get("generation") or 0) + 1
+            events = list((previous or {}).get("events") or [])
+            event_label = f"{event_type}:{file_path}"
+            if event_label not in events:
+                events.append(event_label)
+            if previous is not None:
+                previous["timer"].cancel()
+            timer = threading.Timer(
+                self._debounce_seconds,
+                self._check_plugin_content,
+                args=(plugin_name, generation),
+            )
+            timer.daemon = True
+            self._pending[plugin_name] = {
+                "generation": generation,
+                "events": events[-10:],
+                "timer": timer,
+            }
+            timer.start()
+
+    def _check_plugin_content(self, plugin_name: str, generation: int) -> None:
+        with self._pending_lock:
+            pending = self._pending.get(plugin_name)
+            if pending is None or pending["generation"] != generation:
+                return
+            events = list(pending["events"])
+            self._pending.pop(plugin_name, None)
+
+        new_fingerprint = self.plugin_manager.plugin_source_fingerprint(plugin_name)
+        with self.plugin_manager._lock:
+            plugin_info = self.plugin_manager.plugins.get(plugin_name)
+            if plugin_info is None or not plugin_info.enabled or not plugin_info.loaded:
+                return
+            old_fingerprint = plugin_info.source_fingerprint
+
+        event_summary = ", ".join(events)
+        if new_fingerprint is None:
+            self.logger.warning(
+                "Unable to fingerprint plugin '%s' after source event(s): %s",
+                plugin_name,
+                event_summary,
+            )
+            return
+        if new_fingerprint == old_fingerprint:
+            self.logger.info(
+                "Ignored unchanged plugin source event: plugin=%s events=%s fingerprint=%s",
+                plugin_name,
+                event_summary,
+                new_fingerprint[:12],
+            )
+            return
+
+        self.logger.info(
+            "Detected plugin source content change: plugin=%s events=%s old=%s new=%s",
+            plugin_name,
+            event_summary,
+            old_fingerprint[:12] or "none",
+            new_fingerprint[:12],
+        )
+        self.logger.debug(
+            "Plugin source fingerprint details: plugin=%s old=%s new=%s",
+            plugin_name,
+            old_fingerprint or "none",
+            new_fingerprint,
+        )
+        self.plugin_manager.request_hot_reload(plugin_name)
+
     def on_modified(self, event):
         if event.is_directory:
             return
-        
-        file_path = Path(event.src_path)
-        if file_path.suffix != '.py':
-            return
-        
-        # 防抖处理
-        now = time.time()
-        if file_path in self._last_reload_time:
-            if now - self._last_reload_time[file_path] < self._reload_delay:
-                return
-        self._last_reload_time[file_path] = now
-        
-        # 确定插件名
-        plugin_name = None
-        for name, plugin_info in self.plugin_manager.plugins.items():
-            if file_path.parent == Path(plugin_info.path):
-                plugin_name = name
-                break
-        
-        if plugin_name and self.plugin_manager.plugins[plugin_name].enabled:
-            self.logger.info(f"Detected change in plugin '{plugin_name}', reloading...")
-            threading.Thread(
-                target=self.plugin_manager._reload_plugin_thread,
-                args=(plugin_name,),
-                daemon=True
-            ).start()
-    
+        self._queue_source_event(Path(event.src_path), "modified")
+
     def on_created(self, event):
         if event.is_directory:
             # 新增插件目录
@@ -132,7 +192,9 @@ class PluginFileHandler(FileSystemEventHandler):
                     args=(str(plugin_path),),
                     daemon=True
                 ).start()
-    
+            return
+        self._queue_source_event(Path(event.src_path), "created")
+
     def on_deleted(self, event):
         if event.is_directory:
             # 插件目录被删除
@@ -145,6 +207,14 @@ class PluginFileHandler(FileSystemEventHandler):
                     args=(plugin_name,),
                     daemon=True
                 ).start()
+            return
+        self._queue_source_event(Path(event.src_path), "deleted")
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        self._queue_source_event(Path(event.src_path), "moved_from")
+        self._queue_source_event(Path(event.dest_path), "moved_to")
 
 
 class PluginManager:
@@ -157,6 +227,10 @@ class PluginManager:
         
         self.plugins: Dict[str, PluginInfo] = {}
         self._lock = threading.RLock()
+        self._hot_reload_lock = threading.Lock()
+        self._pending_hot_reloads: set[str] = set()
+        self._hot_reload_poll_interval = 1.0
+        self._hot_reload_max_wait = 30 * 60.0
         self.routing_order = RoutingOrderStore(self.plugins_dir / "routing_order.json")
         self.runtime_registry = get_plugin_runtime_registry()
         
@@ -185,6 +259,42 @@ class PluginManager:
         except Exception as e:
             self.logger.error(f"Error stopping file monitoring: {e}")
     
+    @staticmethod
+    def _source_fingerprint(plugin_path: Path) -> Optional[str]:
+        """Hash Python source paths and contents for stable hot-reload decisions."""
+        try:
+            source_files = sorted(
+                (path for path in plugin_path.rglob("*.py") if path.is_file()),
+                key=lambda path: path.relative_to(plugin_path).as_posix(),
+            )
+            digest = hashlib.sha256()
+            for source_path in source_files:
+                relative = source_path.relative_to(plugin_path).as_posix().encode("utf-8")
+                digest.update(relative)
+                digest.update(b"\0")
+                digest.update(source_path.read_bytes())
+                digest.update(b"\0")
+            return digest.hexdigest()
+        except OSError:
+            return None
+
+    def plugin_source_fingerprint(self, plugin_name: str) -> Optional[str]:
+        with self._lock:
+            plugin_info = self.plugins.get(plugin_name)
+            if plugin_info is None:
+                return None
+            plugin_path = Path(plugin_info.path)
+        return self._source_fingerprint(plugin_path)
+
+    def plugin_for_source_path(self, source_path: Path) -> Optional[str]:
+        candidate = source_path.resolve()
+        with self._lock:
+            plugins = [(name, Path(info.path).resolve()) for name, info in self.plugins.items()]
+        for plugin_name, plugin_path in sorted(plugins, key=lambda item: len(item[1].parts), reverse=True):
+            if candidate == plugin_path or plugin_path in candidate.parents:
+                return plugin_name
+        return None
+
     def discover_plugins(self):
         """发现所有插件并预加载信息（支持递归子目录）"""
         self.logger.debug("Discovering plugins...")
@@ -406,10 +516,11 @@ class PluginManager:
                 plugin_info.listener_ids = listener_ids
                 plugin_info.last_error = ""
                 plugin_info.last_loaded_at = time.time()
+                plugin_info.source_fingerprint = self._source_fingerprint(plugin_path) or ""
                 if not plugin_info.enabled:
                     for listener_id in listener_ids:
                         self.event_bus.disable_listener(listener_id)
-                
+
                 # self.plugins[plugin_name] = plugin_info # 不再需要，因为我们是更新
                 
                 # 发布插件加载事件
@@ -521,11 +632,92 @@ class PluginManager:
             # 再加载
             return self.load_plugin(plugin_name)
     
-    def _reload_plugin_thread(self, plugin_name: str):
-        """在线程中重载插件"""
-        time.sleep(0.5)  # 稍等一下让文件写入完成
-        self.reload_plugin(plugin_name)
-    
+    def _plugin_active_task_count(self, plugin_name: str) -> int:
+        with self._lock:
+            plugin_info = self.plugins.get(plugin_name)
+            context = plugin_info.runtime_context if plugin_info is not None else None
+        return context.tasks.active_count() if context is not None else 0
+
+    def request_hot_reload(self, plugin_name: str) -> bool:
+        """合并源码触发的重载，并等待插件活动任务结束。"""
+        with self._lock:
+            plugin_info = self.plugins.get(plugin_name)
+            if plugin_info is None or not plugin_info.enabled or not plugin_info.loaded:
+                return False
+
+        with self._hot_reload_lock:
+            if plugin_name in self._pending_hot_reloads:
+                self.logger.debug("Coalesced pending hot reload for plugin '%s'", plugin_name)
+                return True
+            self._pending_hot_reloads.add(plugin_name)
+
+        thread = threading.Thread(
+            target=self._hot_reload_when_idle,
+            args=(plugin_name,),
+            name=f"plugin-reload-{plugin_name.replace('/', '-')}",
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _hot_reload_when_idle(self, plugin_name: str) -> None:
+        deadline = time.monotonic() + self._hot_reload_max_wait
+        waiting_logged = False
+        try:
+            while True:
+                with self._lock:
+                    plugin_info = self.plugins.get(plugin_name)
+                    if plugin_info is None or not plugin_info.enabled or not plugin_info.loaded:
+                        return
+
+                active_tasks = self._plugin_active_task_count(plugin_name)
+                if active_tasks == 0:
+                    break
+                if not waiting_logged:
+                    self.logger.info(
+                        "Deferring hot reload for plugin '%s': %s active task(s)",
+                        plugin_name,
+                        active_tasks,
+                    )
+                    waiting_logged = True
+                if time.monotonic() >= deadline:
+                    self.logger.warning(
+                        "Skipped hot reload for plugin '%s' after waiting %.0f seconds; "
+                        "%s task(s) still active",
+                        plugin_name,
+                        self._hot_reload_max_wait,
+                        active_tasks,
+                    )
+                    return
+                time.sleep(self._hot_reload_poll_interval)
+
+            new_fingerprint = self.plugin_source_fingerprint(plugin_name)
+            with self._lock:
+                plugin_info = self.plugins.get(plugin_name)
+                if plugin_info is None or not plugin_info.enabled or not plugin_info.loaded:
+                    return
+                loaded_fingerprint = plugin_info.source_fingerprint
+            if new_fingerprint is None:
+                self.logger.warning("Skipped hot reload for plugin '%s': source fingerprint failed", plugin_name)
+                return
+            if new_fingerprint == loaded_fingerprint:
+                self.logger.info(
+                    "Cancelled pending hot reload for plugin '%s': source content returned to loaded state",
+                    plugin_name,
+                )
+                return
+
+            self.logger.info(
+                "Reloading plugin '%s' after active tasks completed: old=%s new=%s",
+                plugin_name,
+                loaded_fingerprint[:12] or "none",
+                new_fingerprint[:12],
+            )
+            self.reload_plugin(plugin_name)
+        finally:
+            with self._hot_reload_lock:
+                self._pending_hot_reloads.discard(plugin_name)
+
     def _discover_and_load_new_plugin(self, plugin_path: str):
         """发现并加载新插件"""
         time.sleep(1.0)  # 等待目录创建完成

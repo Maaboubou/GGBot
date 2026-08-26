@@ -3133,6 +3133,7 @@ const LLMManager = {
                 data.session_stats || {},
                 data.runtime || {},
                 data.upgrade || {},
+                data.file_tools || {},
             );
             this.scheduleCodexJobsPoll(
                 (data.active || []).length,
@@ -3159,7 +3160,7 @@ const LLMManager = {
         );
     },
 
-    renderCodexJobs(active, recent, stats, sessions = [], sessionStats = {}, runtime = {}, upgrade = {}) {
+    renderCodexJobs(active, recent, stats, sessions = [], sessionStats = {}, runtime = {}, upgrade = {}, fileTools = {}) {
         const container = document.getElementById('codexJobsList');
         if (!container) return;
         this.codexExpandedSessions ||= new Set();
@@ -3208,11 +3209,26 @@ const LLMManager = {
         const operation = upgrade.operation || null;
         const operationRunning = Boolean(upgrade.operation_running);
         const serverRunning = Boolean(runtime.running);
+        const runtimeError = String(runtime.last_error || '');
         const maintenance = Boolean(runtime.maintenance || operationRunning);
         const dotClass = maintenance ? 'busy' : serverRunning ? 'ready' : 'failed';
-        const installedVersion = String(upgrade.installed_version || runtime.active_version || '-');
+        const installedVersion = String(runtime.active_version || upgrade.installed_version || '-');
         const schemaShort = String(runtime.schema_hash || '').slice(0, 10) || '-';
         const checkedCurrent = Boolean(upgrade.available_version && !upgrade.update_available);
+        const fileToolNames = Array.isArray(fileTools.command_names) ? fileTools.command_names : [];
+        const fileToolRoots = Array.isArray(fileTools.tool_roots) ? fileTools.tool_roots : [];
+        const fileToolsReady = fileTools.status === 'ready';
+        const fileToolsLabel = fileToolsReady ? `${fileToolNames.length} 项` : '未就绪';
+        const codexRuntimePath = String(fileTools.codex?.path || fileTools.codex?.configured || '-');
+        const codexCandidates = Array.isArray(fileTools.codex_candidates) ? fileTools.codex_candidates : [];
+        const codexCandidatePaths = [...new Set(
+            [codexRuntimePath, ...codexCandidates.map(item => String(item?.path || ''))]
+                .filter(path => path && path !== '-'),
+        )];
+        const codexPathValue = this.codexRuntimePathDraft ?? codexRuntimePath;
+        const codexCandidateOptions = codexCandidatePaths
+            .map(path => `<option value="${this.escapeHtml(path)}"></option>`)
+            .join('');
 
         const updateButton = operationRunning
             ? `<button class="btn btn-outline-secondary" disabled><span class="spinner-border spinner-border-sm me-1"></span>处理中</button>`
@@ -3356,17 +3372,38 @@ const LLMManager = {
                 <div class="codex-runtime-strip">
                     <div class="codex-runtime-identity">
                         <span class="codex-runtime-dot ${dotClass}"></span>
-                        <div><strong>${maintenance ? '运行环境维护中' : serverRunning ? 'Codex 正常运行' : 'Codex 未就绪'}</strong><small>${this.escapeHtml(installedVersion)}</small></div>
+                        <div><strong title="${this.escapeHtml(runtimeError)}">${maintenance ? '运行环境维护中' : serverRunning ? 'Codex 正常运行' : 'Codex 未就绪'}</strong><small>${this.escapeHtml(installedVersion)}</small></div>
                     </div>
                     <div class="codex-runtime-facts">
                         <span>进程<strong>${workerCount}</strong></span><span>队列<strong>${queueCount}</strong></span><span>会话<strong>${sessionCount}</strong></span><span>任务<strong>${activeCount}</strong></span><span>线程 Token<strong>${formatK(sessionStats.current_thread_total_tokens || 0)}</strong></span><span>Schema<strong class="codex-mono">${this.escapeHtml(schemaShort)}</strong></span><span>安装<strong>${this.escapeHtml(upgrade.installation?.method_label || '-')}</strong></span>
+                        <span>文件工具<strong>${this.escapeHtml(fileToolsLabel)}</strong></span>
                         ${upgrade.update_available ? `<span class="codex-inline-badge warning">可用 ${this.escapeHtml(upgrade.available_version || '')}</span>` : ''}
                     </div>
                     <div class="codex-runtime-actions">
+                        <button class="btn btn-outline-secondary codex-file-tools-refresh" title="重新探测文件工具"><i class="bi bi-tools"></i></button>
                         <button class="btn btn-outline-secondary codex-update-check" ${operationRunning ? 'disabled' : ''} title="检查最新版本"><i class="bi bi-arrow-clockwise"></i></button>
                         ${updateButton}${rollbackButton}
                     </div>
                 </div>
+                <details class="codex-tool-details" ${this.codexToolDetailsOpen ? 'open' : ''}>
+                    <summary>Codex 与文件环境 <span>${this.escapeHtml(fileToolsReady ? '已连接' : '需要检查')}</span></summary>
+                    <div class="codex-tool-detail-grid">
+                        <div class="codex-runtime-selector">
+                            <small>WSL Codex 路径</small>
+                            <div>
+                                <input class="form-control codex-runtime-path" list="codexRuntimeCandidates" value="${this.escapeHtml(codexPathValue)}" placeholder="/home/user/.local/bin/codex" spellcheck="false">
+                                <datalist id="codexRuntimeCandidates">${codexCandidateOptions}</datalist>
+                                <button class="btn btn-primary codex-runtime-select" ${operationRunning ? 'disabled' : ''}>切换</button>
+                            </div>
+                            <span>仅接受 WSL 原生绝对路径；可选择使用不同模型配置的 Codex 包装器。</span>
+                        </div>
+                        <div><small>Codex</small><span class="codex-mono" title="${this.escapeHtml(codexRuntimePath)}">${this.escapeHtml(codexRuntimePath)}</span></div>
+                        <div><small>可用命令</small><span>${this.escapeHtml(fileToolNames.join(' · ') || '未探测到')}</span></div>
+                        <div><small>工具环境</small><span class="codex-mono">${this.escapeHtml(fileToolRoots.join(' · ') || '使用系统工具')}</span></div>
+                        ${runtimeError ? `<div><small>运行时诊断</small><span class="text-danger" title="${this.escapeHtml(runtimeError)}">${this.escapeHtml(runtimeError)}</span></div>` : ''}
+                        ${fileTools.error ? `<div><small>诊断</small><span class="text-danger">${this.escapeHtml(fileTools.error)}</span></div>` : ''}
+                    </div>
+                </details>
                 ${operationHtml}
                 <section class="codex-section">
                     <div class="codex-section-head"><h6>会话</h6><small>${sessionCount} 个持久上下文 · ${Number(sessionStats.total_turn_count || 0).toLocaleString()} 轮</small></div>
@@ -3384,11 +3421,17 @@ const LLMManager = {
                 const chatId = button.dataset.chatId;
                 if (this.codexExpandedSessions.has(chatId)) this.codexExpandedSessions.delete(chatId);
                 else this.codexExpandedSessions.add(chatId);
-                this.renderCodexJobs(active, recent, stats, sessions, sessionStats, runtime, upgrade);
+                this.renderCodexJobs(active, recent, stats, sessions, sessionStats, runtime, upgrade, fileTools);
             });
         });
         container.querySelector('.codex-history')?.addEventListener('toggle', event => {
             this.codexHistoryOpen = event.currentTarget.open;
+        });
+        container.querySelector('.codex-tool-details')?.addEventListener('toggle', event => {
+            this.codexToolDetailsOpen = event.currentTarget.open;
+        });
+        container.querySelector('.codex-runtime-path')?.addEventListener('input', event => {
+            this.codexRuntimePathDraft = event.currentTarget.value;
         });
         container.querySelectorAll('.codex-job-cancel').forEach(button => {
             button.addEventListener('click', () => this.cancelCodexJob(button.dataset.requestId));
@@ -3406,8 +3449,43 @@ const LLMManager = {
             button.addEventListener('click', () => this.interruptCodexSession(button.dataset.chatId));
         });
         container.querySelector('.codex-update-check')?.addEventListener('click', () => this.checkCodexUpdate());
+        container.querySelector('.codex-file-tools-refresh')?.addEventListener('click', () => this.refreshCodexFileTools());
+        container.querySelector('.codex-runtime-select')?.addEventListener('click', () => this.selectCodexRuntime());
         container.querySelector('.codex-update-start')?.addEventListener('click', () => this.startCodexUpdate(upgrade));
         container.querySelector('.codex-update-rollback')?.addEventListener('click', () => this.rollbackCodex(upgrade));
+    },
+
+    async refreshCodexFileTools() {
+        try {
+            const result = await API.codexJobs.refreshFileTools();
+            const count = Array.isArray(result.data?.command_names) ? result.data.command_names.length : 0;
+            UI.showSuccess(`文件处理环境已刷新，共发现 ${count} 项工具`);
+        } catch (e) {
+            UI.showError(e.message);
+        } finally {
+            await this.loadCodexJobs({ quiet: true });
+        }
+    },
+
+    async selectCodexRuntime() {
+        const input = document.querySelector('#codexJobsList .codex-runtime-path');
+        const path = String(input?.value || '').trim();
+        if (!path) {
+            UI.showError('请输入 WSL 内的 Codex 绝对路径');
+            return;
+        }
+        const button = document.querySelector('#codexJobsList .codex-runtime-select');
+        if (button) button.disabled = true;
+        try {
+            await API.codexJobs.selectRuntime(path);
+            this.codexRuntimePathDraft = null;
+            UI.showSuccess('Codex 运行路径已切换');
+        } catch (e) {
+            UI.showError('切换失败：' + e.message);
+        } finally {
+            if (button) button.disabled = false;
+            await this.loadCodexJobs({ quiet: true });
+        }
     },
 
     async cancelCodexJob(requestId) {

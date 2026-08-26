@@ -35,10 +35,15 @@ def is_unrecoverable_offscreen_window(
     normal_rect: dict,
     iconic: bool,
 ) -> bool:
-    """Identify a non-minimized window whose current and restore positions are invalid."""
+    """Identify a window whose current and restore positions are both invalid.
+
+    ``iconic`` is intentionally diagnostic-only. A normally minimized window
+    keeps a usable ``normal_rect``; field observations show that a broken Qt
+    listener can remain iconic with both rectangles at Windows' -32000
+    sentinel until a taskbar click changes only its iconic state.
+    """
     return bool(
-        not iconic
-        and is_offscreen_sentinel_rect(window_rect)
+        is_offscreen_sentinel_rect(window_rect)
         and is_offscreen_sentinel_rect(normal_rect)
     )
 

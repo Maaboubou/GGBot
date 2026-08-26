@@ -341,6 +341,13 @@ class RuntimeOperationService:
             self.cancel(operation_id)
         return len(ids)
 
+    def active_count(self, owner: Optional[str] = None) -> int:
+        """Return the number of in-process operations, optionally for one owner."""
+        with self._lock:
+            if owner is None:
+                return len(self._active)
+            return sum(1 for item in self._active.values() if item.get("owner") == owner)
+
     def _row(self, row: sqlite3.Row) -> Dict[str, Any]:
         result = {
             "operation_id": row["operation_id"], "owner": row["owner"], "kind": row["kind"],

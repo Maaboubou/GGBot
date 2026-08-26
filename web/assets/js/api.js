@@ -385,6 +385,9 @@ const API = {
     codexJobs: {
         list: () => API.get('/api/codex/jobs'),
         refreshRuntime: () => API.post('/api/codex/jobs/runtime/refresh', {}),
+        selectRuntime: (path) => API.post('/api/codex/jobs/runtime/select', { path }),
+        getFileTools: () => API.get('/api/codex/jobs/file-tools'),
+        refreshFileTools: () => API.post('/api/codex/jobs/file-tools/refresh', {}),
         cancel: (requestId) => API.post(`/api/codex/jobs/${encodeURIComponent(requestId)}/cancel`, {}),
         events: (requestId) => API.get(`/api/codex/jobs/events/${encodeURIComponent(requestId)}`),
         checkUpdate: () => API.post('/api/codex/jobs/upgrade/check', {}),

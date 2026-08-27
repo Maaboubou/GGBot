@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional, Dict
 
 logger = logging.getLogger(__name__)
+ASSISTANT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "assistant" / "config.json"
 
 
 def get_plugin_config(plugin_name: str, plugin_path: Optional[str] = None) -> Dict[str, Any]:
@@ -27,6 +28,10 @@ def get_plugin_config(plugin_name: str, plugin_path: Optional[str] = None) -> Di
     try:
         if plugin_path:
             config_file = Path(plugin_path) / "config.json"
+        elif plugin_name in {"assistant", "builtin_chatbot"}:
+            # ``builtin_chatbot`` is accepted only while historical callers
+            # and persisted settings are migrated to the first-class domain.
+            config_file = ASSISTANT_CONFIG_PATH
         else:
             # 自动推断插件路径
             # 将插件名称中的斜杠转换为路径分隔符

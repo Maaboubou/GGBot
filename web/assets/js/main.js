@@ -97,6 +97,9 @@ const App = {
                 case 'plugins':
                     await this.loadPlugins(!isBackground);
                     break;
+                case 'codex':
+                    await CodexCenter.load({ quiet: isBackground });
+                    break;
                 case 'wechat':
                     await this.loadWeChat();
                     break;
@@ -982,7 +985,7 @@ const App = {
                 chat_name: chatName,
                 event_id: String(eventId)
             });
-            const response = await API.request(`/api/chatbot/roles/memory-event-source?${params.toString()}`);
+            const response = await API.request(`/api/assistant/roles/memory-event-source?${params.toString()}`);
             const messages = response?.data?.messages || [];
             if (!messages.length) {
                 target.innerHTML = `
@@ -1422,20 +1425,31 @@ const App = {
         }
 
         try {
-            // This API call creates the user in DB AND adds the listener via WeChatManager
-            await API.users.addUser(chatName, remark, isGroup, senderBlacklist);
+            const user = await API.users.addUser(chatName, remark, isGroup, senderBlacklist);
+            let assistantWarning = '';
+            if (form.assistant_enabled?.checked) {
+                try {
+                    await API.chatPolicies.update(user.id, {
+                        expected_version: Number(user.policy_version || 1),
+                        assistant: { enabled: true }
+                    });
+                } catch (error) {
+                    assistantWarning = error.message;
+                }
+            }
 
             // Close modal
             const el = document.getElementById('addUserModal');
             const modal = bootstrap.Modal.getInstance(el);
             if (modal) modal.hide();
 
-            // Refresh list
-            this.loadUsers();
-
-            // Optionally select the new user
-            // We need the ID, but addUser response has it.
-            // For simplicity, just reload for now.
+            await this.loadUsers();
+            await this.selectUser(user.chat_name, user.id);
+            if (assistantWarning) {
+                UI.showError(`聊天已添加并开始监听，但 AI 助手未能启用：${assistantWarning}`);
+            } else {
+                UI.showSuccess(form.assistant_enabled?.checked ? '聊天已就绪，AI 助手可以开始回复' : '聊天已添加，插件可独立运行');
+            }
         } catch (e) {
             UI.showError('添加用户失败：' + e.message);
         }
@@ -1559,15 +1573,17 @@ const App = {
         UI.setActiveManagedChat(selectedChatName);
         UI.renderManagedChatPending(selectedChatName);
 
+        if (!userId) {
+            UI.renderUnmanagedChatPolicy(selectedChatName);
+            return;
+        }
+
         try {
-            const [capabilitiesData, userDetail, codexAccessResponse] = await Promise.all([
+            const [capabilitiesData, policy, assistantOverview, profiles] = await Promise.all([
                 API.capabilities.getAll(),
-                userId
-                    ? API.request(`/api/permissions/users/${userId}`)
-                    : Promise.resolve({ chat_name: selectedChatName, permissions: [] }),
-                userId
-                    ? API.users.getCodexAccess(userId)
-                    : Promise.resolve({ data: null })
+                API.chatPolicies.get(userId),
+                API.assistant.getOverview(),
+                API.codexProfiles.list().catch(() => ({ profiles: [], default_profile_id: '' }))
             ]);
 
             // A slower response for a previously selected chat must never
@@ -1575,11 +1591,8 @@ const App = {
             if (requestId !== this.managedChatSelectionRequest
                 || this.currentThreadName !== selectedChatName) return;
 
-            UI.renderChatCapabilities(
-                userDetail,
-                capabilitiesData.capabilities || [],
-                codexAccessResponse?.data || null
-            );
+            this._selectedChatPolicy = policy;
+            UI.renderChatPolicy(policy, capabilitiesData.capabilities || [], assistantOverview, profiles);
         } catch (e) {
             if (requestId !== this.managedChatSelectionRequest) return;
             UI.renderManagedChatError(selectedChatName);
@@ -1587,109 +1600,84 @@ const App = {
         }
     },
 
-    async saveCodexAccess(userId) {
-        const modeInput = document.getElementById('codexAccessMode');
-        if (!userId || !modeInput) return;
-        const mode = modeInput.value;
-        if (mode === 'owner_full') {
-            const approved = await UI.confirm(
-                '管理员模式允许此私聊中的 Codex 访问本机文件，并自动处理执行审批。只应授予你本人可控的私聊。',
-                {
-                    title: '授予本机最大权限',
-                    confirmText: '确认授予',
-                    variant: 'warning'
-                }
-            );
+    async adoptActiveChat(chatName, isGroup) {
+        try {
+            const user = await API.users.addUser(chatName, '', Boolean(isGroup));
+            UI.showSuccess('聊天已加入策略管理');
+            await this.loadUsers();
+            await this.selectUser(user.chat_name, user.id);
+        } catch (error) {
+            UI.showError(`加入失败：${error.message}`);
+        }
+    },
+
+    linesFromPolicyField(form, name) {
+        return [...new Set(String(form.elements[name]?.value || '').split(/\r?\n|,/).map(item => item.trim()).filter(Boolean))];
+    },
+
+    async saveChatPolicy() {
+        const form = document.getElementById('chatPolicyForm');
+        if (!form) return;
+        const userId = Number(form.dataset.userId || 0);
+        const isGroup = Boolean(this._selectedChatPolicy?.chat?.is_group);
+        const codexMode = isGroup ? 'isolated' : form.elements.codex_mode.value;
+        if (codexMode === 'owner_full') {
+            const approved = await UI.confirm('最大权限允许此私聊中的 Codex 访问本机文件。只应授予你本人可控的私聊。', { title: '确认 Codex 最大权限', confirmText: '确认授予', variant: 'warning' });
             if (!approved) return;
         }
-
-        const button = document.getElementById('saveCodexAccessBtn');
-        if (button) button.disabled = true;
-        try {
-            await API.users.updateCodexAccess(userId, mode);
-            UI.showSuccess(mode === 'owner_full' ? '已设为管理员私聊' : '已启用聊天隔离空间');
-            await this.loadUsers();
-            await this.selectUser(this.currentThreadName, userId);
-        } catch (e) {
-            UI.showError('保存 Codex 访问范围失败：' + e.message);
-        } finally {
-            if (button) button.disabled = false;
-        }
-    },
-
-    async saveUserPermissions(userId, chatName) {
-        try {
-            const targetChatName = chatName || this.currentThreadName;
-            // If creating new user (userId is null)
-            let targetId = userId;
-            if (!targetId) {
-                // Create user first
-                const newUser = await API.users.addUser(targetChatName, "Auto-created");
-                targetId = newUser.id;
-                // Update list to reflect new ID (optional, but good practice)
-            }
-
-            const checks = document.querySelectorAll('.permission-check:checked');
-            const permissions = [];
-
-            checks.forEach(c => {
-                const pluginName = c.value;
-                const mentionCheck = document.getElementById(`mention-${pluginName}`);
-                const pushCheck = document.getElementById(`push-${pluginName}`);
-                const proactiveCheck = document.getElementById(`proactive-${pluginName}`);
-                const followupCheck = document.getElementById(`followup-enabled-${pluginName}`);
-                const ignoredSendersText = document.getElementById(`ignored-senders-${pluginName}`)?.value || '';
-                const ignoredSenders = ignoredSendersText
-                    .split(/\r?\n/)
-                    .map(sender => sender.trim())
-                    .filter(Boolean);
-
-                // Add base permission
-                permissions.push({
-                    plugin_name: pluginName,
-                    require_mention: mentionCheck ? mentionCheck.checked : false,
-                    proactive_enabled: proactiveCheck ? proactiveCheck.checked : false,
-                    followup_enabled: followupCheck ? followupCheck.checked : false,
-                    followup_window_seconds: Number(document.getElementById(`followup-window-${pluginName}`)?.value || 60),
-                    followup_merge_seconds: Number(document.getElementById(`followup-merge-${pluginName}`)?.value || 3),
-                    followup_max_turns: Number(document.getElementById(`followup-max-turns-${pluginName}`)?.value || 3),
-                    memory_profile: document.getElementById(`memory-profile-${pluginName}`)?.value || null,
-                    ignored_senders: ignoredSenders.length > 0 ? JSON.stringify([...new Set(ignoredSenders)]) : null
-                });
-
-                // Add push permission if checked
-                if (pushCheck && pushCheck.checked) {
-                    permissions.push({
-                        plugin_name: `${pluginName}#push`,
-                        require_mention: false
-                    });
-                }
+        const pluginGrants = [];
+        form.querySelectorAll('.chat-policy-plugin-toggle:checked').forEach(toggle => {
+            const card = toggle.closest('.chat-policy-plugin');
+            pluginGrants.push({
+                plugin_name: toggle.value,
+                require_mention: Boolean(card.querySelector('.chat-policy-plugin-mention')?.checked)
             });
-
-            await API.users.updatePermissions(targetId, { permissions });
-
-            UI.showSuccess('权限已保存');
-
-            // Refresh to ensure IDs are synced if we just created it
-            await this.loadUsers();
-            // Re-select to update UI state
-            this.selectUser(targetChatName, targetId);
-
-        } catch (e) {
-            UI.showError('保存权限失败：' + e.message);
-        }
-    },
-
-    async openAssistantChatEditorFromChats(userId) {
+            if (card.querySelector('.chat-policy-plugin-push')?.checked) {
+                pluginGrants.push({ plugin_name: `${toggle.value}#push`, require_mention: false });
+            }
+        });
+        const roleValue = form.elements.role_id.value;
+        const judgeValue = isGroup ? form.elements.judge_id.value : '';
+        const payload = {
+            expected_version: Number(form.dataset.version),
+            chat: {
+                remark: form.elements.remark.value.trim(),
+                listening_enabled: form.elements.listening_enabled.checked,
+                sender_blacklist: this.linesFromPolicyField(form, 'sender_blacklist'),
+                ...(isGroup ? {
+                    bot_group_nickname: form.elements.bot_group_nickname.value.trim(),
+                    bot_group_nickname_auto_enabled: form.elements.bot_group_nickname_auto_enabled.checked
+                } : {})
+            },
+            assistant: {
+                enabled: form.elements.assistant_enabled.checked,
+                codex_profile_id: form.elements.codex_profile_id.value || null,
+                role_id: roleValue ? Number(roleValue) : null,
+                followup_enabled: form.elements.followup_enabled.checked,
+                memory_mode: form.elements.memory_mode.value,
+                ignored_senders: this.linesFromPolicyField(form, 'assistant_ignored_senders'),
+                ...(isGroup ? {
+                    proactive_enabled: form.elements.proactive_enabled.checked,
+                    judge_id: judgeValue ? Number(judgeValue) : null
+                } : {})
+            },
+            codex: { mode: codexMode },
+            plugin_grants: pluginGrants
+        };
+        form.querySelectorAll('button').forEach(button => { button.disabled = true; });
         try {
-            const overview = await API.assistant.getOverview();
-            this._assistantOverview = overview;
-            this._roles = overview.roles || [];
-            this._judges = overview.judges || [];
-            this._chatbotUsers = overview.chats || [];
-            this.showAssistantChatEditor(userId);
+            const updated = await API.chatPolicies.update(userId, payload);
+            this._selectedChatPolicy = updated;
+            UI.showSuccess('聊天策略已保存');
+            await this.loadUsers();
+            await this.selectUser(updated.chat.chat_name, userId);
         } catch (error) {
-            UI.showError('加载 AI 助手聊天配置失败：' + error.message);
+            UI.showError(`保存失败：${error.message}`);
+            if (/版本|刷新|current_version/.test(error.message)) {
+                await this.selectUser(this.currentThreadName, userId);
+            }
+        } finally {
+            form.querySelectorAll('button').forEach(button => { button.disabled = false; });
         }
     },
 
@@ -1740,7 +1728,7 @@ const App = {
             this._assistantOverview = overview;
             this._roles = roles;
             this._judges = judges;
-            this._chatbotUsers = chats;
+            this._assistantChats = chats;
 
             UI.updateMetric('statsTotalRoles', roles.length);
             UI.updateMetric('statsTotalJudges', judges.length);
@@ -1848,7 +1836,7 @@ const App = {
         if (modelSummary) {
             const mappings = Object.entries(overview.models?.mappings || {});
             if (!mappings.length) {
-                modelSummary.innerHTML = '<div class="assistant-empty-inline">尚未配置 Chatbot 模型路由。</div>';
+                modelSummary.innerHTML = '<div class="assistant-empty-inline">尚未配置 Judge 或记忆辅助模型。</div>';
             } else {
                 const labels = {
                     chat: '对话回复', judge: '主动判断',
@@ -1865,7 +1853,7 @@ const App = {
     filterAssistantChats() {
         const query = (document.getElementById('assistantChatsSearch')?.value || '').trim().toLowerCase();
         const filter = document.getElementById('assistantChatsFilter')?.value || 'all';
-        const chats = (this._chatbotUsers || []).filter(chat => {
+        const chats = (this._assistantChats || []).filter(chat => {
             const matchesText = !query || `${chat.chat_name} ${chat.remark || ''}`.toLowerCase().includes(query);
             const matchesState = filter === 'all'
                 || (filter === 'enabled' && chat.enabled)
@@ -1909,7 +1897,7 @@ const App = {
                             <strong title="${rawName}">${name}</strong>
                             <small>${chat.remark ? rawName + ' · ' : ''}${chat.is_group ? '群聊' : '私聊'}${chat.is_listening ? ' · 正在监听' : ' · 未监听'}</small>
                         </div>
-                        <span class="assistant-state-pill ${chat.enabled ? 'on' : 'off'}">${chat.enabled ? 'Chatbot 已启用' : '未启用'}</span>
+                        <span class="assistant-state-pill ${chat.enabled ? 'on' : 'off'}">${chat.enabled ? 'AI 助手已启用' : '未启用'}</span>
                     </div>
                     <div class="assistant-chat-config">
                         <div><span>角色</span><strong>${role}</strong><small>${chat.role_source === 'chat' ? '聊天覆盖' : '继承全局'}</small></div>
@@ -1925,11 +1913,11 @@ const App = {
     },
 
     async showAssistantGlobalSettings() {
-        await this.showCapabilitySettings('builtin_chatbot');
+        await this.showCapabilitySettings('assistant');
     },
 
     showAssistantChatEditor(userId) {
-        const chat = (this._chatbotUsers || []).find(item => item.id === userId);
+        const chat = (this._assistantChats || []).find(item => item.id === userId);
         if (!chat) return;
         const memory = chat.memory || { mode: 'inherit', overrides: {} };
         const globalMemory = this._assistantOverview?.global?.memory || {};
@@ -1968,7 +1956,7 @@ const App = {
                 </div>
                 <div class="assistant-editor-section">
                     <h6>助手状态</h6>
-                    <label class="assistant-setting-switch"><span><strong>在此聊天中启用 Chatbot</strong><small>关闭后不处理此聊天的 AI 对话。</small></span><input class="form-check-input" type="checkbox" name="enabled" ${chat.enabled ? 'checked' : ''}></label>
+                    <label class="assistant-setting-switch"><span><strong>在此聊天中启用 AI 助手</strong><small>关闭后不处理此聊天的 AI 对话。</small></span><input class="form-check-input" type="checkbox" name="enabled" ${chat.enabled ? 'checked' : ''}></label>
                     ${proactiveControl}
                     <label class="assistant-setting-switch"><span><strong>允许连续对话</strong><small>Bot 回复后，短时间内无需再次 @ 也可继续对话。</small></span><input class="form-check-input" type="checkbox" name="followup_enabled" ${chat.followup_enabled ? 'checked' : ''}></label>
                 </div>
@@ -1992,7 +1980,7 @@ const App = {
                     <div class="d-flex justify-content-between align-items-start gap-3 mb-3">
                         <div><h6 class="mb-1">长期记忆</h6><div class="form-text m-0">先选择工作方式；只有“自定义”才显示聊天级参数。</div></div>
                         <div class="d-flex flex-wrap gap-2 justify-content-end">
-                            <button class="btn btn-sm btn-light border" type="button" onclick="App.showCapabilitySettings('builtin_chatbot', {focusGroup: 'memory'})"><i class="bi bi-globe2 me-1"></i>全局记忆默认</button>
+                            <button class="btn btn-sm btn-light border" type="button" onclick="App.showCapabilitySettings('assistant', {focusGroup: 'memory'})"><i class="bi bi-globe2 me-1"></i>全局记忆默认</button>
                             <button class="btn btn-sm btn-light border" type="button" onclick="App.openChatMemoryLibrary(${Number(chat.id)})"><i class="bi bi-database me-1"></i>查看记忆库</button>
                         </div>
                     </div>
@@ -2026,7 +2014,7 @@ const App = {
                     <h6>局部黑名单</h6>
                     <label class="form-label">忽略的发送者</label>
                     <textarea class="form-control" name="ignored_senders" rows="4" placeholder="每行一个发送者">${UI.escapeHtml((chat.ignored_senders || []).join('\n'))}</textarea>
-                    <div class="form-text">仅影响此聊天中的 Chatbot，不影响其他自动化。</div>
+                    <div class="form-text">仅影响此聊天中的 AI 助手，不影响其他插件与自动化。</div>
                 </div>
             </form>`;
         const assistantForm = document.getElementById('assistantChatForm');
@@ -2073,7 +2061,7 @@ const App = {
 
     async saveAssistantChat(userId) {
         const form = document.getElementById('assistantChatForm');
-        const chat = (this._chatbotUsers || []).find(item => item.id === userId);
+        const chat = (this._assistantChats || []).find(item => item.id === userId);
         if (!form || !form.checkValidity()) {
             form?.reportValidity();
             return;

@@ -1,4 +1,4 @@
-"""Aggregated Chatbot console data and chat-level configuration mutations."""
+"""Aggregated core Assistant console data and chat-level policy mutations."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.models.chatbot_judge import ChatBotJudge, UserChatBotJudge
 from app.models.chatbot_role import ChatBotRole, UserChatBotRole
-from app.models.user_permission import UserPermission, WeChatUser
+from app.models.assistant_policy import AssistantChatPolicy
+from app.models.user_permission import WeChatUser
 from app.services.capability_service import CapabilityService
 from app.services.config_service import get_setting
 from app.utils.bot_mentions import bot_names_for_user
@@ -49,7 +50,7 @@ def _json_list(value: Any) -> List[str]:
 
 
 def _memory_summary(
-    permission: Optional[UserPermission],
+    permission: Optional[AssistantChatPolicy],
     global_config: Mapping[str, Any],
 ) -> Dict[str, Any]:
     profile = _json_object(permission.memory_profile if permission else None)
@@ -160,7 +161,7 @@ class AssistantConsoleService:
             with manager._config_lock:
                 model_configs = copy.deepcopy(manager.config.get("models", {}))
                 mappings = copy.deepcopy(
-                    manager.config.get("plugin_mappings", {}).get("builtin_chatbot", {})
+                    manager.config.get("plugin_mappings", {}).get("assistant", {})
                 )
         except Exception:
             return {"models": [], "mappings": {}}
@@ -173,12 +174,20 @@ class AssistantConsoleService:
             }
             for model_id, config in model_configs.items()
         ]
+        auxiliary_tasks = {
+            "judge",
+            "followup_judge",
+            "memory_generate",
+            "memory_review",
+            "memory_synthesize",
+        }
         public_mappings = {
             call_type: {
                 "primary": mapping.get("primary") or "",
                 "fallback": list(mapping.get("fallback") or []),
             }
             for call_type, mapping in mappings.items()
+            if call_type in auxiliary_tasks and isinstance(mapping, dict)
         }
         return {"models": models, "mappings": public_mappings}
 
@@ -195,7 +204,7 @@ class AssistantConsoleService:
         }
         active_names = self._active_chat_names()
         default_role_name = str(
-            get_plugin_setting("builtin_chatbot", "default_role", "default") or "default"
+            get_plugin_setting("assistant", "default_role", "default") or "default"
         )
         default_role = next((role for role in roles if role["name"] == default_role_name), None)
         global_bot_name = str(get_setting("WECHAT_BOT_NAME", "微信助手") or "微信助手")
@@ -205,16 +214,16 @@ class AssistantConsoleService:
 
         users = (
             self.db.query(WeChatUser)
-            .options(selectinload(WeChatUser.permissions))
+            .options(
+                selectinload(WeChatUser.permissions),
+                selectinload(WeChatUser.assistant_policy),
+            )
             .order_by(WeChatUser.id)
             .all()
         )
         chats = []
         for user in users:
-            permission = next(
-                (item for item in user.permissions if item.plugin_name == "builtin_chatbot"),
-                None,
-            )
+            permission = user.assistant_policy
             role_id = role_bindings.get(user.id)
             judge_id = judge_bindings.get(user.id)
             profile = _json_object(permission.memory_profile if permission else None)
@@ -227,7 +236,7 @@ class AssistantConsoleService:
                     "remark": user.remark or "",
                     "is_group": bool(user.is_group),
                     "is_listening": user.chat_name in active_names,
-                    "enabled": permission is not None,
+                    "enabled": bool(permission and permission.enabled),
                     "proactive_enabled": bool(permission.proactive_enabled) if permission else False,
                     "followup_enabled": bool(permission.followup_enabled) if permission else False,
                     "followup_window_seconds": int(permission.followup_window_seconds or 60) if permission else 60,
@@ -248,12 +257,12 @@ class AssistantConsoleService:
             )
 
         capability_service = CapabilityService(self.plugin_manager, self.db)
-        capability = capability_service.get_capability("builtin_chatbot")
+        capability = capability_service.get_capability("assistant")
         global_flags = {
             "default_role": default_role_name,
-            "allow_mention_trigger": bool(get_plugin_setting("builtin_chatbot", "allow_mention_trigger", True)),
-            "memory_enabled": bool(get_plugin_setting("builtin_chatbot", "memory_enabled", True)),
-            "search_enabled": bool(get_plugin_setting("builtin_chatbot", "search_enabled", True)),
+            "allow_mention_trigger": bool(get_plugin_setting("assistant", "allow_mention_trigger", True)),
+            "memory_enabled": bool(get_plugin_setting("assistant", "memory_enabled", True)),
+            "search_enabled": bool(get_plugin_setting("assistant", "search_enabled", True)),
             "image_enrichment_enabled": bool(
                 get_plugin_setting(
                     "builtin_chat_logger",
@@ -280,7 +289,13 @@ class AssistantConsoleService:
             "chats": chats,
         }
 
-    def update_chat(self, user_id: int, changes: Mapping[str, Any]) -> None:
+    def update_chat(
+        self,
+        user_id: int,
+        changes: Mapping[str, Any],
+        *,
+        commit: bool = True,
+    ) -> Dict[str, Any]:
         user = self.db.query(WeChatUser).filter(WeChatUser.id == user_id).first()
         if user is None:
             raise AssistantConsoleError("聊天不存在")
@@ -299,8 +314,11 @@ class AssistantConsoleService:
             user.bot_group_nickname = nickname or None
         if "bot_group_nickname_auto_enabled" in changes:
             user.bot_group_nickname_auto_enabled = bool(changes["bot_group_nickname_auto_enabled"])
-        if changes.get("enabled") is not False and not user.is_group and changes.get("proactive_enabled") is True:
-            raise AssistantConsoleError("私聊收到消息时会直接回复，不支持主动回复开关")
+        if not user.is_group and changes.get("proactive_enabled") is True:
+            if changes.get("enabled") is False:
+                changes["proactive_enabled"] = False
+            else:
+                raise AssistantConsoleError("私聊收到消息时会直接回复，不支持主动回复开关")
 
         # 主动回复只有一个用户入口：聊天级开关。开启时必须有 Judge；
         # 若界面没有显式选择，则沿用已有绑定或自动绑定默认 Judge。
@@ -341,11 +359,8 @@ class AssistantConsoleService:
             raise AssistantConsoleError("Judge 不存在")
 
         permission = (
-            self.db.query(UserPermission)
-            .filter(
-                UserPermission.user_id == user_id,
-                UserPermission.plugin_name == "builtin_chatbot",
-            )
+            self.db.query(AssistantChatPolicy)
+            .filter(AssistantChatPolicy.user_id == user_id)
             .first()
         )
         permission_fields = {
@@ -354,6 +369,7 @@ class AssistantConsoleService:
             "followup_window_seconds",
             "followup_merge_seconds",
             "followup_max_turns",
+            "codex_profile_id",
         }
         has_permission_changes = bool(
             permission_fields.intersection(changes) or "ignored_senders" in changes
@@ -361,7 +377,13 @@ class AssistantConsoleService:
         explicitly_disabled = changes.get("enabled") is False
         should_enable = bool(
             changes.get("enabled") is True
-            or ("enabled" not in changes and (permission is not None or has_permission_changes))
+            or (
+                "enabled" not in changes
+                and (
+                    bool(permission and permission.enabled)
+                    or has_permission_changes
+                )
+            )
         )
         if (
             permission is None
@@ -370,14 +392,23 @@ class AssistantConsoleService:
         ):
             raise AssistantConsoleError("请先为该聊天启用 AI 助手，再设置独立记忆模式")
         if should_enable and permission is None:
-            permission = UserPermission(user_id=user_id, plugin_name="builtin_chatbot")
+            permission = AssistantChatPolicy(user_id=user_id, enabled=True)
             self.db.add(permission)
-        if explicitly_disabled and permission is not None:
-            self.db.delete(permission)
-            permission = None
-        elif permission is not None:
+        if permission is not None:
+            if explicitly_disabled:
+                permission.enabled = False
+            elif should_enable:
+                permission.enabled = True
             for field_name in permission_fields.intersection(changes):
-                setattr(permission, field_name, changes[field_name])
+                value = changes[field_name]
+                if field_name == "codex_profile_id":
+                    value = str(value or "").strip() or None
+                    if value:
+                        from app.services.codex_profile_service import get_codex_profile_service
+
+                        if get_codex_profile_service().get_profile(value) is None:
+                            raise AssistantConsoleError("Codex Profile 不存在")
+                setattr(permission, field_name, value)
             if "ignored_senders" in changes:
                 permission.ignored_senders = (
                     json.dumps(_json_list(changes["ignored_senders"]), ensure_ascii=False)
@@ -415,6 +446,7 @@ class AssistantConsoleService:
                         {"enabled": True, "overrides": overrides},
                         ensure_ascii=False,
                     )
+            permission.version = int(permission.version or 0) + 1
 
         reload_roles = False
         if "role_id" in changes:
@@ -444,31 +476,50 @@ class AssistantConsoleService:
                     self.db.add(UserChatBotJudge(user_id=user_id, judge_id=judge_id))
             reload_judges = True
 
+        effect = {
+            "chat_name": user.chat_name,
+            "reload_roles": reload_roles,
+            "reload_judges": reload_judges,
+            "invalidate_memory": memory_mode is not None,
+        }
+        if not commit:
+            return effect
+
+        user.policy_version = int(user.policy_version or 1) + 1
         try:
             self.db.commit()
         except Exception:
             self.db.rollback()
             raise
 
+        self.apply_runtime_side_effects(effect)
+        return effect
+
+    @staticmethod
+    def apply_runtime_side_effects(effect: Mapping[str, Any]) -> None:
+        """Refresh non-authoritative runtime caches after a committed update."""
+
+        reload_roles = bool(effect.get("reload_roles"))
+        reload_judges = bool(effect.get("reload_judges"))
         if reload_roles or reload_judges:
             try:
-                from app.plugins.builtin_chatbot.main import get_chatbot_plugin
+                from app.assistant.runtime import get_assistant_handler
 
-                plugin = get_chatbot_plugin()
-                if plugin and reload_roles:
-                    plugin.reload_roles()
-                if plugin and reload_judges:
-                    plugin.reload_judges()
+                handler = get_assistant_handler()
+                if handler and reload_roles:
+                    handler.reload_roles()
+                if handler and reload_judges:
+                    handler.reload_judges()
             except Exception:
                 # The database is authoritative; a future request or plugin
-                # reload will refresh the in-memory cache.
+                # restart will refresh the in-memory cache.
                 pass
-        if memory_mode is not None:
+        if effect.get("invalidate_memory"):
             try:
-                from app.plugins.builtin_chatbot.main import get_chatbot_plugin
+                from app.assistant.runtime import get_assistant_handler
 
-                plugin = get_chatbot_plugin()
-                if plugin and hasattr(plugin, "invalidate_memory_context"):
-                    plugin.invalidate_memory_context(user.chat_name)
+                handler = get_assistant_handler()
+                if handler:
+                    handler.invalidate_memory_context(str(effect.get("chat_name") or ""))
             except Exception:
                 pass

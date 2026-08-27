@@ -10,7 +10,11 @@ const API = {
             const response = await fetch(url, options);
             if (!response.ok) {
                 const error = await response.json().catch(() => ({}));
-                throw new Error(error.detail || error.message || `HTTP ${response.status}`);
+                const detail = error.detail || error.message;
+                const message = typeof detail === 'object'
+                    ? (detail.message || JSON.stringify(detail))
+                    : detail;
+                throw new Error(message || `HTTP ${response.status}`);
             }
             return await response.json();
         } catch (error) {
@@ -163,6 +167,26 @@ const API = {
         })
     },
 
+    chatPolicies: {
+        get: userId => API.get(`/api/chats/${encodeURIComponent(userId)}/policy`),
+        update: (userId, policy) => API.request(`/api/chats/${encodeURIComponent(userId)}/policy`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(policy)
+        })
+    },
+
+    codexProfiles: {
+        list: () => API.get('/api/codex/profiles'),
+        create: payload => API.post('/api/codex/profiles', payload),
+        update: (profileId, payload) => API.request(`/api/codex/profiles/${encodeURIComponent(profileId)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        }),
+        setDefault: profileId => API.put('/api/codex/profiles/default/selection', { profile_id: profileId })
+    },
+
     memory: {
         getOverview: userId => API.get(`/api/assistant/memory/chats/${userId}/overview`),
         getEvents: (userId, params = {}) => {
@@ -260,12 +284,6 @@ const API = {
     users: {
         getAll: () => API.get('/api/permissions/users'),
         delete: (id) => API.request(`/api/permissions/users/${id}`, { method: 'DELETE' }),
-        updatePermissions: (userId, permissions) => API.put(`/api/permissions/users/${userId}/permissions`, permissions),
-        getCodexAccess: (userId) => API.get(`/api/permissions/users/${userId}/codex-access`),
-        updateCodexAccess: (userId, mode) => API.put(
-            `/api/permissions/users/${userId}/codex-access`,
-            { mode }
-        ),
         getMemory: (userId) => API.get(`/api/permissions/users/${userId}/memory`),
         getMemoryEvents: (userId, params = {}) => {
             const query = new URLSearchParams();
@@ -358,28 +376,28 @@ const API = {
 
     // Roles
     roles: {
-        getAll: () => API.get('/api/chatbot/roles/'),
-        getDetail: (id) => API.get(`/api/chatbot/roles/${id}`),
-        create: (data) => API.post('/api/chatbot/roles/', data),
-        update: (id, data) => API.request(`/api/chatbot/roles/${id}`, {
+        getAll: () => API.get('/api/assistant/roles/'),
+        getDetail: (id) => API.get(`/api/assistant/roles/${id}`),
+        create: (data) => API.post('/api/assistant/roles/', data),
+        update: (id, data) => API.request(`/api/assistant/roles/${id}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
         }),
-        delete: (id) => API.request(`/api/chatbot/roles/${id}`, { method: 'DELETE' })
+        delete: (id) => API.request(`/api/assistant/roles/${id}`, { method: 'DELETE' })
     },
 
     // Judges
     judges: {
-        getAll: () => API.get('/api/chatbot/judges/'),
-        getDetail: (id) => API.get(`/api/chatbot/judges/${id}`),
-        create: (data) => API.post('/api/chatbot/judges/', data),
-        update: (id, data) => API.request(`/api/chatbot/judges/${id}`, {
+        getAll: () => API.get('/api/assistant/judges/'),
+        getDetail: (id) => API.get(`/api/assistant/judges/${id}`),
+        create: (data) => API.post('/api/assistant/judges/', data),
+        update: (id, data) => API.request(`/api/assistant/judges/${id}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
         }),
-        delete: (id) => API.request(`/api/chatbot/judges/${id}`, { method: 'DELETE' })
+        delete: (id) => API.request(`/api/assistant/judges/${id}`, { method: 'DELETE' })
     },
 
     codexJobs: {

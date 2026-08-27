@@ -1,4 +1,4 @@
-"""Token-budgeted context helpers for builtin_chatbot.
+"""Token-budgeted context helpers for the core Assistant.
 
 This module intentionally has no memory persistence. Durable memory lives in
 ``memory_store.py`` and is selected per turn by ``memory_service.py``.

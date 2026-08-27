@@ -360,14 +360,13 @@ const LLMManager = {
         return {
             '/ai/mappings': 'llm-mappings',
             '/ai/usage': 'llm-stats',
-            '/ai/sessions': 'llm-codex-jobs',
             '/ai/calls': 'llm-history',
             '/ai/network': 'llm-proxy'
         }[path] || 'llm-models';
     },
 
     async activateSubTab(targetId, options = {}) {
-        const panes = ['llm-history', 'llm-models', 'llm-mappings', 'llm-stats', 'llm-codex-jobs', 'llm-proxy'];
+        const panes = ['llm-history', 'llm-models', 'llm-mappings', 'llm-stats', 'llm-proxy'];
         if (!panes.includes(targetId)) targetId = 'llm-models';
         panes.forEach(id => {
             const pane = document.getElementById(id);
@@ -390,7 +389,6 @@ const LLMManager = {
                 'llm-models': '/ai/models',
                 'llm-mappings': '/ai/mappings',
                 'llm-stats': '/ai/usage',
-                'llm-codex-jobs': '/ai/sessions',
                 'llm-history': '/ai/calls',
                 'llm-proxy': '/ai/network'
             };
@@ -413,7 +411,6 @@ const LLMManager = {
             return this.loadMappings();
         }
         if (targetId === 'llm-stats') return this.loadStats();
-        if (targetId === 'llm-codex-jobs') return this.loadCodexJobs();
         if (targetId === 'llm-proxy') return this.loadProxy();
         return this.loadCallHistory();
     },
@@ -788,6 +785,7 @@ const LLMManager = {
         document.getElementById('modelProviderOverrideGroup')?.classList.toggle('d-none', !['compatible', 'other'].includes(presetKey));
         const isCodex = presetKey === 'local_codex';
         document.getElementById('modelCodexReasoningGroup')?.classList.toggle('d-none', !isCodex);
+        document.getElementById('modelCodexProfileGroup')?.classList.toggle('d-none', !isCodex);
         document.getElementById('modelCodexIsolatedGroup')?.classList.toggle('d-none', !isCodex);
         document.getElementById('modelCredentialSection')?.classList.toggle('d-none', isCodex);
         document.getElementById('modelApiBaseRequired')?.classList.toggle('d-none', !preset.apiBaseRequired);
@@ -820,6 +818,7 @@ const LLMManager = {
             document.getElementById('modelWebSearch').checked = false;
             document.getElementById('modelExtraBody').value = '';
         }
+        if (isCodex) await this.loadCodexProfileOptions();
         this.updateCredentialFields();
         if (presetKey === 'other') {
             if (!this.catalogProviders.length) await this.loadModelCatalogProviders();
@@ -870,6 +869,25 @@ const LLMManager = {
             if (requestId !== this.catalogRequestId) return;
             console.warn(`Catalog unavailable for ${providerKey}:`, error);
             this.setCatalogState([], '目录暂时不可用，仍可手动输入模型名称。');
+        }
+    },
+
+    async loadCodexProfileOptions(selectedProfile = null) {
+        const select = document.getElementById('modelCodexProfile');
+        if (!select) return;
+        const selected = selectedProfile === null ? select.value : selectedProfile;
+        select.disabled = true;
+        try {
+            const data = await API.codexProfiles.list();
+            select.innerHTML = '<option value="">Codex 当前配置</option>' + (data.profiles || [])
+                .filter(profile => profile.available)
+                .map(profile => `<option value="${this.escapeHtml(profile.name)}">${this.escapeHtml(profile.name)} · ${this.escapeHtml(profile.model)}</option>`)
+                .join('');
+            select.value = Array.from(select.options).some(option => option.value === selected) ? selected : '';
+        } catch (error) {
+            select.innerHTML = '<option value="">无法加载 Profile，使用当前配置</option>';
+        } finally {
+            select.disabled = false;
         }
     },
 
@@ -2141,6 +2159,9 @@ const LLMManager = {
         document.getElementById('modelVision').checked = Boolean(config.supports_vision || config.vision || config.image_input);
         document.getElementById('modelWebSearch').checked = Boolean(config.enable_web_search || config.codex_web_search);
         document.getElementById('modelCodexReasoning').value = config.codex_reasoning_effort || 'medium';
+        if (presetKey === 'local_codex') {
+            await this.loadCodexProfileOptions(config.codex_profile_id || '');
+        }
         document.getElementById('modelCodexIsolated').checked = config.codex_isolated_workdir !== false;
         document.getElementById('modelExtraBody').value = config.extra_body ? JSON.stringify(config.extra_body, null, 2) : '';
         document.getElementById('modelApiKeyEnv').value = meta.credential?.environment_variable || this.getActiveProviderPreset().envVar || '';
@@ -2310,6 +2331,9 @@ const LLMManager = {
             payload.enable_web_search = false;
             payload.codex_web_search = webSearch;
             payload.codex_reasoning_effort = document.getElementById('modelCodexReasoning').value;
+            const codexProfileId = document.getElementById('modelCodexProfile').value;
+            if (codexProfileId) payload.codex_profile_id = codexProfileId;
+            else if (isEdit && this.currentModels[targetModelId]?.codex_profile_id) payload.clear_fields.push('codex_profile_id');
             payload.codex_isolated_workdir = document.getElementById('modelCodexIsolated').checked;
         } else {
             payload.enable_web_search = webSearch;
@@ -3151,11 +3175,11 @@ const LLMManager = {
 
     scheduleCodexJobsPoll(activeCount = 0, operationRunning = false) {
         clearTimeout(this.codexJobsPollTimer);
-        const pane = document.getElementById('llm-codex-jobs');
-        if (!pane?.classList.contains('active')) return;
+        const pane = document.getElementById('codex');
+        if (!pane || pane.classList.contains('d-none')) return;
         const delay = operationRunning ? 1000 : activeCount > 0 ? 2000 : 10000;
         this.codexJobsPollTimer = setTimeout(
-            () => this.loadCodexJobs({ quiet: true }),
+            () => CodexCenter.load({ quiet: true }),
             delay,
         );
     },

@@ -639,6 +639,7 @@ class CodexAgentRuntime:
         retry: bool = False,
         max_turns: int = 0,
         allow_exec_fallback: Optional[bool] = None,
+        persistent_session: bool = True,
     ) -> Dict[str, Any]:
         profile = self._profile("chat")
         request = self._prepare_payload(payload, profile)
@@ -649,7 +650,7 @@ class CodexAgentRuntime:
         # Restricted chats deliberately use a fresh exec process. Unlike the
         # shared App Server, exec can ignore user config and execpolicy rules,
         # so a broad local allow rule cannot pierce the per-chat boundary.
-        if not access.persistent_thread:
+        if not persistent_session or not access.persistent_thread:
             return self._exec(request)
 
         pool = self._pool(profile.pool)

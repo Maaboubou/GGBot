@@ -1,4 +1,4 @@
-"""Bounded background scheduling for conversational-memory pipelines."""
+"""Bounded background scheduling for Assistant memory pipelines."""
 
 from __future__ import annotations
 

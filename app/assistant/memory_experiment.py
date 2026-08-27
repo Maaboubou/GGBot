@@ -1,4 +1,4 @@
-"""Prepare isolated, reproducible historical-memory experiments.
+"""Prepare isolated, reproducible Assistant memory experiments.
 
 Preparation is deliberately local-only: it normalizes a structured chat
 export, creates an empty MemoryStore-compatible database, snapshots the
@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Sequence
 
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
+from app.assistant.memory_store import MemoryStore
 
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -164,13 +164,13 @@ def _copy_chat_rows(
 
 def _pipeline_hashes(project_root: Path) -> Dict[str, str]:
     relative_paths = (
-        "app/plugins/builtin_chatbot/memory_experiment.py",
-        "app/plugins/builtin_chatbot/memory_experiment_runner.py",
-        "app/plugins/builtin_chatbot/memory_service.py",
-        "app/plugins/builtin_chatbot/memory_store.py",
-        "app/plugins/builtin_chatbot/embedding_service.py",
+        "app/assistant/memory_experiment.py",
+        "app/assistant/memory_experiment_runner.py",
+        "app/assistant/memory_service.py",
+        "app/assistant/memory_store.py",
+        "app/assistant/embedding_service.py",
         "app/services/llm_manager.py",
-        "app/plugins/builtin_chatbot/config.json",
+        "app/assistant/config.json",
         "data/llm_mappings.json",
     )
     result = {}

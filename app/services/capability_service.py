@@ -19,6 +19,7 @@ import re
 import copy
 from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional
 
 from sqlalchemy.orm import Session
@@ -51,6 +52,11 @@ CATEGORY_META = {
     "tool": {"label": "实用工具", "icon": "bi-tools", "order": 70},
     "utility": {"label": "实用工具", "icon": "bi-lightning-charge", "order": 70},
 }
+
+CORE_ASSISTANT_ID = "assistant"
+CORE_ASSISTANT_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1] / "assistant" / "config.json"
+)
 
 
 def normalize_llm_task_descriptors(config: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -105,7 +111,7 @@ GROUP_META = OrderedDict(
 )
 
 
-CHATBOT_GROUP_FIELDS = {
+ASSISTANT_GROUP_FIELDS = {
     "reply": {"default_role", "allow_mention_trigger"},
     "context": {
         "context_limit",
@@ -142,7 +148,7 @@ CHATBOT_GROUP_FIELDS = {
     },
 }
 
-CHATBOT_BASIC_FIELDS = {
+ASSISTANT_BASIC_FIELDS = {
     "default_role",
     "allow_mention_trigger",
     "codex_persistent_session_enabled",
@@ -392,10 +398,10 @@ def _infer_group(plugin_id: str, key: str, field: Mapping[str, Any]) -> str:
     if declared:
         return str(declared)
 
-    if plugin_id == "builtin_chatbot":
+    if plugin_id == CORE_ASSISTANT_ID:
         if key.startswith("memory_"):
             return "memory"
-        for group_id, keys in CHATBOT_GROUP_FIELDS.items():
+        for group_id, keys in ASSISTANT_GROUP_FIELDS.items():
             if key in keys:
                 return group_id
     elif plugin_id == "summary_plus":
@@ -432,8 +438,8 @@ def _infer_level(
     declared = field.get("level") or field.get("x-level")
     if declared in {"basic", "advanced", "developer"}:
         return str(declared)
-    if plugin_id == "builtin_chatbot":
-        return "basic" if key in CHATBOT_BASIC_FIELDS else "advanced"
+    if plugin_id == CORE_ASSISTANT_ID:
+        return "basic" if key in ASSISTANT_BASIC_FIELDS else "advanced"
     if group_id == "developer":
         return "developer"
     if group_id in {"advanced", "browser", "network"}:
@@ -540,6 +546,27 @@ class CapabilityService:
         self.plugin_manager = plugin_manager
         self.db = db
 
+    def _component(self, component_id: str) -> Optional[Any]:
+        plugin = self.plugin_manager.get_plugin_info(component_id)
+        if plugin is not None or component_id != CORE_ASSISTANT_ID:
+            return plugin
+        try:
+            config = json.loads(CORE_ASSISTANT_CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError):
+            return None
+        return SimpleNamespace(
+            name=CORE_ASSISTANT_ID,
+            version=str(config.get("version") or ""),
+            description=str(config.get("description") or ""),
+            author=str(config.get("author") or "System"),
+            path=str(CORE_ASSISTANT_CONFIG_PATH.parent),
+            enabled=True,
+            loaded=False,
+            listener_ids=[],
+            config=config,
+            kind="core",
+        )
+
     def _assignment_counts(self) -> Dict[str, Dict[str, int]]:
         if self.db is None:
             return {}
@@ -563,6 +590,17 @@ class CapabilityService:
         assignments = counts.get(plugin_id, {"chats": 0, "push_chats": 0})
         enabled = bool(plugin.enabled)
         loaded = bool(plugin.loaded)
+        listener_count = len(plugin.listener_ids or [])
+        if getattr(plugin, "kind", "plugin") == "core":
+            try:
+                from app.assistant.runtime import get_assistant_runtime
+
+                core_status = get_assistant_runtime().status()
+                enabled = True
+                loaded = bool(core_status.get("ready"))
+                listener_count = int(core_status.get("listener_count") or 0)
+            except Exception:
+                loaded = False
         if enabled and loaded:
             status = "running"
         elif not enabled:
@@ -583,12 +621,12 @@ class CapabilityService:
             "category_order": category_meta["order"],
             "icon": str(raw_ui.get("icon") or category_meta["icon"]),
             "llm_tasks": normalize_llm_task_descriptors(config),
-            "featured": plugin_id == "builtin_chatbot",
+            "featured": False,
             "system": plugin_id.startswith("builtin_"),
             "enabled": enabled,
             "loaded": loaded,
             "status": status,
-            "listener_count": len(plugin.listener_ids or []),
+            "listener_count": listener_count,
             "settings_count": len(schema),
             "configurable": bool(schema),
             "features": list(config.get("features") or []),
@@ -601,6 +639,7 @@ class CapabilityService:
         items = [
             self._capability_item(plugin_id, plugin, counts)
             for plugin_id, plugin in self.plugin_manager.plugins.items()
+            if getattr(plugin, "kind", "plugin") == "plugin"
         ]
         return sorted(
             items,
@@ -612,20 +651,20 @@ class CapabilityService:
         )
 
     def get_capability(self, plugin_id: str) -> Optional[Dict[str, Any]]:
-        plugin = self.plugin_manager.get_plugin_info(plugin_id)
+        plugin = self._component(plugin_id)
         if plugin is None:
             return None
         return self._capability_item(plugin_id, plugin, self._assignment_counts())
 
     def get_settings(self, plugin_id: str) -> Optional[Dict[str, Any]]:
-        plugin = self.plugin_manager.get_plugin_info(plugin_id)
+        plugin = self._component(plugin_id)
         if plugin is None:
             return None
         groups = normalize_settings_descriptor(plugin_id, plugin.config or {})
         # Relational choices belong to the console contract rather than static
         # plugin manifests. Expose them as safe select options so users do not
         # have to type internal role identifiers by hand.
-        if self.db is not None and plugin_id == "builtin_chatbot":
+        if self.db is not None and plugin_id == CORE_ASSISTANT_ID:
             role_options = [
                 {"value": role.name, "label": role.display_name}
                 for role in self.db.query(ChatBotRole).order_by(ChatBotRole.id).all()
@@ -658,7 +697,7 @@ class CapabilityService:
     def update_settings(self, plugin_id: str, values: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """Validate and atomically apply a partial global settings patch."""
 
-        plugin = self.plugin_manager.get_plugin_info(plugin_id)
+        plugin = self._component(plugin_id)
         if plugin is None:
             return None
 
@@ -677,10 +716,18 @@ class CapabilityService:
         else:
             config.update(validated)
 
+        is_core_component = getattr(plugin, "kind", "plugin") == "core"
         should_reload = bool(plugin.loaded and plugin.enabled)
         _atomic_write_json(config_path, config)
         try:
-            if should_reload:
+            if is_core_component:
+                plugin.config = config
+                from app.assistant.runtime import get_assistant_runtime
+
+                runtime = get_assistant_runtime()
+                if runtime.handler is not None and not runtime.restart():
+                    raise RuntimeError("核心助手重新加载失败")
+            elif should_reload:
                 if not self.plugin_manager.reload_plugin(plugin_id):
                     raise RuntimeError("插件重新加载失败")
             else:
@@ -689,8 +736,19 @@ class CapabilityService:
             rollback_payload = json.loads(original_bytes.decode("utf-8-sig"))
             _atomic_write_json(config_path, rollback_payload)
             # reload_plugin may remove the registry entry before failing.
-            restored = self.plugin_manager.get_plugin_info(plugin_id)
-            if should_reload:
+            restored = self._component(plugin_id)
+            if is_core_component:
+                if restored is not None:
+                    restored.config = rollback_payload
+                try:
+                    from app.assistant.runtime import get_assistant_runtime
+
+                    runtime = get_assistant_runtime()
+                    if runtime.handler is not None:
+                        runtime.restart()
+                except Exception:
+                    pass
+            elif should_reload:
                 if restored is None:
                     self.plugin_manager.load_plugin(plugin_id)
                 else:

@@ -76,7 +76,6 @@ class BackupService:
     }
     DIAGNOSTIC_NAMES = {
         "llm_call_history.jsonl",
-        "llm_chat_cache_diagnostics.jsonl",
     }
     MACHINE_BOUND_DATA_DIRECTORIES = {
         "chrome_profile",

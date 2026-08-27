@@ -1,11 +1,9 @@
-"""
-Judge 管理器 - 处理聊天机器人的主动回复 Judge 配置
-"""
+"""Assistant 主动回复 Judge 配置管理器。"""
 
 import logging
 from typing import Dict, Any, Optional
 
-from app.plugins.builtin_chatbot.prompt_renderer import render_judge_prompt
+from app.assistant.prompt_renderer import render_judge_prompt
 
 logger = logging.getLogger(__name__)
 

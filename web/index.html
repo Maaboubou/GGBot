@@ -40,7 +40,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
 
     <!-- App CSS -->
-    <link href="/static/assets/css/style.css?v=3.6.10" rel="stylesheet">
+    <link href="/static/assets/css/style.css?v=3.6.11" rel="stylesheet">
     <link href="/static/assets/css/dashboard.css?v=3.5.3" rel="stylesheet">
 </head>
 
@@ -70,6 +70,12 @@
                     </a>
                 </li>
                 <li class="nav-item">
+                    <a href="/codex" class="nav-link" data-tab="codex">
+                        <i class="bi bi-terminal"></i>
+                        <span>Codex</span>
+                    </a>
+                </li>
+                <li class="nav-item">
                     <a href="/chats" class="nav-link" data-tab="users">
                         <i class="bi bi-chat-square-text"></i>
                         <span>聊天</span>
@@ -90,7 +96,7 @@
                 <li class="nav-item">
                     <a href="/ai" class="nav-link" data-tab="llm">
                         <i class="bi bi-cpu"></i>
-                        <span>模型与调用</span>
+                        <span>辅助模型</span>
                     </a>
                 </li>
 
@@ -222,6 +228,71 @@
                 </div>
             </div>
 
+            <!-- Tab: Codex Control Center -->
+            <div id="codex" class="tab-content d-none workspace-page">
+                <div class="codex-home-shell">
+                    <section class="codex-home-hero">
+                        <div>
+                            <span class="codex-home-eyebrow"><i class="bi bi-stars"></i> Assistant engine</span>
+                            <h2>Codex 运行中心</h2>
+                            <p>配置 Assistant 的唯一回复引擎，管理隔离 Profile、会话与正在执行的任务。</p>
+                        </div>
+                        <div class="codex-home-hero-actions">
+                            <button class="btn btn-light" onclick="CodexCenter.openProfileModal()"><i class="bi bi-plus-lg me-1"></i>新建 Profile</button>
+                            <button class="btn btn-outline-light" onclick="CodexCenter.load()"><i class="bi bi-arrow-clockwise"></i></button>
+                        </div>
+                    </section>
+
+                    <section id="codexReadiness" class="codex-readiness" aria-live="polite">
+                        <div class="loading-wrapper small">正在检查首次运行条件…</div>
+                    </section>
+
+                    <section class="codex-profile-section modern-card">
+                        <div class="codex-home-section-head">
+                            <div><h5>Codex Profiles</h5><p>每次请求显式选择 Profile；不同账号和自定义接口不会切换全局运行态。</p></div>
+                            <button class="btn btn-sm btn-primary" onclick="CodexCenter.openProfileModal()"><i class="bi bi-plus-lg me-1"></i>新建</button>
+                        </div>
+                        <div id="codexProfilesGrid" class="codex-profile-grid">
+                            <div class="loading-wrapper small">正在读取 Profile…</div>
+                        </div>
+                    </section>
+
+                    <section class="modern-card codex-runtime-section">
+                        <div class="codex-home-section-head">
+                            <div><h5>运行、会话与任务</h5><p>查看 Codex 进程、上下文、额度与任务历史。</p></div>
+                        </div>
+                        <div id="codexJobsList">
+                            <div class="loading-wrapper small">正在读取 Codex 运行状态…</div>
+                        </div>
+                    </section>
+                </div>
+
+                <div class="modal fade" id="codexProfileModal" tabindex="-1" aria-hidden="true">
+                    <div class="modal-dialog modal-lg modal-dialog-centered">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <div><h5 class="modal-title">新建 Codex Profile</h5><p class="modal-subtitle mb-0">为兼容 OpenAI Responses API 的模型创建独立 Codex 环境。</p></div>
+                                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                            </div>
+                            <div class="modal-body">
+                                <form id="codexProfileForm" class="row g-3" autocomplete="off">
+                                    <div class="col-md-5"><label class="form-label">Profile 名称</label><input class="form-control" name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}" placeholder="例如 deepseek-main" required></div>
+                                    <div class="col-md-7"><label class="form-label">模型 ID</label><input class="form-control" name="model" maxlength="128" placeholder="例如 deepseek-chat" required></div>
+                                    <div class="col-md-5"><label class="form-label">供应商名称</label><input class="form-control" name="provider_name" maxlength="100" value="OpenAI Responses compatible"></div>
+                                    <div class="col-md-7"><label class="form-label">Responses API Base URL</label><input class="form-control" name="base_url" type="url" placeholder="https://api.example.com/v1" required></div>
+                                    <div class="col-12"><label class="form-label">API Key</label><input class="form-control" name="api_key" type="password" maxlength="4096" autocomplete="new-password" required><div class="form-text">密钥通过标准输入交给 WSL，并存入权限为 0600 的独立文件；不会写入 Profile 清单或返回网页。</div></div>
+                                    <div class="col-md-4"><label class="form-label">推理强度</label><select class="form-select" name="reasoning_effort"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option></select></div>
+                                    <div class="col-md-4"><label class="form-label">输出详细度</label><select class="form-select" name="model_verbosity"><option selected>inherit</option><option>low</option><option>medium</option><option>high</option></select></div>
+                                    <div class="col-md-4"><label class="form-label">上下文窗口</label><input class="form-control" name="context_window" type="number" min="4096" max="10000000" value="128000"></div>
+                                    <div class="col-12"><label class="form-check form-switch"><input class="form-check-input" type="checkbox" name="make_default" checked><span class="form-check-label">设为 Assistant 默认 Profile</span></label></div>
+                                </form>
+                            </div>
+                            <div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="saveCodexProfileButton" onclick="CodexCenter.createProfile()">创建 Profile</button></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Tab: Plugins -->
             <div id="plugins" class="tab-content d-none workspace-page">
                 <div id="pluginsList">
@@ -312,11 +383,15 @@
                                         </div>
                                     </div>
                                 </div>
+                                <label class="form-check form-switch rounded border p-3 ps-5 mb-0">
+                                    <input class="form-check-input" type="checkbox" name="assistant_enabled" checked>
+                                    <span class="form-check-label"><strong>同时启用 AI 助手</strong><br><small class="text-muted">使用 Codex 默认 Profile 回复；插件权限稍后可独立调整。</small></span>
+                                </label>
                             </form>
                         </div>
                         <div class="modal-footer">
                             <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-                            <button type="button" class="btn btn-primary" onclick="App.submitAddUser()">添加并监听</button>
+                            <button type="button" class="btn btn-primary" onclick="App.submitAddUser()">添加并完成配置</button>
                         </div>
                     </div>
                 </div>
@@ -444,9 +519,9 @@
                         </div>
                         <select class="form-select form-select-sm assistant-filter-select" id="assistantChatsFilter">
                             <option value="all">全部聊天</option>
-                            <option value="enabled">已启用 Chatbot</option>
+                            <option value="enabled">已启用 AI 助手</option>
                             <option value="proactive">已启用主动回复</option>
-                            <option value="disabled">未启用 Chatbot</option>
+                            <option value="disabled">未启用 AI 助手</option>
                         </select>
                     </div>
                     <div id="assistantChatsGrid" class="assistant-chat-grid"></div>
@@ -500,13 +575,6 @@
                         <button class="nav-link" id="llm-stats-tab" data-bs-toggle="pill" data-bs-target="#llm-stats"
                             type="button">
                             <i class="bi bi-graph-up me-1"></i> 用量
-                        </button>
-                    </li>
-
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="llm-codex-jobs-tab" data-bs-toggle="pill"
-                            data-bs-target="#llm-codex-jobs" type="button">
-                            <i class="bi bi-chat-square-dots me-1"></i> Codex 会话
                         </button>
                     </li>
 
@@ -619,23 +687,6 @@
                             </button>
                         </div>
                         <div id="llmStatsList">
-                            <div class="col-12 text-center py-5">
-                                <div class="spinner-border text-primary" role="status"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Codex Sessions Section -->
-                    <div class="tab-pane fade d-none workspace-section" id="llm-codex-jobs">
-                        <div class="d-flex justify-content-between align-items-center mb-2">
-                            <div>
-                                <h5 class="fw-bold text-secondary mb-0"><i class="bi bi-chat-square-dots me-2"></i>Codex 运行中心</h5>
-                            </div>
-                            <button class="btn btn-outline-secondary btn-sm" onclick="LLMManager.loadCodexJobs()" title="刷新" aria-label="刷新">
-                                <i class="bi bi-arrow-clockwise"></i>
-                            </button>
-                        </div>
-                        <div id="codexJobsList">
                             <div class="col-12 text-center py-5">
                                 <div class="spinner-border text-primary" role="status"></div>
                             </div>
@@ -1244,6 +1295,13 @@
                                                     <option value="xhigh">极高</option>
                                                 </select>
                                             </div>
+                                            <div class="col-sm-6 col-lg-4 d-none" id="modelCodexProfileGroup">
+                                                <label class="form-label" for="modelCodexProfile">Codex Profile</label>
+                                                <select class="form-select" id="modelCodexProfile">
+                                                    <option value="">Codex 当前配置</option>
+                                                </select>
+                                                <div class="form-text">辅助任务也可绑定隔离 Profile，不会切换全局 Codex。</div>
+                                            </div>
                                         </div>
                                         <div class="model-capability-options">
                                             <label class="form-check">
@@ -1386,12 +1444,13 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
     <!-- App Scripts -->
-    <script src="/static/assets/js/api.js?v=3.5.6"></script>
-    <script src="/static/assets/js/ui.js?v=3.4.3"></script>
+    <script src="/static/assets/js/api.js?v=3.5.7"></script>
+    <script src="/static/assets/js/ui.js?v=3.4.4"></script>
     <script src="/static/assets/js/system_operations.js?v=1.3.0"></script>
-    <script src="/static/assets/js/llm_manager.js?v=3.3.1"></script>
-    <script src="/static/assets/js/main.js?v=3.6.3"></script>
-    <script src="/static/assets/js/memory_console.js?v=1.0.1"></script>
+    <script src="/static/assets/js/llm_manager.js?v=3.4.1"></script>
+    <script src="/static/assets/js/codex_center.js?v=1.0.1"></script>
+    <script src="/static/assets/js/main.js?v=3.6.4"></script>
+    <script src="/static/assets/js/memory_console.js?v=1.0.2"></script>
 
     <!-- ==================== Judge History Modal ==================== -->
     <div class="modal fade" id="judgeHistoryModal" tabindex="-1" aria-labelledby="judgeHistoryModalLabel"

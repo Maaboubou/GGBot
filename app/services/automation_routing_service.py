@@ -111,7 +111,7 @@ class AutomationRoutingService:
             return {"eligible": False, "reason": "未分配到该聊天", "condition": "未分配"}
         plugin_base = _plugin_base(listener["plugin_name"])
         if (
-            plugin_base != "builtin_chatbot"
+            plugin_base not in {"assistant", "builtin_chatbot"}
             and bool(chat.is_group)
             and bool(permission.require_mention)
             and not bool(context.get("mentioned"))
@@ -175,7 +175,11 @@ class AutomationRoutingService:
         event_type: EventType,
         context: Mapping[str, Any],
     ) -> List[Dict[str, Any]]:
-        listeners = self.event_bus.get_listeners(event_type).get(event_type.value, [])
+        listeners = [
+            listener
+            for listener in self.event_bus.get_listeners(event_type).get(event_type.value, [])
+            if listener.get("owner_kind", "plugin") == "plugin"
+        ]
         items: List[Dict[str, Any]] = []
         eligible_rank = 0
         for absolute_rank, listener in enumerate(listeners, start=1):
@@ -282,7 +286,11 @@ class AutomationRoutingService:
             raise AutomationRoutingError("未知的消息事件类型") from exc
         if event_type not in MESSAGE_EVENT_META:
             raise AutomationRoutingError("该事件不允许在消息路由中排序")
-        listeners = self.event_bus.get_listeners(event_type).get(event_type.value, [])
+        listeners = [
+            listener
+            for listener in self.event_bus.get_listeners(event_type).get(event_type.value, [])
+            if listener.get("owner_kind", "plugin") == "plugin"
+        ]
         if not listeners:
             raise AutomationRoutingError("该事件当前没有可排序的监听器")
         listener_keys = [str(listener.get("listener_key") or "") for listener in listeners]
@@ -316,7 +324,11 @@ class AutomationRoutingService:
             if previous_order:
                 self.plugin_manager.routing_order.replace_event(event_type.value, previous_order)
             raise
-        ordered = self.event_bus.get_listeners(event_type).get(event_type.value, [])
+        ordered = [
+            listener
+            for listener in self.event_bus.get_listeners(event_type).get(event_type.value, [])
+            if listener.get("owner_kind", "plugin") == "plugin"
+        ]
         return {
             "message": "执行顺序已保存并立即生效",
             "event_type": event_type.value,

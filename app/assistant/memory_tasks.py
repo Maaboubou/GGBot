@@ -1,4 +1,4 @@
-"""Single registry for conversational-memory model routes and task contracts.
+"""Single registry for Assistant memory model routes and task contracts.
 
 Users choose a small number of route profiles.  Internal operations keep their
 own identifiers for prompts, schemas, telemetry, timeouts, and output limits.

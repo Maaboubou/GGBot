@@ -9,10 +9,11 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.user_permission import UserPermission, WeChatUser
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
-from app.plugins.builtin_chatbot.memory_config import upgrade_memory_config_keys
-from app.plugins.builtin_chatbot.person_memory import PersonMemoryStore
+from app.models.assistant_policy import AssistantChatPolicy
+from app.models.user_permission import WeChatUser
+from app.assistant.memory_store import MemoryStore
+from app.assistant.memory_config import upgrade_memory_config_keys
+from app.assistant.person_memory import PersonMemoryStore
 from app.utils.plugin_config import get_plugin_config
 
 
@@ -53,12 +54,11 @@ class MemoryConsoleService:
             raise MemoryConsoleError("聊天不存在")
         return user
 
-    def _permission(self, user_id: int) -> Optional[UserPermission]:
+    def _permission(self, user_id: int) -> Optional[AssistantChatPolicy]:
         return (
-            self.db.query(UserPermission)
+            self.db.query(AssistantChatPolicy)
             .filter(
-                UserPermission.user_id == int(user_id),
-                UserPermission.plugin_name == "builtin_chatbot",
+                AssistantChatPolicy.user_id == int(user_id),
             )
             .first()
         )
@@ -67,19 +67,19 @@ class MemoryConsoleService:
     def _invalidate_live_memory(chat_name: str) -> None:
         """Make explicit administration changes visible on the next reply."""
         try:
-            from app.plugins.builtin_chatbot.main import get_chatbot_plugin
+            from app.assistant.runtime import get_assistant_handler
 
-            plugin = get_chatbot_plugin()
-            if plugin and hasattr(plugin, "invalidate_memory_context"):
-                plugin.invalidate_memory_context(chat_name)
+            handler = get_assistant_handler()
+            if handler:
+                handler.invalidate_memory_context(chat_name)
         except Exception:
-            # The database remains authoritative. A stopped plugin will load
+            # The database remains authoritative. A stopped Assistant will load
             # the new value when it starts.
             pass
 
     @staticmethod
     def global_memory_config() -> Dict[str, Any]:
-        plugin_config = get_plugin_config("builtin_chatbot")
+        plugin_config = get_plugin_config("assistant")
         schema = plugin_config.get("config_schema") or {}
         current = plugin_config.get("config") or {}
         values: Dict[str, Any] = {}
@@ -92,7 +92,7 @@ class MemoryConsoleService:
     @staticmethod
     def validate_memory_overrides(overrides: Dict[str, Any]) -> Dict[str, Any]:
         overrides = upgrade_memory_config_keys(overrides)
-        plugin_config = get_plugin_config("builtin_chatbot")
+        plugin_config = get_plugin_config("assistant")
         schema = plugin_config.get("config_schema") or {}
         result: Dict[str, Any] = {}
         for key, value in overrides.items():
@@ -165,9 +165,9 @@ class MemoryConsoleService:
 
     def overview(self, user_id: int) -> Dict[str, Any]:
         user = self._user(user_id)
-        from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-        from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-        from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+        from app.assistant.chat_log import ChatLogManager
+        from app.assistant.context_manager import ChatContextManager
+        from app.assistant.memory_service import ChatMemoryService
 
         memory_service = ChatMemoryService(ChatLogManager(), ChatContextManager())
         try:
@@ -185,10 +185,10 @@ class MemoryConsoleService:
             "last_error": "",
         }
         try:
-            from app.plugins.builtin_chatbot.main import get_chatbot_plugin
+            from app.assistant.runtime import get_assistant_handler
 
-            plugin = get_chatbot_plugin()
-            service = getattr(plugin, "memory_service", None) if plugin else None
+            handler = get_assistant_handler()
+            service = getattr(handler, "memory_service", None) if handler else None
             embedder = getattr(service, "embedding_service", None)
             if embedder is not None:
                 embedding = {
@@ -253,7 +253,7 @@ class MemoryConsoleService:
         event.pop("embedding", None)
         event.pop("search_text", None)
         event["has_embedding"] = int(event.get("embedding_dim") or 0) > 0
-        from app.plugins.builtin_chatbot.memory_source import read_event_source
+        from app.assistant.memory_source import read_event_source
 
         return {
             "event": event,
@@ -300,9 +300,9 @@ class MemoryConsoleService:
         reason: str,
     ) -> Dict[str, Any]:
         user = self._user(user_id)
-        from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-        from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-        from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+        from app.assistant.chat_log import ChatLogManager
+        from app.assistant.context_manager import ChatContextManager
+        from app.assistant.memory_service import ChatMemoryService
 
         service = ChatMemoryService(ChatLogManager(), ChatContextManager())
         try:
@@ -324,9 +324,9 @@ class MemoryConsoleService:
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
         user = self._user(user_id)
-        from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-        from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-        from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+        from app.assistant.chat_log import ChatLogManager
+        from app.assistant.context_manager import ChatContextManager
+        from app.assistant.memory_service import ChatMemoryService
 
         service = ChatMemoryService(ChatLogManager(), ChatContextManager())
         try:
@@ -350,9 +350,9 @@ class MemoryConsoleService:
 
     def delete_event(self, user_id: int, event_id: int, *, reason: str) -> Dict[str, Any]:
         user = self._user(user_id)
-        from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-        from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-        from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+        from app.assistant.chat_log import ChatLogManager
+        from app.assistant.context_manager import ChatContextManager
+        from app.assistant.memory_service import ChatMemoryService
 
         service = ChatMemoryService(ChatLogManager(), ChatContextManager())
         try:
@@ -511,9 +511,9 @@ class MemoryConsoleService:
             self._invalidate_live_memory(user.chat_name)
             return result
         if category == "event":
-            from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-            from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-            from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+            from app.assistant.chat_log import ChatLogManager
+            from app.assistant.context_manager import ChatContextManager
+            from app.assistant.memory_service import ChatMemoryService
 
             service = ChatMemoryService(ChatLogManager(), ChatContextManager())
             try:
@@ -745,9 +745,9 @@ class MemoryConsoleService:
         if scope not in {"stage", "events", "people", "all"}:
             raise MemoryConsoleError("不支持的清理范围")
         preview = self.clear_preview(user_id).get(scope) or {}
-        from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-        from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-        from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+        from app.assistant.chat_log import ChatLogManager
+        from app.assistant.context_manager import ChatContextManager
+        from app.assistant.memory_service import ChatMemoryService
 
         service = ChatMemoryService(ChatLogManager(), ChatContextManager())
         try:

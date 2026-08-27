@@ -632,11 +632,11 @@ def get_dashboard_stats():
         error_count = 0
         llm_response_times = []
         
-        e2e_latency_stats = session_stats.get('builtin_chatbot.reply_latency')
+        e2e_latency_stats = session_stats.get('assistant.reply_latency')
         
         for key, data in session_stats.items():
             # Skip the virtual latency metric for call counts and tokens
-            if key == 'builtin_chatbot.reply_latency':
+            if key == 'assistant.reply_latency':
                 continue
                 
             token_usage += data.get('total_tokens', 0)
@@ -819,7 +819,7 @@ async def get_latest_judge():
             recent_lines = lines[-2000:] if len(lines) > 2000 else lines
         
         # 查找最新的 judge 输出
-        # 日志格式: 2026-01-29 10:32:50,163 [INFO] app.plugins.builtin_chatbot.main: ⚖️ Judge decided to STAY SILENT: reason
+        # 日志格式: 2026-01-29 10:32:50,163 [INFO] app.assistant.handler: ⚖️ Judge decided to STAY SILENT: reason
         # 或: ⚖️ Judge decided to REPLY: reason
         judge_pattern = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*Judge decided to (STAY SILENT|REPLY): (.+)')
         

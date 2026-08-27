@@ -1,4 +1,4 @@
-"""Resolve raw messages referenced by memory events."""
+"""Resolve raw chat messages referenced by Assistant memory events."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
+from app.assistant.chat_log import ChatLogManager
+from app.assistant.memory_store import MemoryStore
 
 
 LIVE_CHAT_LOG_NAMESPACE = "live_chat_log"

@@ -71,19 +71,19 @@ def _judge_to_dict(judge: ChatBotJudge, db: Session) -> Dict[str, Any]:
     }
 
 
-def _reload_chatbot_judges_safely() -> None:
+def _reload_assistant_judges_safely() -> None:
     """重载运行中的 Judge 缓存。"""
     try:
-        from app.plugins.builtin_chatbot.main import get_chatbot_plugin
+        from app.assistant.runtime import get_assistant_handler
         import logging
 
         logger = logging.getLogger(__name__)
-        plugin = get_chatbot_plugin()
-        if plugin:
-            plugin.reload_judges()
-            logger.info("✅ ChatBot Judge 配置已重载")
+        handler = get_assistant_handler()
+        if handler:
+            handler.reload_judges()
+            logger.info("✅ Assistant Judge 配置已重载")
         else:
-            logger.warning("⚠️ ChatBot 插件未初始化，跳过 Judge 重载")
+            logger.warning("⚠️ Assistant 未运行，跳过 Judge 重载")
     except Exception as e:
         import logging
 
@@ -104,17 +104,17 @@ async def list_judges(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 
 @router.post("/reload")
-async def reload_chatbot_judges() -> Dict[str, Any]:
-    """重载 ChatBot Judge 配置"""
+async def reload_assistant_judges() -> Dict[str, Any]:
+    """重载 Assistant Judge 配置。"""
     try:
-        from app.plugins.builtin_chatbot.main import get_chatbot_plugin
+        from app.assistant.runtime import get_assistant_handler
 
-        plugin = get_chatbot_plugin()
-        if not plugin:
-            raise HTTPException(status_code=500, detail="ChatBot 插件未初始化")
+        handler = get_assistant_handler()
+        if not handler:
+            raise HTTPException(status_code=503, detail="Assistant 未运行")
 
-        plugin.reload_judges()
-        return {"success": True, "message": "ChatBot Judge 配置重新加载成功"}
+        handler.reload_judges()
+        return {"success": True, "message": "Assistant Judge 配置重新加载成功"}
     except HTTPException:
         raise
     except Exception as e:
@@ -158,7 +158,7 @@ async def create_judge(judge_request: JudgeCreateRequest, db: Session = Depends(
         db.commit()
         db.refresh(new_judge)
 
-        _reload_chatbot_judges_safely()
+        _reload_assistant_judges_safely()
         return {"message": f"Judge '{new_judge.display_name}' 创建成功", "judge_id": new_judge.id}
     except HTTPException:
         raise
@@ -191,7 +191,7 @@ async def update_judge(
                 setattr(judge, key, value)
 
         db.commit()
-        _reload_chatbot_judges_safely()
+        _reload_assistant_judges_safely()
         return {"message": f"Judge '{judge.display_name}' 更新成功"}
     except HTTPException:
         raise
@@ -217,7 +217,7 @@ async def delete_judge(judge_id: int, db: Session = Depends(get_db)) -> Dict[str
         display_name = judge.display_name
         db.delete(judge)
         db.commit()
-        _reload_chatbot_judges_safely()
+        _reload_assistant_judges_safely()
         return {"message": f"Judge '{display_name}' 删除成功"}
     except HTTPException:
         raise
@@ -284,7 +284,7 @@ async def assign_user_judge(
             db.add(UserChatBotJudge(user_id=user_id, judge_id=assign_request.judge_id))
 
         db.commit()
-        _reload_chatbot_judges_safely()
+        _reload_assistant_judges_safely()
         return {"message": f"用户 '{user.chat_name}' 的 Judge 已设置为 '{judge.display_name}'"}
     except HTTPException:
         raise
@@ -305,7 +305,7 @@ async def remove_user_judge(user_id: int, db: Session = Depends(get_db)) -> Dict
         if existing:
             db.delete(existing)
             db.commit()
-            _reload_chatbot_judges_safely()
+            _reload_assistant_judges_safely()
             return {"message": f"用户 '{user.chat_name}' 的 Judge 绑定已移除"}
 
         return {"message": f"用户 '{user.chat_name}' 没有 Judge 绑定"}

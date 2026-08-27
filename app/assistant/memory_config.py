@@ -1,4 +1,4 @@
-"""Manifest-backed configuration helpers for conversational memory."""
+"""Core configuration helpers for Assistant conversational memory."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ LEGACY_MEMORY_CONFIG_ALIASES = {
 
 
 def memory_schema() -> Dict[str, Dict[str, Any]]:
-    manifest = get_plugin_config("builtin_chatbot")
+    manifest = get_plugin_config("assistant")
     schema = manifest.get("config_schema") or {}
     return {
         str(key): dict(definition)
@@ -38,7 +38,7 @@ def memory_schema() -> Dict[str, Dict[str, Any]]:
 
 
 def memory_config_defaults() -> Dict[str, Any]:
-    manifest = get_plugin_config("builtin_chatbot")
+    manifest = get_plugin_config("assistant")
     schema = memory_schema()
     configured = manifest.get("config") or {}
     return {

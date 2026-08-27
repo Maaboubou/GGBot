@@ -1,4 +1,4 @@
-"""SQLite persistence for event-based conversational memory."""
+"""SQLite persistence for event-based Assistant memory."""
 
 from __future__ import annotations
 

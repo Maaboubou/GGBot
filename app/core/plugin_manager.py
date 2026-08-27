@@ -49,6 +49,7 @@ class PluginInfo:
     last_failed_at: Optional[float] = None
     last_unloaded_at: Optional[float] = None
     source_fingerprint: str = ""
+    kind: str = "plugin"
 
     def __post_init__(self):
         if self.config is None:
@@ -326,6 +327,13 @@ class PluginManager:
                 self.logger.error(f"Failed to load config for plugin '{plugin_key}': {e}")
                 continue
 
+            if str(config.get("component_kind") or "plugin").strip().lower() == "core":
+                self.logger.debug(
+                    "Skipping application-owned core component during plugin discovery: %s",
+                    plugin_key,
+                )
+                continue
+
             plugin_info = PluginInfo(
                 name=config.get('name', plugin_dir.name),
                 version=config.get('version', '1.0.0'),
@@ -333,7 +341,8 @@ class PluginManager:
                 author=config.get('author', ''),
                 path=str(plugin_dir),
                 enabled=bool((config.get('runtime') or {}).get('enabled', True)),
-                config=config
+                config=config,
+                kind="plugin",
             )
             self.plugins[plugin_key] = plugin_info
             self.logger.debug(f"Found plugin: {plugin_key}")
@@ -363,6 +372,13 @@ class PluginManager:
     def load_plugin(self, plugin_name: str) -> bool:
         """加载插件"""
         with self._lock:
+            existing_info = self.plugins.get(plugin_name)
+            if existing_info is not None and existing_info.kind != "plugin":
+                self.logger.warning(
+                    "Core component '%s' is managed by the application lifecycle, not PluginManager",
+                    plugin_name,
+                )
+                return False
             if plugin_name in self.plugins and self.plugins[plugin_name].loaded:
                 self.logger.warning(f"Plugin '{plugin_name}' is already loaded")
                 return True
@@ -563,7 +579,9 @@ class PluginManager:
                 return False
             
             plugin_info = self.plugins[plugin_name]
-            
+            if plugin_info.kind != "plugin":
+                return False
+
             try:
                 # 取消所有事件订阅
                 for listener_id in plugin_info.listener_ids:
@@ -610,7 +628,9 @@ class PluginManager:
         """按加载顺序的逆序卸载全部插件，确保驱动等插件资源被释放。"""
         results: Dict[str, bool] = {}
 
-        for plugin_name in reversed(list(self.plugins.keys())):
+        for plugin_name in reversed(
+            [name for name, item in self.plugins.items() if item.kind == "plugin"]
+        ):
             results[plugin_name] = self.unload_plugin(plugin_name)
 
         unloaded_count = sum(results.values())
@@ -622,6 +642,8 @@ class PluginManager:
         with self._lock:
             if plugin_name not in self.plugins:
                 return self.load_plugin(plugin_name)
+            if self.plugins[plugin_name].kind != "plugin":
+                return False
             
             self.logger.debug(f"Reloading plugin '{plugin_name}'")
             
@@ -729,8 +751,10 @@ class PluginManager:
         """加载所有插件"""
         self.discover_plugins() # 先发现所有插件
         results = {}
-        
+
         for plugin_name in list(self.plugins.keys()):
+            if self.plugins[plugin_name].kind != "plugin":
+                continue
             if self.plugins[plugin_name].enabled:
                 results[plugin_name] = self.load_plugin(plugin_name)
             else:
@@ -739,7 +763,8 @@ class PluginManager:
                 results[plugin_name] = True
         
         loaded_count = sum(results.values())
-        self.logger.info(f"Loaded {loaded_count}/{len(self.plugins)} plugins")
+        plugin_count = sum(1 for item in self.plugins.values() if item.kind == "plugin")
+        self.logger.info(f"Loaded {loaded_count}/{plugin_count} plugins")
         
         return results
     
@@ -750,6 +775,8 @@ class PluginManager:
                 return False
 
             plugin_info = self.plugins[plugin_name]
+            if plugin_info.kind != "plugin":
+                return False
             if not self._save_plugin_runtime_enabled(plugin_name, True):
                 return False
             plugin_info.enabled = True
@@ -777,6 +804,8 @@ class PluginManager:
                 return False
 
             plugin_info = self.plugins[plugin_name]
+            if plugin_info.kind != "plugin":
+                return False
             if not self._save_plugin_runtime_enabled(plugin_name, False):
                 return False
             plugin_info.enabled = False
@@ -828,6 +857,8 @@ class PluginManager:
         """列出所有插件"""
         result = {}
         for name, plugin in self.plugins.items():
+            if plugin.kind != "plugin":
+                continue
             # 获取运行中的监听器信息
             listeners = self.get_plugin_listeners(name)
             
@@ -875,17 +906,18 @@ class PluginManager:
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
+        plugin_values = [item for item in self.plugins.values() if item.kind == "plugin"]
         stats = {
-            "total_plugins": len(self.plugins),
-            "loaded_plugins": sum(1 for p in self.plugins.values() if p.loaded),
-            "enabled_plugins": sum(1 for p in self.plugins.values() if p.enabled),
-            "total_listeners": sum(len(p.listener_ids) for p in self.plugins.values())
+            "total_plugins": len(plugin_values),
+            "loaded_plugins": sum(1 for p in plugin_values if p.loaded),
+            "enabled_plugins": sum(1 for p in plugin_values if p.enabled),
+            "total_listeners": sum(len(p.listener_ids) for p in plugin_values)
         }
         
         # 聚合监听器信息: EventType -> [PluginName, ...]
         listeners_by_type: Dict[str, List[str]] = {}
         
-        for plugin in self.plugins.values():
+        for plugin in plugin_values:
             if not plugin.enabled or not plugin.loaded:
                 continue
                 
@@ -941,7 +973,7 @@ class PluginManager:
 
     def get_all_plugin_names(self) -> List[str]:
         """获取所有已发现插件的名称列表"""
-        return list(self.plugins.keys())
+        return [name for name, item in self.plugins.items() if item.kind == "plugin"]
     
     def get_plugin_listeners(self, plugin_name: str) -> List[Dict[str, Any]]:
         """获取插件的所有监听器信息"""

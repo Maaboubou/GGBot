@@ -1,5 +1,5 @@
 """
-角色管理器 - 处理聊天机器人的角色设定
+角色管理器 - 处理 Assistant 的角色设定
 """
 
 import json
@@ -8,7 +8,7 @@ from typing import Dict
 from pathlib import Path
 
 from app.services.config_service import get_setting
-from app.plugins.builtin_chatbot.prompt_renderer import render_role_prompt
+from app.assistant.prompt_renderer import render_role_prompt
 
 logger = logging.getLogger(__name__)
 

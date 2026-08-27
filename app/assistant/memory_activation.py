@@ -1,4 +1,4 @@
-"""Promote an isolated historical-memory experiment into the live store."""
+"""Promote an isolated Assistant memory experiment into the live store."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.plugins.builtin_chatbot.memory_experiment import (
+from app.assistant.memory_experiment import (
     MemoryExperimentError,
     verify_experiment,
 )
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
+from app.assistant.memory_store import MemoryStore
 
 
 class MemoryActivationError(RuntimeError):
@@ -465,7 +465,7 @@ def _disjoint_live_boundary(
 
 
 def _load_memory_config(chat_name: str) -> Dict[str, Any]:
-    config_path = Path("app/plugins/builtin_chatbot/config.json")
+    config_path = Path("app/assistant/config.json")
     with config_path.open("r", encoding="utf-8") as source:
         document = json.load(source)
     config = dict(document.get("config") or {})
@@ -479,8 +479,8 @@ def _load_memory_config(chat_name: str) -> Dict[str, Any]:
                 """
                 SELECT p.memory_profile
                 FROM wechat_users AS u
-                JOIN user_permissions AS p ON p.user_id = u.id
-                WHERE u.chat_name = ? AND p.plugin_name = 'builtin_chatbot'
+                JOIN assistant_chat_policies AS p ON p.user_id = u.id
+                WHERE u.chat_name = ? AND p.enabled = 1
                 LIMIT 1
                 """,
                 (chat_name,),
@@ -523,9 +523,9 @@ def _backfill_candidate(
     # already use the stable HTTPX path; activation backfill must match them.
     litellm.disable_aiohttp_transport = True
 
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+    from app.assistant.chat_log import ChatLogManager
+    from app.assistant.context_manager import ChatContextManager
+    from app.assistant.memory_service import ChatMemoryService
     from app.services.llm_manager import LLMManager
 
     chat_log = ChatLogManager()
@@ -849,7 +849,7 @@ def activate_experiment(
             if allow_disjoint_live_log
             else _find_live_boundary(history_source, live_log)
         )
-        from app.plugins.builtin_chatbot.chat_log import ChatLogManager
+        from app.assistant.chat_log import ChatLogManager
 
         chat_log = ChatLogManager()
         cumulative_count = int(chat_log.count_messages(chat_name))
@@ -944,7 +944,7 @@ def activate_experiment(
                     "snapshot": str(snapshot),
                     "command": (
                         f"{sys.executable} -m "
-                        "app.plugins.builtin_chatbot.memory_activation "
+                        "app.assistant.memory_activation "
                         f"rollback --activation \"{activation}\""
                     ),
                 },
@@ -1072,7 +1072,7 @@ def resume_activation(
             _atomic_json(manifest_path, manifest)
             return manifest
 
-        from app.plugins.builtin_chatbot.chat_log import ChatLogManager
+        from app.assistant.chat_log import ChatLogManager
 
         chat_log = ChatLogManager()
         cumulative_count = int(chat_log.count_messages(chat_name))
@@ -1123,7 +1123,7 @@ def resume_activation(
                     "snapshot": str(snapshot),
                     "command": (
                         f"{sys.executable} -m "
-                        "app.plugins.builtin_chatbot.memory_activation "
+                        "app.assistant.memory_activation "
                         f"rollback --activation \"{activation}\""
                     ),
                 },

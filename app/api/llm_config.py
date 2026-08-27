@@ -56,6 +56,7 @@ CLEARABLE_MODEL_FIELDS = frozenset({
     "max_input_tokens",
     "timeout",
     "max_retries",
+    "codex_profile_id",
 })
 
 CATALOG_PROVIDER_LABELS = {
@@ -492,6 +493,7 @@ class ModelConfig(BaseModel):
     codex_web_search: Optional[bool] = None
     codex_sandbox: Optional[str] = None
     codex_isolated_workdir: Optional[bool] = None
+    codex_profile_id: Optional[str] = None
     credential_mode: Optional[str] = None
     clear_fields: Optional[List[str]] = None
 
@@ -930,6 +932,11 @@ async def get_plugin_mappings(plugin_name: str):
 @router.put("/mappings/{plugin_name}/{call_type}")
 async def update_mapping(plugin_name: str, call_type: str, mapping: PluginMapping):
     """更新插件映射"""
+    if plugin_name in {"assistant", "builtin_chatbot"} and call_type == "chat":
+        raise HTTPException(
+            status_code=400,
+            detail="AI 助手最终回复仅由 Codex 驱动，不能创建通用模型路由",
+        )
     try:
         llm_manager = get_llm_manager()
         existing = (
@@ -1207,18 +1214,6 @@ async def get_call_history_entry(plugin_name: str, call_type: str, index: int = 
         raise
     except Exception as e:
         logger.error(f"获取调用历史详情失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/cache-diagnostics/chat")
-async def get_chat_cache_diagnostics(limit: int = Query(100, ge=1, le=500)):
-    """获取 builtin_chatbot.chat 的 KV cache 诊断流水，最新记录在前。"""
-    try:
-        llm_manager = get_llm_manager()
-        records = llm_manager.get_chat_cache_diagnostics(limit=limit)
-        return {"status": "success", "data": records}
-    except Exception as e:
-        logger.error(f"获取 LLM cache 诊断记录失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

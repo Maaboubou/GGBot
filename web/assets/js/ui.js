@@ -8,6 +8,7 @@ const UI = {
     themeStorageKey: 'wxauto.colorTheme',
     routes: {
         dashboard: '/',
+        codex: '/codex',
         users: '/chats',
         roles: '/assistant',
         plugins: '/plugins',
@@ -17,6 +18,8 @@ const UI = {
     },
     routeAliases: {
         '/dashboard': 'dashboard',
+        '/codex/profiles': 'codex',
+        '/codex/runs': 'codex',
         '/users': 'users',
         '/roles': 'roles',
         '/automations': 'plugins',
@@ -35,7 +38,7 @@ const UI = {
         '/ai/models': 'llm',
         '/ai/mappings': 'llm',
         '/ai/usage': 'llm',
-        '/ai/sessions': 'llm',
+        '/ai/sessions': 'codex',
         '/ai/calls': 'llm',
         '/ai/network': 'llm',
         '/operations': 'logs'
@@ -258,13 +261,14 @@ const UI = {
         // Update Title
         const titleMap = {
             'dashboard': '概览',
+            'codex': 'Codex 运行中心',
             'plugins': '插件',
             'users': '聊天',
             'roles': 'AI 助手',
             'settings': '系统',
             'wechat': 'WeChat 状态',
             'logs': '运行与日志',
-            'llm': '模型与调用'
+            'llm': '辅助模型'
         };
         document.getElementById('pageTitle').textContent = titleMap[tabId] || '概览';
     },
@@ -1508,187 +1512,116 @@ const UI = {
         }
     },
 
-    renderChatCapabilities(user, capabilities, codexAccess = null) {
+    renderChatPolicy(policy, capabilities, assistantOverview, profilesData) {
         const container = document.getElementById('userPermissionsPanelContainer');
         if (!container) return;
         container.removeAttribute('aria-busy');
-
-        const permissions = user.permissions || [];
-        const current = new Set(permissions.map(item => item.plugin_name));
-        const permissionByName = Object.fromEntries(
-            permissions.filter(item => !item.plugin_name.endsWith('#push')).map(item => [item.plugin_name, item])
-        );
-        const chatMeta = (window.App._managedChats || []).find(item => item.chat_name === user.chat_name) || {};
-        const enabledCount = (capabilities || []).filter(item => current.has(item.id)).length;
-        const safeChatName = this.escapeHtml(user.chat_name || '');
-        const userId = Number(user.id) || null;
-        const accessMode = user.is_group
-            ? 'isolated'
-            : String(codexAccess?.mode || user.codex_access_mode || 'isolated');
-        const ownerAccess = accessMode === 'owner_full';
-        const accessPath = this.escapeHtml(codexAccess?.scope_root || '保存后创建聊天专属目录');
-        const accessDescription = ownerAccess
-            ? '继承本机 Codex 配置与规则，可访问本机文件；执行审批由自动审查处理。'
-            : (user.is_group
-                ? '仅可读写该群的专属目录，所有群成员共享；不继承本机规则，Skill 只读可用。'
-                : '仅可读写此私聊的专属目录；不继承本机规则，Skill 只读可用。');
-        const formatList = (raw) => {
-            if (!raw) return '';
-            try {
-                const parsed = JSON.parse(raw);
-                return Array.isArray(parsed) ? parsed.join('\n') : String(raw);
-            } catch (error) {
-                return String(raw);
-            }
-        };
-        const cards = [...(capabilities || [])]
-            .sort((a, b) => Number(b.featured) - Number(a.featured) || a.category_order - b.category_order || a.display_name.localeCompare(b.display_name))
+        const chat = policy.chat || {};
+        const assistant = policy.assistant || {};
+        const codex = policy.codex || {};
+        const grants = policy.plugin_grants || [];
+        const grantByName = Object.fromEntries(grants.map(item => [item.plugin_name, item]));
+        const roles = assistantOverview.roles || [];
+        const judges = assistantOverview.judges || [];
+        const profiles = profilesData.profiles || [];
+        const selectedProfile = assistant.codex_profile_id || '';
+        const defaultProfileLabel = profilesData.default_profile_id
+            ? `继承默认 Profile · ${profilesData.default_profile_id}`
+            : '继承 Codex 当前配置';
+        const formatLines = values => (values || []).join('\n');
+        const safeName = this.escapeHtml(chat.chat_name || '');
+        const roleOptions = roles.map(item => `<option value="${Number(item.id)}" ${Number(assistant.role_id) === Number(item.id) ? 'selected' : ''}>${this.escapeHtml(item.display_name || item.name)}</option>`).join('');
+        const judgeOptions = judges.map(item => `<option value="${Number(item.id)}" ${Number(assistant.judge_id) === Number(item.id) ? 'selected' : ''}>${this.escapeHtml(item.display_name || item.name)}</option>`).join('');
+        const profileOptions = [
+            `<option value="" ${selectedProfile ? '' : 'selected'}>${this.escapeHtml(defaultProfileLabel)}</option>`,
+            ...profiles.filter(item => item.available).map(item => `<option value="${this.escapeHtml(item.name)}" ${selectedProfile === item.name ? 'selected' : ''}>${this.escapeHtml(item.name)} · ${this.escapeHtml(item.model)}</option>`)
+        ].join('');
+        const pluginCards = [...(capabilities || [])]
+            .sort((a, b) => Number(b.featured) - Number(a.featured) || String(a.display_name).localeCompare(String(b.display_name)))
             .map(capability => {
-                const id = capability.id;
-                const permission = permissionByName[id] || {};
-                const enabledForChat = current.has(id);
+                const grant = grantByName[capability.id];
+                const pushGrant = grantByName[`${capability.id}#push`];
+                const checked = Boolean(grant);
+                const available = Boolean(capability.enabled && capability.loaded);
                 const supportsPush = (capability.features || []).includes('push');
-                const supportsMentionOption = id !== 'builtin_chatbot';
-                const pushEnabled = current.has(`${id}#push`);
-                const globallyAvailable = capability.enabled && capability.loaded;
-                const icon = capability.icon || 'bi-lightning-charge';
-                let specialContent = '';
-
-                if (id === 'builtin_chatbot') {
-                    const ignored = formatList(permission.ignored_senders);
-                    const proactiveEnabled = Boolean(user.is_group && permission.proactive_enabled);
-                    let memoryEnabled = false;
-                    try { memoryEnabled = !!JSON.parse(permission.memory_profile || '{}').enabled; } catch (error) { /* legacy value */ }
-                    const summary = [
-                        proactiveEnabled ? '主动回复' : '',
-                        permission.followup_enabled ? `连续对话 ${permission.followup_window_seconds || 60}s` : '',
-                        memoryEnabled ? '独立记忆配置' : '继承全局记忆'
-                    ].filter(Boolean).join(' · ');
-                    specialContent = `
-                        <input class="proactive-check d-none" type="checkbox" id="proactive-${id}" ${proactiveEnabled ? 'checked' : ''}>
-                        <input class="followup-check d-none" type="checkbox" id="followup-enabled-${id}" ${permission.followup_enabled ? 'checked' : ''}>
-                        <input type="hidden" id="followup-window-${id}" value="${Number(permission.followup_window_seconds || 60)}">
-                        <input type="hidden" id="followup-merge-${id}" value="${Number(permission.followup_merge_seconds || 3)}">
-                        <input type="hidden" id="followup-max-turns-${id}" value="${Number(permission.followup_max_turns || 3)}">
-                        <textarea class="d-none memory-profile-input" id="memory-profile-${id}">${this.escapeHtml(permission.memory_profile || '')}</textarea>
-                        <textarea class="d-none ignored-senders-input" id="ignored-senders-${id}">${this.escapeHtml(ignored)}</textarea>
-                        <div class="chat-capability-special">
-                            <div><strong>AI 助手会话配置</strong><small id="chatbot-settings-summary-${id}">${this.escapeHtml(summary || '继承全局行为')}</small></div>
-                            <button type="button" class="btn btn-sm btn-primary chatbot-chat-configure" id="chatbot-settings-${id}"
-                                ${enabledForChat && userId ? '' : 'disabled'}>配置</button>
-                        </div>
-                        <button type="button" class="chat-memory-override-link" data-plugin-id="${this.escapeHtml(id)}" ${enabledForChat ? '' : 'disabled'}>
-                            <i class="bi bi-database-gear me-1"></i>高级记忆覆盖
-                        </button>`;
-                }
-
                 return `
-                    <article class="chat-capability-card ${enabledForChat ? 'selected' : ''} ${globallyAvailable ? '' : 'unavailable'}" data-capability-id="${this.escapeHtml(id)}">
-                        <div class="chat-capability-main">
-                            <div class="chat-capability-icon"><i class="bi ${this.escapeHtml(icon)}"></i></div>
-                            <div class="chat-capability-copy">
-                                <div class="chat-capability-title-row">
-                                    <strong>${this.escapeHtml(capability.display_name || id)}</strong>
-                                    ${capability.featured ? '<span class="chat-featured-pill">AI 助手</span>' : ''}
-                                    ${!globallyAvailable ? '<span class="chat-unavailable-pill">全局未运行</span>' : ''}
-                                </div>
-                                <p>${this.escapeHtml(capability.description || '暂无功能说明')}</p>
-                                <small>${this.escapeHtml(capability.category_label || '其他能力')}</small>
-                            </div>
-                            <div class="form-check form-switch chat-capability-toggle">
-                                <input class="form-check-input permission-check" type="checkbox" value="${this.escapeHtml(id)}" id="perm-${this.escapeHtml(id)}"
-                                    ${enabledForChat ? 'checked' : ''} ${globallyAvailable ? '' : 'disabled'} aria-label="在此聊天启用 ${this.escapeHtml(capability.display_name || id)}">
-                            </div>
+                    <article class="chat-policy-plugin ${checked ? 'selected' : ''} ${available ? '' : 'unavailable'}" data-plugin-card="${this.escapeHtml(capability.id)}">
+                        <div class="chat-policy-plugin-main">
+                            <span><i class="bi ${this.escapeHtml(capability.icon || 'bi-puzzle')}"></i></span>
+                            <div><strong>${this.escapeHtml(capability.display_name || capability.id)}</strong><small>${this.escapeHtml(capability.description || capability.category_label || '')}</small></div>
+                            <input class="form-check-input chat-policy-plugin-toggle" type="checkbox" value="${this.escapeHtml(capability.id)}" ${checked ? 'checked' : ''} ${available ? '' : 'disabled'}>
                         </div>
-                        ${specialContent}
-                        ${supportsMentionOption || supportsPush ? `<details class="chat-capability-advanced" ${permission.require_mention || pushEnabled ? 'open' : ''}>
-                            <summary>触发与执行选项</summary>
-                            <div class="chat-capability-options">
-                                ${supportsMentionOption ? `<label><span><strong>需要 @Bot</strong><small>只有明确提及机器人时触发</small></span><input class="form-check-input mention-check" type="checkbox" id="mention-${this.escapeHtml(id)}" ${permission.require_mention ? 'checked' : ''} ${enabledForChat ? '' : 'disabled'}></label>` : ''}
-                                ${supportsPush ? `<label><span><strong>允许后台推送</strong><small>计划任务可向此聊天发送结果</small></span><input class="form-check-input push-check" type="checkbox" id="push-${this.escapeHtml(id)}" ${pushEnabled ? 'checked' : ''} ${enabledForChat ? '' : 'disabled'}></label>` : `<input class="push-check d-none" type="checkbox" id="push-${this.escapeHtml(id)}" data-unsupported="true" disabled>`}
-                            </div>
-                        </details>` : ''}
+                        <div class="chat-policy-plugin-options">
+                            ${chat.is_group ? `<label><input class="form-check-input chat-policy-plugin-mention" type="checkbox" ${grant?.require_mention ? 'checked' : ''} ${checked && available ? '' : 'disabled'}><span>仅在 @Bot 时触发</span></label>` : ''}
+                            ${supportsPush ? `<label><input class="form-check-input chat-policy-plugin-push" type="checkbox" ${pushGrant ? 'checked' : ''} ${checked && available ? '' : 'disabled'}><span>允许后台推送</span></label>` : ''}
+                        </div>
                     </article>`;
             }).join('');
 
         container.innerHTML = `
-            <div class="chat-detail-shell">
-                <div class="chat-detail-header">
-                    <div>
-                        <div class="d-flex align-items-center gap-2 flex-wrap">
-                            <h3>${safeChatName}</h3>
-                            <span class="assistant-state-pill ${chatMeta.is_listening ? 'on' : 'off'}">${chatMeta.is_listening ? '正在监听' : '未监听'}</span>
-                        </div>
-                        <p>${user.is_group ? '群聊' : '私聊'} · 已启用 ${enabledCount} 项能力</p>
-                    </div>
-                    <div class="chat-detail-actions">
-                        ${userId ? `<button class="btn btn-sm btn-light border" onclick="App.showEditUserModal(${userId}, this.dataset.chatname, ${!!user.is_group})" data-chatname="${safeChatName}"><i class="bi bi-pencil me-1"></i>基本信息</button>` : ''}
-                        <button class="btn btn-sm btn-primary" onclick="App.saveUserPermissions(${userId || 'null'}, this.dataset.chatname)" data-chatname="${safeChatName}"><i class="bi bi-check-lg me-1"></i>保存能力</button>
-                    </div>
-                </div>
-                <section class="chat-codex-access ${ownerAccess ? 'owner' : ''}" id="chatCodexAccess">
-                    <div class="chat-codex-access-icon"><i class="bi ${ownerAccess ? 'bi-key' : 'bi-folder2'}"></i></div>
-                    <div class="chat-codex-access-copy">
-                        <div class="chat-codex-access-title">
-                            <strong>Codex 访问范围</strong>
-                            <span id="codexAccessPill">${ownerAccess ? '管理员' : '隔离'}</span>
-                        </div>
-                        <p id="codexAccessDescription">${this.escapeHtml(accessDescription)}</p>
-                        <code title="${accessPath}">${accessPath}</code>
-                    </div>
-                    <div class="chat-codex-access-actions">
-                        <select class="form-select form-select-sm" id="codexAccessMode" data-current="${accessMode}"
-                            ${!userId || user.is_group ? 'disabled' : ''} aria-label="Codex 访问范围">
-                            <option value="isolated" ${ownerAccess ? '' : 'selected'}>隔离空间</option>
-                            ${user.is_group ? '' : `<option value="owner_full" ${ownerAccess ? 'selected' : ''}>管理员 · 最大权限</option>`}
-                        </select>
-                        ${userId && !user.is_group ? `<button type="button" class="btn btn-sm btn-light border" id="saveCodexAccessBtn" onclick="App.saveCodexAccess(${userId})" disabled>应用</button>` : ''}
+            <form id="chatPolicyForm" class="chat-policy-shell" data-user-id="${Number(policy.user_id)}" data-version="${Number(policy.version)}">
+                <header class="chat-policy-header">
+                    <div><span>${chat.is_group ? '群聊' : '私聊'}策略</span><h3>${safeName}</h3><p>一次保存监听、Assistant、Codex 边界与插件授权；未显示的配置不会被覆盖。</p></div>
+                    <div><span class="assistant-state-pill ${chat.listening_active ? 'on' : 'off'}">${chat.listening_active ? '监听已生效' : (chat.listening_enabled ? '等待连接同步' : '未监听')}</span><button class="btn btn-primary" type="button" onclick="App.saveChatPolicy()"><i class="bi bi-check2 me-1"></i>保存策略</button></div>
+                </header>
+
+                <section class="chat-policy-section">
+                    <div class="chat-policy-section-title"><span>01</span><div><h5>接入与监听</h5><p>先决定是否接收这个聊天的消息。关闭监听不会删除 Assistant 或插件配置。</p></div></div>
+                    <div class="chat-policy-form-grid">
+                        <label class="chat-policy-switch"><span><strong>接收消息</strong><small>连接可用时立即同步到微信监听器</small></span><input class="form-check-input" type="checkbox" name="listening_enabled" ${chat.listening_enabled ? 'checked' : ''}></label>
+                        <label><span>管理备注</span><input class="form-control" name="remark" value="${this.escapeHtml(chat.remark || '')}" maxlength="255" placeholder="便于管理员识别"></label>
+                        <label class="wide"><span>全局发送者黑名单</span><textarea class="form-control" name="sender_blacklist" rows="2" placeholder="每行一个名称">${this.escapeHtml(formatLines(chat.sender_blacklist))}</textarea></label>
                     </div>
                 </section>
-                <div class="chat-detail-notice"><i class="bi bi-info-circle"></i><span>这里只决定“此聊天能用什么”。各能力的全局行为在“AI 助手”或“插件”页管理。</span></div>
-                <div class="chat-capability-grid">${cards || '<div class="assistant-empty-inline">尚未发现可用能力。</div>'}</div>
-            </div>`;
 
-        const accessSelect = container.querySelector('#codexAccessMode');
-        accessSelect?.addEventListener('change', () => {
-            const selectingOwner = accessSelect.value === 'owner_full';
-            const accessSection = container.querySelector('#chatCodexAccess');
-            const accessPill = container.querySelector('#codexAccessPill');
-            const accessCopy = container.querySelector('#codexAccessDescription');
-            const accessButton = container.querySelector('#saveCodexAccessBtn');
-            accessSection?.classList.toggle('owner', selectingOwner);
-            if (accessPill) accessPill.textContent = selectingOwner ? '管理员' : '隔离';
-            if (accessCopy) {
-                accessCopy.textContent = selectingOwner
-                    ? '可访问本机文件并继承本机 Codex 配置；仅用于你本人可控的私聊。'
-                    : '仅可读写此私聊的专属目录；不继承本机规则，Skill 只读可用。';
-            }
-            if (accessButton) accessButton.disabled = accessSelect.value === accessSelect.dataset.current;
-        });
+                <section class="chat-policy-section assistant-policy-block ${assistant.enabled ? 'enabled' : ''}">
+                    <div class="chat-policy-section-title"><span>02</span><div><h5>Assistant · Codex 回复</h5><p>Assistant 是核心能力，不属于插件。最终回复只会从所选 Codex Profile 产生。</p></div></div>
+                    <div class="chat-policy-form-grid">
+                        <label class="chat-policy-switch wide"><span><strong>在此聊天启用 Assistant</strong><small>关闭时插件仍可继续独立处理消息</small></span><input class="form-check-input" type="checkbox" name="assistant_enabled" ${assistant.enabled ? 'checked' : ''}></label>
+                        <label><span>Codex Profile</span><select class="form-select" name="codex_profile_id">${profileOptions}</select><small class="field-help"><a href="/codex" onclick="event.preventDefault(); UI.switchTab('codex')">管理 Profiles</a></small></label>
+                        <label><span>Codex 访问范围</span><select class="form-select" name="codex_mode" ${chat.is_group ? 'disabled' : ''}><option value="isolated" ${codex.mode === 'owner_full' ? '' : 'selected'}>隔离空间</option>${chat.is_group ? '' : `<option value="owner_full" ${codex.mode === 'owner_full' ? 'selected' : ''}>管理员 · 本机最大权限</option>`}</select><small class="field-help">${this.escapeHtml(codex.label || '隔离空间')} · ${this.escapeHtml(codex.workdir || '')}</small></label>
+                        <label><span>角色</span><select class="form-select" name="role_id"><option value="">继承全局默认角色</option>${roleOptions}</select></label>
+                        <label class="chat-policy-switch"><span><strong>允许连续对话</strong><small>回复后短时间内无需再次 @</small></span><input class="form-check-input" type="checkbox" name="followup_enabled" ${assistant.followup_enabled ? 'checked' : ''}></label>
+                        ${chat.is_group ? `<label class="chat-policy-switch"><span><strong>允许主动参与</strong><small>由 Judge 判断是否插话</small></span><input class="form-check-input" type="checkbox" name="proactive_enabled" ${assistant.proactive_enabled ? 'checked' : ''}></label><label><span>主动回复 Judge</span><select class="form-select" name="judge_id"><option value="">自动选择默认 Judge</option>${judgeOptions}</select></label>` : ''}
+                        ${chat.is_group ? `<label><span>群内 Bot 昵称</span><input class="form-control" name="bot_group_nickname" value="${this.escapeHtml(chat.bot_group_nickname || '')}" placeholder="用于识别 @ 名称"></label><label class="chat-policy-switch"><span><strong>自动校准群昵称</strong><small>从微信的本群昵称读取</small></span><input class="form-check-input" type="checkbox" name="bot_group_nickname_auto_enabled" ${chat.bot_group_nickname_auto_enabled ? 'checked' : ''}></label>` : ''}
+                        <label><span>记忆策略</span><select class="form-select" name="memory_mode"><option value="inherit" ${assistant.memory?.mode === 'inherit' ? 'selected' : ''}>继承全局</option><option value="off" ${assistant.memory?.mode === 'off' ? 'selected' : ''}>此聊天关闭</option><option value="custom" ${assistant.memory?.mode === 'custom' ? 'selected' : ''}>保留自定义覆盖</option></select></label>
+                        <label class="wide"><span>Assistant 忽略的发送者</span><textarea class="form-control" name="assistant_ignored_senders" rows="2" placeholder="每行一个名称">${this.escapeHtml(formatLines(assistant.ignored_senders))}</textarea></label>
+                    </div>
+                </section>
 
-        container.querySelectorAll('.permission-check').forEach(toggle => {
-            const update = () => {
-                const card = toggle.closest('.chat-capability-card');
-                const enabled = toggle.checked;
-                const available = !card.classList.contains('unavailable');
-                card.classList.toggle('selected', enabled);
-                card.querySelectorAll('.mention-check, .push-check').forEach(input => {
-                    input.disabled = !enabled || !available || input.dataset.unsupported === 'true';
-                    if (!enabled) input.checked = false;
+                <section class="chat-policy-section">
+                    <div class="chat-policy-section-title"><span>03</span><div><h5>独立插件</h5><p>插件授权与 Assistant 分开保存。即使 Assistant 未配置或不可用，已授权插件仍会正常运行。</p></div></div>
+                    <div class="chat-policy-plugin-grid">${pluginCards || '<div class="assistant-empty-inline">当前没有可授权插件。</div>'}</div>
+                </section>
+
+                <footer class="chat-policy-footer"><span><i class="bi bi-shield-lock"></i>策略版本 ${Number(policy.version)} · 检测到并发修改时不会覆盖</span><button class="btn btn-primary" type="button" onclick="App.saveChatPolicy()">保存全部策略</button></footer>
+            </form>`;
+
+        container.querySelectorAll('.chat-policy-plugin-toggle').forEach(toggle => {
+            const sync = () => {
+                const card = toggle.closest('.chat-policy-plugin');
+                card.classList.toggle('selected', toggle.checked);
+                card.querySelectorAll('.chat-policy-plugin-options input').forEach(input => {
+                    input.disabled = !toggle.checked || card.classList.contains('unavailable');
+                    if (!toggle.checked) input.checked = false;
                 });
-                card.querySelectorAll('.chat-capability-special button').forEach(button => button.disabled = !enabled || !available);
-                const chatbotButton = card.querySelector('.chat-memory-override-link');
-                if (chatbotButton) chatbotButton.disabled = !enabled || !available;
             };
-            toggle.addEventListener('change', update);
-            update();
+            toggle.addEventListener('change', sync);
+            sync();
         });
-        container.querySelector('.chatbot-chat-configure')?.addEventListener('click', () => {
-            if (userId) App.openAssistantChatEditorFromChats(userId);
-        });
-        container.querySelector('.chat-memory-override-link')?.addEventListener('click', event => {
-            if (userId) App.showChatbotPermissionModal(event.currentTarget.dataset.pluginId, userId);
-        });
+    },
+
+    renderUnmanagedChatPolicy(chatName) {
+        const container = document.getElementById('userPermissionsPanelContainer');
+        if (!container) return;
+        container.removeAttribute('aria-busy');
+        container.innerHTML = `
+            <div class="chat-policy-unmanaged">
+                <span><i class="bi bi-shield-plus"></i></span>
+                <h3>${this.escapeHtml(chatName)}</h3>
+                <p>微信正在监听这个聊天，但它还没有受控策略。先确认聊天类型，再配置 Assistant、Codex 权限或独立插件。</p>
+                <div><button class="btn btn-primary" onclick="App.adoptActiveChat(this.dataset.chat, false)" data-chat="${this.escapeHtml(chatName)}"><i class="bi bi-person me-1"></i>作为私聊管理</button><button class="btn btn-outline-primary" onclick="App.adoptActiveChat(this.dataset.chat, true)" data-chat="${this.escapeHtml(chatName)}"><i class="bi bi-people me-1"></i>作为群聊管理</button></div>
+            </div>`;
     },
 
     renderLogs(content, searchKeyword) {
@@ -1787,7 +1720,7 @@ const UI = {
         const hasBasicFields = editableFields.some(field => field.level === 'basic');
         const levelFilter = hasBasicFields ? 'basic' : 'all';
         const globalMemory = editableFields.find(field => field.key === 'memory_enabled');
-        const inheritanceSummary = settings.capability_id === 'builtin_chatbot' && globalMemory ? `
+        const inheritanceSummary = settings.capability_id === 'assistant' && globalMemory ? `
             <div class="cap-settings-inheritance">
                 <span class="cap-settings-inheritance-icon"><i class="bi bi-database-check"></i></span>
                 <div><strong data-global-memory-summary>长期记忆全局默认：${globalMemory.value ? '开启' : '关闭'}</strong>
@@ -1910,7 +1843,7 @@ const UI = {
         };
 
         const syncDependencies = () => {
-            if (shell.dataset.capabilityId !== 'builtin_chatbot') return;
+            if (shell.dataset.capabilityId !== 'assistant') return;
             const memoryToggle = shell.querySelector('[data-config-key="memory_enabled"]');
             if (!memoryToggle) return;
             const enabled = memoryToggle.checked;

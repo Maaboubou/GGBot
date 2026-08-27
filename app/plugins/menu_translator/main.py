@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from app.core.event_bus import Event, EventType, get_event_bus
 from app.utils.plugin_config import get_config
 from app.services.llm_manager import get_llm_manager
-from app.plugins.builtin_chatbot.chat_log import ChatLogManager
+from app.assistant.chat_log import ChatLogManager
 
 from .menu_generator import generate_html, render_image
 

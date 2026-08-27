@@ -16,6 +16,7 @@ import queue
 import time
 
 from sqlalchemy.orm import Session
+from app.models.assistant_policy import AssistantChatPolicy
 from app.models.user_permission import WeChatUser
 from app.utils.bot_mentions import bot_names_for_user, find_bot_mention
 
@@ -95,6 +96,9 @@ class EventListener:
     handler_name: str = ""
     order_source: str = "routing_order"
     trigger_spec: Dict[str, Any] = field(default_factory=dict)
+    owner_kind: str = "plugin"
+    permission_key: str = ""
+    display_name: str = ""
 
 
 class EventBus:
@@ -144,6 +148,9 @@ class EventBus:
         handler_name: str = "",
         order_source: str = "routing_order",
         trigger_spec: Optional[Dict[str, Any]] = None,
+        owner_kind: str = "plugin",
+        permission_key: str = "",
+        display_name: str = "",
     ) -> str:
         """订阅事件"""
         with self._lock:
@@ -161,13 +168,18 @@ class EventBus:
                 handler_name=handler_name or getattr(handler, "__name__", "handler"),
                 order_source=order_source,
                 trigger_spec=dict(trigger_spec or {}),
+                owner_kind=("core" if owner_kind == "core" else "plugin"),
+                permission_key=str(permission_key or ""),
+                display_name=str(display_name or ""),
             )
             
             if event_type not in self._listeners:
                 self._listeners[event_type] = []
             
             self._listeners[event_type].append(listener)
-            self._listeners[event_type].sort(key=lambda x: (x.order_index, x.listener_key))
+            self._listeners[event_type].sort(
+                key=lambda x: (x.owner_kind == "core", x.order_index, x.listener_key)
+            )
             
             self._stats['listeners_count'] += 1
             
@@ -432,12 +444,21 @@ class EventBus:
                     user_permissions = {p.plugin_name: p for p in user.permissions}
                     
                     # 支持多级目录插件名：既匹配完整键（如 feishu/xxx），也匹配末级简名（如 xxx）
-                    def _has_permission_and_mention_check(listener_plugin_name: str) -> bool:
+                    def _has_permission_and_mention_check(listener: EventListener) -> bool:
+                        if listener.owner_kind == "core":
+                            policy = (
+                                db.query(AssistantChatPolicy)
+                                .filter(AssistantChatPolicy.user_id == user.id)
+                                .first()
+                            )
+                            return bool(policy and policy.enabled)
+
                         # 首先检查是否有权限
                         permission_config = None
-                        plugin_base = listener_plugin_name.rsplit('/', 1)[-1]
-                        if listener_plugin_name in user_permissions:
-                            permission_config = user_permissions[listener_plugin_name]
+                        permission_name = listener.permission_key or listener.plugin_name
+                        plugin_base = permission_name.rsplit('/', 1)[-1]
+                        if permission_name in user_permissions:
+                            permission_config = user_permissions[permission_name]
                         else:
                             # 检查末级简名匹配
                             if plugin_base in user_permissions:
@@ -448,43 +469,42 @@ class EventBus:
                                 # the message and decide whether to consume it.
                                 for permission_key, permission in user_permissions.items():
                                     permission_base = str(permission_key).split("#", 1)[0].rsplit("/", 1)[-1]
-                                    if permission_base in {listener_plugin_name, plugin_base}:
+                                    if permission_base in {permission_name, plugin_base}:
                                         permission_config = permission
                                         break
                         
                         if not permission_config:
                             return False  # 没有权限
 
-                        # builtin_chatbot 的触发策略由插件内部控制（主动/@独立开关）
-                        # 这里仅做权限放行，不使用 require_mention 限制它。
-                        if plugin_base == "builtin_chatbot":
-                            return True
-                        
                         # 检查@触发条件
                         if permission_config.require_mention:
                             # 优先检查是否存在“会话期权限豁免”
-                            if self._check_session_permission(chat_name, listener_plugin_name):
+                            if self._check_session_permission(chat_name, permission_name):
                                 # 存在有效会话，豁免@检查
                                 pass
                             # 否则执行标准的@检查
                             elif chat_type == "group" and not is_mentioned:
-                                self.logger.debug(f"Plugin '{listener_plugin_name}' requires mention but not mentioned for user '{chat_name}'")
+                                self.logger.debug(f"Plugin '{permission_name}' requires mention but not mentioned for user '{chat_name}'")
                                 return False
                             # 私聊不需要@，群聊需要@且已经@了才通过
                         
                         return True
 
                     # 筛选出有权限且满足@条件的监听器
-                    final_listeners = [l for l in active_listeners if _has_permission_and_mention_check(l.plugin_name)]
+                    final_listeners = [l for l in active_listeners if _has_permission_and_mention_check(l)]
                     
                     allowed_plugins = set(user_permissions.keys())
                     self.logger.debug(
                         f"User '{chat_name}' has permissions: {allowed_plugins}. Mentioned: {is_mentioned}. Executing {len(final_listeners)} listeners after permission and mention check."
                     )
                 else:
-                    # 如果用户不在权限表中，则默认放行所有监听器，避免业务被静默拦截
-                    final_listeners = active_listeners
-                    self.logger.debug(f"User '{chat_name}' not in permission list. Defaulting to allow all listeners: {len(final_listeners)} to execute.")
+                    # Unknown chats are not authorized implicitly.  Discovery
+                    # and authorization are administrator-owned operations.
+                    final_listeners = []
+                    self.logger.info(
+                        "Chat '%s' is not managed; denying all message handlers",
+                        chat_name,
+                    )
             finally:
                 db.close()
         else:
@@ -493,6 +513,17 @@ class EventBus:
         
         # 同步执行所有有权限的监听器
         for listener in final_listeners:
+            if (
+                listener.owner_kind == "core"
+                and isinstance(getattr(event, "data", None), dict)
+                and event.data.get("_consumed") is True
+            ):
+                self.logger.debug(
+                    "Skipping core fallback '%s' because an earlier plugin consumed %s",
+                    listener.plugin_name,
+                    event.type.value,
+                )
+                continue
             try:
                 self.logger.debug(f"Executing handler for {listener.plugin_name} for user {chat_name}")
                 # 为本次调用注入 wx 代理：当插件调用发送相关方法时自动标记已消费
@@ -501,10 +532,19 @@ class EventBus:
 
                 if original_wx is not None:
                     class _WxConsumeProxy:
-                        def __init__(self, wx_obj, evt, plugin_name: str):
+                        def __init__(
+                            self,
+                            wx_obj,
+                            evt,
+                            plugin_name: str,
+                            owner_kind: str,
+                            display_name: str,
+                        ):
                             self._wx = wx_obj
                             self._evt = evt
                             self._plugin_name = plugin_name
+                            self._owner_kind = owner_kind
+                            self._display_name = display_name
 
                         def _mark_consumed(self):
                             try:
@@ -530,8 +570,8 @@ class EventBus:
 
                         def _get_plugin_display_name(self) -> str:
                             plugin_base = (self._plugin_name or "").rsplit("/", 1)[-1]
-                            if plugin_base == "builtin_chatbot":
-                                return self._get_bot_display_name()
+                            if self._owner_kind == "core":
+                                return self._display_name or self._get_bot_display_name()
 
                             try:
                                 config_path = Path("app/plugins") / self._plugin_name / "config.json"
@@ -643,7 +683,13 @@ class EventBus:
                             return getattr(self._wx, name)
 
                     try:
-                        event.context['wx'] = _WxConsumeProxy(original_wx, event, listener.plugin_name)
+                        event.context['wx'] = _WxConsumeProxy(
+                            original_wx,
+                            event,
+                            listener.plugin_name,
+                            listener.owner_kind,
+                            listener.display_name,
+                        )
                         proxy_installed = True
                     except Exception:
                         proxy_installed = False
@@ -803,6 +849,9 @@ class EventBus:
                         'handler_name': l.handler_name,
                         'order_source': l.order_source,
                         'trigger_spec': dict(l.trigger_spec),
+                        'owner_kind': l.owner_kind,
+                        'permission_key': l.permission_key,
+                        'display_name': l.display_name,
                     } for l in listeners
                 ]
             }
@@ -820,6 +869,9 @@ class EventBus:
                     'handler_name': l.handler_name,
                     'order_source': l.order_source,
                     'trigger_spec': dict(l.trigger_spec),
+                    'owner_kind': l.owner_kind,
+                    'permission_key': l.permission_key,
+                    'display_name': l.display_name,
                 } for l in listeners
             ]
             for event_type, listeners in self._listeners.items()
@@ -849,13 +901,20 @@ class EventBus:
         """Atomically apply the complete visible order for one event type."""
         with self._lock:
             listeners = self._listeners.get(event_type, [])
-            by_key = {listener.listener_key: listener for listener in listeners}
-            if len(by_key) != len(listeners) or set(listener_keys) != set(by_key):
+            reorderable = [listener for listener in listeners if listener.owner_kind == "plugin"]
+            by_key = {listener.listener_key: listener for listener in reorderable}
+            if len(by_key) != len(reorderable) or set(listener_keys) != set(by_key):
                 return False
             for index, key in enumerate(listener_keys):
                 by_key[key].order_index = index
                 by_key[key].order_source = "routing_order"
-            listeners.sort(key=lambda item: (item.order_index, item.listener_key))
+            listeners.sort(
+                key=lambda item: (
+                    item.owner_kind == "core",
+                    item.order_index,
+                    item.listener_key,
+                )
+            )
             return True
     
     def get_listener_info(self, listener_id: str) -> Optional[Dict[str, Any]]:
@@ -875,6 +934,9 @@ class EventBus:
                             "handler_name": listener.handler_name,
                             "order_source": listener.order_source,
                             "trigger_spec": dict(listener.trigger_spec),
+                            "owner_kind": listener.owner_kind,
+                            "permission_key": listener.permission_key,
+                            "display_name": listener.display_name,
                         }
             return None
 

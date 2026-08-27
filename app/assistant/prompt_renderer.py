@@ -1,5 +1,5 @@
 """
-Prompt 渲染工具
+Assistant Prompt 渲染工具
 - 安全变量替换（仅替换已知变量，避免 JSON 花括号误伤）
 - Judge 双模式渲染（simple/template）
 """

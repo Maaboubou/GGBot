@@ -10,14 +10,6 @@
         .filter(Boolean);
 
     Object.assign(App, {
-        async showChatbotPermissionModal(_pluginName = 'builtin_chatbot', userId = null) {
-            if (!userId) {
-                UI.showError('请先选择一个聊天');
-                return;
-            }
-            await this.openAssistantChatEditorFromChats(Number(userId));
-        },
-
         async openMemoryLibraryHub() {
             const shortcut = document.getElementById('memoryLibraryShortcut');
             if (shortcut?.getAttribute('aria-busy') === 'true') return;
@@ -40,7 +32,7 @@
                 }
                 const selected = users.find(item => item.chat_name === this.currentThreadName)
                     || users.find(item => item.id === savedUserId)
-                    || users.find(item => item.chatbotEnabled)
+                    || users.find(item => item.assistantEnabled)
                     || users[0];
                 await this.openChatMemoryLibrary(selected.id, { users });
             } catch (error) {
@@ -60,13 +52,11 @@
                     chat_name: String(item.chat_name),
                     remark: String(item.remark || ''),
                     is_group: !!item.is_group,
-                    chatbotEnabled: (item.permissions || []).some(permission => (
-                        permission.plugin_name === 'builtin_chatbot'
-                    ))
+                    assistantEnabled: Boolean(item.assistant_enabled)
                 }))
                 .sort((left, right) => {
-                    if (left.chatbotEnabled !== right.chatbotEnabled) {
-                        return Number(right.chatbotEnabled) - Number(left.chatbotEnabled);
+                    if (left.assistantEnabled !== right.assistantEnabled) {
+                        return Number(right.assistantEnabled) - Number(left.assistantEnabled);
                     }
                     return (left.remark || left.chat_name).localeCompare(
                         right.remark || right.chat_name,
@@ -108,7 +98,7 @@
                 return `<button type="button" class="dropdown-item memory-user-option ${active ? 'active' : ''}" onclick="App.switchMemoryLibraryUser(${item.id})">
                     <span class="memory-user-option-avatar ${item.is_group ? 'is-group' : ''}"><i class="bi ${item.is_group ? 'bi-people-fill' : 'bi-person-fill'}"></i></span>
                     <span class="memory-user-option-copy"><strong>${this.escapeHtml(label)}</strong><small>${this.escapeHtml(secondary)}</small></span>
-                    ${item.chatbotEnabled ? '<span class="memory-user-option-badge">AI 助手</span>' : ''}
+                    ${item.assistantEnabled ? '<span class="memory-user-option-badge">AI 助手</span>' : ''}
                     <i class="bi bi-check-lg memory-user-option-check"></i>
                 </button>`;
             }).join('');

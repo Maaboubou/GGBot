@@ -1,7 +1,4 @@
-"""
-ChatBot 插件主模块
-实现智能聊天机器人功能，包括角色扮演、上下文记忆和网络搜索
-"""
+"""Core Codex Assistant message handling and conversation orchestration."""
 
 import json
 import re
@@ -20,19 +17,22 @@ from datetime import datetime
 from app.core.event_bus import Event, EventType
 from app.services.config_service import get_setting
 from app.services.codex_access_service import codex_access_service
+from app.services.assistant_reply_gateway import (
+    CodexReplyRequest,
+    get_assistant_reply_gateway,
+)
 from app.services.llm_manager import get_llm_manager
-from app.plugins.builtin_chatbot.web_search import WebSearchOutcome, WebSearchService
-from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
-from app.plugins.builtin_chatbot.memory_config import (
+from app.assistant.chat_log import ChatLogManager
+from app.assistant.context_manager import ChatContextManager
+from app.assistant.memory_service import ChatMemoryService
+from app.assistant.memory_config import (
     load_memory_config,
     memory_config_defaults,
     sanitize_memory_config,
     upgrade_memory_config_keys,
 )
-from app.plugins.builtin_chatbot.role_manager import RoleManager
-from app.plugins.builtin_chatbot.judge_manager import JudgeManager
+from app.assistant.role_manager import RoleManager
+from app.assistant.judge_manager import JudgeManager
 from app.utils.dashboard_events import append_dashboard_event
 from app.utils.bot_mentions import bot_names_for_user, find_bot_mention, strip_bot_mentions
 from app.utils.plugin_config import get_config
@@ -87,8 +87,8 @@ _FOLLOWUP_RELATION_ALIASES = {
 }
 
 
-class ChatBotPlugin:
-    """ChatBot 插件主类"""
+class AssistantHandler:
+    """Application-owned message handler for the first-class Assistant."""
 
     def __init__(self, context=None):
         self.runtime_context = context
@@ -100,17 +100,16 @@ class ChatBotPlugin:
             self.chat_log_manager,
             self.context_manager,
         )
-        self.web_search_service = WebSearchService()
         self.role_manager = RoleManager()
         self.judge_manager = JudgeManager()
 
         # 从插件自己的 config.json 读取配置
-        plugin_name = "builtin_chatbot"
+        component_name = "assistant"
         self.codex_persistent_session_enabled = bool(
-            get_config("codex_persistent_session_enabled", True, plugin_name=plugin_name)
+            get_config("codex_persistent_session_enabled", True, plugin_name=component_name)
         )
         codex_effort = str(
-            get_config("codex_reasoning_effort", "inherit", plugin_name=plugin_name) or "inherit"
+            get_config("codex_reasoning_effort", "inherit", plugin_name=component_name) or "inherit"
         ).strip().lower()
         self.codex_reasoning_effort = (
             codex_effort
@@ -118,7 +117,7 @@ class ChatBotPlugin:
             else "inherit"
         )
         codex_summary = str(
-            get_config("codex_reasoning_summary", "inherit", plugin_name=plugin_name) or "inherit"
+            get_config("codex_reasoning_summary", "inherit", plugin_name=component_name) or "inherit"
         ).strip().lower()
         self.codex_reasoning_summary = (
             codex_summary
@@ -126,7 +125,7 @@ class ChatBotPlugin:
             else "inherit"
         )
         codex_search_mode = str(
-            get_config("codex_web_search_mode", "inherit", plugin_name=plugin_name) or "inherit"
+            get_config("codex_web_search_mode", "inherit", plugin_name=component_name) or "inherit"
         ).strip().lower()
         self.codex_web_search_mode = (
             codex_search_mode
@@ -135,46 +134,46 @@ class ChatBotPlugin:
         )
         self.codex_turn_timeout_seconds = max(
             0,
-            min(3600, int(get_config("codex_turn_timeout_seconds", 0, plugin_name=plugin_name) or 0)),
+            min(3600, int(get_config("codex_turn_timeout_seconds", 0, plugin_name=component_name) or 0)),
         )
         self.codex_max_turns_per_thread = max(
             0,
-            min(10000, int(get_config("codex_max_turns_per_thread", 0, plugin_name=plugin_name) or 0)),
+            min(10000, int(get_config("codex_max_turns_per_thread", 0, plugin_name=component_name) or 0)),
         )
         self.codex_exec_fallback_enabled = bool(
-            get_config("codex_exec_fallback_enabled", True, plugin_name=plugin_name)
+            get_config("codex_exec_fallback_enabled", True, plugin_name=component_name)
         )
-        self.context_limit = int(get_config("context_limit", 30, plugin_name=plugin_name))
-        self.max_context_tokens = int(get_config("max_context_tokens", 220000, plugin_name=plugin_name))
+        self.context_limit = int(get_config("context_limit", 30, plugin_name=component_name))
+        self.max_context_tokens = int(get_config("max_context_tokens", 220000, plugin_name=component_name))
         self.context_window_auto_detect = bool(
-            get_config("context_window_auto_detect", True, plugin_name=plugin_name)
+            get_config("context_window_auto_detect", True, plugin_name=component_name)
         )
         self.context_safety_margin_tokens = int(
-            get_config("context_safety_margin_tokens", 24576, plugin_name=plugin_name)
+            get_config("context_safety_margin_tokens", 24576, plugin_name=component_name)
         )
-        self.reserved_output_tokens = int(get_config("reserved_output_tokens", 8192, plugin_name=plugin_name))
-        self.context_message_fetch_limit = int(get_config("context_message_fetch_limit", 300, plugin_name=plugin_name))
-        self.context_window_strategy = str(get_config("context_window_strategy", "anchored_append", plugin_name=plugin_name) or "anchored_append")
-        self.anchor_message_count = int(get_config("anchor_message_count", 300, plugin_name=plugin_name))
-        self.anchor_rollover_prompt_tokens = int(get_config("anchor_rollover_prompt_tokens", 205000, plugin_name=plugin_name))
-        self.memory_context_ratio = float(get_config("memory_context_ratio", 0.10, plugin_name=plugin_name))
-        self.recent_context_ratio = float(get_config("recent_context_ratio", 0.35, plugin_name=plugin_name))
-        self.ephemeral_context_ratio = float(get_config("ephemeral_context_ratio", 0.10, plugin_name=plugin_name))
+        self.reserved_output_tokens = int(get_config("reserved_output_tokens", 8192, plugin_name=component_name))
+        self.context_message_fetch_limit = int(get_config("context_message_fetch_limit", 300, plugin_name=component_name))
+        self.context_window_strategy = str(get_config("context_window_strategy", "anchored_append", plugin_name=component_name) or "anchored_append")
+        self.anchor_message_count = int(get_config("anchor_message_count", 300, plugin_name=component_name))
+        self.anchor_rollover_prompt_tokens = int(get_config("anchor_rollover_prompt_tokens", 205000, plugin_name=component_name))
+        self.memory_context_ratio = float(get_config("memory_context_ratio", 0.10, plugin_name=component_name))
+        self.recent_context_ratio = float(get_config("recent_context_ratio", 0.35, plugin_name=component_name))
+        self.ephemeral_context_ratio = float(get_config("ephemeral_context_ratio", 0.10, plugin_name=component_name))
         self.ephemeral_context_max_tokens = int(
-            get_config("ephemeral_context_max_tokens", 16000, plugin_name=plugin_name)
+            get_config("ephemeral_context_max_tokens", 16000, plugin_name=component_name)
         )
         memory_values = load_memory_config(
             lambda key, default: get_config(
-                key, default, plugin_name=plugin_name
+                key, default, plugin_name=component_name
             )
         )
         for key, value in memory_values.items():
             setattr(self, key, value)
-        self.default_role = get_config("default_role", "default", plugin_name=plugin_name)
-        self.search_enabled = get_config("search_enabled", True, plugin_name=plugin_name)
+        self.default_role = get_config("default_role", "default", plugin_name=component_name)
+        self.search_enabled = get_config("search_enabled", True, plugin_name=component_name)
 
         # 群聊触发配置。主动回复是否启用以及触发/冷却参数分别由聊天权限和 Judge 管理。
-        self.allow_mention_trigger = get_config("allow_mention_trigger", True, plugin_name=plugin_name)
+        self.allow_mention_trigger = get_config("allow_mention_trigger", True, plugin_name=component_name)
 
         logger.info(
             f"🔧 ChatBot group trigger config: allow_mention_trigger={self.allow_mention_trigger}; "
@@ -226,7 +225,7 @@ class ChatBotPlugin:
         self._followup_closed = False
 
         logger.info(
-            "ChatBot插件初始化完成 - bot_name=%s codex_persistent=%s effort=%s search=%s",
+            "Assistant 初始化完成 - bot_name=%s codex_persistent=%s effort=%s search=%s",
             self.bot_name,
             self.codex_persistent_session_enabled,
             self.codex_reasoning_effort,
@@ -235,7 +234,7 @@ class ChatBotPlugin:
 
     def _is_search_enabled(self) -> bool:
         """动态读取网络搜索开关，使 Web 端配置修改无需重启插件即可生效。"""
-        value = get_config("search_enabled", self.search_enabled, plugin_name="builtin_chatbot")
+        value = get_config("search_enabled", self.search_enabled, plugin_name="assistant")
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
@@ -274,41 +273,17 @@ class ChatBotPlugin:
             self._bot_names_for_chat(chat_name),
         ) is not None
 
-    def _should_run_framework_search(self, chat_name: str = "") -> bool:
-        """非 Codex 走本地 DDGS；Codex 保留其原生搜索。"""
-        if not self._is_search_enabled():
-            logger.debug("🔍 Framework pre-search disabled, skipping for %s", chat_name)
-            return False
-
-        try:
-            capabilities = get_llm_manager().get_call_capabilities("builtin_chatbot", "chat")
-            native_web_search = bool(capabilities.get("native_web_search"))
-        except Exception as exc:
-            logger.warning(
-                "⚠️ Failed to detect chatbot reply provider; retaining framework pre-search: %s",
-                exc,
-            )
-            return True
-
-        if native_web_search:
-            logger.info(
-                "🔍 Chatbot reply model provides Codex native search; skipping local DDGS for %s",
-                chat_name,
-            )
-            return False
-        return True
-
     def reload_roles(self):
         """重新加载角色配置"""
-        logger.info("🔄 ChatBot插件重新加载角色配置...")
+        logger.info("🔄 Assistant 正在重新加载角色配置...")
         self.role_manager.reload_roles()
-        logger.info("✅ ChatBot插件角色配置重新加载完成")
+        logger.info("✅ Assistant 角色配置重新加载完成")
 
     def reload_judges(self):
         """重新加载 Judge 配置"""
-        logger.info("🔄 ChatBot插件重新加载 Judge 配置...")
+        logger.info("🔄 Assistant 正在重新加载 Judge 配置...")
         self.judge_manager.reload_judges()
-        logger.info("✅ ChatBot插件 Judge 配置重新加载完成")
+        logger.info("✅ Assistant Judge 配置重新加载完成")
 
     def handle_text_message(self, event: Event):
         """处理文本消息事件"""
@@ -317,7 +292,7 @@ class ChatBotPlugin:
         # UnboundLocalError after successfully deciding to ignore the message.
         proactive_processing_acquired = False
         try:
-            logger.info(f"🤖 ChatBot plugin received text message event")
+            logger.info("🤖 Assistant received text message event")
 
             # 获取事件数据，保持与其他插件一致的数据结构
             content = event.data.get("message", "")
@@ -545,22 +520,12 @@ class ChatBotPlugin:
                 config=memory_config,
             )
 
-            # 非 Codex 使用本地 DDGS 工具；Codex 由原生搜索完成本轮检索。
-            search_outcome = WebSearchOutcome.skipped()
-            if self._should_run_framework_search(chat_name):
-                # 确保搜索上下文包含当前消息；引用文字消息使用增强后的本轮内容，避免只搜“核实一下”
-                search_context = context_msgs[-self.context_limit:] + [{"sender": sender, "content": llm_content}]
-                search_outcome = self.web_search_service.search(
-                    search_context,
-                    bot_names=self._bot_names_for_chat(chat_name),
-                )
-
             # 构建消息数组（包含 system prompt 和变量替换）
             role_name = self._get_user_role(chat_name)
             messages = self._build_messages_array(
                 chat_name,
                 context_msgs,
-                search_outcome.prompt_text,
+                "",
                 sender,
                 llm_content,
                 role_name,
@@ -605,28 +570,7 @@ class ChatBotPlugin:
                         "sha256": event.data.get("quoted_file_sha256"),
                     }
                 )
-            if input_files:
-                try:
-                    file_capabilities = get_llm_manager().get_call_capabilities(
-                        "builtin_chatbot",
-                        "chat",
-                    )
-                except Exception:
-                    file_capabilities = {}
-                if not file_capabilities.get("local_codex"):
-                    wx_manager = event.context.get("wx")
-                    if wx_manager:
-                        wx_manager.send_message(
-                            chat_name,
-                            "⚠️ 当前聊天模型不能读取本地文件，请先切换到 Codex 模式",
-                            silent=True,
-                        )
-                    logger.warning(
-                        "🤖 Quoted file rejected because the active chat provider is not local Codex: %s",
-                        chat_name,
-                    )
-                    return False
-            response = self._call_chat_llm(
+            response = self._request_codex_reply(
                 chat_name,
                 role_name,
                 messages,
@@ -637,9 +581,7 @@ class ChatBotPlugin:
             if response_attachments:
                 response = self._strip_internal_action_markers(response)
 
-            # 搜索失败提示只加到发送后的最后一段，不修改模型返回的 JSON，
-            # 也不写入聊天记录，避免破坏多段回复协议和后续上下文。
-            display_suffix = "⚠️⛓️‍💥" if search_outcome.failed else ""
+            display_suffix = ""
 
             # 发送回复
             wx_manager = event.context.get("wx")
@@ -669,7 +611,7 @@ class ChatBotPlugin:
                     if response_attachments:
                         result = self._send_response_attachments(wx_manager, chat_name, response_attachments)
                     if not result:
-                        logger.error(f"🤖 Failed to send chatbot attachment(s) to {chat_name}")
+                        logger.error("🤖 Failed to send Assistant attachment(s) to %s", chat_name)
                         return False
                     self._finalize_anchored_context(chat_name, response)
                     self._open_followup_window(
@@ -681,13 +623,13 @@ class ChatBotPlugin:
                         role_name=role_name,
                         automatic=followup_approved,
                     )
-                    logger.info(f"🤖 Sent chatbot response to {chat_name}")
+                    logger.info("🤖 Sent Assistant response to %s", chat_name)
 
                     # 记录 E2E 响应时间
                     duration = time.time() - start_time
                     try:
                         # 使用 "reply_latency" 作为 call_type, "system" 作为 model
-                        get_llm_manager()._record_stats("builtin_chatbot", "reply_latency", "system", None, duration)
+                        get_llm_manager()._record_stats("assistant", "reply_latency", "system", None, duration)
                         logger.info(f"⏱️ E2E Reply Latency: {duration:.2f}s")
                     except Exception as e:
                         logger.warning(f"Failed to record latency: {e}")
@@ -697,7 +639,7 @@ class ChatBotPlugin:
 
                     return True
                 else:
-                    logger.error(f"🤖 Failed to send chatbot response to {chat_name}")
+                    logger.error("🤖 Failed to send Assistant response to %s", chat_name)
             else:
                 logger.error("🤖 WeChat manager not available")
             return False
@@ -721,20 +663,20 @@ class ChatBotPlugin:
         """检查用户是否开启了主动回复权限"""
         try:
             from app.models.base import SessionLocal
-            from app.models.user_permission import UserPermission, WeChatUser
+            from app.models.assistant_policy import AssistantChatPolicy
+            from app.models.user_permission import WeChatUser
 
             with SessionLocal() as db:
                 user = db.query(WeChatUser).filter(WeChatUser.chat_name == chat_name).first()
                 if not user:
                     return False
 
-                # 查找 plugin='builtin_chatbot' 的权限
-                perm = db.query(UserPermission).filter(
-                    UserPermission.user_id == user.id,
-                    UserPermission.plugin_name == 'builtin_chatbot'
+                policy = db.query(AssistantChatPolicy).filter(
+                    AssistantChatPolicy.user_id == user.id,
+                    AssistantChatPolicy.enabled.is_(True),
                 ).first()
 
-                if perm and perm.proactive_enabled:
+                if policy and policy.proactive_enabled:
                     return True
             return False
         except Exception as e:
@@ -1084,7 +1026,7 @@ class ChatBotPlugin:
                 },
                 {"role": "user", "content": judge_text},
             ]
-            raw = self._call_llm(
+            raw = self._call_auxiliary_model(
                 "followup_judge",
                 messages,
                 response_format={"type": "json_object"},
@@ -1153,7 +1095,7 @@ class ChatBotPlugin:
                         )
                         approved_event = Event(
                             type=EventType.CHATBOT_FOLLOWUP_APPROVED,
-                            source="builtin_chatbot_followup",
+                            source="assistant_followup",
                             data=event_data,
                             context={"wx": target.get("wx")},
                             timestamp=float(target.get("event_timestamp") or time.time()),
@@ -1315,8 +1257,10 @@ class ChatBotPlugin:
         if invalidate_provider and self.codex_persistent_session_enabled:
             try:
                 from app.services.agent_runtime import get_agent_runtime
+                from app.services.codex_profile_service import get_codex_runtime_registry
 
                 get_agent_runtime().invalidate_chat(chat_name)
+                get_codex_runtime_registry().invalidate_chat(chat_name)
             except Exception as exc:
                 logger.warning(
                     "🔗 Failed to invalidate stale Codex thread for %s: %s",
@@ -1474,7 +1418,7 @@ class ChatBotPlugin:
     def handle_quote_image_message(self, event: Event):
         """处理引用图片消息事件 (Unified Flow)"""
         try:
-            logger.info(f"🤖 ChatBot plugin received quote image message event")
+            logger.info("🤖 Assistant received quote image message event")
             start_time = time.time()
             logger.info(f"🔍 开始处理quote_image消息")
 
@@ -1600,34 +1544,11 @@ class ChatBotPlugin:
                 )
                 self.memory_service.schedule(chat_name, memory_config)
 
-                # 4.3 准备模型实际可消费的图片输入。视觉模型直接接收图片；
-                # 非视觉模型复用聊天记录插件的图片内容补充，避免盲猜。
+                # 4.3 最终回复固定由 Codex 处理，图片始终作为本轮原始输入提交。
                 # 引用图片问答必须把“当前问题指向随本条消息附带的图片”写进文本，
                 # 否则像“真的吗 / 我问你这个”这类短问句很容易被长历史上下文带偏。
-                try:
-                    chat_capabilities = get_llm_manager().get_call_capabilities(
-                        "builtin_chatbot",
-                        "chat",
-                    )
-                except Exception:
-                    chat_capabilities = {}
-                chat_supports_vision = bool(chat_capabilities.get("vision"))
+                chat_supports_vision = True
                 image_description = ""
-                if not chat_supports_vision:
-                    try:
-                        from app.plugins.builtin_chat_logger.main import describe_image_for_chat
-
-                        image_description = str(describe_image_for_chat(image_base64) or "").strip()
-                    except Exception as exc:
-                        logger.warning(
-                            "⚠️ 图片内容补充生成失败，将跳过补充并继续调用聊天模型: %s",
-                            exc,
-                        )
-                    else:
-                        if not image_description:
-                            logger.warning(
-                                "⚠️ 图片内容补充未生成内容，将跳过补充并继续调用聊天模型"
-                            )
 
                 quote_image_content = self._build_quote_image_augmented_content(
                     content,
@@ -1641,22 +1562,12 @@ class ChatBotPlugin:
                     recent_messages=context_msgs,
                     config=memory_config,
                 )
-                search_context = context_msgs[-self.context_limit:] + [{"sender": sender, "content": quote_image_content}]
-                search_outcome = WebSearchOutcome.skipped()
-                if self._should_run_framework_search(chat_name):
-                    search_outcome = self.web_search_service.search(
-                        search_context,
-                        image_base64=image_base64 if chat_supports_vision else None,
-                        image_description=image_description,
-                        bot_names=self._bot_names_for_chat(chat_name),
-                    )
-
                 # 4.4 构建消息（包含 system prompt 和变量替换）
                 role_name = self._get_user_role(chat_name)
                 messages = self._build_messages_array(
                     chat_name,
                     context_msgs,
-                    search_outcome.prompt_text,
+                    "",
                     sender,
                     quote_image_content,
                     role_name,
@@ -1683,7 +1594,7 @@ class ChatBotPlugin:
                     messages,
                 )
                 response_attachments: List[Dict[str, Any]] = []
-                response = self._call_chat_llm(
+                response = self._request_codex_reply(
                     chat_name,
                     role_name,
                     messages,
@@ -1703,7 +1614,7 @@ class ChatBotPlugin:
                             chat_name,
                             response,
                             role_name,
-                            display_suffix="⚠️⛓️‍💥" if search_outcome.failed else "",
+                            display_suffix="",
                         )
                         if has_response_text
                         else bool(response_attachments)
@@ -1720,7 +1631,7 @@ class ChatBotPlugin:
                         # 记录 E2E 响应时间
                         duration = time.time() - start_time
                         try:
-                            get_llm_manager()._record_stats("builtin_chatbot", "reply_latency", "system", None, duration)
+                            get_llm_manager()._record_stats("assistant", "reply_latency", "system", None, duration)
                             logger.info(f"⏱️ E2E Reply Latency (Quote): {duration:.2f}s")
                         except Exception as e:
                             logger.warning(f"Failed to record latency: {e}")
@@ -2001,8 +1912,23 @@ class ChatBotPlugin:
         return "\n".join(chat_lines)
 
     def _get_active_model_context_window(self, chat_name: str) -> int:
-        """Prefer authoritative App Server telemetry, then model metadata."""
+        """Use authoritative Codex runtime telemetry when it is available."""
         if self.context_window_auto_detect:
+            try:
+                from app.services.codex_profile_service import get_codex_profile_service
+
+                profile_id = str(
+                    self._get_user_permission_config(chat_name).get("codex_profile_id")
+                    or self._default_codex_profile_id()
+                    or ""
+                ).strip()
+                if profile_id:
+                    profile = get_codex_profile_service().get_profile(profile_id)
+                    context_window = int((profile or {}).get("context_window") or 0)
+                    if context_window > 0:
+                        return context_window
+            except Exception as e:
+                logger.debug("Codex Profile context metadata unavailable for %s: %s", chat_name, e)
             try:
                 from app.services.agent_runtime import get_agent_runtime
 
@@ -2013,19 +1939,6 @@ class ChatBotPlugin:
             except Exception as e:
                 logger.debug("Codex context telemetry unavailable for %s: %s", chat_name, e)
 
-            try:
-                manager = get_llm_manager()
-                mapping = manager._get_mapping("builtin_chatbot", "chat") or {}
-                model = (manager.config.get("models") or {}).get(mapping.get("primary")) or {}
-                context_window = int(
-                    model.get("context_window_tokens")
-                    or model.get("max_input_tokens")
-                    or 0
-                )
-                if context_window > 0:
-                    return context_window
-            except Exception as e:
-                logger.debug("Configured model context metadata unavailable: %s", e)
         return 0
 
     def _effective_context_limits(
@@ -2731,16 +2644,14 @@ class ChatBotPlugin:
         *,
         input_image_count: int = 0,
     ) -> tuple[int, str]:
-        """Count the current chat prompt with the active provider's renderer."""
+        """Count the current chat prompt with Codex's renderer."""
         try:
-            token_count = get_llm_manager().count_rendered_prompt_tokens(
-                plugin_name="builtin_chatbot",
-                call_type="chat",
-                messages=messages,
+            token_count = get_assistant_reply_gateway().count_prompt_tokens(
+                messages,
+                native_web_search_enabled=self._is_search_enabled(),
                 input_image_count=input_image_count,
             )
-            if token_count is not None:
-                return int(token_count), "codex_o200k_base"
+            return int(token_count), "codex_o200k_base"
         except Exception as e:
             logger.warning(f"⚠️ Accurate Codex prompt token count unavailable, using heuristic: {e}")
 
@@ -2900,7 +2811,7 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             return None
         return {"type": "json_object"}
 
-    def _call_chat_llm(
+    def _request_codex_reply(
         self,
         chat_name: str,
         role_name: str,
@@ -2908,40 +2819,58 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         **kwargs,
     ) -> str:
         response_format = self._get_human_like_response_format(role_name)
-        call_kwargs = dict(kwargs)
-        call_kwargs["_wxautox_chat_name"] = chat_name
-        call_kwargs["_wxautox_role_name"] = role_name
-        # These hidden kwargs are consumed only by the local Codex adapter;
-        # ordinary LLM providers and their fallback parameters stay untouched.
-        if self.codex_persistent_session_enabled:
-            call_kwargs["_wxautox_chat_id"] = chat_name
-        call_kwargs["_wxautox_codex_reasoning_effort"] = self.codex_reasoning_effort
-        call_kwargs["_wxautox_codex_reasoning_summary"] = self.codex_reasoning_summary
         search_enabled = self._is_search_enabled()
-        call_kwargs["_wxautox_codex_web_search_mode"] = (
-            self.codex_web_search_mode if search_enabled else "disabled"
-        )
-        try:
-            capabilities = get_llm_manager().get_call_capabilities(
-                "builtin_chatbot",
-                "chat",
-            )
-        except Exception:
-            capabilities = {}
-        if not capabilities.get("native_web_search"):
-            # 普通模型只能使用本轮已注入的本地 DDGS 资料，避免模型配置里
-            # 残留的 provider 搜索插件形成第二条、不可见的搜索路径。
-            call_kwargs["_wxautox_disable_model_web_search"] = True
-        call_kwargs["_wxautox_codex_timeout_seconds"] = self.codex_turn_timeout_seconds
-        call_kwargs["_wxautox_codex_max_turns"] = self.codex_max_turns_per_thread
-        call_kwargs["_wxautox_codex_exec_fallback"] = self.codex_exec_fallback_enabled
+        output_schema = None
         if response_format:
-            call_kwargs["response_format"] = response_format
+            output_schema = {
+                "type": "object",
+                "properties": {
+                    "messages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    }
+                },
+                "required": ["messages"],
+                "additionalProperties": False,
+            }
 
-        response = self._call_llm("chat", messages, **call_kwargs)
+        def call_codex(call_messages: List[Dict], *, retry: bool = False) -> str:
+            result = get_assistant_reply_gateway().reply(
+                CodexReplyRequest(
+                    chat_name=chat_name,
+                    role_name=role_name,
+                    codex_profile_id=str(
+                        self._get_user_permission_config(chat_name).get("codex_profile_id")
+                        or self._default_codex_profile_id()
+                        or ""
+                    ),
+                    messages=call_messages,
+                    persistent_session=self.codex_persistent_session_enabled,
+                    retry=retry,
+                    reasoning_effort=self.codex_reasoning_effort,
+                    reasoning_summary=self.codex_reasoning_summary,
+                    web_search_mode=(
+                        self.codex_web_search_mode if search_enabled else "disabled"
+                    ),
+                    timeout_seconds=self.codex_turn_timeout_seconds,
+                    max_turns=self.codex_max_turns_per_thread,
+                    allow_exec_fallback=self.codex_exec_fallback_enabled,
+                    output_schema=output_schema,
+                    input_files=kwargs.get("_wxautox_input_files") or (),
+                    allow_image_input=bool(kwargs.get("_wxautox_allow_image_input")),
+                )
+            )
+            attachment_capture = kwargs.get("_wxautox_attachment_capture")
+            if isinstance(attachment_capture, list):
+                attachment_capture.clear()
+                attachment_capture.extend(result.attachments)
+            return self._strip_markdown(result.text)
+
+        response = call_codex(messages)
         if not response_format:
             return response
-        attachment_capture = call_kwargs.get("_wxautox_attachment_capture")
+        attachment_capture = kwargs.get("_wxautox_attachment_capture")
         if isinstance(attachment_capture, list) and attachment_capture:
             logger.info("🤖 Human-like JSON retry skipped because model returned attachment(s)")
             return response
@@ -2960,9 +2889,7 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             },
         ]
         logger.warning("🤖 Human-like JSON response invalid or empty; retrying once")
-        retry_kwargs = dict(call_kwargs)
-        retry_kwargs["_wxautox_codex_retry"] = True
-        return self._call_llm("chat", retry_messages, **retry_kwargs)
+        return call_codex(retry_messages, retry=True)
 
     def _is_valid_human_like_response(self, response: str) -> bool:
         return self._extract_human_like_messages(response or "") is not None
@@ -3288,38 +3215,49 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         return None
 
     def _get_user_permission_config(self, chat_name: str) -> Dict[str, Any]:
-        """获取用户针对本插件的权限配置"""
+        """Return the first-class assistant policy for a managed chat."""
         try:
             from app.models.base import SessionLocal
-            from app.models.user_permission import UserPermission, WeChatUser
+            from app.models.assistant_policy import AssistantChatPolicy
+            from app.models.user_permission import WeChatUser
 
             with SessionLocal() as db:
                 user = db.query(WeChatUser).filter(WeChatUser.chat_name == chat_name).first()
                 if not user:
                     return {}
 
-                perm = db.query(UserPermission).filter(
-                    UserPermission.user_id == user.id,
-                    UserPermission.plugin_name == 'builtin_chatbot'
+                policy = db.query(AssistantChatPolicy).filter(
+                    AssistantChatPolicy.user_id == user.id,
+                    AssistantChatPolicy.enabled.is_(True),
                 ).first()
 
-                if perm:
+                if policy:
                     return {
-                        "proactive_enabled": perm.proactive_enabled,
-                        "followup_enabled": bool(getattr(perm, "followup_enabled", False)),
-                        "followup_window_seconds": int(getattr(perm, "followup_window_seconds", 60) or 60),
-                        "followup_merge_seconds": int(getattr(perm, "followup_merge_seconds", 3) or 3),
-                        "followup_max_turns": int(getattr(perm, "followup_max_turns", 3) or 3),
-                        "memory_profile": getattr(perm, "memory_profile", None),
-                        "ignored_senders": getattr(perm, "ignored_senders", None),
+                        "proactive_enabled": policy.proactive_enabled,
+                        "followup_enabled": bool(policy.followup_enabled),
+                        "followup_window_seconds": int(policy.followup_window_seconds or 60),
+                        "followup_merge_seconds": int(policy.followup_merge_seconds or 3),
+                        "followup_max_turns": int(policy.followup_max_turns or 3),
+                        "memory_profile": policy.memory_profile,
+                        "ignored_senders": policy.ignored_senders,
+                        "codex_profile_id": policy.codex_profile_id,
                     }
             return {}
         except Exception as e:
             logger.error(f"❌ Error getting user permission config: {e}")
             return {}
 
+    @staticmethod
+    def _default_codex_profile_id() -> str:
+        try:
+            from app.services.codex_profile_service import CodexProfileService
+
+            return CodexProfileService.default_profile_id()
+        except Exception:
+            return ""
+
     def _get_ignored_senders(self, chat_name: str) -> List[str]:
-        """Return normalized sender names ignored for this chat's builtin_chatbot permission."""
+        """Return normalized sender names ignored by this chat's assistant policy."""
         raw_value = self._get_user_permission_config(chat_name).get("ignored_senders")
         if not raw_value:
             return []
@@ -3429,7 +3367,7 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             last_bot_index = -1
             for i in range(len(messages) - 1, -1, -1):
                 # 简单匹配发送者名称 (可能需要更严谨的判断，但目前足够)
-                if self._is_chatbot_reply_record(messages[i]):
+                if self._is_assistant_reply_record(messages[i]):
                     last_bot_index = i
                     break
 
@@ -3455,8 +3393,8 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             logger.error(f"❌ Error analyzing chat state: {e}")
             return {"msg_count": 0, "last_reply_time": None}
 
-    def _is_chatbot_reply_record(self, message: Dict[str, Any]) -> bool:
-        """判断聊天记录中的机器人消息是否应视为 chatbot 角色发言。"""
+    def _is_assistant_reply_record(self, message: Dict[str, Any]) -> bool:
+        """判断聊天记录中的机器人消息是否应视为 Assistant 发言。"""
         if not message.get("is_bot") and message.get("sender") != self.bot_name:
             return False
 
@@ -3478,7 +3416,7 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         """判断聊天记录中的机器人消息是否为工具型输出。"""
         if not message.get("is_bot") and message.get("sender") != self.bot_name:
             return False
-        return not self._is_chatbot_reply_record(message)
+        return not self._is_assistant_reply_record(message)
 
     def _get_judge_context_messages(self, chat_name: str, limit: int = 20) -> List[Dict[str, Any]]:
         """获取 Judge 上下文，保留工具摘要但避免误判为角色刚发言。"""
@@ -3643,7 +3581,11 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
 
             # 尝试使用原生 JSON 模式
             # 注意：LiteLLM/DeepSeek 支持 response_format={"type": "json_object"}
-            response_text = self._call_llm("judge", messages, response_format={"type": "json_object"})
+            response_text = self._call_auxiliary_model(
+                "judge",
+                messages,
+                response_format={"type": "json_object"},
+            )
 
             logger.debug(f"⚖️ Judge raw response: {response_text}")
 
@@ -3693,29 +3635,35 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             logger.error(f"❌ Judge consultation failed: {e}")
             return False
 
-    def _call_llm(self, call_type: str, messages: List[Dict], **kwargs) -> str:
-        """
-        统一调用 LLM（使用 LLM Manager）
+    def _call_auxiliary_model(
+        self,
+        task_type: str,
+        messages: List[Dict],
+        **kwargs,
+    ) -> str:
+        """调用 Judge 等辅助模型；此入口不允许生成最终对话回复。
 
         Args:
-            call_type: 调用类型 ("chat", "vision", "judge")
+            task_type: 辅助任务类型（judge 或 followup_judge）
             messages: OpenAI 格式的消息数组
             **kwargs: 额外参数（如 response_format）
 
         Returns:
             模型返回的文本内容
         """
+        if task_type not in {"judge", "followup_judge"}:
+            raise ValueError(f"不支持的 Assistant 辅助模型任务: {task_type}")
         try:
             llm_manager = get_llm_manager()
             response = llm_manager.call(
-                plugin_name="builtin_chatbot",
-                call_type=call_type,
+                plugin_name="assistant",
+                call_type=task_type,
                 messages=messages,
                 **kwargs
             )
             return self._strip_markdown(response)
         except Exception as e:
-            logger.error(f"🤖 LLM调用失败 ({call_type}): {e}")
+            logger.error("🤖 Assistant 辅助模型调用失败 (%s): %s", task_type, e)
             raise
 
     def _reconcile_memory_trace(
@@ -3897,89 +3845,3 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         text = re.sub(r"<[^>]+>", "", text)
 
         return text.strip()
-
-# 全局实例
-chatbot_plugin = None
-
-
-def get_chatbot_plugin():
-    """获取chatbot_plugin实例（避免导入时的None问题）"""
-    return chatbot_plugin
-
-
-def handle_text_message(event: Event):
-    """处理文本消息事件"""
-    global chatbot_plugin
-    if chatbot_plugin:
-        return chatbot_plugin.handle_text_message(event)
-    return False
-
-
-def handle_quote_image_message(event: Event):
-    """处理引用图片消息事件"""
-    global chatbot_plugin
-    if chatbot_plugin:
-        return chatbot_plugin.handle_quote_image_message(event)
-    return False
-
-
-def handle_followup_approved(event: Event):
-    """Run an approved follow-up reply inside the chat's serialized EventBus queue."""
-    global chatbot_plugin
-    if chatbot_plugin:
-        return chatbot_plugin.handle_text_message(event)
-    return False
-
-
-def register(event_bus, subscribe, context):
-    """插件注册函数"""
-    global chatbot_plugin
-
-    logger.info("🤖 Registering ChatBot plugin...")
-
-    # 初始化ChatBot插件
-    chatbot_plugin = ChatBotPlugin(context)
-    chatbot_plugin.event_bus = event_bus
-    context.health.register(lambda: {
-        "status": "healthy" if chatbot_plugin is not None and not chatbot_plugin._followup_closed else "degraded",
-        "message": "聊天、记忆与后续回复服务运行正常" if chatbot_plugin is not None and not chatbot_plugin._followup_closed else "聊天服务正在关闭",
-        "pending_followups": len(chatbot_plugin._followup_sessions) if chatbot_plugin is not None else 0,
-    })
-    context.register_cleanup(unregister)
-
-    # 订阅文本消息事件
-    subscribe(
-        event_type=EventType.TEXT_MESSAGE_RECEIVED,
-        handler=handle_text_message
-        # 不指定优先级，使用配置文件中的值
-    )
-
-    # 订阅引用图片消息事件 - 专门处理需要图片的场景
-    subscribe(
-        event_type=EventType.QUOTE_IMAGE_MESSAGE_RECEIVED,
-        handler=handle_quote_image_message,
-    )
-
-    # 订阅引用文字消息事件 - 处理纯文字引用
-    subscribe(
-        event_type=EventType.QUOTE_TEXT_MESSAGE_RECEIVED,
-        handler=handle_text_message,
-    )
-
-    subscribe(
-        event_type=EventType.CHATBOT_FOLLOWUP_APPROVED,
-        handler=handle_followup_approved,
-    )
-
-    logger.info("✅ ChatBot 插件注册成功")
-
-
-def unregister():
-    """取消注册插件"""
-    global chatbot_plugin
-
-    logger.info("🤖 Unregistering ChatBot plugin...")
-    if chatbot_plugin:
-        chatbot_plugin.close()
-    chatbot_plugin = None
-    logger.info("ChatBot plugin unregistered")

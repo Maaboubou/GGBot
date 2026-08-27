@@ -28,7 +28,7 @@ except ImportError:
     _requests = None
 
 from app.services.config_service import get_setting
-from app.plugins.builtin_chatbot.memory_tasks import (
+from app.assistant.memory_tasks import (
     MEMORY_ROUTE_PROFILES,
     default_memory_route_mappings,
     migrate_memory_route_mappings,
@@ -149,9 +149,6 @@ class LLMManager:
         self.stats_path = telemetry_root / "llm_stats.json"
         self.daily_stats_path = telemetry_root / "llm_daily_stats.json"
         self.call_history_path = telemetry_root / "llm_call_history.jsonl"
-        self.cache_diagnostics_path = (
-            telemetry_root / "llm_chat_cache_diagnostics.jsonl"
-        )
         self.config = {"models": {}, "plugin_mappings": {}}
         self.session_stats = {}
         self.total_stats = {}
@@ -172,7 +169,6 @@ class LLMManager:
         self.load_stats()
         self.load_daily_stats()
         self.load_call_history()
-        self._compact_cache_diagnostics()
 
         litellm.set_verbose = False
         # fallback 到不支持某些参数的模型时，自动丢弃不支持的参数
@@ -421,24 +417,34 @@ class LLMManager:
                         ", ".join(sorted(removed)),
                     )
 
-        # 搜索工具不再占用独立模型路由；历史 OCR/vision 路由统一迁移到
-        # 聊天记录插件的图片内容补充任务。此清理在“空模型”判断前执行，
-        # 让升级后的公开版也不会继续展示失效点位。
+        # Migrate the historical plugin-owned routes to the first-class
+        # Assistant namespace before pruning retired reply/tool routes.
         all_mappings = self.config.setdefault("plugin_mappings", {})
-        chatbot_mappings = all_mappings.get("builtin_chatbot")
-        if not isinstance(chatbot_mappings, dict):
-            chatbot_mappings = {}
-        if chatbot_mappings.pop("web_search", None) is not None:
+        assistant_mappings = all_mappings.setdefault("assistant", {})
+        legacy_assistant_mappings = all_mappings.pop("builtin_chatbot", None)
+        if isinstance(legacy_assistant_mappings, dict):
+            for call_type, mapping in legacy_assistant_mappings.items():
+                assistant_mappings.setdefault(call_type, mapping)
             modified = True
-            logger.info("🧹 已删除旧模型路由 builtin_chatbot.web_search")
-        legacy_image_mapping = chatbot_mappings.pop("ocr", None)
+            logger.info("🧹 已将旧 builtin_chatbot 辅助模型路由迁移到 assistant")
+
+        if assistant_mappings.pop("web_search", None) is not None:
+            modified = True
+            logger.info("🧹 已删除旧模型路由 assistant.web_search")
+        legacy_image_mapping = assistant_mappings.pop("ocr", None)
         if legacy_image_mapping is not None:
             modified = True
-            logger.info("🧹 已迁移旧模型路由 builtin_chatbot.ocr")
-        legacy_vision_mapping = chatbot_mappings.pop("vision", None)
+            logger.info("🧹 已迁移旧模型路由 assistant.ocr")
+        legacy_vision_mapping = assistant_mappings.pop("vision", None)
         if legacy_vision_mapping is not None:
             modified = True
-            logger.info("🧹 已迁移未使用的旧模型路由 builtin_chatbot.vision")
+            logger.info("🧹 已迁移未使用的旧模型路由 assistant.vision")
+        legacy_chat_mapping = assistant_mappings.pop("chat", None)
+        if legacy_chat_mapping is not None:
+            modified = True
+            logger.info(
+                "🧹 已删除最终回复的通用模型路由 assistant.chat；聊天回复现仅由 Codex 驱动"
+            )
 
         logger_mappings = all_mappings.get("builtin_chat_logger")
         if not isinstance(logger_mappings, dict):
@@ -446,7 +452,7 @@ class LLMManager:
         if "image_understanding" not in logger_mappings:
             replacement = legacy_image_mapping
             if not isinstance(replacement, dict):
-                replacement = legacy_vision_mapping or chatbot_mappings.get("chat")
+                replacement = legacy_vision_mapping or legacy_chat_mapping
             if isinstance(replacement, dict) and replacement.get("primary"):
                 logger_mappings["image_understanding"] = copy.deepcopy(replacement)
                 all_mappings["builtin_chat_logger"] = logger_mappings
@@ -542,7 +548,7 @@ class LLMManager:
             {},
         )
         if (
-            "followup_judge" not in chatbot_mappings
+            "followup_judge" not in assistant_mappings
             and "deepseek" in self.config.get("models", {})
             and "deepseek-followup" not in self.config.get("models", {})
         ):
@@ -557,8 +563,8 @@ class LLMManager:
             self.config["models"]["deepseek-followup"] = followup_model
             modified = True
 
-        if "followup_judge" not in chatbot_mappings:
-            regular_judge = chatbot_mappings.get("judge") or {}
+        if "followup_judge" not in assistant_mappings:
+            regular_judge = assistant_mappings.get("judge") or {}
             regular_primary = str(regular_judge.get("primary") or "").strip()
             preferred_primary = (
                 "deepseek-followup"
@@ -568,7 +574,7 @@ class LLMManager:
             fallback = []
             if regular_primary and regular_primary != preferred_primary:
                 fallback.append(regular_primary)
-            chatbot_mappings["followup_judge"] = {
+            assistant_mappings["followup_judge"] = {
                 "primary": preferred_primary,
                 "fallback": fallback,
                 "override_params": {
@@ -631,10 +637,10 @@ class LLMManager:
             review_fallback=list(memory_dedup_fallback),
             synthesize_fallback=list(preferred_memory_fallback),
         )
-        if migrate_memory_route_mappings(chatbot_mappings, memory_defaults):
+        if migrate_memory_route_mappings(assistant_mappings, memory_defaults):
             modified = True
         for call_type in MEMORY_ROUTE_PROFILES:
-            current = chatbot_mappings[call_type]
+            current = assistant_mappings[call_type]
             primary = str(current.get("primary") or "").strip()
             fallback = []
             for model_id in current.get("fallback") or []:
@@ -1079,7 +1085,7 @@ class LLMManager:
         统一调用接口
 
         Args:
-            plugin_name: 插件名称 (如 "builtin_chatbot")
+            plugin_name: 组件名称（例如 ``assistant``）
             call_type:   调用类型 (如 "chat", "search", "vision", "judge")
             messages:    OpenAI 格式的消息数组
             **kwargs:    额外参数 (temperature, max_tokens, tools …)
@@ -1087,6 +1093,10 @@ class LLMManager:
         Returns:
             模型返回的文本内容
         """
+        if plugin_name in {"assistant", "builtin_chatbot"} and call_type == "chat":
+            raise ValueError(
+                "AI 助手最终回复只能通过 CodexReplyGateway 调用，不能使用通用模型路由"
+            )
         self._check_and_reload_if_modified()
 
         # ── 1. 获取配置 ──
@@ -1439,16 +1449,6 @@ class LLMManager:
                 response_time,
                 token_usage=token_usage,
             )
-            self._record_cache_diagnostics(
-                plugin_name=plugin_name,
-                call_type=call_type,
-                model_id=primary_model_id,
-                actual_model=self.last_used_model,
-                messages=messages,
-                response_time=response_time,
-                token_usage=token_usage,
-                success=True,
-            )
             self._record_call_history(
                 plugin_name,
                 call_type,
@@ -1576,16 +1576,6 @@ class LLMManager:
                     response_time,
                     token_usage=token_usage,
                 )
-                self._record_cache_diagnostics(
-                    plugin_name=plugin_name,
-                    call_type=call_type,
-                    model_id=primary_model_id,
-                    actual_model=self.last_used_model,
-                    messages=messages,
-                    response_time=response_time,
-                    token_usage=token_usage,
-                    success=True,
-                )
                 self._record_call_history(
                     plugin_name,
                     call_type,
@@ -1656,17 +1646,6 @@ class LLMManager:
                     f"LLM 返回空响应/失败内容且所有 Fallback 均失效 "
                     f"[实际模型: {self.last_used_model}]"
                 )
-                self._record_cache_diagnostics(
-                    plugin_name=plugin_name,
-                    call_type=call_type,
-                    model_id=primary_model_id,
-                    actual_model=self.last_used_model,
-                    messages=messages,
-                    response_time=response_time,
-                    token_usage=self._extract_token_usage(response),
-                    success=False,
-                    error=error_msg,
-                )
                 raise ValueError(error_msg)
 
             # 记录实际使用的模型名（fallback 时 resp.model 是真正生效的模型）
@@ -1681,22 +1660,6 @@ class LLMManager:
             self._record_stats(
                 plugin_name, call_type, primary_model_id,
                 response, response_time, token_usage=token_usage
-            )
-            self._record_cache_diagnostics(
-                plugin_name=plugin_name,
-                call_type=call_type,
-                model_id=primary_model_id,
-                actual_model=self.last_used_model,
-                messages=messages,
-                response_time=response_time,
-                token_usage=token_usage,
-                success=True,
-                stream_recovered=bool(
-                    getattr(response, "_stream_recovered_empty_content", False)
-                ),
-                stream_recovered_chars=int(
-                    getattr(response, "_stream_recovered_chars", 0) or 0
-                ),
             )
 
             # 记录调用历史（请求+响应，最多若干条/来源）
@@ -2009,7 +1972,7 @@ class LLMManager:
     def _get_mapping(self, plugin_name: str, call_type: str) -> Optional[Dict]:
         """获取插件调用映射"""
         plugin_mappings = self.config.get("plugin_mappings", {}).get(plugin_name, {})
-        if plugin_name == "builtin_chatbot":
+        if plugin_name in {"assistant", "builtin_chatbot"}:
             memory_mapping = resolve_memory_mapping(plugin_mappings, call_type)
             if memory_mapping is not None:
                 return memory_mapping
@@ -2131,6 +2094,7 @@ class LLMManager:
     ) -> tuple:
         """Call the shared Codex runtime using the appropriate workload profile."""
         from app.services.agent_runtime import get_agent_runtime
+        from app.services.codex_profile_service import get_codex_runtime_registry
 
         extra_body = copy.deepcopy(params.get("extra_body") or {})
         timeout = int(params.get("timeout") or model_config.get("timeout") or 600)
@@ -2178,7 +2142,17 @@ class LLMManager:
             payload.setdefault("extra_body", {})["wxautox_allow_image_input"] = True
 
         t0 = time.time()
-        runtime = get_agent_runtime()
+        codex_profile_id = str(model_config.get("codex_profile_id") or "").strip()
+        if codex_profile_id:
+            runtime, codex_profile = get_codex_runtime_registry().resolve(codex_profile_id)
+            payload["model"] = str(codex_profile.get("model") or payload["model"])
+            payload["codex_runtime_profile"] = codex_profile_id
+            if "reasoning_effort" not in payload:
+                payload["reasoning_effort"] = str(
+                    codex_profile.get("reasoning_effort") or "high"
+                )
+        else:
+            runtime = get_agent_runtime()
         if chat_id:
             response = runtime.chat(
                 payload,
@@ -2559,158 +2533,6 @@ class LLMManager:
                 sanitized[key] = cls._sanitize_history_value(sanitized[key])
         return sanitized
 
-    @staticmethod
-    def _cache_diagnostics_limit() -> int:
-        try:
-            return max(50, int(get_setting("LLM_CHAT_CACHE_DIAGNOSTICS_LIMIT", "") or 500))
-        except Exception:
-            return 500
-
-    @staticmethod
-    def _stable_hash(value: Any) -> str:
-        import hashlib
-        try:
-            payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        except Exception:
-            payload = str(value)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-
-    @staticmethod
-    def _message_text_for_diagnostics(content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict):
-                    if item.get("type") == "text":
-                        parts.append(str(item.get("text", "")))
-                    elif item.get("type"):
-                        parts.append(f"[{item.get('type')}]")
-                else:
-                    parts.append(str(item))
-            return "\n".join(parts)
-        return str(content or "")
-
-    def _record_cache_diagnostics(
-        self,
-        plugin_name: str,
-        call_type: str,
-        model_id: str,
-        actual_model: str,
-        messages: list,
-        response_time: float,
-        token_usage: dict,
-        success: bool,
-        error: str = "",
-        stream_recovered: bool = False,
-        stream_recovered_chars: int = 0,
-    ) -> None:
-        """为总回复调用保存较长的 KV cache 诊断流水，便于排查命中突变。"""
-        if plugin_name != "builtin_chatbot" or call_type != "chat":
-            return
-
-        usage = token_usage or {}
-        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-        cached_tokens = int(usage.get("cached_tokens", 0) or 0)
-        cache_miss_tokens = int(usage.get("cache_miss_tokens", 0) or 0)
-        cache_denominator = cached_tokens + cache_miss_tokens
-        if not cache_denominator and prompt_tokens:
-            cache_denominator = prompt_tokens
-            cache_miss_tokens = max(prompt_tokens - cached_tokens, 0)
-
-        raw_messages = list(messages or [])
-        message_summaries = []
-        retained_messages = raw_messages[-120:]
-        start_index = max(0, len(raw_messages) - len(retained_messages))
-        for idx, message in enumerate(retained_messages, start=start_index):
-            text = self._message_text_for_diagnostics(message.get("content") if isinstance(message, dict) else message)
-            message_summaries.append({
-                "index": idx,
-                "role": message.get("role", "") if isinstance(message, dict) else "",
-                "chars": len(text),
-                "hash": self._stable_hash(text),
-                "preview": text[:180],
-            })
-
-        last_user = next(
-            (item for item in reversed(message_summaries) if item.get("role") == "user"),
-            message_summaries[-1] if message_summaries else {},
-        )
-        system_messages = [item for item in message_summaries if item.get("role") == "system"]
-        record = {
-            "timestamp": datetime.now().isoformat(),
-            "key": f"{plugin_name}.{call_type}",
-            "model_id": model_id,
-            "actual_model": actual_model,
-            "success": success,
-            "response_time": round(response_time, 3),
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
-            "total_tokens": int(usage.get("total_tokens", 0) or 0),
-            "cache_hit_tokens": cached_tokens,
-            "cache_miss_tokens": cache_miss_tokens,
-            "cache_hit_rate": round(cached_tokens / cache_denominator, 6) if cache_denominator else 0,
-            "usage_estimated": bool(usage.get("estimated", False)),
-            "usage_source": str(usage.get("source") or usage.get("encoding") or ""),
-            "request_hash": self._stable_hash(messages or []),
-            "message_count": len(messages or []),
-            "message_summaries": message_summaries,
-            "system_hashes": [item.get("hash") for item in system_messages],
-            "last_user_hash": last_user.get("hash", ""),
-            "last_user_preview": last_user.get("preview", ""),
-            "stream_recovered": bool(stream_recovered),
-            "stream_recovered_chars": int(stream_recovered_chars or 0),
-            "error": error,
-        }
-
-        try:
-            self.cache_diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
-            existing = []
-            if self.cache_diagnostics_path.exists():
-                with open(self.cache_diagnostics_path, "r", encoding="utf-8") as f:
-                    existing = [line.rstrip("\n") for line in f if line.strip()]
-            existing.append(json.dumps(record, ensure_ascii=False, default=str))
-            limit = self._cache_diagnostics_limit()
-            existing = existing[-limit:]
-            tmp_path = self.cache_diagnostics_path.with_suffix(".jsonl.tmp")
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(existing))
-                if existing:
-                    f.write("\n")
-            os.replace(tmp_path, self.cache_diagnostics_path)
-        except Exception as exc:
-            logger.warning(f"⚠️ 保存 LLM cache 诊断记录失败: {exc}")
-
-    def _compact_cache_diagnostics(self) -> None:
-        """Bound legacy cache diagnostics without retaining giant message arrays."""
-        try:
-            if not self.cache_diagnostics_path.exists() or self.cache_diagnostics_path.stat().st_size <= 10 * 1024 * 1024:
-                return
-            compacted = []
-            with self.cache_diagnostics_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    summaries = record.get("message_summaries")
-                    if isinstance(summaries, list) and len(summaries) > 120:
-                        record["message_summaries"] = summaries[-120:]
-                    if isinstance(record.get("error"), str):
-                        record["error"] = record["error"][:2000]
-                    compacted.append(json.dumps(record, ensure_ascii=False, default=str))
-            compacted = compacted[-self._cache_diagnostics_limit():]
-            temporary = self.cache_diagnostics_path.with_suffix(".jsonl.tmp")
-            with temporary.open("w", encoding="utf-8") as handle:
-                handle.write("\n".join(compacted))
-                if compacted:
-                    handle.write("\n")
-            os.replace(temporary, self.cache_diagnostics_path)
-            logger.info("🧹 已压缩 LLM cache 诊断记录: %s 条", len(compacted))
-        except Exception as exc:
-            logger.warning("⚠️ 压缩 LLM cache 诊断记录失败: %s", exc)
-
     def get_call_history(self, plugin_name: str = None, call_type: str = None) -> dict:
         """获取调用历史记录，可按插件/类型筛选"""
         with self._call_history_lock:
@@ -2841,33 +2663,6 @@ class LLMManager:
                 })
         summaries.sort(key=lambda x: x["last_call"], reverse=True)
         return summaries
-
-    def get_chat_cache_diagnostics(self, limit: int = 100) -> list:
-        """读取 builtin_chatbot.chat 的 KV cache 诊断流水，最新记录在前。"""
-        if not self.cache_diagnostics_path.exists():
-            return []
-
-        try:
-            safe_limit = min(max(int(limit or 100), 1), self._cache_diagnostics_limit())
-        except Exception:
-            safe_limit = 100
-
-        records = []
-        try:
-            with open(self.cache_diagnostics_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        except Exception as exc:
-            logger.warning(f"⚠️ 读取 LLM cache 诊断记录失败: {exc}")
-            return []
-
-        return list(reversed(records[-safe_limit:]))
 
     @staticmethod
     def _empty_stats_entry() -> dict:
@@ -3253,6 +3048,8 @@ class LLMManager:
 
     def update_mapping(self, plugin_name: str, call_type: str, mapping: Dict):
         """更新插件映射"""
+        if plugin_name in {"assistant", "builtin_chatbot"} and call_type == "chat":
+            raise ValueError("AI 助手最终回复不支持通用模型路由")
         with self._config_lock:
             if "plugin_mappings" not in self.config:
                 self.config["plugin_mappings"] = {}
@@ -3270,8 +3067,19 @@ class LLMManager:
         logger.info(f"✅ 插件映射已更新: {plugin_name}.{call_type}")
 
     def _get_default_config(self) -> Dict:
-        """公开发行版不内置模型、密钥引用或任务映射。"""
-        return {"models": {}, "plugin_mappings": {}}
+        """公开版仅声明辅助任务槽位，不内置模型、密钥或模型绑定。"""
+        return {
+            "models": {},
+            "plugin_mappings": {
+                "assistant": {
+                    "judge": {},
+                    "followup_judge": {},
+                    "memory_generate": {},
+                    "memory_review": {},
+                    "memory_synthesize": {},
+                }
+            },
+        }
 
 
 # ─────────────── 全局单例 ────────────────

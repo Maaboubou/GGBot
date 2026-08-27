@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from app.core.event_bus import Event, EventType
-from app.plugins.builtin_chatbot.chat_log import ChatLogManager
+from app.assistant.chat_log import ChatLogManager
 from app.plugins.builtin_chat_logger.image_understanding import understand_image
 from app.utils.plugin_config import get_config
 

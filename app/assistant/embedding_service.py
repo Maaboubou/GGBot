@@ -1,4 +1,4 @@
-"""Lazy CPU-only embeddings for conversational memory."""
+"""Lazy CPU-only embeddings for Assistant conversational memory."""
 
 from __future__ import annotations
 

@@ -1,6 +1,4 @@
-"""
-聊天记录管理器
-"""
+"""Assistant 聊天记录管理器。"""
 
 import os
 import json

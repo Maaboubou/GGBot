@@ -1,4 +1,4 @@
-"""Run a prepared historical-memory experiment with bounded concurrency."""
+"""Run a prepared Assistant memory experiment with bounded concurrency."""
 
 from __future__ import annotations
 
@@ -16,15 +16,15 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import litellm
 
-from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-from app.plugins.builtin_chatbot.embedding_service import LocalEmbeddingService
-from app.plugins.builtin_chatbot.memory_experiment import (
+from app.assistant.context_manager import ChatContextManager
+from app.assistant.embedding_service import LocalEmbeddingService
+from app.assistant.memory_experiment import (
     MemoryExperimentError,
     _write_json,
     verify_experiment,
 )
-from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
+from app.assistant.memory_service import ChatMemoryService
+from app.assistant.memory_store import MemoryStore
 from app.services.llm_manager import LLMManager
 
 
@@ -468,7 +468,7 @@ def _configure_experiment_llm(
     plugin_mappings = manager.config.get("plugin_mappings")
     if not isinstance(plugin_mappings, dict):
         return
-    plugin = plugin_mappings.get("builtin_chatbot")
+    plugin = plugin_mappings.get("assistant")
     if not isinstance(plugin, dict):
         return
     generate_mapping = plugin.get("memory_generate")

@@ -1,4 +1,4 @@
-"""Historical rebuild and atomic activation for person memory.
+"""Historical rebuild and atomic activation for Assistant person memory.
 
 The pipeline deliberately runs in an isolated SQLite candidate:
 
@@ -31,10 +31,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import litellm
 
-from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
-from app.plugins.builtin_chatbot.person_memory import (
+from app.assistant.context_manager import ChatContextManager
+from app.assistant.memory_service import ChatMemoryService
+from app.assistant.memory_store import MemoryStore
+from app.assistant.person_memory import (
     PERSON_MEMORY_SCHEMA_VERSION,
     PersonMemoryEngine,
     PersonMemoryStore,
@@ -856,12 +856,12 @@ def _configure_deepseek_manager(
     models = manager.config.get("models", {})
     if "deepseek" not in models:
         raise RuntimeError("LLM Manager has no 'deepseek' model")
-    chatbot = manager.config.setdefault("plugin_mappings", {}).setdefault(
-        "builtin_chatbot",
+    assistant_routes = manager.config.setdefault("plugin_mappings", {}).setdefault(
+        "assistant",
         {},
     )
     for call_type in ("memory_generate", "memory_review", "memory_synthesize"):
-        mapping = chatbot.setdefault(call_type, {})
+        mapping = assistant_routes.setdefault(call_type, {})
         mapping["primary"] = "deepseek"
         mapping["fallback"] = []
         mapping["override_params"] = {}

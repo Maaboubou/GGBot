@@ -1,24 +1,18 @@
 {
-  "name": "builtin_chatbot",
-  "display_name": "聊天机器人",
+  "name": "assistant",
+  "component_kind": "core",
+  "display_name": "AI 助手",
   "version": "2.0.0",
-  "description": "智能聊天机器人，支持角色扮演、上下文记忆和网络搜索",
+  "description": "由 Codex 驱动的核心 AI 助手，支持角色、Judge 与长期记忆",
   "author": "Project Contributors",
   "category": "ai",
   "requires": [
     "openai",
-    "google-genai",
-    "ddgs"
+    "google-genai"
   ],
   "ui": {
     "icon": "bi-robot",
     "llm_tasks": {
-      "chat": {
-        "label": "对话回复",
-        "description": "生成聊天中最终发送的回复内容",
-        "category": "对话",
-        "order": 10
-      },
       "judge": {
         "label": "主动回复判断",
         "description": "判断 AI 是否应该主动参与当前群聊",
@@ -69,8 +63,8 @@
         "order": 30
       },
       "tools": {
-        "title": "网页搜索",
-        "description": "普通模型使用内置 DDGS 搜索；本地 Codex 使用原生搜索",
+        "title": "Codex 网页搜索",
+        "description": "由 Codex 原生搜索处理聊天回复，不经过辅助模型预搜索",
         "order": 40
       },
       "context": {
@@ -88,12 +82,12 @@
     },
     "codex_persistent_session_enabled": {
       "type": "boolean",
-      "description": "Codex 回复是否按聊天对象复用持久会话；普通模型不受影响",
+      "description": "Codex 回复是否按聊天对象复用持久会话",
       "default": true
     },
     "codex_reasoning_effort": {
       "type": "string",
-      "description": "Codex 推理强度覆盖；inherit 使用 LLM 模型配置",
+      "description": "Codex 推理强度覆盖；inherit 使用 Codex 运行配置",
       "default": "inherit",
       "enum": [
         "inherit",
@@ -104,7 +98,7 @@
         "xhigh"
       ],
       "enum_labels": {
-        "inherit": "继承 LLM 模型配置",
+        "inherit": "继承 Codex 运行配置",
         "minimal": "最低（最快）",
         "low": "低",
         "medium": "中",
@@ -133,7 +127,7 @@
     },
     "codex_web_search_mode": {
       "type": "string",
-      "description": "Codex 原生 Web 搜索模式；与框架预搜索互相独立",
+      "description": "Codex 原生 Web 搜索模式",
       "default": "inherit",
       "enum": [
         "inherit",
@@ -143,7 +137,7 @@
         "live"
       ],
       "enum_labels": {
-        "inherit": "继承 LLM 模型配置",
+        "inherit": "继承 Codex 运行配置",
         "disabled": "禁用",
         "cached": "缓存索引",
         "indexed": "索引门控",
@@ -152,7 +146,7 @@
     },
     "codex_turn_timeout_seconds": {
       "type": "integer",
-      "description": "Codex 单轮回复超时；0 表示继承 LLM 模型配置",
+      "description": "Codex 单轮回复超时；0 表示继承 Codex 运行配置",
       "default": 0,
       "minimum": 0,
       "maximum": 3600
@@ -554,46 +548,8 @@
     },
     "search_enabled": {
       "type": "boolean",
-      "description": "统一网页搜索开关：普通模型使用内置 DDGS，本地 Codex 使用原生搜索",
+      "description": "是否允许 Codex 在聊天回复中使用原生网页搜索",
       "default": true
-    },
-    "search_region": {
-      "type": "string",
-      "description": "DDGS 搜索区域；仅影响非 Codex 对话",
-      "default": "cn-zh",
-      "level": "advanced"
-    },
-    "search_safesearch": {
-      "type": "string",
-      "description": "DDGS 安全搜索级别；仅影响非 Codex 对话",
-      "default": "moderate",
-      "enum": ["on", "moderate", "off"],
-      "enum_labels": {"on": "严格", "moderate": "适中", "off": "关闭"},
-      "level": "advanced"
-    },
-    "search_max_results": {
-      "type": "integer",
-      "description": "每轮 DDGS 最多保留的搜索结果数",
-      "default": 6,
-      "minimum": 1,
-      "maximum": 20,
-      "level": "advanced"
-    },
-    "search_fetch_max_pages": {
-      "type": "integer",
-      "description": "每轮最多进一步读取的网页数；0 表示只使用搜索摘要",
-      "default": 2,
-      "minimum": 0,
-      "maximum": 5,
-      "level": "advanced"
-    },
-    "search_timeout_seconds": {
-      "type": "integer",
-      "description": "DDGS 搜索和单页读取超时秒数",
-      "default": 10,
-      "minimum": 3,
-      "maximum": 60,
-      "level": "advanced"
     },
     "allow_mention_trigger": {
       "type": "boolean",
@@ -691,11 +647,6 @@
     "memory_candidate_retention_days": 90,
     "memory_maintenance_interval_hours": 24,
     "search_enabled": true,
-    "search_region": "cn-zh",
-    "search_safesearch": "moderate",
-    "search_max_results": 6,
-    "search_fetch_max_pages": 2,
-    "search_timeout_seconds": 10,
     "allow_mention_trigger": true,
     "proactive_interval_minutes": 1,
     "proactive_msg_threshold": 5,

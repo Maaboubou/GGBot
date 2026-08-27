@@ -33,7 +33,7 @@ class StorageService:
             "data/chatbot_anchor_contexts",
         ],
         "diagnostics": [
-            "data/llm_call_history.jsonl", "data/llm_chat_cache_diagnostics.jsonl",
+            "data/llm_call_history.jsonl",
             "data/corrupt_telemetry_20260728_0034", "logs",
         ],
         "managed_plugins": ["data/plugins", "tmp/plugins"],

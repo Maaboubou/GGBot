@@ -1,4 +1,4 @@
-"""First-class Chatbot console endpoints."""
+"""First-class core Assistant console endpoints."""
 
 from typing import Any, Dict, List, Literal, Optional
 
@@ -146,7 +146,7 @@ def update_assistant_chat(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"聊天配置未保存：{exc}") from exc
-    return {"message": "聊天的 Chatbot 配置已保存"}
+    return {"message": "聊天的 AI 助手配置已保存"}
 
 
 @router.get("/memory/chats/{user_id}/overview")

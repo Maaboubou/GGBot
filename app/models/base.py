@@ -57,8 +57,8 @@ def ensure_wechat_user_access_columns(bind=None):
 
     existing = {column["name"] for column in inspector.get_columns("wechat_users")}
     added = []
+    quote = active_engine.dialect.identifier_preparer.quote
     if "codex_access_mode" not in existing:
-        quote = active_engine.dialect.identifier_preparer.quote
         with active_engine.begin() as connection:
             connection.execute(
                 text(
@@ -69,7 +69,41 @@ def ensure_wechat_user_access_columns(bind=None):
             )
         logger.info("已添加 Codex 聊天访问策略字段: wechat_users.codex_access_mode")
         added.append("codex_access_mode")
+    if "policy_version" not in existing:
+        with active_engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"ALTER TABLE {quote('wechat_users')} "
+                    f"ADD COLUMN {quote('policy_version')} "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
+            )
+        logger.info("已添加聊天策略版本字段: wechat_users.policy_version")
+        added.append("policy_version")
     return added
+
+
+def ensure_assistant_policy_columns(bind=None):
+    """Add request-scoped Codex profile selection to existing policy tables."""
+    active_engine = bind or engine
+    inspector = inspect(active_engine)
+    if not inspector.has_table("assistant_chat_policies"):
+        return []
+    existing = {
+        column["name"] for column in inspector.get_columns("assistant_chat_policies")
+    }
+    if "codex_profile_id" in existing:
+        return []
+    quote = active_engine.dialect.identifier_preparer.quote
+    with active_engine.begin() as connection:
+        connection.execute(
+            text(
+                f"ALTER TABLE {quote('assistant_chat_policies')} "
+                f"ADD COLUMN {quote('codex_profile_id')} VARCHAR"
+            )
+        )
+    logger.info("已添加 Assistant 的逐请求 Codex Profile 字段")
+    return ["codex_profile_id"]
 
 
 def get_db():
@@ -88,7 +122,10 @@ def create_tables():
     from . import user_permission  # 先导入WeChatUser
     from . import chatbot_role    # 后导入引用WeChatUser的模型
     from . import chatbot_judge   # Judge 配置与用户绑定
+    from . import assistant_policy
     
     Base.metadata.create_all(bind=engine)
     drop_legacy_knowledge_base_columns(engine)
     ensure_wechat_user_access_columns(engine)
+    ensure_assistant_policy_columns(engine)
+    assistant_policy.migrate_legacy_assistant_permissions(engine)

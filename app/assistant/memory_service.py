@@ -1,4 +1,4 @@
-"""Event-based, retrieval-first memory for builtin_chatbot."""
+"""Event-based, retrieval-first memory for the core Assistant."""
 
 from __future__ import annotations
 
@@ -15,14 +15,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import numpy as np
 
-from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-from app.plugins.builtin_chatbot.embedding_service import LocalEmbeddingService
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
-from app.plugins.builtin_chatbot.memory_output_schemas import (
+from app.assistant.context_manager import ChatContextManager
+from app.assistant.embedding_service import LocalEmbeddingService
+from app.assistant.memory_store import MemoryStore
+from app.assistant.memory_output_schemas import (
     codex_memory_output_schema,
 )
-from app.plugins.builtin_chatbot.memory_scheduler import MemoryBackgroundScheduler
-from app.plugins.builtin_chatbot.person_memory import PersonMemoryEngine
+from app.assistant.memory_scheduler import MemoryBackgroundScheduler
+from app.assistant.person_memory import PersonMemoryEngine
 from app.services.llm_manager import get_llm_manager
 
 logger = logging.getLogger(__name__)
@@ -1931,7 +1931,7 @@ class ChatMemoryService:
             usage_capture: List[Dict[str, Any]] = []
             try:
                 return manager.call(
-                    plugin_name="builtin_chatbot",
+                    plugin_name="assistant",
                     call_type=call_type,
                     messages=request_messages,
                     _wxautox_chat_name=history_chat_name,
@@ -3612,7 +3612,7 @@ class ChatMemoryService:
                     or source_start
                 ),
             )
-            from app.plugins.builtin_chatbot.memory_source import (
+            from app.assistant.memory_source import (
                 read_event_source,
             )
 

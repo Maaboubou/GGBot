@@ -1,4 +1,4 @@
-"""Evidence-backed alias audit for person memory.
+"""Evidence-backed alias audit for Assistant person memory.
 
 The historical person rebuild primarily learns facts about message authors.
 Group nicknames such as "熊猫" often appear only in other members' messages,
@@ -28,15 +28,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import litellm
 
-from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
-from app.plugins.builtin_chatbot.person_memory import (
+from app.assistant.context_manager import ChatContextManager
+from app.assistant.memory_service import ChatMemoryService
+from app.assistant.memory_store import MemoryStore
+from app.assistant.person_memory import (
     PersonMemoryEngine,
     _clean_text,
     _json_load,
 )
-from app.plugins.builtin_chatbot.person_memory_rebuild import (
+from app.assistant.person_memory_rebuild import (
     DeepSeekBudget,
     _NoChatLog,
     _backup_database,
@@ -737,12 +737,12 @@ class AliasAuditCorpus:
 def _configure_alias_manager(workspace: Path):
     litellm.disable_aiohttp_transport = True
     manager = _configure_deepseek_manager(workspace)
-    chatbot = manager.config.setdefault("plugin_mappings", {}).setdefault(
-        "builtin_chatbot",
+    assistant_routes = manager.config.setdefault("plugin_mappings", {}).setdefault(
+        "assistant",
         {},
     )
     for call_type in ("memory_generate", "memory_review"):
-        mapping = chatbot.setdefault(call_type, {})
+        mapping = assistant_routes.setdefault(call_type, {})
         mapping["primary"] = "deepseek"
         mapping["fallback"] = []
         mapping["override_params"] = {}

@@ -1428,7 +1428,11 @@ class CodexAppServerManager:
         if not isinstance(output_schema, dict):
             output_schema = None
 
+        runtime_profile = str(request.get("codex_runtime_profile") or "").strip()
         state = None if ephemeral else self.state_store.get(chat_id)
+        if state and str(state.get("runtime_profile") or "") != runtime_profile:
+            # A thread belongs to the Profile and credentials that created it.
+            state = None
         effective_rotate_tokens = self.rotate_tokens
         state_context_window = int((state or {}).get("model_context_window") or 0)
         if state_context_window > 0:
@@ -1562,6 +1566,7 @@ class CodexAppServerManager:
                 "backend": "codex_app_server",
                 "pool_worker": self.instance_name,
                 "profile": role_name,
+                "config_profile": runtime_profile or None,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
                 "web_search": web_search_enabled,
@@ -1688,6 +1693,7 @@ class CodexAppServerManager:
             previous_turn_count = int(state.get("turn_count") or 0) if state and delta.resume else 0
             state_payload = {
                 "thread_id": thread_id,
+                "runtime_profile": runtime_profile or None,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
                 "reasoning_summary": reasoning_summary,

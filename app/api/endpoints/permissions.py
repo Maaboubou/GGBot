@@ -20,7 +20,6 @@ from app.dependencies import get_wechat_manager_instance
 from app.services.codex_access_service import (
     ISOLATED_ACCESS,
     OWNER_FULL_ACCESS,
-    CodexAccessService,
     normalize_codex_access_mode,
 )
 
@@ -31,10 +30,6 @@ class ChatMemoryUpdate(BaseModel):
     stage_summary: Optional[str] = None
     stage_mode: Literal["auto", "manual"] = "manual"
     reason: str = Field(default="管理员编辑阶段记忆", min_length=2, max_length=1000)
-
-
-class CodexAccessUpdate(BaseModel):
-    mode: Literal["isolated", "owner_full"]
 
 
 class ChatMemoryEventCorrection(BaseModel):
@@ -129,13 +124,13 @@ def _get_user_or_404(db: Session, user_id: int):
     return db_user
 
 
-def _invalidate_chatbot_memory_context(chat_name: str) -> None:
+def _invalidate_assistant_memory_context(chat_name: str) -> None:
     try:
-        from app.plugins.builtin_chatbot.main import get_chatbot_plugin
+        from app.assistant.runtime import get_assistant_handler
 
-        plugin = get_chatbot_plugin()
-        if plugin and hasattr(plugin, "invalidate_memory_context"):
-            plugin.invalidate_memory_context(chat_name)
+        handler = get_assistant_handler()
+        if handler:
+            handler.invalidate_memory_context(chat_name)
     except Exception:
         pass
 
@@ -144,8 +139,10 @@ def _invalidate_codex_thread(chat_name: str) -> None:
     """Ensure an existing thread is never reused across a policy transition."""
     try:
         from app.services.agent_runtime import get_agent_runtime
+        from app.services.codex_profile_service import get_codex_runtime_registry
 
         get_agent_runtime().invalidate_chat(chat_name)
+        get_codex_runtime_registry().invalidate_chat(chat_name)
     except Exception:
         pass
 
@@ -163,7 +160,9 @@ def create_wechat_user(
     db_user = db.query(models_permission.WeChatUser).filter(models_permission.WeChatUser.chat_name == user.chat_name).first()
     if db_user:
         # “添加”已有聊天等同于显式恢复监听，并允许后续断线自动恢复。
-        db_user.listening_enabled = True
+        if not db_user.listening_enabled:
+            db_user.listening_enabled = True
+            db_user.policy_version = int(db_user.policy_version or 1) + 1
         db.commit()
         db.refresh(db_user)
         if wechat_manager and wechat_manager.is_connected():
@@ -207,46 +206,13 @@ def get_wechat_user(user_id: int, db: Session = Depends(models_base.get_db)):
     return db_user
 
 
-@router.get("/users/{user_id}/codex-access")
-def get_user_codex_access(
-    user_id: int,
-    db: Session = Depends(models_base.get_db),
-):
-    """Return the effective, administrator-owned Codex boundary for one chat."""
-    db_user = _get_user_or_404(db, user_id)
-    context = CodexAccessService().for_user(db_user, ensure=False)
-    return {"status": "success", "data": context.public()}
-
-
-@router.put("/users/{user_id}/codex-access")
-def update_user_codex_access(
-    user_id: int,
-    payload: CodexAccessUpdate,
-    db: Session = Depends(models_base.get_db),
-):
-    """Select isolated access or explicit owner access for a private chat."""
-    db_user = _get_user_or_404(db, user_id)
-    mode = normalize_codex_access_mode(payload.mode)
-    if db_user.is_group and mode == OWNER_FULL_ACCESS:
-        raise HTTPException(status_code=400, detail="群聊成员共享隔离空间，不能授予本机最大权限")
-
-    changed = normalize_codex_access_mode(db_user.codex_access_mode) != mode
-    db_user.codex_access_mode = mode
-    db.commit()
-    db.refresh(db_user)
-    if changed:
-        _invalidate_codex_thread(db_user.chat_name)
-    context = CodexAccessService().for_user(db_user, ensure=mode == ISOLATED_ACCESS)
-    return {"status": "success", "data": context.public()}
-
-
 @router.get("/users/{user_id}/memory")
 def get_user_memory(user_id: int, db: Session = Depends(models_base.get_db)):
     """Return event-memory statistics and the editable stage summary."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+    from app.assistant.context_manager import ChatContextManager
+    from app.assistant.chat_log import ChatLogManager
+    from app.assistant.memory_service import ChatMemoryService
 
     service = ChatMemoryService(ChatLogManager(), ChatContextManager())
     try:
@@ -272,7 +238,7 @@ def browse_user_memory_events(
 ):
     """Browse complete event cards without loading vector blobs."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_store import MemoryStore
 
     items, total = MemoryStore().browse_events(
         db_user.chat_name,
@@ -310,10 +276,10 @@ def browse_user_memory_people(
 ):
     """Return all current person profiles for the selected chat."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_store import MemoryStore
 
     store = MemoryStore()
-    from app.plugins.builtin_chatbot.person_memory import (
+    from app.assistant.person_memory import (
         PersonMemoryStore,
     )
 
@@ -356,8 +322,8 @@ def browse_user_memory_person_audits(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory import (
+    from app.assistant.memory_store import MemoryStore
+    from app.assistant.person_memory import (
         PersonMemoryStore,
     )
 
@@ -384,7 +350,7 @@ def browse_user_memory_person_identity_audits(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_store import MemoryStore
 
     items = MemoryStore().list_person_audits(
         db_user.chat_name,
@@ -410,8 +376,8 @@ def get_user_memory_person(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory import (
+    from app.assistant.memory_store import MemoryStore
+    from app.assistant.person_memory import (
         PersonMemoryStore,
     )
 
@@ -442,8 +408,8 @@ def review_user_memory_person_observation(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory import (
+    from app.assistant.memory_store import MemoryStore
+    from app.assistant.person_memory import (
         PersonMemoryStore,
     )
 
@@ -466,7 +432,7 @@ def review_user_memory_person_observation(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": result}
 
 
@@ -478,8 +444,8 @@ def add_user_memory_person_fact(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory import (
+    from app.assistant.memory_store import MemoryStore
+    from app.assistant.person_memory import (
         PersonMemoryStore,
     )
 
@@ -493,7 +459,7 @@ def add_user_memory_person_fact(
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": result}
 
 
@@ -508,8 +474,8 @@ def delete_user_memory_person_fact(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
-    from app.plugins.builtin_chatbot.person_memory import (
+    from app.assistant.memory_store import MemoryStore
+    from app.assistant.person_memory import (
         PersonMemoryStore,
     )
 
@@ -522,7 +488,7 @@ def delete_user_memory_person_fact(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": result}
 
 
@@ -533,9 +499,9 @@ def refresh_user_memory_person(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+    from app.assistant.chat_log import ChatLogManager
+    from app.assistant.context_manager import ChatContextManager
+    from app.assistant.memory_service import ChatMemoryService
 
     service = ChatMemoryService(ChatLogManager(), ChatContextManager())
     try:
@@ -552,7 +518,7 @@ def refresh_user_memory_person(
             status_code=400,
             detail="person has no active observations to refresh",
         )
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": result}
 
 
@@ -564,7 +530,7 @@ def add_user_memory_person_alias(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_store import MemoryStore
 
     try:
         audit = MemoryStore().add_person_alias(
@@ -576,7 +542,7 @@ def add_user_memory_person_alias(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": {"audit": audit}}
 
 
@@ -588,7 +554,7 @@ def merge_user_memory_person(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_store import MemoryStore
 
     try:
         audit = MemoryStore().merge_people(
@@ -599,7 +565,7 @@ def merge_user_memory_person(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": {"audit": audit}}
 
 
@@ -612,7 +578,7 @@ def revert_user_memory_person_identity_audit(
     db: Session = Depends(models_base.get_db),
 ):
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_store import MemoryStore
 
     try:
         audit = MemoryStore().revert_person_audit(
@@ -621,7 +587,7 @@ def revert_user_memory_person_identity_audit(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": {"audit": audit}}
 
 
@@ -633,7 +599,7 @@ def browse_user_memory_corrections(
 ):
     """Return the auditable correction history for one chat."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_store import MemoryStore
 
     items = MemoryStore().list_corrections(
         db_user.chat_name,
@@ -662,9 +628,9 @@ def correct_user_memory_event(
 ):
     """Correct one event and repair its derived stage/person memories."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+    from app.assistant.context_manager import ChatContextManager
+    from app.assistant.chat_log import ChatLogManager
+    from app.assistant.memory_service import ChatMemoryService
 
     service = ChatMemoryService(ChatLogManager(), ChatContextManager())
     try:
@@ -685,7 +651,7 @@ def correct_user_memory_event(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         service.close()
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": result}
 
 
@@ -702,9 +668,9 @@ def delete_user_memory_event(
 ):
     """Soft-delete one event, repair derived memory, and keep an undo record."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+    from app.assistant.context_manager import ChatContextManager
+    from app.assistant.chat_log import ChatLogManager
+    from app.assistant.memory_service import ChatMemoryService
 
     service = ChatMemoryService(ChatLogManager(), ChatContextManager())
     try:
@@ -717,7 +683,7 @@ def delete_user_memory_event(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         service.close()
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": result}
 
 
@@ -729,9 +695,9 @@ def revert_user_memory_correction(
 ):
     """Revert one active correction from its stored before-snapshot."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+    from app.assistant.context_manager import ChatContextManager
+    from app.assistant.chat_log import ChatLogManager
+    from app.assistant.memory_service import ChatMemoryService
 
     service = ChatMemoryService(ChatLogManager(), ChatContextManager())
     try:
@@ -743,7 +709,7 @@ def revert_user_memory_correction(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         service.close()
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": result}
 
 
@@ -755,8 +721,8 @@ def get_user_memory_event_source(
 ):
     """Return the raw chat range referenced by one memory event."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.memory_source import read_event_source
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_source import read_event_source
+    from app.assistant.memory_store import MemoryStore
 
     store = MemoryStore()
     event = store.get_event(db_user.chat_name, event_id)
@@ -799,9 +765,9 @@ def update_user_memory(
 ):
     """Manually edit the stage summary."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+    from app.assistant.context_manager import ChatContextManager
+    from app.assistant.chat_log import ChatLogManager
+    from app.assistant.memory_service import ChatMemoryService
 
     service = ChatMemoryService(ChatLogManager(), ChatContextManager())
     try:
@@ -813,7 +779,7 @@ def update_user_memory(
         )
     finally:
         service.close()
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": document}
 
 
@@ -825,16 +791,16 @@ def clear_user_memory(
 ):
     """Clear an explicitly selected event-memory tier for one chat."""
     db_user = _get_user_or_404(db, user_id)
-    from app.plugins.builtin_chatbot.context_manager import ChatContextManager
-    from app.plugins.builtin_chatbot.chat_log import ChatLogManager
-    from app.plugins.builtin_chatbot.memory_service import ChatMemoryService
+    from app.assistant.context_manager import ChatContextManager
+    from app.assistant.chat_log import ChatLogManager
+    from app.assistant.memory_service import ChatMemoryService
 
     service = ChatMemoryService(ChatLogManager(), ChatContextManager())
     try:
         document = service.clear_memory(db_user.chat_name, scope)
     finally:
         service.close()
-    _invalidate_chatbot_memory_context(db_user.chat_name)
+    _invalidate_assistant_memory_context(db_user.chat_name)
     return {"status": "success", "data": document}
 
 @router.put("/users/{user_id}", response_model=schemas_permission.WeChatUser)
@@ -864,53 +830,12 @@ def update_wechat_user(
         db_user.bot_group_nickname = nickname or None
     if user_update.bot_group_nickname_auto_enabled is not None:
         db_user.bot_group_nickname_auto_enabled = user_update.bot_group_nickname_auto_enabled
-    
+
+    db_user.policy_version = int(db_user.policy_version or 1) + 1
     db.commit()
     db.refresh(db_user)
     if access_changed:
         _invalidate_codex_thread(db_user.chat_name)
-    return db_user
-
-@router.put("/users/{user_id}/permissions", response_model=schemas_permission.WeChatUser)
-def update_user_permissions(
-    user_id: int, 
-    permissions: schemas_permission.PermissionsUpdateRequest,
-    db: Session = Depends(models_base.get_db),
-    wechat_manager: WeChatManager = Depends(get_wechat_manager_instance)
-):
-    """更新指定用户的插件权限列表，并确保其被监听"""
-    db_user = db.query(models_permission.WeChatUser).filter(models_permission.WeChatUser.id == user_id).first()
-    if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # 删除旧权限
-    db.query(models_permission.UserPermission).filter(models_permission.UserPermission.user_id == user_id).delete()
-
-    # 添加新权限
-    for permission_item in permissions.permissions:
-        db_permission = models_permission.UserPermission(
-            user_id=user_id, 
-            plugin_name=permission_item.plugin_name,
-            require_mention=permission_item.require_mention,
-            proactive_enabled=permission_item.proactive_enabled,
-            followup_enabled=permission_item.followup_enabled,
-            followup_window_seconds=max(10, min(600, permission_item.followup_window_seconds)),
-            followup_merge_seconds=max(1, min(30, permission_item.followup_merge_seconds)),
-            followup_max_turns=max(1, min(10, permission_item.followup_max_turns)),
-            memory_profile=permission_item.memory_profile,
-            ignored_senders=permission_item.ignored_senders,
-        )
-        db.add(db_permission)
-    
-    db.commit()
-    db.refresh(db_user)
-
-    _invalidate_chatbot_memory_context(db_user.chat_name)
-
-    # 确保更新权限后，监听也处于激活状态
-    if wechat_manager and wechat_manager.is_connected():
-        wechat_manager.add_listen_chat(db_user.chat_name)
-    
     return db_user
 
 @router.delete("/users/{user_id}", response_model=schemas_permission.WeChatUser)

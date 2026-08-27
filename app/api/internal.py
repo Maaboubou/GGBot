@@ -46,15 +46,14 @@ def check_summary_permission(chat_name: str) -> bool:
                     return True
                 return False
             else:
-                # 如果用户不在权限表中，默认允许（保持向后兼容）
-                logger.debug(f"用户 '{chat_name}' 不在权限表中，默认允许摘要功能")
-                return True
+                logger.info("聊天 '%s' 未纳入管理，拒绝摘要能力", chat_name)
+                return False
         finally:
             db.close()
     except Exception as e:
         logger.warning(f"⚠️ 检查摘要权限失败: {e}")
-        # 如果检查失败，默认允许（保持向后兼容）
-        return True
+        # Authorization lookup failures must fail closed.
+        return False
 
 class WeChatMessage(BaseModel):
     content: str

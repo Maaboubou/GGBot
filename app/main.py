@@ -31,7 +31,7 @@ from .core.event_bus import get_event_bus, EventType
 from .core.plugin_manager import PluginManager
 from .core.wechat_manager import WeChatManager
 from .models.base import create_tables, SessionLocal
-from .api.endpoints import assistant, automation, backups, capabilities, operations, system, settings, plugins, wechat, permissions, chatbot_roles, chatbot_judges, dashboard
+from .api.endpoints import assistant, assistant_judges, assistant_roles, automation, backups, capabilities, chat_policies, codex_profiles, operations, system, settings, plugins, wechat, permissions, dashboard
 from .api import internal as internal_api
 from .api import codex_proxy
 from .api import codex_jobs
@@ -75,6 +75,7 @@ plugin_manager: Optional[PluginManager] = None
 wechat_manager = None
 monitor_service = None
 agent_runtime = None
+assistant_runtime = None
 
 
 def ensure_initial_settings(db: SessionLocal):
@@ -124,9 +125,9 @@ def ensure_initial_settings(db: SessionLocal):
     _ensure_wechat_user_listener_preference_column(db)
     
     # 创建默认的ChatBot角色
-    _ensure_default_chatbot_roles(db)
+    _ensure_default_assistant_roles(db)
     # 创建默认的ChatBot Judge，并迁移绑定
-    default_judge = _ensure_default_chatbot_judges(db)
+    default_judge = _ensure_default_assistant_judges(db)
     migration_flag_key = "CHATBOT_DEFAULT_JUDGE_BIND_MIGRATION_V1"
     migration_flag = db.query(models_setting.Setting).filter(models_setting.Setting.key == migration_flag_key).first()
     if default_judge and not migration_flag:
@@ -168,8 +169,8 @@ def _ensure_chatbot_judge_timing_columns(db: SessionLocal):
         if "sqlite" not in str(db.bind.url):
             return
 
-        trigger_interval = int(get_plugin_setting("builtin_chatbot", "proactive_interval_minutes", 1) or 1)
-        trigger_threshold = int(get_plugin_setting("builtin_chatbot", "proactive_msg_threshold", 5) or 0)
+        trigger_interval = int(get_plugin_setting("assistant", "proactive_interval_minutes", 1) or 1)
+        trigger_threshold = int(get_plugin_setting("assistant", "proactive_msg_threshold", 5) or 0)
         cooldown_minutes = trigger_interval
         cooldown_threshold = trigger_threshold
 
@@ -291,7 +292,7 @@ def _ensure_wechat_user_listener_preference_column(db: SessionLocal):
         db.rollback()
 
 
-def _ensure_default_chatbot_roles(db: SessionLocal):
+def _ensure_default_assistant_roles(db: SessionLocal):
     """确保系统内置的 ChatBot 角色存在，不覆盖用户已有配置。"""
     try:
         from app.models.chatbot_role import ChatBotRole
@@ -356,7 +357,7 @@ def _get_system_default_judge_prompt() -> str:
 }"""
 
 
-def _ensure_default_chatbot_judges(db: SessionLocal):
+def _ensure_default_assistant_judges(db: SessionLocal):
     """确保内置 Judge 存在，并从旧配置迁移默认 prompt（幂等）。"""
     try:
         from app.models.chatbot_judge import ChatBotJudge
@@ -364,7 +365,7 @@ def _ensure_default_chatbot_judges(db: SessionLocal):
         default_judge = db.query(ChatBotJudge).filter(ChatBotJudge.name == "default_judge").first()
         created_count = 0
         if not default_judge:
-            legacy_prompt = get_plugin_setting("builtin_chatbot", "proactive_judge_prompt", None)
+            legacy_prompt = get_plugin_setting("assistant", "proactive_judge_prompt", None)
             prompt_text = legacy_prompt if isinstance(legacy_prompt, str) and legacy_prompt.strip() else _get_system_default_judge_prompt()
 
             default_judge = ChatBotJudge(
@@ -373,10 +374,10 @@ def _ensure_default_chatbot_judges(db: SessionLocal):
                 description="默认主动回复判断器（由旧 proactive_judge_prompt 迁移）",
                 prompt=prompt_text,
                 prompt_mode="template",
-                trigger_msg_threshold=int(get_plugin_setting("builtin_chatbot", "proactive_msg_threshold", 5) or 0),
-                trigger_interval_minutes=int(get_plugin_setting("builtin_chatbot", "proactive_interval_minutes", 1) or 1),
-                cooldown_msg_threshold=int(get_plugin_setting("builtin_chatbot", "proactive_msg_threshold", 5) or 0),
-                cooldown_minutes=int(get_plugin_setting("builtin_chatbot", "proactive_interval_minutes", 1) or 1),
+                trigger_msg_threshold=int(get_plugin_setting("assistant", "proactive_msg_threshold", 5) or 0),
+                trigger_interval_minutes=int(get_plugin_setting("assistant", "proactive_interval_minutes", 1) or 1),
+                cooldown_msg_threshold=int(get_plugin_setting("assistant", "proactive_msg_threshold", 5) or 0),
+                cooldown_minutes=int(get_plugin_setting("assistant", "proactive_interval_minutes", 1) or 1),
                 is_builtin="true",
             )
             db.add(default_judge)
@@ -404,10 +405,11 @@ def _bind_default_judge_to_existing_chatbot_users(db: SessionLocal, default_judg
     """为当前已有 chatbot 权限的用户批量绑定默认 Judge（幂等）"""
     try:
         from app.models.chatbot_judge import UserChatBotJudge
+        from app.models.assistant_policy import AssistantChatPolicy
 
         user_ids = (
-            db.query(models_permission.UserPermission.user_id)
-            .filter(models_permission.UserPermission.plugin_name == "builtin_chatbot")
+            db.query(AssistantChatPolicy.user_id)
+            .filter(AssistantChatPolicy.enabled.is_(True))
             .distinct()
             .all()
         )
@@ -434,7 +436,7 @@ def _bind_default_judge_to_existing_chatbot_users(db: SessionLocal, default_judg
 
 
 def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_manager: PluginManager):
-    """同步数据库中所有用户的监听状态，并确保他们拥有全部权限"""
+    """Synchronize explicit listener intent without granting capabilities."""
     if not (wechat_manager and wechat_manager.is_connected_cached()):
         logger.warning("WeChat manager not connected, skipping listener sync.")
         return
@@ -461,7 +463,6 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
         logger.info("No users found in database to sync.")
         return
 
-    all_plugins = plugin_manager.get_all_plugin_names()
     success_count = 0
     for user in users:
         # 手动暂停是持久化意图，启动和重连时都不能被自动恢复覆盖。
@@ -482,15 +483,12 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
         else:
             logger.error(f"Failed to start listening to '{user.chat_name}'.")
             
-        # 同步权限 - 只为新用户授权，不覆盖现有用户的权限配置
         current_permissions = {p.plugin_name for p in user.permissions}
         if not current_permissions:
-            # 只有完全没有权限的新用户才自动授权所有插件
-            logger.debug(f"New user '{user.chat_name}' detected. Granting all plugin permissions...")
-            for plugin_name in all_plugins:
-                permission = models_permission.UserPermission(user_id=user.id, plugin_name=plugin_name)
-                db.add(permission)
-            db.commit()
+            logger.debug(
+                "Chat '%s' has no explicit capability grants; leaving it unassigned",
+                user.chat_name,
+            )
         else:
             logger.debug(f"User '{user.chat_name}' already has permissions: {current_permissions}")
             # 现有用户保持其权限配置不变
@@ -501,7 +499,7 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global event_bus, plugin_manager, wechat_manager, monitor_service, agent_runtime
+    global event_bus, plugin_manager, wechat_manager, monitor_service, agent_runtime, assistant_runtime
     
     logger.info("Starting WeChat Automation Assistant...")
     
@@ -513,12 +511,20 @@ async def lifespan(app: FastAPI):
         # Run the separate memory database migrations before plugins or API
         # requests can access it. Component versions make this idempotent and
         # safe across restarts and multiple store instances.
-        from app.plugins.builtin_chatbot.memory_store import MemoryStore
-        from app.plugins.builtin_chatbot.person_memory import PersonMemoryStore
+        try:
+            from app.assistant.memory_store import MemoryStore
+            from app.assistant.person_memory import PersonMemoryStore
 
-        memory_store = MemoryStore()
-        PersonMemoryStore(memory_store)
-        logger.info("Memory database schema ready: %s", memory_store.schema_versions())
+            memory_store = MemoryStore()
+            PersonMemoryStore(memory_store)
+            logger.info("Memory database schema ready: %s", memory_store.schema_versions())
+        except Exception as exc:
+            # Memory is an optional assistant enhancement.  Its storage must
+            # never prevent independent plugins from starting.
+            logger.exception(
+                "Assistant memory schema is unavailable; continuing without blocking plugins: %s",
+                exc,
+            )
 
         # 1. 初始化数据库
         create_tables()
@@ -560,6 +566,17 @@ async def lifespan(app: FastAPI):
         plugin_manager.start_monitoring()
         plugin_manager.load_all_plugins()
         logger.info("Plugin manager initialized")
+
+        # The assistant is a first-class, failure-isolated application
+        # component.  It is deliberately started outside PluginManager.
+        from app.assistant.runtime import get_assistant_runtime
+
+        assistant_runtime = get_assistant_runtime()
+        if not assistant_runtime.start(event_bus):
+            logger.warning(
+                "Core assistant is degraded; independent plugins remain available: %s",
+                assistant_runtime.status().get("error") or "unknown error",
+            )
         
         # 5. 初始化微信管理器
         wechat_manager = WeChatManager(event_bus=event_bus)
@@ -614,6 +631,7 @@ async def lifespan(app: FastAPI):
         app.state.wechat_manager = wechat_manager
         app.state.monitor_service = monitor_service
         app.state.codex_runtime = agent_runtime
+        app.state.assistant_runtime = assistant_runtime
         
         logger.info("Application startup completed")
         
@@ -630,6 +648,10 @@ async def lifespan(app: FastAPI):
         if monitor_service:
             monitor_service.stop_monitoring()
             logger.info("WeChat monitor service stopped")
+
+        if assistant_runtime:
+            assistant_runtime.stop()
+            logger.info("Core assistant stopped")
         
         if plugin_manager:
             plugin_manager.stop_monitoring()
@@ -647,6 +669,14 @@ async def lifespan(app: FastAPI):
                 await loop.run_in_executor(None, agent_runtime.stop)
             except Exception as e:
                 logger.warning("Codex runtime shutdown failed: %s", e)
+
+        try:
+            from app.services.codex_profile_service import get_codex_runtime_registry
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, get_codex_runtime_registry().stop_all)
+        except Exception as e:
+            logger.warning("Codex Profile runtimes shutdown failed: %s", e)
 
         if wechat_manager:
             wechat_manager.stop()
@@ -693,13 +723,15 @@ app.include_router(plugins.router, prefix="/api/plugins", tags=["plugins"])
 app.include_router(capabilities.router, prefix="/api/capabilities", tags=["capabilities"])
 app.include_router(automation.router, prefix="/api/automation", tags=["automation"])
 app.include_router(assistant.router, prefix="/api/assistant", tags=["assistant"])
+app.include_router(chat_policies.router, prefix="/api/chats", tags=["chat-policies"])
+app.include_router(codex_profiles.router, prefix="/api/codex/profiles", tags=["codex-profiles"])
 app.include_router(wechat.router, prefix="/api/wechat", tags=["wechat"])
 app.include_router(internal_api.router, prefix="/api/internal", tags=["internal"])
 app.include_router(codex_proxy.router)
 app.include_router(codex_jobs.router)
 app.include_router(permissions.router, prefix="/api/permissions", tags=["permissions"])
-app.include_router(chatbot_roles.router, prefix="/api/chatbot/roles", tags=["chatbot_roles"])
-app.include_router(chatbot_judges.router, prefix="/api/chatbot/judges", tags=["chatbot_judges"])
+app.include_router(assistant_roles.router, prefix="/api/assistant/roles", tags=["assistant_roles"])
+app.include_router(assistant_judges.router, prefix="/api/assistant/judges", tags=["assistant_judges"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(llm_config.router)  # LLM 配置管理 API（已包含 /api/llm 前缀）
 app.include_router(litellm_updates.router)

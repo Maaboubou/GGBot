@@ -1,4 +1,4 @@
-"""Evidence-ledger person memory for high-volume group chats.
+"""Evidence-ledger Assistant person memory for high-volume group chats.
 
 The event memory answers "what happened".  This module independently answers
 "who is this person over time" from raw messages.  Generated profile text is a
@@ -16,7 +16,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from app.plugins.builtin_chatbot.memory_store import MemoryStore
+from app.assistant.memory_store import MemoryStore
 
 logger = logging.getLogger(__name__)
 

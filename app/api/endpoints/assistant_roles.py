@@ -1,7 +1,6 @@
-"""
-ChatBot角色管理API端点
-"""
+"""Assistant role management API endpoints."""
 
+import logging
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -13,6 +12,23 @@ from app.models.user_permission import WeChatUser
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _reload_assistant_roles_safely() -> bool:
+    """Refresh the live role cache when the Assistant is running."""
+    try:
+        from app.assistant.runtime import get_assistant_handler
+
+        handler = get_assistant_handler()
+        if handler is None:
+            logger.warning("Assistant 未运行，角色将在下次启动时加载")
+            return False
+        handler.reload_roles()
+        return True
+    except Exception as exc:
+        logger.warning("重载 Assistant 角色配置失败: %s", exc)
+        return False
 
 
 class RoleCreateRequest(BaseModel):
@@ -98,8 +114,8 @@ async def get_memory_event_source(
     event_id: int = Query(..., ge=1),
 ) -> Dict[str, Any]:
     """Return one event card and the raw chat range that produced it."""
-    from app.plugins.builtin_chatbot.memory_source import read_event_source
-    from app.plugins.builtin_chatbot.memory_store import MemoryStore
+    from app.assistant.memory_source import read_event_source
+    from app.assistant.memory_store import MemoryStore
 
     store = MemoryStore()
     event = store.get_event(chat_name, event_id)
@@ -177,19 +193,7 @@ async def create_role(
         db.commit()
         db.refresh(new_role)
         
-        # 立即重载ChatBot插件的角色配置
-        try:
-            from app.plugins.builtin_chatbot.main import get_chatbot_plugin
-            if get_chatbot_plugin():
-                get_chatbot_plugin().reload_roles()
-                import logging
-                logging.getLogger(__name__).info(f"✅ ChatBot角色配置已重载（新增角色: {role_request.name}）")
-            else:
-                import logging
-                logging.getLogger(__name__).warning("⚠️ ChatBot插件未初始化，跳过重载")
-        except Exception as reload_error:
-            import logging
-            logging.getLogger(__name__).warning(f"⚠️ 重载角色配置失败: {reload_error}")
+        _reload_assistant_roles_safely()
         
         return {
             "message": f"角色 '{role_request.display_name}' 创建成功",
@@ -230,19 +234,7 @@ async def update_role(
         
         db.commit()
         
-        # 立即重载ChatBot插件的角色配置
-        try:
-            from app.plugins.builtin_chatbot.main import get_chatbot_plugin
-            if get_chatbot_plugin():
-                get_chatbot_plugin().reload_roles()
-                import logging
-                logging.getLogger(__name__).info(f"✅ ChatBot角色配置已重载（更新角色: {role_name}）")
-            else:
-                import logging
-                logging.getLogger(__name__).warning("⚠️ ChatBot插件未初始化，跳过重载")
-        except Exception as reload_error:
-            import logging
-            logging.getLogger(__name__).warning(f"⚠️ 重载角色配置失败: {reload_error}")
+        _reload_assistant_roles_safely()
         
         return {
             "message": f"角色 '{role.display_name}' 更新成功"
@@ -273,19 +265,7 @@ async def delete_role(role_id: int, db: Session = Depends(get_db)) -> Dict[str, 
         db.delete(role)
         db.commit()
         
-        # 立即重载ChatBot插件的角色配置
-        try:
-            from app.plugins.builtin_chatbot.main import get_chatbot_plugin
-            if get_chatbot_plugin():
-                get_chatbot_plugin().reload_roles()
-                import logging
-                logging.getLogger(__name__).info(f"✅ ChatBot角色配置已重载（删除角色: {role_name}）")
-            else:
-                import logging
-                logging.getLogger(__name__).warning("⚠️ ChatBot插件未初始化，跳过重载")
-        except Exception as reload_error:
-            import logging
-            logging.getLogger(__name__).warning(f"⚠️ 重载角色配置失败: {reload_error}")
+        _reload_assistant_roles_safely()
         
         return {
             "message": f"角色 '{display_name}' 删除成功"
@@ -359,19 +339,7 @@ async def assign_user_role(
         
         db.commit()
         
-        # 立即重载ChatBot插件的角色配置
-        try:
-            from app.plugins.builtin_chatbot.main import get_chatbot_plugin
-            if get_chatbot_plugin():
-                get_chatbot_plugin().reload_roles()
-                import logging
-                logging.getLogger(__name__).info(f"✅ ChatBot角色配置已重载（用户 '{user.chat_name}' 分配角色: {role.name}）")
-            else:
-                import logging
-                logging.getLogger(__name__).warning("⚠️ ChatBot插件未初始化，跳过重载")
-        except Exception as reload_error:
-            import logging
-            logging.getLogger(__name__).warning(f"⚠️ 重载角色配置失败: {reload_error}")
+        _reload_assistant_roles_safely()
         
         return {
             "message": f"用户 '{user.chat_name}' 的角色已设置为 '{role.display_name}'"
@@ -396,19 +364,7 @@ async def remove_user_role(user_id: int, db: Session = Depends(get_db)) -> Dict[
             db.delete(user_role)
             db.commit()
             
-            # 立即重载ChatBot插件的角色配置
-            try:
-                from app.plugins.builtin_chatbot.main import get_chatbot_plugin
-                if get_chatbot_plugin():
-                    get_chatbot_plugin().reload_roles()
-                    import logging
-                    logging.getLogger(__name__).info(f"✅ ChatBot角色配置已重载（用户 '{user.chat_name}' 移除角色）")
-                else:
-                    import logging
-                    logging.getLogger(__name__).warning("⚠️ ChatBot插件未初始化，跳过重载")
-            except Exception as reload_error:
-                import logging
-                logging.getLogger(__name__).warning(f"⚠️ 重载角色配置失败: {reload_error}")
+            _reload_assistant_roles_safely()
             
             return {
                 "message": f"用户 '{user.chat_name}' 的角色配置已移除"
@@ -425,36 +381,22 @@ async def remove_user_role(user_id: int, db: Session = Depends(get_db)) -> Dict[
 
 
 @router.post("/reload")
-async def reload_chatbot_roles():
-    """重新加载ChatBot插件的角色配置"""
+async def reload_assistant_roles():
+    """重新加载 Assistant 的角色配置。"""
     try:
-        # 使用模块级导入获取运行时的chatbot_plugin实例
-        from app.plugins.builtin_chatbot.main import get_chatbot_plugin
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        logger.info("🔄 收到重新加载角色配置的请求")
-        
-        if get_chatbot_plugin():
-            logger.info("✅ ChatBot插件实例存在，开始重新加载...")
-            get_chatbot_plugin().reload_roles()
-            logger.info("✅ ChatBot角色配置重新加载成功")
-            return {
-                "success": True,
-                "message": "ChatBot角色配置重新加载成功"
-            }
-        else:
-            logger.error("❌ ChatBot插件未初始化")
+        if not _reload_assistant_roles_safely():
             raise HTTPException(
-                status_code=500,
-                detail="ChatBot插件未初始化"
+                status_code=503,
+                detail="Assistant 未运行"
             )
+        return {
+            "success": True,
+            "message": "Assistant 角色配置重新加载成功"
+        }
     except HTTPException:
         raise
     except Exception as e:
-        import logging
         import traceback
-        logger = logging.getLogger(__name__)
         logger.error(f"❌ 重新加载角色配置失败: {str(e)}")
         logger.error(f"堆栈追踪:\n{traceback.format_exc()}")
         raise HTTPException(

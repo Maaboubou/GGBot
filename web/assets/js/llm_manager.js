@@ -1329,7 +1329,7 @@ const LLMManager = {
                                 </div>
                                 <div id="modelTestResult_${domModelId}" class="llm-model-test-result" style="display:none;"></div>
                                 <div class="llm-model-actions">
-                                    <button class="btn btn-sm btn-outline-primary llm-model-test" id="testModelBtn_${domModelId}" data-model-id="${safeModelId}">
+                                    <button class="btn btn-sm btn-quiet-accent llm-model-test" id="testModelBtn_${domModelId}" data-model-id="${safeModelId}">
                                         <i class="bi bi-lightning-charge me-1"></i>测试
                                     </button>
                                     <button class="btn btn-sm btn-outline-secondary llm-model-edit" data-model-id="${safeModelId}">

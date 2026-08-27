@@ -1125,7 +1125,7 @@ const UI = {
                         <span>${this.escapeHtml(info.category_label || '其他')}</span>
                     </div>
                     <div class="capability-actions">
-                        <button class="btn btn-primary btn-sm capability-configure" ${info.configurable ? '' : 'disabled'}>
+                        <button class="btn btn-quiet-accent btn-sm capability-configure" ${info.configurable ? '' : 'disabled'}>
                             <i class="bi bi-sliders me-1"></i>配置
                         </button>
                         <button class="btn btn-light border btn-sm capability-assign">

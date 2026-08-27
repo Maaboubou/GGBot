@@ -1193,9 +1193,9 @@ const UI = {
 
         if (!users || users.length === 0) {
             list.innerHTML = `
-                <div class="text-center py-5 text-muted">
-                    <i class="bi bi-people opacity-25" style="font-size: 2rem;"></i>
-                    <p class="mt-2 small">暂无监听中的聊天或用户。<br>请点击上方按钮添加。</p>
+                <div class="chat-picker-empty">
+                    <i class="bi bi-search"></i>
+                    <span>没有符合当前条件的聊天</span>
                 </div>
             `;
             return;
@@ -1207,88 +1207,24 @@ const UI = {
             const listeningEnabled = u.listening_enabled !== false;
             const isConfigured = u.has_permission_config;
             const isSelected = window.App.currentThreadName === u.chat_name;
-            const activeClass = isSelected ? 'active' : '';
-            const chatTypeIcon = u.is_group ? '👥' : '👤';
+            const chatTypeIcon = u.is_group ? 'bi-people' : 'bi-person';
             const chatTypeLabel = u.is_group ? '群聊' : '私聊';
-            const blacklistCount = (() => {
-                if (!u.sender_blacklist) return 0;
-                try {
-                    const parsed = JSON.parse(u.sender_blacklist);
-                    return Array.isArray(parsed) ? parsed.map(item => String(item || '').trim()).filter(Boolean).length : 0;
-                } catch (e) {
-                    return String(u.sender_blacklist).split(/\r?\n/).map(item => item.trim()).filter(Boolean).length;
-                }
-            })();
-
-            // Safe encoding for attribute
             const safeChatName = this.escapeHtml(u.chat_name);
             const displayName = this.escapeHtml(u.remark || u.chat_name);
+            const statusClass = isActive ? 'active' : (listeningEnabled ? 'waiting' : 'paused');
+            const statusLabel = isActive ? '监听中' : (listeningEnabled ? '等待连接' : '已暂停');
 
             return `
-                <div class="list-group-item list-group-item-action py-3 ${activeClass}"
-                   role="button" tabindex="0" data-chat-select
-                   aria-current="${isSelected ? 'true' : 'false'}"
-                   data-user-id="${userId || ''}" data-chatname="${safeChatName}">
-                    <div class="d-flex justify-content-between align-items-center">
-                        <div class="d-flex align-items-start gap-2 flex-grow-1">
-                            <span class="fs-5" title="${chatTypeLabel}">${chatTypeIcon}</span>
-                            <div class="flex-grow-1">
-                                <div class="fw-bold text-break">${displayName}</div>
-                                ${u.remark ? `<div class="small text-muted text-break">${safeChatName}</div>` : ''}
-                                <div class="mt-1">
-                                    ${isActive
-                                        ? '<span class="badge bg-success-subtle text-success border border-success-subtle rounded-pill" style="font-size: 0.7em;">监听中</span>'
-                                        : listeningEnabled
-                                            ? '<span class="badge bg-warning-subtle text-warning border border-warning-subtle rounded-pill" style="font-size: 0.7em;">等待恢复</span>'
-                                            : '<span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle rounded-pill" style="font-size: 0.7em;">已暂停</span>'}
-                                    ${isConfigured ? '<span class="badge bg-primary-subtle text-primary border border-primary-subtle rounded-pill" style="font-size: 0.7em;">已管理</span>' : ''}
-                                    ${u.codex_access_mode === 'owner_full' && !u.is_group
-                                        ? '<span class="badge bg-warning-subtle text-warning border border-warning-subtle rounded-pill" style="font-size: 0.7em;">管理员</span>'
-                                        : '<span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle rounded-pill" style="font-size: 0.7em;">Codex 隔离</span>'}
-                                    ${blacklistCount > 0 ? `<span class="badge bg-danger-subtle text-danger border border-danger-subtle rounded-pill" style="font-size: 0.7em;">已屏蔽 ${blacklistCount} 人</span>` : ''}
-                                </div>
-                            </div>
-                        </div>
-                        <div class="d-flex gap-1 ms-2">
-                            ${userId ? `
-                                <button type="button" class="btn btn-link text-primary p-0"
-                                    onclick="event.preventDefault(); event.stopPropagation(); App.openChatMemoryLibrary(${userId})"
-                                    title="打开记忆库" aria-label="打开记忆库">
-                                    <i class="bi bi-database-gear"></i>
-                                </button>
-                                <button type="button" class="btn btn-link text-secondary p-0"
-                                    onclick="event.preventDefault(); event.stopPropagation(); App.showEditUserModal(${userId}, this.getAttribute('data-chatname'), ${!!u.is_group})"
-                                    data-chatname="${safeChatName}"
-                                    title="编辑用户信息">
-                                    <i class="bi bi-pencil"></i>
-                                </button>
-                            ` : ''}
-                            ${isActive ? `
-                                <button class="btn btn-link text-warning p-0"
-                                    onclick="event.stopPropagation(); App.removeListener(this.getAttribute('data-chatname'))"
-                                    data-chatname="${safeChatName}"
-                                    title="停止监听">
-                                    <i class="bi bi-stop-circle"></i>
-                                </button>
-                            ` : userId ? `
-                                <button class="btn btn-link text-success p-0"
-                                    onclick="event.stopPropagation(); App.addListener(this.getAttribute('data-chatname'))"
-                                    data-chatname="${safeChatName}"
-                                    title="恢复监听">
-                                    <i class="bi bi-play-circle"></i>
-                                </button>
-                            ` : ''}
-                            ${userId ? `
-                                <button class="btn btn-link text-danger p-0"
-                                    onclick="event.stopPropagation(); App.deleteUser(${userId}, this.getAttribute('data-chatname'))"
-                                    data-chatname="${safeChatName}"
-                                    title="删除用户">
-                                    <i class="bi bi-trash"></i>
-                                </button>
-                            ` : ''}
-                        </div>
-                    </div>
-                </div>
+                <button type="button" class="chat-picker-item ${isSelected ? 'active' : ''}"
+                    data-chat-select aria-current="${isSelected ? 'true' : 'false'}"
+                    data-user-id="${userId || ''}" data-chatname="${safeChatName}">
+                    <span class="chat-picker-item-icon"><i class="bi ${chatTypeIcon}"></i></span>
+                    <span class="chat-picker-item-copy">
+                        <strong>${displayName}</strong>
+                        <small>${u.remark ? `${safeChatName} · ` : ''}${chatTypeLabel}${isConfigured ? '' : ' · 待管理'}</small>
+                    </span>
+                    <span class="chat-picker-status ${statusClass}"><i></i>${statusLabel}</span>
+                </button>
             `;
         }).join('');
 
@@ -1297,16 +1233,28 @@ const UI = {
             window.App.selectUser(item.dataset.chatname, userId);
         };
         list.querySelectorAll('[data-chat-select]').forEach(item => {
-            item.addEventListener('click', event => {
-                if (event.target.closest('button')) return;
-                selectChat(item);
-            });
-            item.addEventListener('keydown', event => {
-                if (event.target !== item || !['Enter', ' '].includes(event.key)) return;
-                event.preventDefault();
-                selectChat(item);
-            });
+            item.addEventListener('click', () => selectChat(item));
         });
+    },
+
+    bindManagedChatPicker() {
+        const picker = document.getElementById('chatPicker');
+        if (!picker || picker.dataset.bound) return;
+        picker.dataset.bound = 'true';
+        document.addEventListener('click', event => {
+            if (picker.open && !picker.contains(event.target)) picker.open = false;
+        });
+        picker.addEventListener('keydown', event => {
+            if (event.key === 'Escape') {
+                picker.open = false;
+                picker.querySelector('summary')?.focus();
+            }
+        });
+    },
+
+    closeManagedChatPicker() {
+        const picker = document.getElementById('chatPicker');
+        if (picker) picker.open = false;
     },
 
     setActiveManagedChat(chatName) {
@@ -1316,6 +1264,41 @@ const UI = {
             item.classList.toggle('active', isSelected);
             item.setAttribute('aria-current', isSelected ? 'true' : 'false');
         });
+        const chat = (window.App._managedChats || []).find(item => item.chat_name === selectedName);
+        if (chat) this.setManagedChatContext(chat);
+    },
+
+    setManagedChatContext(chat) {
+        const label = document.getElementById('selectedChatLabel');
+        const meta = document.getElementById('selectedChatMeta');
+        const avatar = document.getElementById('selectedChatAvatar');
+        const userId = Number(chat?.user_id || chat?.id || 0);
+        const chatName = String(chat?.chat_name || '');
+        const displayName = String(chat?.remark || chatName || '选择一个聊天');
+        const listening = Boolean(chat?.listening_active ?? chat?.is_listening);
+        const listeningEnabled = chat?.listening_enabled !== false;
+        const typeLabel = chat?.is_group ? '群聊' : '私聊';
+        const statusLabel = listening ? '监听中' : (listeningEnabled ? '等待连接' : '已暂停');
+        if (label) label.textContent = displayName;
+        if (meta) meta.textContent = chatName
+            ? `${chat.remark ? `${chatName} · ` : ''}${typeLabel} · ${statusLabel}`
+            : '按需展开列表，不占用编辑空间';
+        if (avatar) avatar.innerHTML = `<i class="bi ${chatName ? (chat?.is_group ? 'bi-people' : 'bi-person') : 'bi-chat-square-text'}"></i>`;
+        const memoryButton = document.getElementById('chatMemoryButton');
+        const deleteButton = document.getElementById('chatDeleteButton');
+        if (memoryButton) memoryButton.disabled = !userId;
+        if (deleteButton) deleteButton.disabled = !userId;
+    },
+
+    resetManagedChatContext() {
+        this.setManagedChatContext(null);
+        const saveButton = document.getElementById('chatPolicySaveButton');
+        if (saveButton) {
+            saveButton.disabled = true;
+            saveButton.classList.remove('is-dirty', 'is-saving');
+            const label = saveButton.querySelector('span');
+            if (label) label.textContent = '已保存';
+        }
     },
 
     renderManagedChatPending(chatName) {
@@ -1323,12 +1306,14 @@ const UI = {
         if (!container) return;
         container.setAttribute('aria-busy', 'true');
         container.innerHTML = `
-            <div class="card-body d-flex flex-column align-items-center justify-content-center text-muted">
-                <span class="spinner-border spinner-border-sm mb-3" aria-hidden="true"></span>
-                <h6 class="mb-1">${this.escapeHtml(chatName || '聊天')}</h6>
-                <p class="small mb-0">正在加载聊天配置…</p>
+            <div class="chat-policy-empty">
+                <span class="spinner-border spinner-border-sm" aria-hidden="true"></span>
+                <h6>${this.escapeHtml(chatName || '聊天')}</h6>
+                <p>正在加载聊天配置…</p>
             </div>
         `;
+        const saveButton = document.getElementById('chatPolicySaveButton');
+        if (saveButton) saveButton.disabled = true;
     },
 
     renderManagedChatError(chatName) {
@@ -1336,10 +1321,10 @@ const UI = {
         if (!container) return;
         container.removeAttribute('aria-busy');
         container.innerHTML = `
-            <div class="card-body d-flex flex-column align-items-center justify-content-center text-muted">
-                <i class="bi bi-exclamation-circle text-danger fs-3 mb-3" aria-hidden="true"></i>
-                <h6 class="mb-1">${this.escapeHtml(chatName || '聊天')}</h6>
-                <p class="small mb-0">聊天配置加载失败，请重试。</p>
+            <div class="chat-policy-empty error">
+                <i class="bi bi-exclamation-circle" aria-hidden="true"></i>
+                <h6>${this.escapeHtml(chatName || '聊天')}</h6>
+                <p>聊天配置加载失败，请重试。</p>
             </div>
         `;
     },
@@ -1519,17 +1504,24 @@ const UI = {
         const chat = policy.chat || {};
         const assistant = policy.assistant || {};
         const codex = policy.codex || {};
+        const memory = assistant.memory || { mode: 'inherit', overrides: {} };
+        const globalMemory = assistantOverview.global?.memory || {};
+        const memoryOverrides = memory.overrides || {};
+        const memoryValue = (key, fallback) => memoryOverrides[key] !== undefined
+            ? memoryOverrides[key]
+            : (globalMemory[key] !== undefined ? globalMemory[key] : fallback);
         const grants = policy.plugin_grants || [];
         const grantByName = Object.fromEntries(grants.map(item => [item.plugin_name, item]));
         const roles = assistantOverview.roles || [];
         const judges = assistantOverview.judges || [];
         const profiles = profilesData.profiles || [];
         const selectedProfile = assistant.codex_profile_id || '';
+        const selectedPluginCount = grants.filter(item => !String(item.plugin_name).includes('#')).length;
         const defaultProfileLabel = profilesData.default_profile_id
-            ? `继承默认 Profile · ${profilesData.default_profile_id}`
+            ? `继承默认 · ${profilesData.default_profile_id}`
             : '继承 Codex 当前配置';
+        const profileSummary = selectedProfile || profilesData.default_profile_id || '继承当前配置';
         const formatLines = values => (values || []).join('\n');
-        const safeName = this.escapeHtml(chat.chat_name || '');
         const roleOptions = roles.map(item => `<option value="${Number(item.id)}" ${Number(assistant.role_id) === Number(item.id) ? 'selected' : ''}>${this.escapeHtml(item.display_name || item.name)}</option>`).join('');
         const judgeOptions = judges.map(item => `<option value="${Number(item.id)}" ${Number(assistant.judge_id) === Number(item.id) ? 'selected' : ''}>${this.escapeHtml(item.display_name || item.name)}</option>`).join('');
         const profileOptions = [
@@ -1537,19 +1529,23 @@ const UI = {
             ...profiles.filter(item => item.available).map(item => `<option value="${this.escapeHtml(item.name)}" ${selectedProfile === item.name ? 'selected' : ''}>${this.escapeHtml(item.name)} · ${this.escapeHtml(item.model)}</option>`)
         ].join('');
         const pluginCards = [...(capabilities || [])]
-            .sort((a, b) => Number(b.featured) - Number(a.featured) || String(a.display_name).localeCompare(String(b.display_name)))
+            .sort((a, b) => Number(Boolean(grantByName[b.id])) - Number(Boolean(grantByName[a.id]))
+                || Number(b.featured) - Number(a.featured)
+                || String(a.display_name || a.id).localeCompare(String(b.display_name || b.id)))
             .map(capability => {
                 const grant = grantByName[capability.id];
                 const pushGrant = grantByName[`${capability.id}#push`];
                 const checked = Boolean(grant);
                 const available = Boolean(capability.enabled && capability.loaded);
                 const supportsPush = (capability.features || []).includes('push');
+                const searchValue = `${capability.display_name || ''} ${capability.id} ${capability.description || ''}`.toLowerCase();
                 return `
-                    <article class="chat-policy-plugin ${checked ? 'selected' : ''} ${available ? '' : 'unavailable'}" data-plugin-card="${this.escapeHtml(capability.id)}">
+                    <article class="chat-policy-plugin ${checked ? 'selected' : ''} ${available ? '' : 'unavailable'}"
+                        data-plugin-card="${this.escapeHtml(capability.id)}" data-plugin-search="${this.escapeHtml(searchValue)}">
                         <div class="chat-policy-plugin-main">
                             <span><i class="bi ${this.escapeHtml(capability.icon || 'bi-puzzle')}"></i></span>
                             <div><strong>${this.escapeHtml(capability.display_name || capability.id)}</strong><small>${this.escapeHtml(capability.description || capability.category_label || '')}</small></div>
-                            <input class="form-check-input chat-policy-plugin-toggle" type="checkbox" value="${this.escapeHtml(capability.id)}" ${checked ? 'checked' : ''} ${available ? '' : 'disabled'}>
+                            <input class="form-check-input chat-policy-plugin-toggle" type="checkbox" value="${this.escapeHtml(capability.id)}" ${checked ? 'checked' : ''} ${available ? '' : 'disabled'} aria-label="启用 ${this.escapeHtml(capability.display_name || capability.id)}">
                         </div>
                         <div class="chat-policy-plugin-options">
                             ${chat.is_group ? `<label><input class="form-check-input chat-policy-plugin-mention" type="checkbox" ${grant?.require_mention ? 'checked' : ''} ${checked && available ? '' : 'disabled'}><span>仅在 @Bot 时触发</span></label>` : ''}
@@ -1557,64 +1553,279 @@ const UI = {
                         </div>
                     </article>`;
             }).join('');
+        const activePane = ['assistant', 'plugins', 'advanced'].includes(this.chatPolicyActivePane)
+            ? this.chatPolicyActivePane
+            : 'assistant';
 
         container.innerHTML = `
-            <form id="chatPolicyForm" class="chat-policy-shell" data-user-id="${Number(policy.user_id)}" data-version="${Number(policy.version)}">
-                <header class="chat-policy-header">
-                    <div><span>${chat.is_group ? '群聊' : '私聊'}策略</span><h3>${safeName}</h3><p>一次保存监听、Assistant、Codex 边界与插件授权；未显示的配置不会被覆盖。</p></div>
-                    <div><span class="assistant-state-pill ${chat.listening_active ? 'on' : 'off'}">${chat.listening_active ? '监听已生效' : (chat.listening_enabled ? '等待连接同步' : '未监听')}</span><button class="btn btn-primary" type="button" onclick="App.saveChatPolicy()"><i class="bi bi-check2 me-1"></i>保存策略</button></div>
-                </header>
-
-                <section class="chat-policy-section">
-                    <div class="chat-policy-section-title"><span>01</span><div><h5>接入与监听</h5><p>先决定是否接收这个聊天的消息。关闭监听不会删除 Assistant 或插件配置。</p></div></div>
-                    <div class="chat-policy-form-grid">
-                        <label class="chat-policy-switch"><span><strong>接收消息</strong><small>连接可用时立即同步到微信监听器</small></span><input class="form-check-input" type="checkbox" name="listening_enabled" ${chat.listening_enabled ? 'checked' : ''}></label>
-                        <label><span>管理备注</span><input class="form-control" name="remark" value="${this.escapeHtml(chat.remark || '')}" maxlength="255" placeholder="便于管理员识别"></label>
-                        <label class="wide"><span>全局发送者黑名单</span><textarea class="form-control" name="sender_blacklist" rows="2" placeholder="每行一个名称">${this.escapeHtml(formatLines(chat.sender_blacklist))}</textarea></label>
-                    </div>
+            <form id="chatPolicyForm" class="chat-policy-shell" data-user-id="${Number(policy.user_id)}"
+                data-version="${Number(policy.version)}" data-original-group="${Boolean(chat.is_group)}">
+                <section class="chat-policy-summary" aria-label="当前聊天关键状态">
+                    <label class="chat-policy-state-toggle">
+                        <span><i class="bi bi-ear"></i><span><strong>接收消息</strong><small>${chat.listening_active ? '监听已生效' : (chat.listening_enabled ? '等待连接同步' : '当前已暂停')}</small></span></span>
+                        <input class="form-check-input" type="checkbox" name="listening_enabled" ${chat.listening_enabled ? 'checked' : ''}>
+                    </label>
+                    <label class="chat-policy-state-toggle">
+                        <span><i class="bi bi-stars"></i><span><strong>AI 助手</strong><small>核心回复能力</small></span></span>
+                        <input class="form-check-input" type="checkbox" name="assistant_enabled" ${assistant.enabled ? 'checked' : ''}>
+                    </label>
+                    <div class="chat-policy-fact"><span>Codex Profile</span><strong data-profile-summary>${this.escapeHtml(profileSummary)}</strong></div>
+                    <div class="chat-policy-fact"><span>独立插件</span><strong data-plugin-count>${selectedPluginCount} 项已启用</strong></div>
                 </section>
 
-                <section class="chat-policy-section assistant-policy-block ${assistant.enabled ? 'enabled' : ''}">
-                    <div class="chat-policy-section-title"><span>02</span><div><h5>Assistant · Codex 回复</h5><p>Assistant 是核心能力，不属于插件。最终回复只会从所选 Codex Profile 产生。</p></div></div>
-                    <div class="chat-policy-form-grid">
-                        <label class="chat-policy-switch wide"><span><strong>在此聊天启用 Assistant</strong><small>关闭时插件仍可继续独立处理消息</small></span><input class="form-check-input" type="checkbox" name="assistant_enabled" ${assistant.enabled ? 'checked' : ''}></label>
-                        <label><span>Codex Profile</span><select class="form-select" name="codex_profile_id">${profileOptions}</select><small class="field-help"><a href="/codex" onclick="event.preventDefault(); UI.switchTab('codex')">管理 Profiles</a></small></label>
-                        <label><span>Codex 访问范围</span><select class="form-select" name="codex_mode" ${chat.is_group ? 'disabled' : ''}><option value="isolated" ${codex.mode === 'owner_full' ? '' : 'selected'}>隔离空间</option>${chat.is_group ? '' : `<option value="owner_full" ${codex.mode === 'owner_full' ? 'selected' : ''}>管理员 · 本机最大权限</option>`}</select><small class="field-help">${this.escapeHtml(codex.label || '隔离空间')} · ${this.escapeHtml(codex.workdir || '')}</small></label>
-                        <label><span>角色</span><select class="form-select" name="role_id"><option value="">继承全局默认角色</option>${roleOptions}</select></label>
-                        <label class="chat-policy-switch"><span><strong>允许连续对话</strong><small>回复后短时间内无需再次 @</small></span><input class="form-check-input" type="checkbox" name="followup_enabled" ${assistant.followup_enabled ? 'checked' : ''}></label>
-                        ${chat.is_group ? `<label class="chat-policy-switch"><span><strong>允许主动参与</strong><small>由 Judge 判断是否插话</small></span><input class="form-check-input" type="checkbox" name="proactive_enabled" ${assistant.proactive_enabled ? 'checked' : ''}></label><label><span>主动回复 Judge</span><select class="form-select" name="judge_id"><option value="">自动选择默认 Judge</option>${judgeOptions}</select></label>` : ''}
-                        ${chat.is_group ? `<label><span>群内 Bot 昵称</span><input class="form-control" name="bot_group_nickname" value="${this.escapeHtml(chat.bot_group_nickname || '')}" placeholder="用于识别 @ 名称"></label><label class="chat-policy-switch"><span><strong>自动校准群昵称</strong><small>从微信的本群昵称读取</small></span><input class="form-check-input" type="checkbox" name="bot_group_nickname_auto_enabled" ${chat.bot_group_nickname_auto_enabled ? 'checked' : ''}></label>` : ''}
-                        <label><span>记忆策略</span><select class="form-select" name="memory_mode"><option value="inherit" ${assistant.memory?.mode === 'inherit' ? 'selected' : ''}>继承全局</option><option value="off" ${assistant.memory?.mode === 'off' ? 'selected' : ''}>此聊天关闭</option><option value="custom" ${assistant.memory?.mode === 'custom' ? 'selected' : ''}>保留自定义覆盖</option></select></label>
-                        <label class="wide"><span>Assistant 忽略的发送者</span><textarea class="form-control" name="assistant_ignored_senders" rows="2" placeholder="每行一个名称">${this.escapeHtml(formatLines(assistant.ignored_senders))}</textarea></label>
-                    </div>
-                </section>
+                <nav class="chat-policy-tabs" role="tablist" aria-label="聊天配置分区">
+                    <button type="button" class="${activePane === 'assistant' ? 'active' : ''}" data-chat-policy-tab="assistant" aria-selected="${activePane === 'assistant'}"><i class="bi bi-stars"></i>助手</button>
+                    <button type="button" class="${activePane === 'plugins' ? 'active' : ''}" data-chat-policy-tab="plugins" aria-selected="${activePane === 'plugins'}"><i class="bi bi-puzzle"></i>插件 <span data-plugin-tab-count>${selectedPluginCount}</span></button>
+                    <button type="button" class="${activePane === 'advanced' ? 'active' : ''}" data-chat-policy-tab="advanced" aria-selected="${activePane === 'advanced'}"><i class="bi bi-sliders"></i>高级</button>
+                </nav>
 
-                <section class="chat-policy-section">
-                    <div class="chat-policy-section-title"><span>03</span><div><h5>独立插件</h5><p>插件授权与 Assistant 分开保存。即使 Assistant 未配置或不可用，已授权插件仍会正常运行。</p></div></div>
-                    <div class="chat-policy-plugin-grid">${pluginCards || '<div class="assistant-empty-inline">当前没有可授权插件。</div>'}</div>
-                </section>
+                <div class="chat-policy-pane ${activePane === 'assistant' ? 'active' : ''}" data-chat-policy-pane="assistant">
+                    <section class="chat-policy-block">
+                        <div class="chat-policy-block-head"><div><h4>回复身份</h4><p>Assistant 是核心能力，不属于插件；最终回复只会从所选 Codex Profile 产生。</p></div></div>
+                        <div class="chat-policy-field-grid three">
+                            <label><span>Codex Profile</span><select class="form-select" name="codex_profile_id">${profileOptions}</select><small><a href="/codex" onclick="event.preventDefault(); UI.switchTab('codex')">管理 Profiles</a></small></label>
+                            <label><span>角色</span><select class="form-select" name="role_id"><option value="">继承全局默认角色</option>${roleOptions}</select></label>
+                            <label><span>Codex 访问范围</span><select class="form-select" name="codex_mode" data-private-value="${this.escapeHtml(codex.mode || 'isolated')}" ${chat.is_group ? 'disabled' : ''}><option value="isolated" ${codex.mode === 'owner_full' ? '' : 'selected'}>隔离空间</option>${chat.is_group ? '' : `<option value="owner_full" ${codex.mode === 'owner_full' ? 'selected' : ''}>管理员 · 本机最大权限</option>`}</select><small class="field-help">${this.escapeHtml(codex.label || '隔离空间')} · ${this.escapeHtml(codex.workdir || '')}</small></label>
+                        </div>
+                    </section>
 
-                <footer class="chat-policy-footer"><span><i class="bi bi-shield-lock"></i>策略版本 ${Number(policy.version)} · 检测到并发修改时不会覆盖</span><button class="btn btn-primary" type="button" onclick="App.saveChatPolicy()">保存全部策略</button></footer>
+                    <section class="chat-policy-block">
+                        <div class="chat-policy-block-head"><div><h4>对话行为</h4><p>低频参数仅在对应能力开启时展开。</p></div></div>
+                        <div class="chat-policy-switch-grid">
+                            <label class="chat-policy-switch"><span><strong>允许连续对话</strong><small>回复后短时间内无需再次触发</small></span><input class="form-check-input" type="checkbox" name="followup_enabled" ${assistant.followup_enabled ? 'checked' : ''}></label>
+                            ${chat.is_group ? `<label class="chat-policy-switch"><span><strong>允许主动参与</strong><small>由 Judge 判断是否加入群聊</small></span><input class="form-check-input" type="checkbox" name="proactive_enabled" ${assistant.proactive_enabled ? 'checked' : ''} ${judges.length ? '' : 'disabled'}></label>` : ''}
+                        </div>
+                        <div class="chat-policy-dependent" data-followup-settings>
+                            <label><span>有效窗口（秒）</span><input class="form-control" name="followup_window_seconds" type="number" min="10" max="600" value="${Number(assistant.followup_window_seconds || 60)}" required></label>
+                            <label><span>消息合并（秒）</span><input class="form-control" name="followup_merge_seconds" type="number" min="1" max="30" value="${Number(assistant.followup_merge_seconds || 3)}" required></label>
+                            <label><span>最多轮数</span><input class="form-control" name="followup_max_turns" type="number" min="1" max="10" value="${Number(assistant.followup_max_turns || 3)}" required></label>
+                        </div>
+                        ${chat.is_group ? `<div class="chat-policy-group-settings">
+                            <label data-judge-setting><span>主动回复 Judge</span><select class="form-select" name="judge_id"><option value="">选择 Judge</option>${judgeOptions}</select><small>${judges.length ? '仅在主动参与开启时运行' : '请先在 AI 助手页创建 Judge'}</small></label>
+                            <label><span>群内 Bot 昵称</span><input class="form-control" name="bot_group_nickname" value="${this.escapeHtml(chat.bot_group_nickname || '')}" maxlength="128" placeholder="不需要填写 @"><small>${chat.bot_group_nickname_detected ? `最近识别：${this.escapeHtml(chat.bot_group_nickname_detected)}` : '用于准确识别群内 @ 名称'}</small></label>
+                            <label class="chat-policy-switch compact"><span><strong>自动校准群昵称</strong><small>从微信读取本群昵称</small></span><input class="form-check-input" type="checkbox" name="bot_group_nickname_auto_enabled" ${chat.bot_group_nickname_auto_enabled ? 'checked' : ''}></label>
+                        </div>` : ''}
+                    </section>
+
+                    <section class="chat-policy-block chat-policy-memory">
+                        <div class="chat-policy-block-head"><div><h4>长期记忆</h4><p>默认继承全局；只有自定义模式才展示聊天级参数。</p></div><div class="chat-policy-block-actions"><button class="btn btn-sm btn-light border" type="button" onclick="App.showCapabilitySettings('assistant', {focusGroup: 'memory'})"><i class="bi bi-globe2 me-1"></i>全局记忆默认</button><button class="btn btn-sm btn-light border" type="button" onclick="App.openSelectedChatMemory()"><i class="bi bi-database me-1"></i>查看记忆库</button></div></div>
+                        <div class="chat-memory-mode-grid">
+                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="inherit" ${memory.mode === 'inherit' ? 'checked' : ''}><span><i class="bi bi-diagram-2"></i><strong>继承全局</strong><small>随全局策略自动调整</small></span></label>
+                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="off" ${memory.mode === 'off' ? 'checked' : ''}><span><i class="bi bi-slash-circle"></i><strong>此聊天关闭</strong><small>不检索也不生成新记忆</small></span></label>
+                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="custom" ${memory.mode === 'custom' ? 'checked' : ''}><span><i class="bi bi-toggles"></i><strong>此聊天自定义</strong><small>仅覆盖下列常用参数</small></span></label>
+                        </div>
+                        <div class="chat-memory-custom" data-memory-custom>
+                            <div class="chat-policy-switch-grid">
+                                <label class="chat-policy-switch compact"><span><strong>证据复核</strong><small>低可信内容先进入待复核区</small></span><input class="form-check-input" type="checkbox" name="memory_verification_enabled" ${memoryValue('memory_verification_enabled', true) ? 'checked' : ''}></label>
+                                <label class="chat-policy-switch compact"><span><strong>人物记忆</strong><small>维护有来源的人物事实与关系</small></span><input class="form-check-input" type="checkbox" name="memory_person_enabled" ${memoryValue('memory_person_enabled', true) ? 'checked' : ''}></label>
+                            </div>
+                            <div class="chat-policy-dependent two">
+                                <label><span>检索时间范围（天）</span><input class="form-control" name="memory_retention_days" type="number" min="0" max="3650" value="${Number(memoryValue('memory_retention_days', 365))}" required></label>
+                                <label><span>每次最多召回</span><input class="form-control" name="memory_retrieval_top_k" type="number" min="1" max="20" value="${Number(memoryValue('memory_retrieval_top_k', 6))}" required></label>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <div class="chat-policy-pane ${activePane === 'plugins' ? 'active' : ''}" data-chat-policy-pane="plugins">
+                    <section class="chat-policy-block">
+                        <div class="chat-policy-block-head"><div><h4>独立插件</h4><p>与 AI 助手分开授权；默认只显示当前已启用项。</p></div></div>
+                        <div class="chat-plugin-toolbar">
+                            <label><i class="bi bi-search"></i><input type="search" data-plugin-search-input placeholder="搜索插件" autocomplete="off"></label>
+                            <div><button type="button" class="active" data-plugin-filter="enabled">已启用</button><button type="button" data-plugin-filter="all">全部</button></div>
+                        </div>
+                        <div class="chat-policy-plugin-grid">${pluginCards || '<div class="assistant-empty-inline">当前没有可授权插件。</div>'}</div>
+                        <div class="chat-plugin-filter-empty d-none" data-plugin-filter-empty>没有符合当前条件的插件</div>
+                    </section>
+                </div>
+
+                <div class="chat-policy-pane ${activePane === 'advanced' ? 'active' : ''}" data-chat-policy-pane="advanced">
+                    <section class="chat-policy-block">
+                        <div class="chat-policy-block-head"><div><h4>聊天信息</h4><p>名称用于微信匹配，不可在此修改；备注与类型只维护一份。</p></div></div>
+                        <div class="chat-policy-field-grid two">
+                            <label><span>管理备注</span><input class="form-control" name="remark" value="${this.escapeHtml(chat.remark || '')}" maxlength="255" placeholder="便于管理员识别"></label>
+                            <label><span>聊天类型</span><select class="form-select" name="chat_type"><option value="private" ${chat.is_group ? '' : 'selected'}>私聊</option><option value="group" ${chat.is_group ? 'selected' : ''}>群聊</option></select><small data-chat-type-note>改变类型后将重新加载对应设置</small></label>
+                        </div>
+                    </section>
+                    <section class="chat-policy-block">
+                        <div class="chat-policy-block-head"><div><h4>忽略规则</h4><p>区分整条处理链与仅 AI 助手，避免重复配置。</p></div></div>
+                        <div class="chat-policy-field-grid two">
+                            <label><span>全局发送者黑名单</span><textarea class="form-control" name="sender_blacklist" rows="5" placeholder="每行一个名称">${this.escapeHtml(formatLines(chat.sender_blacklist))}</textarea><small>消息将被所有插件与助手忽略</small></label>
+                            <label><span>仅 AI 助手忽略</span><textarea class="form-control" name="assistant_ignored_senders" rows="5" placeholder="每行一个名称">${this.escapeHtml(formatLines(assistant.ignored_senders))}</textarea><small>其他插件仍可处理这些发送者</small></label>
+                        </div>
+                    </section>
+                    <footer class="chat-policy-version"><i class="bi bi-shield-lock"></i><span>策略版本 ${Number(policy.version)}；检测到并发修改时不会覆盖其他页面。</span></footer>
+                </div>
             </form>`;
 
-        container.querySelectorAll('.chat-policy-plugin-toggle').forEach(toggle => {
-            const sync = () => {
-                const card = toggle.closest('.chat-policy-plugin');
-                card.classList.toggle('selected', toggle.checked);
-                card.querySelectorAll('.chat-policy-plugin-options input').forEach(input => {
-                    input.disabled = !toggle.checked || card.classList.contains('unavailable');
-                    if (!toggle.checked) input.checked = false;
-                });
-            };
-            toggle.addEventListener('change', sync);
-            sync();
+        const form = document.getElementById('chatPolicyForm');
+        this.setManagedChatContext({ ...chat, user_id: policy.user_id });
+        this.bindChatPolicyForm(form, profilesData);
+    },
+
+    bindChatPolicyForm(form, profilesData) {
+        if (!form) return;
+        const syncPlugin = toggle => {
+            const card = toggle.closest('.chat-policy-plugin');
+            card.classList.toggle('selected', toggle.checked);
+            card.querySelectorAll('.chat-policy-plugin-options input').forEach(input => {
+                input.disabled = !toggle.checked || card.classList.contains('unavailable');
+                if (!toggle.checked) input.checked = false;
+            });
+        };
+        form.querySelectorAll('.chat-policy-plugin-toggle').forEach(toggle => {
+            toggle.addEventListener('change', () => syncPlugin(toggle));
+            syncPlugin(toggle);
         });
+
+        const syncDependentControls = () => {
+            const followupEnabled = form.elements.followup_enabled.checked;
+            form.querySelector('[data-followup-settings]')?.classList.toggle('is-collapsed', !followupEnabled);
+            const proactiveEnabled = Boolean(form.elements.proactive_enabled?.checked);
+            const judgeSetting = form.querySelector('[data-judge-setting]');
+            if (judgeSetting) {
+                judgeSetting.classList.toggle('is-disabled', !proactiveEnabled);
+                form.elements.judge_id.disabled = !proactiveEnabled;
+                form.elements.judge_id.required = proactiveEnabled;
+                if (proactiveEnabled && !form.elements.judge_id.value) {
+                    form.elements.judge_id.value = form.elements.judge_id.querySelector('option[value]:not([value=""])')?.value || '';
+                }
+            }
+            const memoryMode = form.elements.memory_mode.value;
+            form.querySelector('[data-memory-custom]')?.classList.toggle('is-collapsed', memoryMode !== 'custom');
+            form.querySelectorAll('.chat-memory-mode').forEach(card => {
+                card.classList.toggle('selected', card.querySelector('input').checked);
+            });
+            const groupSelected = form.elements.chat_type.value === 'group';
+            const codexSelect = form.elements.codex_mode;
+            if (groupSelected) {
+                if (codexSelect.value !== 'isolated') codexSelect.dataset.privateValue = codexSelect.value;
+                codexSelect.value = 'isolated';
+                codexSelect.disabled = true;
+            } else {
+                codexSelect.disabled = false;
+                const privateValue = codexSelect.dataset.privateValue;
+                if ([...codexSelect.options].some(option => option.value === privateValue)) codexSelect.value = privateValue;
+            }
+            const typeChanged = groupSelected !== (form.dataset.originalGroup === 'true');
+            const typeNote = form.querySelector('[data-chat-type-note]');
+            if (typeNote) typeNote.textContent = typeChanged
+                ? '保存后会重新加载对应的群聊 / 私聊设置'
+                : '改变类型后将重新加载对应设置';
+        };
+
+        const updateSummary = () => {
+            const selectedCount = form.querySelectorAll('.chat-policy-plugin-toggle:checked').length;
+            form.querySelectorAll('[data-plugin-count]').forEach(item => { item.textContent = `${selectedCount} 项已启用`; });
+            form.querySelectorAll('[data-plugin-tab-count]').forEach(item => { item.textContent = selectedCount; });
+            const profileSelect = form.elements.codex_profile_id;
+            const profileLabel = profileSelect.value
+                || profilesData.default_profile_id
+                || '继承当前配置';
+            const summary = form.querySelector('[data-profile-summary]');
+            if (summary) summary.textContent = profileLabel;
+        };
+
+        form.querySelectorAll('[data-chat-policy-tab]').forEach(button => {
+            button.addEventListener('click', () => this.switchChatPolicyPane(button.dataset.chatPolicyTab));
+        });
+        const pluginSearch = form.querySelector('[data-plugin-search-input]');
+        const applyPluginFilter = () => {
+            const query = String(pluginSearch?.value || '').trim().toLowerCase();
+            const activeFilter = form.querySelector('[data-plugin-filter].active')?.dataset.pluginFilter || 'enabled';
+            let visible = 0;
+            form.querySelectorAll('[data-plugin-card]').forEach(card => {
+                const matchesQuery = !query || String(card.dataset.pluginSearch || '').includes(query);
+                const matchesFilter = activeFilter === 'all' || card.classList.contains('selected');
+                const show = matchesQuery && matchesFilter;
+                card.classList.toggle('d-none', !show);
+                if (show) visible += 1;
+            });
+            form.querySelector('[data-plugin-filter-empty]')?.classList.toggle('d-none', visible > 0);
+        };
+        pluginSearch?.addEventListener('input', this.debounce(applyPluginFilter, 100));
+        form.querySelectorAll('[data-plugin-filter]').forEach(button => button.addEventListener('click', () => {
+            form.querySelectorAll('[data-plugin-filter]').forEach(item => item.classList.toggle('active', item === button));
+            applyPluginFilter();
+        }));
+
+        form.addEventListener('change', () => {
+            syncDependentControls();
+            updateSummary();
+            applyPluginFilter();
+            this.syncChatPolicyDirty(form);
+        });
+        form.addEventListener('input', this.debounce(() => this.syncChatPolicyDirty(form), 60));
+        syncDependentControls();
+        updateSummary();
+        applyPluginFilter();
+        form._initialSnapshot = this.serializeChatPolicyForm(form);
+        this.syncChatPolicyDirty(form);
+    },
+
+    switchChatPolicyPane(pane) {
+        const form = document.getElementById('chatPolicyForm');
+        if (!form || !['assistant', 'plugins', 'advanced'].includes(pane)) return;
+        this.chatPolicyActivePane = pane;
+        form.querySelectorAll('[data-chat-policy-tab]').forEach(button => {
+            const active = button.dataset.chatPolicyTab === pane;
+            button.classList.toggle('active', active);
+            button.setAttribute('aria-selected', String(active));
+        });
+        form.querySelectorAll('[data-chat-policy-pane]').forEach(panel => {
+            panel.classList.toggle('active', panel.dataset.chatPolicyPane === pane);
+        });
+    },
+
+    serializeChatPolicyForm(form) {
+        if (!form) return '';
+        const values = [...form.querySelectorAll('input[name], select[name], textarea[name]')].map(control => ({
+            name: control.name,
+            type: control.type,
+            value: control.value,
+            checked: ['checkbox', 'radio'].includes(control.type) ? control.checked : null,
+            disabled: control.disabled
+        }));
+        return JSON.stringify(values);
+    },
+
+    isChatPolicyDirty() {
+        const form = document.getElementById('chatPolicyForm');
+        return Boolean(form?._initialSnapshot && this.serializeChatPolicyForm(form) !== form._initialSnapshot);
+    },
+
+    syncChatPolicyDirty(form = document.getElementById('chatPolicyForm')) {
+        if (!form) return;
+        const dirty = Boolean(form._initialSnapshot && this.serializeChatPolicyForm(form) !== form._initialSnapshot);
+        const button = document.getElementById('chatPolicySaveButton');
+        if (!button) return;
+        button.disabled = !dirty;
+        button.classList.toggle('is-dirty', dirty);
+        button.classList.remove('is-saving');
+        const label = button.querySelector('span');
+        if (label) label.textContent = dirty ? '保存更改' : '已保存';
+    },
+
+    setChatPolicySaving(saving) {
+        const button = document.getElementById('chatPolicySaveButton');
+        if (!button) return;
+        button.disabled = Boolean(saving);
+        button.classList.toggle('is-saving', Boolean(saving));
+        const label = button.querySelector('span');
+        if (label) label.textContent = saving ? '正在保存' : '保存更改';
     },
 
     renderUnmanagedChatPolicy(chatName) {
         const container = document.getElementById('userPermissionsPanelContainer');
         if (!container) return;
         container.removeAttribute('aria-busy');
+        const saveButton = document.getElementById('chatPolicySaveButton');
+        if (saveButton) {
+            saveButton.disabled = true;
+            saveButton.classList.remove('is-dirty', 'is-saving');
+            const label = saveButton.querySelector('span');
+            if (label) label.textContent = '已保存';
+        }
         container.innerHTML = `
             <div class="chat-policy-unmanaged">
                 <span><i class="bi bi-shield-plus"></i></span>

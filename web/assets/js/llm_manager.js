@@ -3238,11 +3238,9 @@ const LLMManager = {
         const dotClass = maintenance ? 'busy' : serverRunning ? 'ready' : 'failed';
         const installedVersion = String(runtime.active_version || upgrade.installed_version || '-');
         const schemaShort = String(runtime.schema_hash || '').slice(0, 10) || '-';
-        const checkedCurrent = Boolean(upgrade.available_version && !upgrade.update_available);
         const fileToolNames = Array.isArray(fileTools.command_names) ? fileTools.command_names : [];
         const fileToolRoots = Array.isArray(fileTools.tool_roots) ? fileTools.tool_roots : [];
         const fileToolsReady = fileTools.status === 'ready';
-        const fileToolsLabel = fileToolsReady ? `${fileToolNames.length} 项` : '未就绪';
         const codexRuntimePath = String(fileTools.codex?.path || fileTools.codex?.configured || '-');
         const codexCandidates = Array.isArray(fileTools.codex_candidates) ? fileTools.codex_candidates : [];
         const codexCandidatePaths = [...new Set(
@@ -3254,14 +3252,19 @@ const LLMManager = {
             .map(path => `<option value="${this.escapeHtml(path)}"></option>`)
             .join('');
 
-        const updateButton = operationRunning
-            ? `<button class="btn btn-outline-secondary" disabled><span class="spinner-border spinner-border-sm me-1"></span>处理中</button>`
-            : checkedCurrent
-                ? `<button class="btn btn-outline-secondary" disabled><i class="bi bi-check2 me-1"></i>已是最新</button>`
-                : `<button class="btn btn-primary codex-update-start"><i class="bi bi-arrow-up-circle me-1"></i>更新</button>`;
-        const rollbackButton = upgrade.rollback_available && !operationRunning
-            ? `<button class="btn btn-outline-secondary codex-update-rollback" title="恢复 ${this.escapeHtml(upgrade.rollback_version || '')}"><i class="bi bi-arrow-counterclockwise"></i></button>`
+        const updateButton = upgrade.update_available && !operationRunning
+            ? `<button class="btn btn-primary codex-update-start"><i class="bi bi-arrow-up-circle me-1"></i>更新至 ${this.escapeHtml(upgrade.available_version || '最新版本')}</button>`
             : '';
+        const rollbackButton = upgrade.rollback_available && !operationRunning
+            ? `<button class="btn btn-outline-secondary codex-update-rollback" title="恢复 ${this.escapeHtml(upgrade.rollback_version || '')}"><i class="bi bi-arrow-counterclockwise me-1"></i>回退至 ${this.escapeHtml(upgrade.rollback_version || '上一版本')}</button>`
+            : '';
+
+        const runtimeActivityHtml = activeCount || queueCount
+            ? `${activeCount ? `<span><strong>${activeCount}</strong> 运行中</span>` : ''}${queueCount ? `<span><strong>${queueCount}</strong> 排队</span>` : ''}`
+            : '<span>当前空闲</span>';
+        const environmentSummary = upgrade.update_available
+            ? `${this.escapeHtml(installedVersion)} · 可更新 ${this.escapeHtml(upgrade.available_version || '')}`
+            : `${this.escapeHtml(installedVersion)} · ${fileToolsReady ? '工具已连接' : '工具需检查'}`;
 
         const operationFinishedAt = operation?.finished_at ? Date.parse(operation.finished_at) : NaN;
         const showOperation = Boolean(operation && (
@@ -3396,44 +3399,46 @@ const LLMManager = {
                 <div class="codex-runtime-strip">
                     <div class="codex-runtime-identity">
                         <span class="codex-runtime-dot ${dotClass}"></span>
-                        <div><strong title="${this.escapeHtml(runtimeError)}">${maintenance ? '运行环境维护中' : serverRunning ? 'Codex 正常运行' : 'Codex 未就绪'}</strong><small>${this.escapeHtml(installedVersion)}</small></div>
+                        <div><strong title="${this.escapeHtml(runtimeError)}">${maintenance ? '运行环境维护中' : serverRunning ? 'Codex 正常运行' : 'Codex 未就绪'}</strong>${runtimeError ? `<small>${this.escapeHtml(runtimeError)}</small>` : ''}</div>
                     </div>
                     <div class="codex-runtime-facts">
-                        <span>进程<strong>${workerCount}</strong></span><span>队列<strong>${queueCount}</strong></span><span>会话<strong>${sessionCount}</strong></span><span>任务<strong>${activeCount}</strong></span><span>线程 Token<strong>${formatK(sessionStats.current_thread_total_tokens || 0)}</strong></span><span>Schema<strong class="codex-mono">${this.escapeHtml(schemaShort)}</strong></span><span>安装<strong>${this.escapeHtml(upgrade.installation?.method_label || '-')}</strong></span>
-                        <span>文件工具<strong>${this.escapeHtml(fileToolsLabel)}</strong></span>
-                        ${upgrade.update_available ? `<span class="codex-inline-badge warning">可用 ${this.escapeHtml(upgrade.available_version || '')}</span>` : ''}
-                    </div>
-                    <div class="codex-runtime-actions">
-                        <button class="btn btn-outline-secondary codex-file-tools-refresh" title="重新探测文件工具"><i class="bi bi-tools"></i></button>
-                        <button class="btn btn-outline-secondary codex-update-check" ${operationRunning ? 'disabled' : ''} title="检查最新版本"><i class="bi bi-arrow-clockwise"></i></button>
-                        ${updateButton}${rollbackButton}
+                        ${runtimeActivityHtml}
                     </div>
                 </div>
+                ${operationHtml}
                 <details class="codex-tool-details" ${this.codexToolDetailsOpen ? 'open' : ''}>
-                    <summary>Codex 与文件环境 <span>${this.escapeHtml(fileToolsReady ? '已连接' : '需要检查')}</span></summary>
-                    <div class="codex-tool-detail-grid">
-                        <div class="codex-runtime-selector">
-                            <small>WSL Codex 路径</small>
-                            <div>
-                                <input class="form-control codex-runtime-path" list="codexRuntimeCandidates" value="${this.escapeHtml(codexPathValue)}" placeholder="/home/user/.local/bin/codex" spellcheck="false">
-                                <datalist id="codexRuntimeCandidates">${codexCandidateOptions}</datalist>
-                                <button class="btn btn-primary codex-runtime-select" ${operationRunning ? 'disabled' : ''}>切换</button>
+                    <summary><span><i class="bi bi-sliders2"></i>环境与版本</span><small>${environmentSummary}</small></summary>
+                    <div class="codex-tool-detail-body">
+                        <div class="codex-tool-detail-grid">
+                            <div class="codex-runtime-selector">
+                                <small>WSL Codex 路径</small>
+                                <div>
+                                    <input class="form-control codex-runtime-path" list="codexRuntimeCandidates" value="${this.escapeHtml(codexPathValue)}" placeholder="/home/user/.local/bin/codex" spellcheck="false">
+                                    <datalist id="codexRuntimeCandidates">${codexCandidateOptions}</datalist>
+                                    <button class="btn btn-primary codex-runtime-select" ${operationRunning ? 'disabled' : ''}>切换</button>
+                                </div>
+                                <span>仅接受 WSL 原生绝对路径；可选择使用不同模型配置的 Codex 包装器。</span>
                             </div>
-                            <span>仅接受 WSL 原生绝对路径；可选择使用不同模型配置的 Codex 包装器。</span>
+                            <div><small>安装方式</small><span>${this.escapeHtml(upgrade.installation?.method_label || '-')}</span></div>
+                            <div><small>Worker</small><span>${workerCount} 个进程</span></div>
+                            <div><small>Schema</small><span class="codex-mono">${this.escapeHtml(schemaShort)}</span></div>
+                            <div><small>可用命令</small><span>${this.escapeHtml(fileToolNames.join(' · ') || '未探测到')}</span></div>
+                            <div><small>工具目录</small><span class="codex-mono">${this.escapeHtml(fileToolRoots.join(' · ') || '使用系统工具')}</span></div>
+                            ${runtimeError ? `<div><small>运行时诊断</small><span class="text-danger" title="${this.escapeHtml(runtimeError)}">${this.escapeHtml(runtimeError)}</span></div>` : ''}
+                            ${fileTools.error ? `<div><small>工具诊断</small><span class="text-danger">${this.escapeHtml(fileTools.error)}</span></div>` : ''}
                         </div>
-                        <div><small>Codex</small><span class="codex-mono" title="${this.escapeHtml(codexRuntimePath)}">${this.escapeHtml(codexRuntimePath)}</span></div>
-                        <div><small>可用命令</small><span>${this.escapeHtml(fileToolNames.join(' · ') || '未探测到')}</span></div>
-                        <div><small>工具环境</small><span class="codex-mono">${this.escapeHtml(fileToolRoots.join(' · ') || '使用系统工具')}</span></div>
-                        ${runtimeError ? `<div><small>运行时诊断</small><span class="text-danger" title="${this.escapeHtml(runtimeError)}">${this.escapeHtml(runtimeError)}</span></div>` : ''}
-                        ${fileTools.error ? `<div><small>诊断</small><span class="text-danger">${this.escapeHtml(fileTools.error)}</span></div>` : ''}
+                        <div class="codex-maintenance-actions">
+                            <button class="btn btn-outline-secondary codex-file-tools-refresh"><i class="bi bi-tools me-1"></i>重新探测工具</button>
+                            <button class="btn btn-outline-secondary codex-update-check" ${operationRunning ? 'disabled' : ''}><i class="bi bi-arrow-clockwise me-1"></i>检查更新</button>
+                            ${updateButton}${rollbackButton}
+                        </div>
                     </div>
                 </details>
-                ${operationHtml}
+                ${active.length ? `<section class="codex-section"><div class="codex-section-head"><h6>正在执行</h6><small>${active.length} 个任务</small></div>${renderJobs(active, true)}</section>` : ''}
                 <section class="codex-section">
                     <div class="codex-section-head"><h6>会话</h6><small>${sessionCount} 个持久上下文 · ${Number(sessionStats.total_turn_count || 0).toLocaleString()} 轮</small></div>
                     ${renderSessions()}
                 </section>
-                ${active.length ? `<section class="codex-section"><div class="codex-section-head"><h6>正在执行</h6><small>${active.length} 个任务</small></div>${renderJobs(active, true)}</section>` : ''}
                 <details class="codex-section codex-history" ${this.codexHistoryOpen ? 'open' : ''}>
                     <summary>任务历史 <span>${recent.length} 条 · 点击展开</span></summary>
                     ${renderJobs(recent, false)}

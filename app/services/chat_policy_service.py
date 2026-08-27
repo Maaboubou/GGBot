@@ -132,6 +132,7 @@ class ChatPolicyService:
         assistant_effect: Mapping[str, Any] = {}
         listening_change: Optional[bool] = None
         codex_changed = False
+        chat_type_changed = False
         try:
             user = self._user(user_id, lock=True)
             current_version = int(user.policy_version or 1)
@@ -141,6 +142,16 @@ class ChatPolicyService:
             chat_changes = _fields(request.chat)
             if "remark" in chat_changes:
                 user.remark = str(chat_changes["remark"] or "").strip() or None
+            if "is_group" in chat_changes:
+                requested_group = bool(chat_changes["is_group"])
+                if bool(user.is_group) != requested_group:
+                    user.is_group = requested_group
+                    chat_type_changed = True
+                    # Private and group chats resolve to different Codex scopes,
+                    # even while both use the isolated access mode.
+                    codex_changed = True
+                    if requested_group and normalize_codex_access_mode(user.codex_access_mode) == OWNER_FULL_ACCESS:
+                        user.codex_access_mode = ISOLATED_ACCESS
             if "listening_enabled" in chat_changes:
                 requested_listening = bool(chat_changes["listening_enabled"])
                 if bool(user.listening_enabled) != requested_listening:
@@ -151,6 +162,11 @@ class ChatPolicyService:
                 user.sender_blacklist = json.dumps(names, ensure_ascii=False) if names else None
 
             assistant_changes = _fields(request.assistant)
+            if chat_type_changed and not user.is_group:
+                # A chat converted to private no longer has a proactive/Judge
+                # execution path. Clear those bindings in the same transaction.
+                assistant_changes["proactive_enabled"] = False
+                assistant_changes["judge_id"] = None
             for field in ("bot_group_nickname", "bot_group_nickname_auto_enabled"):
                 if field in chat_changes:
                     assistant_changes[field] = chat_changes[field]

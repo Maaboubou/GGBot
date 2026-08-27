@@ -1,4 +1,4 @@
-"""Validation and presentation helpers for WxAutoX plugin manifests."""
+"""Validation and presentation helpers for Mabobot plugin manifests."""
 
 from __future__ import annotations
 

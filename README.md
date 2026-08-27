@@ -1,6 +1,6 @@
-# GGBot
+# Mabobot
 
-GGBot 是一个运行在 Windows 上的本地微信自动化助手。它把微信桌面端接入、消息监听、AI 对话、聊天记录和实用插件集中到一个 Web 管理面板中，模型与聊天数据默认保存在用户自己的电脑上。
+Mabobot 是一个运行在 Windows 上的本地微信自动化助手。它把微信桌面端接入、消息监听、AI 对话、聊天记录和实用插件集中到一个 Web 管理面板中，模型与聊天数据默认保存在用户自己的电脑上。
 
 > 管理面板面向可信局域网或 Tailnet，默认没有登录认证，并监听所有本机网络接口。请用 Windows 防火墙和 Tailscale ACL 限制访问范围，不要把 `8888` 端口映射到公网。详细边界见[安全策略](SECURITY.md)。
 
@@ -11,7 +11,7 @@ GGBot 是一个运行在 Windows 上的本地微信自动化助手。它把微�
 - 聊天记录：按聊天保存文本、图片、链接和引用消息，并可在后台补充图片的视觉内容与可见文字。
 - 聊天级权限：每个联系人或群聊可以分别选择允许使用的插件，群聊还可设置是否必须 `@机器人`。
 - 插件系统：内置链接摘要、翻译、汇率、周报、磁链检查和菜单翻译，并支持按 Manifest v2 规范继续扩展。
-- 本地管理：通过 GGbot 管理面板维护聊天、插件、模型、任务路由、角色、Judge 和记忆设置。
+- 本地管理：通过 Mabobot 管理面板维护聊天、插件、模型、任务路由、角色、Judge 和记忆设置。
 - 运行恢复：提供 GUI 启动器、日志查看、微信在线检查、监听恢复和 Windows 登录后自动启动脚本。
 
 首次启动不会预置模型、API Key 或聊天绑定。AI 长期记忆默认关闭，需要时再由用户开启。项目内置“默认助手”“刘局-和联胜”角色以及“默认 Judge”“刘局-和联胜 Judge”。
@@ -28,7 +28,7 @@ flowchart LR
     P --> L[AI 模型 / 外部服务]
     P -->|回复| M[WeChatManager]
     M --> B
-    C[GGbot 管理面板] <--> A
+    C[Mabobot 管理面板] <--> A
     A <--> D[(SQLite / 本地配置)]
 ```
 
@@ -75,12 +75,12 @@ flowchart LR
 
 ```powershell
 cd C:\Users\你的用户名
-git clone https://github.com/Maaboubou/GGBot.git
-cd GGBot
+git clone https://github.com/Maaboubou/Mabobot.git
+cd Mabobot
 .\一键启动.bat
 ```
 
-`git clone` 只在第一次使用时执行。建议把项目放在当前 Windows 用户有完整读写权限的目录中，例如 `C:\Users\你的用户名\GGBot`，不要放到 `Program Files`。
+`git clone` 只在第一次使用时执行。建议把项目放在当前 Windows 用户有完整读写权限的目录中，例如 `C:\Users\你的用户名\Mabobot`，不要放到 `Program Files`。
 
 ### 方法二：下载 ZIP
 
@@ -117,9 +117,9 @@ Install.bat
 
 ## 升级与更新记录
 
-面向使用者的版本公告发布在 [GitHub Releases](https://github.com/Maaboubou/GGBot/releases)，仓库内的长期变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+面向使用者的版本公告发布在 [GitHub Releases](https://github.com/Maaboubou/Mabobot/releases)，仓库内的长期变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-升级前建议先在“系统 → 备份与迁移”中创建并校验备份，然后停止正在执行的长任务、更新代码与依赖并重启 GGBot。涉及插件接入方式或数据结构的版本会在 Release 公告中单独列出迁移提醒。
+升级前建议先在“系统 → 备份与迁移”中创建并校验备份，然后停止正在执行的长任务、更新代码与依赖并重启 Mabobot。涉及插件接入方式或数据结构的版本会在 Release 公告中单独列出迁移提醒。
 
 ## 首次配置
 
@@ -137,7 +137,7 @@ Install.bat
 
 确认微信已经登录，在 GUI 启动器中启动全部服务。浏览器没有自动打开时，手动访问：
 
-- GGbot 管理面板：<http://127.0.0.1:8888/>
+- Mabobot 管理面板：<http://127.0.0.1:8888/>
 - API 文档：<http://127.0.0.1:8888/docs>
 - 主应用健康检查：<http://127.0.0.1:8888/health>
 - 微信桥接健康检查：<http://127.0.0.1:5555/health>
@@ -330,7 +330,7 @@ curl.exe http://127.0.0.1:5555/api/listeners/status
 
 ## Windows 登录后自动启动
 
-项目提供 `Start-WeChat-AutoLogin.bat`。它会等待 Windows 桌面和微信启动，尝试确认微信登录；微信在线后再启动 GGBot。如果出现二维码，仍需人工扫码。
+项目提供 `Start-WeChat-AutoLogin.bat`。它会等待 Windows 桌面和微信启动，尝试确认微信登录；微信在线后再启动 Mabobot。如果出现二维码，仍需人工扫码。
 
 首次使用前先运行一次 `一键启动.bat`，完成虚拟环境安装和 wxautox4 激活，再双击 `Start-WeChat-AutoLogin.bat` 验证。
 
@@ -376,7 +376,7 @@ curl.exe http://127.0.0.1:5555/api/listeners/status
 先在 GUI 中停止全部服务，然后在项目目录运行：
 
 ```powershell
-cd C:\原来的\GGBot
+cd C:\原来的\Mabobot
 git status
 git pull origin main
 .\一键启动.bat
@@ -449,7 +449,7 @@ curl.exe http://127.0.0.1:5555/health
 ## 项目结构
 
 ```text
-GGBot/
+Mabobot/
 ├── app/
 │   ├── api/                    # FastAPI 路由与管理 API
 │   ├── core/                   # 事件总线、插件管理、消息顺序、微信管理
@@ -461,7 +461,7 @@ GGBot/
 ├── docs/                       # 模型与记忆专项文档
 ├── scripts/
 │   └── install.ps1             # Windows 环境与依赖安装器
-├── web/                        # GGbot 单页管理面板
+├── web/                        # Mabobot 单页管理面板
 ├── .env.example                # 可公开的环境变量模板
 ├── requirements.txt            # Python 运行依赖
 ├── launcher.py                 # Windows GUI 服务启动器
@@ -512,4 +512,4 @@ app/plugins/my_plugin/
 
 项目使用 [MIT License](LICENSE)。
 
-问题与改进建议请提交到 [GitHub Issues](https://github.com/Maaboubou/GGBot/issues)。
+问题与改进建议请提交到 [GitHub Issues](https://github.com/Maaboubou/Mabobot/issues)。

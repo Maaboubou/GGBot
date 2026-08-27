@@ -79,7 +79,7 @@ async def get_restart_capabilities() -> Dict[str, Any]:
         "reason": (
             None
             if precise_restart
-            else "当前管理面板进程不支持单独重启 Web 服务。请完整关闭并重新打开 GGBot 管理面板。"
+            else "当前管理面板进程不支持单独重启 Web 服务。请完整关闭并重新打开 Mabobot 管理面板。"
         ),
     }
 
@@ -323,7 +323,7 @@ async def get_system_info() -> Dict[str, Any]:
         
         return {
             "application": {
-                "name": "GGBot",
+                "name": "Mabobot",
                 "version": APP_VERSION,
                 "bot_name": bot_name,
                 "pid": process.pid,

@@ -119,7 +119,7 @@ def main():
     parser.add_argument(
         "--restore",
         metavar="ARCHIVE",
-        help="离线恢复指定 .ggbot-backup.zip 后退出（项目必须处于停止状态）",
+        help="离线恢复指定 .mabobot-backup.zip 后退出（项目必须处于停止状态）",
     )
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"], 
                        help="Log level")

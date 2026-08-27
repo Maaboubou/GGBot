@@ -2,7 +2,7 @@
 setlocal EnableExtensions
 chcp 65001 >nul
 
-title GGBot First Run and Launcher
+title Mabobot First Run and Launcher
 set "ROOT=%~dp0"
 cd /d "%ROOT%" >nul 2>&1
 if errorlevel 1 (
@@ -12,7 +12,7 @@ if errorlevel 1 (
 )
 
 echo ============================================================
-echo GGBot Windows Setup and Launcher
+echo Mabobot Windows Setup and Launcher
 echo ============================================================
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\install.ps1"

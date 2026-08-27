@@ -317,7 +317,7 @@ const SystemOperations = {
                         <button class="btn btn-primary btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="SystemOperations.createBackup()"><i class="bi bi-archive me-1"></i>创建</button>
                         <button class="btn btn-light border btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="document.getElementById('backupImportFile').click()"><i class="bi bi-upload me-1"></i>导入</button>
                         <button class="btn btn-light border btn-sm backup-refresh-button" onclick="SystemOperations.loadBackups()" title="刷新" aria-label="刷新备份列表"><i class="bi bi-arrow-clockwise"></i></button>
-                        <input id="backupImportFile" class="d-none" type="file" accept=".zip,.ggbot-backup.zip" onchange="SystemOperations.importBackup(this)">
+                        <input id="backupImportFile" class="d-none" type="file" accept=".zip,.mabobot-backup.zip" onchange="SystemOperations.importBackup(this)">
                     </div>
                 </header>
                 <div id="backupActiveOperation" class="backup-operation-slot">${this.renderBackupOperation(active)}</div>

@@ -736,7 +736,7 @@ class LLMManager:
 
         Callers use this boundary instead of scattering provider/model-name
         checks throughout plugins.  ``native_web_search`` intentionally means
-        the local Codex runtime; ordinary providers use GGBot's local tools.
+        the local Codex runtime; ordinary providers use Mabobot's local tools.
         """
         self._check_and_reload_if_modified()
         mapping = self._get_mapping(plugin_name, call_type) or {}

@@ -152,7 +152,7 @@ const App = {
                 && capabilities?.services?.includes('web');
             this.webRestartSupported = webRestartSupported;
             this.webRestartUnavailableReason = capabilities?.reason
-                || '当前管理面板进程不支持单独重启 Web 服务。请完整关闭并重新打开 GGBot 管理面板。';
+                || '当前管理面板进程不支持单独重启 Web 服务。请完整关闭并重新打开 Mabobot 管理面板。';
             webButton.disabled = false;
             webButton.classList.toggle('restart-supported', webRestartSupported);
             webButton.classList.toggle('text-secondary', !webRestartSupported);
@@ -162,7 +162,7 @@ const App = {
                 : this.webRestartUnavailableReason;
         } catch (e) {
             this.webRestartSupported = false;
-            this.webRestartUnavailableReason = '无法确认管理面板能力。请完整关闭并重新打开 GGBot 管理面板。';
+            this.webRestartUnavailableReason = '无法确认管理面板能力。请完整关闭并重新打开 Mabobot 管理面板。';
             webButton.disabled = false;
             webButton.classList.remove('restart-supported');
             webButton.classList.add('text-secondary');

@@ -829,7 +829,7 @@ async def test_model_connectivity(model_id: str):
             messages=[{"role": "user", "content": "Hello"}],
             caller_tools=None,
         )
-        # _build_single_model_params 会带上 WxAutoX 内部元数据用于主调用链的视觉降级判断；
+        # _build_single_model_params 会带上 Mabobot 内部元数据用于主调用链的视觉降级判断；
         # 这里是模型连通性测试，直接调用 LiteLLM 前必须移除，避免透传到 OpenAI client。
         params.pop("_wxautox_supports_vision", None)
         params["drop_params"] = True

@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-title GGBot GUI Launcher
+title Mabobot GUI Launcher
 
 set "ROOT=%~dp0"
 if defined WXAUTOX_HOME (
@@ -16,7 +16,7 @@ if errorlevel 1 (
 )
 
 echo ============================================================
-echo GGBot GUI Launcher
+echo Mabobot GUI Launcher
 echo ============================================================
 echo [INFO] Working directory: %CD%
 

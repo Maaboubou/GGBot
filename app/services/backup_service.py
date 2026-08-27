@@ -50,10 +50,10 @@ class BackupOptions:
 
 
 class BackupService:
-    FORMAT_NAME = "ggbot-backup"
+    FORMAT_NAME = "mabobot-backup"
     MANIFEST_NAME = "backup-manifest.json"
     PENDING_NAME = "pending_restore.json"
-    ARCHIVE_SUFFIX = ".ggbot-backup.zip"
+    ARCHIVE_SUFFIX = ".mabobot-backup.zip"
 
     STATE_ROOT_FILES = {
         ".env",
@@ -456,11 +456,11 @@ class BackupService:
         options = options.normalized()
         with self._lock:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            name = f"ggbot-{options.profile}-{timestamp}{self.ARCHIVE_SUFFIX}"
+            name = f"mabobot-{options.profile}-{timestamp}{self.ARCHIVE_SUFFIX}"
             destination = self.backup_root / name
             collision = 1
             while destination.exists():
-                name = f"ggbot-{options.profile}-{timestamp}-{collision}{self.ARCHIVE_SUFFIX}"
+                name = f"mabobot-{options.profile}-{timestamp}-{collision}{self.ARCHIVE_SUFFIX}"
                 destination = self.backup_root / name
                 collision += 1
             temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -590,7 +590,7 @@ class BackupService:
         except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise BackupError(f"无法读取备份清单: {exc}") from exc
         if payload.get("format") != self.FORMAT_NAME:
-            raise BackupError("不是 GGBot 备份包")
+            raise BackupError("不是 Mabobot 备份包")
         if int(payload.get("format_version") or 0) != BACKUP_FORMAT_VERSION:
             raise BackupError(f"不支持的备份格式版本: {payload.get('format_version')}")
         return payload

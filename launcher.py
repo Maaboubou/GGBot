@@ -84,7 +84,7 @@ class ProcessManager(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("GGBot 管理控制台")
+        self.title("Mabobot 管理控制台")
         self.geometry("1100x700")
         self.configure(bg=THEME_BG)
         write_launcher_state()
@@ -137,7 +137,7 @@ class ProcessManager(tk.Tk):
         sidebar.pack(side="left", fill="y")
         
         # 标题
-        lbl_title = tk.Label(sidebar, text="GGBot", bg=THEME_SIDEBAR, fg="white", font=("Arial", 16, "bold"), pady=20)
+        lbl_title = tk.Label(sidebar, text="Mabobot", bg=THEME_SIDEBAR, fg="white", font=("Arial", 16, "bold"), pady=20)
         lbl_title.pack(fill="x")
 
         # 状态区

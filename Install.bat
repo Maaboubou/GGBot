@@ -5,7 +5,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install.ps
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 if "%EXIT_CODE%"=="0" (
-    echo [OK] Setup completed. Run Start.bat to launch GGBot.
+    echo [OK] Setup completed. Run Start.bat to launch Mabobot.
 ) else (
     echo [ERROR] Setup failed. Review the error above.
 )

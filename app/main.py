@@ -691,7 +691,7 @@ async def lifespan(app: FastAPI):
 
 # 创建FastAPI应用
 app = FastAPI(
-    title="WeChat Automation Assistant",
+    title="Mabobot",
     description="基于事件驱动的微信自动化助手",
     version=APP_VERSION,
     lifespan=lifespan
@@ -754,7 +754,7 @@ async def read_root():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>WeChat Assistant</title>
+        <title>Mabobot 管理面板</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 40px; }
             .status { padding: 20px; border-radius: 5px; margin: 10px 0; }
@@ -763,7 +763,7 @@ async def read_root():
         </style>
     </head>
     <body>
-        <h1>微信自动化助手 v2.0</h1>
+        <h1>Mabobot 管理面板</h1>
         <div class="status success">
             <strong>✅ 系统正在运行</strong>
         </div>

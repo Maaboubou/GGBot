@@ -117,7 +117,7 @@ const LLMManager = {
             .replace(/[^A-Z0-9]+/g, '_')
             .replace(/^_+|_+$/g, '')
             .slice(0, 50) || 'MODEL';
-        return `GGBOT_MODEL_${stem}_${hash.toString(16).padStart(8, '0').toUpperCase()}_API_KEY`;
+        return `MABOBOT_MODEL_${stem}_${hash.toString(16).padStart(8, '0').toUpperCase()}_API_KEY`;
     },
 
     mergeDeclaredTaskMappings(rawMappings, capabilities) {

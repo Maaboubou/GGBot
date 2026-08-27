@@ -1,4 +1,4 @@
-# WxAutoX 插件规范（Manifest v2）
+# Mabobot 插件规范（Manifest v2）
 
 本目录中的每个可加载插件必须同时提供 `config.json`、`manifest.json` 和 `main.py`。Manifest v2 是插件的运行契约：插件管理器会在加载时校验声明与实际订阅是否完全一致；声明缺失、字段无效或代码额外注册监听器都会导致插件拒绝加载。
 

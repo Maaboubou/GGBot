@@ -365,9 +365,8 @@ const API = {
         ),
         updateMemory: (userId, payload) => API.put(`/api/permissions/users/${userId}/memory`, payload),
         clearMemory: (userId, scope = 'all') => API.delete(`/api/permissions/users/${userId}/memory?scope=${encodeURIComponent(scope)}`),
-        addUser: (chatName, remark, isGroup, senderBlacklist = null) => API.post('/api/permissions/users', {
+        addUser: (chatName, isGroup, senderBlacklist = null) => API.post('/api/permissions/users', {
             chat_name: chatName,
-            remark,
             is_group: isGroup,
             sender_blacklist: senderBlacklist
         }),

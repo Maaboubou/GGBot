@@ -809,14 +809,11 @@ def update_wechat_user(
     user_update: schemas_permission.WeChatUserUpdate,
     db: Session = Depends(models_base.get_db)
 ):
-    """更新微信用户的基本信息（备注、聊天类型等）"""
+    """更新微信用户的聊天类型与群聊规则。"""
     db_user = db.query(models_permission.WeChatUser).filter(models_permission.WeChatUser.id == user_id).first()
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # 更新字段
-    if user_update.remark is not None:
-        db_user.remark = user_update.remark
     access_changed = False
     if user_update.is_group is not None:
         db_user.is_group = user_update.is_group

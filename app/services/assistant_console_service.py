@@ -233,7 +233,6 @@ class AssistantConsoleService:
                 {
                     "id": user.id,
                     "chat_name": user.chat_name,
-                    "remark": user.remark or "",
                     "is_group": bool(user.is_group),
                     "is_listening": user.chat_name in active_names,
                     "enabled": bool(permission and permission.enabled),

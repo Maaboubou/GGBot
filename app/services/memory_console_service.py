@@ -203,7 +203,6 @@ class MemoryConsoleService:
             "user": {
                 "id": user.id,
                 "chat_name": user.chat_name,
-                "remark": user.remark or "",
                 "is_group": bool(user.is_group),
             },
             "configuration": self.effective_memory_config(user_id),

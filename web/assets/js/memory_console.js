@@ -50,7 +50,6 @@
                 .map(item => ({
                     id: Number(item.id),
                     chat_name: String(item.chat_name),
-                    remark: String(item.remark || ''),
                     is_group: !!item.is_group,
                     assistantEnabled: Boolean(item.assistant_enabled)
                 }))
@@ -58,10 +57,7 @@
                     if (left.assistantEnabled !== right.assistantEnabled) {
                         return Number(right.assistantEnabled) - Number(left.assistantEnabled);
                     }
-                    return (left.remark || left.chat_name).localeCompare(
-                        right.remark || right.chat_name,
-                        'zh-CN'
-                    );
+                    return left.chat_name.localeCompare(right.chat_name, 'zh-CN');
                 });
             this._memoryLibraryUsers = users;
             return users;
@@ -85,15 +81,15 @@
             const empty = document.getElementById('memoryLibraryUserEmpty');
             const toggle = document.getElementById('memoryLibraryUserSwitcher');
             if (chatName) {
-                chatName.textContent = selected ? (selected.remark || selected.chat_name) : '选择聊天';
+                chatName.textContent = selected ? selected.chat_name : '选择聊天';
                 chatName.title = selected?.chat_name || '';
             }
             if (query) query.value = '';
             empty?.classList.toggle('d-none', users.length > 0);
             if (!options) return;
             options.innerHTML = users.map(item => {
-                const label = item.remark || item.chat_name;
-                const secondary = item.remark ? item.chat_name : (item.is_group ? '群聊' : '私聊');
+                const label = item.chat_name;
+                const secondary = item.is_group ? '群聊' : '私聊';
                 const active = item.id === Number(selectedUserId);
                 return `<button type="button" class="dropdown-item memory-user-option ${active ? 'active' : ''}" onclick="App.switchMemoryLibraryUser(${item.id})">
                     <span class="memory-user-option-avatar ${item.is_group ? 'is-group' : ''}"><i class="bi ${item.is_group ? 'bi-people-fill' : 'bi-person-fill'}"></i></span>
@@ -318,7 +314,7 @@
                 const stage = data.stage_memory || {};
                 const user = data.user || {};
                 const selected = (state.users || []).find(item => item.id === state.userId);
-                const chatLabel = selected?.remark || user.remark || user.chat_name || '当前聊天';
+                const chatLabel = selected?.chat_name || user.chat_name || '当前聊天';
                 const chatName = document.getElementById('memoryLibraryChatName');
                 if (chatName) {
                     chatName.textContent = chatLabel;

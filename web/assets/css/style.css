@@ -7266,6 +7266,9 @@ body.automation-pointer-sorting * {
 .chat-policy-field-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .chat-policy-field-grid.two,
 .chat-policy-dependent.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.chat-policy-field-grid.compact { max-width: 420px; }
+.chat-policy-type-block { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 420px); align-items: center; gap: 1rem; }
+.chat-policy-type-block .chat-policy-block-head { margin-bottom: 0; }
 .chat-policy-dependent { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: .7rem; padding: .7rem; border-radius: 10px; background: var(--bg-soft); }
 .chat-policy-group-settings { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: .7rem; padding-top: .7rem; border-top: 1px dashed var(--border-color); }
 
@@ -7396,6 +7399,8 @@ body.automation-pointer-sorting * {
     .chat-policy-group-settings,
     .chat-policy-switch-grid,
     .chat-memory-mode-grid { grid-template-columns: 1fr; }
+    .chat-policy-type-block { display: block; }
+    .chat-policy-type-block .chat-policy-block-head { margin-bottom: .8rem; }
     .chat-policy-summary > * { min-height: 58px; border-right: 0; border-bottom: 1px solid var(--border-soft); }
     .chat-policy-summary > *:last-child { border-bottom: 0; }
     .chat-policy-tabs { overflow-x: auto; }

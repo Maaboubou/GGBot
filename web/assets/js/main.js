@@ -1364,7 +1364,6 @@ const App = {
                         chat_name: name,
                         has_permission_config: false,
                         is_listening: true,
-                        remark: '', // Default empty remark
                         is_group: false // Unknown, assume false or handle in UI
                     });
                 }
@@ -1413,7 +1412,7 @@ const App = {
         const query = String(document.getElementById('chatListSearch')?.value || '').trim().toLowerCase();
         const state = this.managedChatFilter || 'all';
         const chats = (this._managedChats || []).filter(chat => {
-            const matchesQuery = !query || `${chat.chat_name} ${chat.remark || ''}`.toLowerCase().includes(query);
+            const matchesQuery = !query || chat.chat_name.toLowerCase().includes(query);
             const matchesState = state === 'all'
                 || (state === 'active' && chat.is_listening)
                 || (state === 'paused' && !chat.is_listening);
@@ -1448,7 +1447,7 @@ const App = {
         }
 
         try {
-            const user = await API.users.addUser(chatName, '', isGroup, null);
+            const user = await API.users.addUser(chatName, isGroup, null);
             let assistantWarning = '';
             if (form.assistant_enabled?.checked) {
                 try {
@@ -1558,7 +1557,7 @@ const App = {
 
     async adoptActiveChat(chatName, isGroup) {
         try {
-            const user = await API.users.addUser(chatName, '', Boolean(isGroup));
+            const user = await API.users.addUser(chatName, Boolean(isGroup));
             UI.showSuccess('聊天已加入策略管理');
             await this.loadUsers();
             await this.selectUser(user.chat_name, user.id);
@@ -1610,7 +1609,6 @@ const App = {
         const payload = {
             expected_version: Number(form.dataset.version),
             chat: {
-                remark: form.elements.remark.value.trim(),
                 is_group: isGroup,
                 listening_enabled: form.elements.listening_enabled.checked,
                 sender_blacklist: this.linesFromPolicyField(form, 'sender_blacklist'),
@@ -1852,7 +1850,7 @@ const App = {
         const query = (document.getElementById('assistantChatsSearch')?.value || '').trim().toLowerCase();
         const filter = document.getElementById('assistantChatsFilter')?.value || 'all';
         const chats = (this._assistantChats || []).filter(chat => {
-            const matchesText = !query || `${chat.chat_name} ${chat.remark || ''}`.toLowerCase().includes(query);
+            const matchesText = !query || chat.chat_name.toLowerCase().includes(query);
             const matchesState = filter === 'all'
                 || (filter === 'enabled' && chat.enabled)
                 || (filter === 'disabled' && !chat.enabled)
@@ -1874,7 +1872,7 @@ const App = {
             return;
         }
         container.innerHTML = chats.map(chat => {
-            const name = UI.escapeHtml(chat.remark || chat.chat_name);
+            const name = UI.escapeHtml(chat.chat_name);
             const rawName = UI.escapeHtml(chat.chat_name);
             const role = UI.escapeHtml(chat.role?.display_name || '默认角色');
             const judge = UI.escapeHtml(chat.judge?.display_name || '未启用');
@@ -1890,10 +1888,10 @@ const App = {
             return `
                 <article class="assistant-chat-card ${chat.enabled ? 'enabled' : 'disabled'}">
                     <div class="assistant-chat-card-head">
-                        <div class="assignment-avatar" style="background:${this.getAvatarColor(chat.chat_name)}">${UI.escapeHtml(this.getInitials(chat.remark || chat.chat_name))}</div>
+                        <div class="assignment-avatar" style="background:${this.getAvatarColor(chat.chat_name)}">${UI.escapeHtml(this.getInitials(chat.chat_name))}</div>
                         <div class="assistant-chat-identity">
                             <strong title="${rawName}">${name}</strong>
-                            <small>${chat.remark ? rawName + ' · ' : ''}${chat.is_group ? '群聊' : '私聊'}${chat.is_listening ? ' · 正在监听' : ' · 未监听'}</small>
+                            <small>${chat.is_group ? '群聊' : '私聊'}${chat.is_listening ? ' · 正在监听' : ' · 未监听'}</small>
                         </div>
                         <span class="assistant-state-pill ${chat.enabled ? 'on' : 'off'}">${chat.enabled ? 'AI 助手已启用' : '未启用'}</span>
                     </div>

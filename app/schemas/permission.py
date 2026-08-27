@@ -24,7 +24,6 @@ class UserPermission(UserPermissionBase):
 
 class WeChatUserBase(BaseModel):
     chat_name: str
-    remark: Optional[str] = None
     is_group: bool = False
     listening_enabled: bool = True
     policy_version: int = 1
@@ -41,7 +40,6 @@ class WeChatUserCreate(WeChatUserBase):
 
 
 class WeChatUserUpdate(BaseModel):
-    remark: Optional[str] = None
     is_group: Optional[bool] = None
     sender_blacklist: Optional[str] = None
     bot_group_nickname: Optional[str] = None

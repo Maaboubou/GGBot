@@ -101,7 +101,6 @@ class ChatPolicyService:
             "version": int(user.policy_version or 1),
             "chat": {
                 "chat_name": user.chat_name,
-                "remark": user.remark or "",
                 "is_group": bool(user.is_group),
                 "listening_enabled": bool(user.listening_enabled),
                 "listening_active": user.chat_name in active_names,
@@ -140,8 +139,6 @@ class ChatPolicyService:
                 raise ChatPolicyConflict(current_version)
 
             chat_changes = _fields(request.chat)
-            if "remark" in chat_changes:
-                user.remark = str(chat_changes["remark"] or "").strip() or None
             if "is_group" in chat_changes:
                 requested_group = bool(chat_changes["is_group"])
                 if bool(user.is_group) != requested_group:

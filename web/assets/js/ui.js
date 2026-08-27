@@ -1210,7 +1210,6 @@ const UI = {
             const chatTypeIcon = u.is_group ? 'bi-people' : 'bi-person';
             const chatTypeLabel = u.is_group ? '群聊' : '私聊';
             const safeChatName = this.escapeHtml(u.chat_name);
-            const displayName = this.escapeHtml(u.remark || u.chat_name);
             const statusClass = isActive ? 'active' : (listeningEnabled ? 'waiting' : 'paused');
             const statusLabel = isActive ? '监听中' : (listeningEnabled ? '等待连接' : '已暂停');
 
@@ -1220,8 +1219,8 @@ const UI = {
                     data-user-id="${userId || ''}" data-chatname="${safeChatName}">
                     <span class="chat-picker-item-icon"><i class="bi ${chatTypeIcon}"></i></span>
                     <span class="chat-picker-item-copy">
-                        <strong>${displayName}</strong>
-                        <small>${u.remark ? `${safeChatName} · ` : ''}${chatTypeLabel}${isConfigured ? '' : ' · 待管理'}</small>
+                        <strong>${safeChatName}</strong>
+                        <small>${chatTypeLabel}${isConfigured ? '' : ' · 待管理'}</small>
                     </span>
                     <span class="chat-picker-status ${statusClass}"><i></i>${statusLabel}</span>
                 </button>
@@ -1274,14 +1273,14 @@ const UI = {
         const avatar = document.getElementById('selectedChatAvatar');
         const userId = Number(chat?.user_id || chat?.id || 0);
         const chatName = String(chat?.chat_name || '');
-        const displayName = String(chat?.remark || chatName || '选择一个聊天');
+        const displayName = chatName || '选择一个聊天';
         const listening = Boolean(chat?.listening_active ?? chat?.is_listening);
         const listeningEnabled = chat?.listening_enabled !== false;
         const typeLabel = chat?.is_group ? '群聊' : '私聊';
         const statusLabel = listening ? '监听中' : (listeningEnabled ? '等待连接' : '已暂停');
         if (label) label.textContent = displayName;
         if (meta) meta.textContent = chatName
-            ? `${chat.remark ? `${chatName} · ` : ''}${typeLabel} · ${statusLabel}`
+            ? `${typeLabel} · ${statusLabel}`
             : '按需展开列表，不占用编辑空间';
         if (avatar) avatar.innerHTML = `<i class="bi ${chatName ? (chat?.is_group ? 'bi-people' : 'bi-person') : 'bi-chat-square-text'}"></i>`;
         const memoryButton = document.getElementById('chatMemoryButton');
@@ -1640,10 +1639,9 @@ const UI = {
                 </div>
 
                 <div class="chat-policy-pane ${activePane === 'advanced' ? 'active' : ''}" data-chat-policy-pane="advanced">
-                    <section class="chat-policy-block">
-                        <div class="chat-policy-block-head"><div><h4>聊天信息</h4><p>名称用于微信匹配，不可在此修改；备注与类型只维护一份。</p></div></div>
-                        <div class="chat-policy-field-grid two">
-                            <label><span>管理备注</span><input class="form-control" name="remark" value="${this.escapeHtml(chat.remark || '')}" maxlength="255" placeholder="便于管理员识别"></label>
+                    <section class="chat-policy-block chat-policy-type-block">
+                        <div class="chat-policy-block-head"><div><h4>聊天类型</h4><p>真实聊天名称用于微信匹配，不在管理面板中创建显示别名。</p></div></div>
+                        <div class="chat-policy-field-grid compact">
                             <label><span>聊天类型</span><select class="form-select" name="chat_type"><option value="private" ${chat.is_group ? '' : 'selected'}>私聊</option><option value="group" ${chat.is_group ? 'selected' : ''}>群聊</option></select><small data-chat-type-note>改变类型后将重新加载对应设置</small></label>
                         </div>
                     </section>

@@ -213,12 +213,12 @@ class AutomationRoutingService:
     def _chats(self) -> List[Dict[str, Any]]:
         if self.db is None:
             return []
-        chats = self.db.query(WeChatUser).order_by(WeChatUser.remark, WeChatUser.chat_name).all()
+        chats = self.db.query(WeChatUser).order_by(WeChatUser.chat_name).all()
         return [
             {
                 "id": chat.id,
                 "chat_name": chat.chat_name,
-                "display_name": chat.remark or chat.chat_name,
+                "display_name": chat.chat_name,
                 "is_group": bool(chat.is_group),
             }
             for chat in chats
@@ -267,7 +267,7 @@ class AutomationRoutingService:
             "context": {
                 "chat_id": selected_chat.id if selected_chat is not None else None,
                 "chat_name": selected_chat.chat_name if selected_chat is not None else None,
-                "chat_display_name": (selected_chat.remark or selected_chat.chat_name) if selected_chat is not None else "全部聊天",
+                "chat_display_name": selected_chat.chat_name if selected_chat is not None else "全部聊天",
                 "is_group": bool(selected_chat.is_group) if selected_chat is not None else None,
                 "mentioned": bool(mentioned),
             },

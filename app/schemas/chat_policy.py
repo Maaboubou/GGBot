@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field
 
 
 class ChatSettingsPatch(BaseModel):
-    remark: Optional[str] = Field(default=None, max_length=255)
     is_group: Optional[bool] = None
     listening_enabled: Optional[bool] = None
     sender_blacklist: Optional[List[str]] = Field(default=None, max_length=200)

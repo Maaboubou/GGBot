@@ -20,6 +20,8 @@ class WeChatUser(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     chat_name = Column(String, unique=True, index=True, nullable=False)
+    # Legacy storage only. The management remark feature was retired; keeping
+    # the column avoids a destructive migration for existing installations.
     remark = Column(String, nullable=True)
     is_group = Column(Boolean, default=False)
     listening_enabled = Column(Boolean, default=True, nullable=False)
@@ -50,7 +52,7 @@ class WeChatUser(Base):
     # chatbot_role = relationship("UserChatBotRole", back_populates="user", uselist=False, cascade="all, delete-orphan")
 
     def __repr__(self):
-        return f"<WeChatUser(chat_name='{self.chat_name}', remark='{self.remark}')>"
+        return f"<WeChatUser(chat_name='{self.chat_name}')>"
 
     @property
     def assistant_enabled(self) -> bool:

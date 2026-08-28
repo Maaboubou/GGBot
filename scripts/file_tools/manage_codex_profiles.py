@@ -64,6 +64,35 @@ def _required(payload: dict[str, Any], key: str, label: str, limit: int) -> str:
     return value
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_base_url(value: Any) -> str:
+    base_url = str(value or "").strip()
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or any(character.isspace() for character in base_url)
+    ):
+        raise ProfileError("API Base URL 必须是有效的 http(s) 地址，且不能包含账号密码")
+    return base_url.rstrip("/")
+
+
+def _validate_api_key(value: Any) -> str:
+    api_key = str(value or "")
+    if not api_key or len(api_key) > 4096 or any(char in api_key for char in "\r\n\x00"):
+        raise ProfileError("API Key 不能为空，且不能包含换行符")
+    return api_key
+
+
 def _validate(payload: dict[str, Any]) -> dict[str, Any]:
     name = _required(payload, "name", "Profile 名称", 48)
     if not PROFILE_NAME_RE.fullmatch(name):
@@ -75,22 +104,11 @@ def _validate(payload: dict[str, Any]) -> dict[str, Any]:
     if auth_type not in AUTH_TYPES:
         raise ProfileError("登录方式必须是 api_key 或 chatgpt")
 
-    base_url = str(payload.get("base_url") or "").strip()
-    api_key = str(payload.get("api_key") or "")
+    base_url = ""
+    api_key = ""
     if auth_type == "api_key":
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username
-            or parsed.password
-            or any(character.isspace() for character in base_url)
-        ):
-            raise ProfileError("API Base URL 必须是有效的 http(s) 地址，且不能包含账号密码")
-        if not api_key or len(api_key) > 4096 or any(char in api_key for char in "\r\n\x00"):
-            raise ProfileError("API Key 不能为空，且不能包含换行符")
-    else:
-        base_url, api_key = "", ""
+        base_url = _validate_base_url(payload.get("base_url"))
+        api_key = _validate_api_key(payload.get("api_key"))
 
     default_provider = "ChatGPT 官方登录" if auth_type == "chatgpt" else "OpenAI Responses compatible"
     provider_name = str(payload.get("provider_name") or default_provider).strip()
@@ -108,6 +126,8 @@ def _validate(payload: dict[str, Any]) -> dict[str, Any]:
         raise ProfileError("上下文窗口必须是整数") from exc
     if not 4096 <= context_window <= 10_000_000:
         raise ProfileError("上下文窗口必须在 4096 到 10000000 之间")
+    supports_vision = _as_bool(payload.get("supports_vision"))
+    supports_web_search = _as_bool(payload.get("supports_web_search"))
     codex_path = Path(_required(payload, "codex_bin", "Codex 路径", 1000)).expanduser()
     if not codex_path.is_absolute() or not codex_path.is_file() or not os.access(codex_path, os.X_OK):
         raise ProfileError("Codex 路径必须是当前 Linux/WSL 用户可执行的绝对路径")
@@ -115,12 +135,14 @@ def _validate(payload: dict[str, Any]) -> dict[str, Any]:
         "name": name,
         "auth_type": auth_type,
         "model": model,
-        "base_url": base_url.rstrip("/"),
+        "base_url": base_url,
         "api_key": api_key,
         "provider_name": provider_name,
         "reasoning_effort": effort,
         "model_verbosity": verbosity,
         "context_window": context_window,
+        "supports_vision": supports_vision,
+        "supports_web_search": supports_web_search,
         "codex_bin": str(codex_path),
     }
 
@@ -144,6 +166,8 @@ def _model_catalog(profile: dict[str, Any]) -> dict[str, Any]:
     model = profile["model"]
     window = int(profile["context_window"])
     verbosity = profile["model_verbosity"]
+    supports_vision = bool(profile.get("supports_vision", False))
+    supports_web_search = bool(profile.get("supports_web_search", False))
     return {
         "models": [
             {
@@ -172,13 +196,13 @@ def _model_catalog(profile: dict[str, Any]) -> dict[str, Any]:
                 "default_verbosity": None if verbosity == "inherit" else verbosity,
                 "web_search_tool_type": "text",
                 "truncation_policy": {"mode": "tokens", "limit": 10000},
-                "supports_image_detail_original": False,
+                "supports_image_detail_original": supports_vision,
                 "context_window": window,
                 "max_context_window": window,
                 "effective_context_window_percent": 95,
                 "experimental_supported_tools": [],
-                "input_modalities": ["text"],
-                "supports_search_tool": False,
+                "input_modalities": ["text", "image"] if supports_vision else ["text"],
+                "supports_search_tool": supports_web_search,
                 "use_responses_lite": False,
                 "node_repl_auto_review_required": False,
                 "node_repl_disabled": False,
@@ -267,6 +291,8 @@ def create_profile(payload: dict[str, Any], *, home: Path) -> dict[str, Any]:
         "reasoning_effort": profile["reasoning_effort"],
         "model_verbosity": profile["model_verbosity"],
         "context_window": profile["context_window"],
+        "supports_vision": profile["supports_vision"],
+        "supports_web_search": profile["supports_web_search"],
         "wire_api": "chatgpt" if profile["auth_type"] == "chatgpt" else "responses",
         "codex_bin": profile["codex_bin"],
         "wrapper_path": str(paths["wrapper"]),
@@ -311,6 +337,10 @@ def update_profile(payload: dict[str, Any], *, home: Path) -> dict[str, Any]:
         profile = json.loads(paths["manifest"].read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError) as exc:
         raise ProfileError("Codex Profile 不存在或清单已损坏") from exc
+    auth_type = str(profile.get("auth_type") or "api_key")
+    api_profile_fields = {"provider_name", "base_url", "api_key"}
+    if auth_type != "api_key" and api_profile_fields.intersection(payload):
+        raise ProfileError("ChatGPT Profile 不支持 API Key 或接口地址配置")
     if "model" in payload:
         model = _required(payload, "model", "模型 ID", 128)
         if not MODEL_ID_RE.fullmatch(model):
@@ -321,6 +351,21 @@ def update_profile(payload: dict[str, Any], *, home: Path) -> dict[str, Any]:
         if effort not in REASONING_EFFORTS:
             raise ProfileError("推理强度格式不正确")
         profile["reasoning_effort"] = effort
+    if "model_verbosity" in payload:
+        verbosity = str(payload.get("model_verbosity") or "").strip().lower()
+        if verbosity not in VERBOSITY_VALUES:
+            raise ProfileError("输出详细度格式不正确")
+        profile["model_verbosity"] = verbosity
+    if "provider_name" in payload:
+        provider_name = str(payload.get("provider_name") or "").strip()
+        if not provider_name or len(provider_name) > 100 or "\x00" in provider_name:
+            raise ProfileError("供应商名称格式不正确")
+        profile["provider_name"] = provider_name
+    if "base_url" in payload:
+        profile["base_url"] = _validate_base_url(payload.get("base_url"))
+    next_api_key: str | None = None
+    if "api_key" in payload:
+        next_api_key = _validate_api_key(payload.get("api_key"))
     if "context_window" in payload:
         try:
             value = int(payload["context_window"])
@@ -329,6 +374,21 @@ def update_profile(payload: dict[str, Any], *, home: Path) -> dict[str, Any]:
         if not 4096 <= value <= 10_000_000:
             raise ProfileError("上下文窗口必须在 4096 到 10000000 之间")
         profile["context_window"] = value
+    if "supports_vision" in payload:
+        profile["supports_vision"] = _as_bool(payload.get("supports_vision"))
+    if "supports_web_search" in payload:
+        profile["supports_web_search"] = _as_bool(payload.get("supports_web_search"))
+    for key in ("account_email", "plan_type"):
+        if key in payload:
+            value = str(payload.get(key) or "").strip()
+            if len(value) > 320 or "\x00" in value:
+                raise ProfileError("ChatGPT 账号信息格式不正确")
+            if value:
+                profile[key] = value
+            else:
+                profile.pop(key, None)
+    if next_api_key is not None:
+        _atomic_write(paths["secret"], next_api_key + "\n", 0o600)
     _atomic_write(paths["config"], _render_config(profile, paths), 0o600)
     if profile.get("auth_type") == "api_key":
         _atomic_write(paths["catalog"], json.dumps(_model_catalog(profile), ensure_ascii=False, indent=2) + "\n", 0o600)

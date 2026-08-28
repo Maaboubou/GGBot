@@ -33,6 +33,7 @@ const App = {
     managedChatFilter: 'all',
     _managedChatReferenceData: null,
     _managedChatReferencePromise: null,
+    _managedChatProfilesData: null,
 
     async init() {
         console.log('App Initializing...');
@@ -1333,10 +1334,12 @@ const App = {
     // Users & Listeners
     async loadUsers() {
         try {
-            const [usersData, listenersData] = await Promise.all([
+            const [usersData, listenersData, profilesData] = await Promise.all([
                 API.users.getAll(),
-                API.wechat.getListeners()
+                API.wechat.getListeners(),
+                API.codexProfiles.list().catch(() => ({ profiles: [], default_profile_id: '' }))
             ]);
+            this.updateManagedChatProfiles(profilesData);
 
             const dbUsers = usersData || [];
             // Handle different structure of listeners response
@@ -1484,8 +1487,11 @@ const App = {
             this._managedChatReferencePromise = Promise.all([
                 API.capabilities.getAll(),
                 API.assistant.getOverview(),
-                API.codexProfiles.list().catch(() => ({ profiles: [], default_profile_id: '' }))
+                this._managedChatProfilesData
+                    ? Promise.resolve(this._managedChatProfilesData)
+                    : API.codexProfiles.list().catch(() => ({ profiles: [], default_profile_id: '' }))
             ]).then(([capabilitiesData, assistantOverview, profiles]) => {
+                this._managedChatProfilesData = profiles;
                 this._managedChatReferenceData = {
                     capabilities: capabilitiesData.capabilities || [],
                     assistantOverview,
@@ -1497,6 +1503,17 @@ const App = {
             });
         }
         return this._managedChatReferencePromise;
+    },
+
+    updateManagedChatProfiles(profilesData) {
+        const normalized = profilesData && typeof profilesData === 'object'
+            ? profilesData
+            : { profiles: [], default_profile_id: '' };
+        this._managedChatProfilesData = normalized;
+        if (this._managedChatReferenceData) {
+            this._managedChatReferenceData.profiles = normalized;
+        }
+        UI.updateChatPolicyProfileOptions(normalized);
     },
 
     // Permission Management Integration
@@ -1910,6 +1927,12 @@ const App = {
 
     async showAssistantGlobalSettings() {
         await this.showCapabilitySettings('assistant');
+    },
+
+    openAssistantRoleManager() {
+        window.history.pushState({ tab: 'roles', section: 'roles' }, '', '/assistant/roles');
+        UI.switchTab('roles', { history: false });
+        this.setAssistantSection('roles', { history: false });
     },
 
     async showAssistantChatEditor(userId) {

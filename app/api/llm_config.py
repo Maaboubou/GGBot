@@ -1,6 +1,6 @@
 """
 LLM 配置管理 API
-提供模型配置、插件映射、统计查询等接口
+提供模型配置、任务模型路由、统计查询等接口
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from app.models.base import get_db
 from app.models.setting import Setting
+from app.dependencies import get_plugin_manager_instance
+from app.services.model_route_catalog_service import ModelRouteCatalogService
 from app.services.llm_manager import (
     GEMINI_3_SAMPLING_PARAMETERS,
     get_llm_manager,
@@ -508,18 +510,18 @@ class SharedCredentialUpdate(BaseModel):
     value: str
 
 
-class PluginMapping(BaseModel):
-    """插件映射配置"""
+class TaskModelRoute(BaseModel):
+    """单项任务的模型路由配置。"""
     primary: str
     fallback: Optional[List[str]] = []
     override_params: Optional[Dict[str, Any]] = {}
 
 
 class UpdateMappingRequest(BaseModel):
-    """更新插件映射请求"""
-    plugin_name: str
+    """更新任务模型路由请求。"""
+    owner_id: str
     call_type: str
-    mapping: PluginMapping
+    mapping: TaskModelRoute
 
 
 class ReorderRequest(BaseModel):
@@ -897,42 +899,54 @@ async def test_model_connectivity(model_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== 插件映射接口 ====================
+# ==================== 任务模型路由接口 ====================
+
+@router.get("/route-owners")
+async def get_route_owners(plugin_manager=Depends(get_plugin_manager_instance)):
+    """返回核心组件与插件组成的模型路由主体目录。"""
+    try:
+        llm_manager = get_llm_manager()
+        mappings = llm_manager.config.get("plugin_mappings", {})
+        owners = ModelRouteCatalogService(plugin_manager).list_owners(mappings.keys())
+        return {"status": "success", "data": owners}
+    except Exception as exc:
+        logger.error("获取模型路由主体失败: %s", exc)
+        raise HTTPException(status_code=500, detail="无法读取模型路由主体目录") from exc
 
 @router.get("/mappings")
 async def get_mappings():
-    """获取所有插件映射"""
+    """获取所有任务模型路由。"""
     try:
         llm_manager = get_llm_manager()
         mappings = llm_manager.config.get("plugin_mappings", {})
         return {"status": "success", "data": public_model_config(mappings)}
     except Exception as e:
-        logger.error(f"获取插件映射失败: {e}")
+        logger.error(f"获取任务模型路由失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/mappings/{plugin_name}")
-async def get_plugin_mappings(plugin_name: str):
-    """获取单个插件的所有映射"""
+@router.get("/mappings/{owner_id}")
+async def get_owner_mappings(owner_id: str):
+    """获取单个路由主体的所有任务模型路由。"""
     try:
         llm_manager = get_llm_manager()
         mappings = llm_manager.config.get("plugin_mappings", {})
         
-        if plugin_name not in mappings:
-            raise HTTPException(status_code=404, detail=f"插件 {plugin_name} 没有配置")
+        if owner_id not in mappings:
+            raise HTTPException(status_code=404, detail=f"路由主体 {owner_id} 没有配置")
         
-        return {"status": "success", "data": public_model_config(mappings[plugin_name])}
+        return {"status": "success", "data": public_model_config(mappings[owner_id])}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"获取插件映射失败: {e}")
+        logger.error(f"获取任务模型路由失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/mappings/{plugin_name}/{call_type}")
-async def update_mapping(plugin_name: str, call_type: str, mapping: PluginMapping):
-    """更新插件映射"""
-    if plugin_name in {"assistant", "builtin_chatbot"} and call_type == "chat":
+@router.put("/mappings/{owner_id}/{call_type}")
+async def update_mapping(owner_id: str, call_type: str, mapping: TaskModelRoute):
+    """更新一项任务模型路由。"""
+    if owner_id in {"assistant", "builtin_chatbot"} and call_type == "chat":
         raise HTTPException(
             status_code=400,
             detail="AI 助手最终回复仅由 Codex 驱动，不能创建通用模型路由",
@@ -941,42 +955,42 @@ async def update_mapping(plugin_name: str, call_type: str, mapping: PluginMappin
         llm_manager = get_llm_manager()
         existing = (
             llm_manager.config.get("plugin_mappings", {})
-            .get(plugin_name, {})
+            .get(owner_id, {})
             .get(call_type, {})
         )
         incoming = mapping.dict(exclude_none=True)
         llm_manager.update_mapping(
-            plugin_name,
+            owner_id,
             call_type,
             merge_redacted_config(existing, incoming),
         )
         
-        return {"status": "success", "message": f"插件映射 {plugin_name}.{call_type} 已更新"}
+        return {"status": "success", "message": f"任务模型路由 {owner_id}.{call_type} 已更新"}
     except Exception as e:
-        logger.error(f"更新插件映射失败: {e}")
+        logger.error(f"更新任务模型路由失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/mappings/{plugin_name}/{call_type}")
-async def delete_mapping(plugin_name: str, call_type: str):
-    """删除插件映射"""
+@router.delete("/mappings/{owner_id}/{call_type}")
+async def delete_mapping(owner_id: str, call_type: str):
+    """删除一项任务模型路由。"""
     try:
         llm_manager = get_llm_manager()
         
-        if plugin_name not in llm_manager.config.get("plugin_mappings", {}):
-            raise HTTPException(status_code=404, detail=f"插件 {plugin_name} 没有配置")
+        if owner_id not in llm_manager.config.get("plugin_mappings", {}):
+            raise HTTPException(status_code=404, detail=f"路由主体 {owner_id} 没有配置")
         
-        if call_type not in llm_manager.config["plugin_mappings"][plugin_name]:
+        if call_type not in llm_manager.config["plugin_mappings"][owner_id]:
             raise HTTPException(status_code=404, detail=f"调用类型 {call_type} 不存在")
         
-        del llm_manager.config["plugin_mappings"][plugin_name][call_type]
+        del llm_manager.config["plugin_mappings"][owner_id][call_type]
         llm_manager.save_config()
         
-        return {"status": "success", "message": f"插件映射 {plugin_name}.{call_type} 已删除"}
+        return {"status": "success", "message": f"任务模型路由 {owner_id}.{call_type} 已删除"}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"删除插件映射失败: {e}")
+        logger.error(f"删除任务模型路由失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

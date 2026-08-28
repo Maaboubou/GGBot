@@ -1,20 +1,20 @@
 # Mabobot
 
-Mabobot 是一个运行在 Windows 上的本地微信自动化助手。它把微信桌面端接入、消息监听、AI 对话、聊天记录和实用插件集中到一个 Web 管理面板中，模型与聊天数据默认保存在用户自己的电脑上。
+Mabobot 是一个运行在 Windows 上的本地微信自动化助手。微信桥接、核心 AI 助手、独立插件和辅助模型路由由同一个 Web 管理面板统一配置，模型凭据、聊天策略、记录和记忆保存在用户自己的电脑上。
 
 > 管理面板面向可信局域网或 Tailnet，默认没有登录认证，并监听所有本机网络接口。请用 Windows 防火墙和 Tailscale ACL 限制访问范围，不要把 `8888` 端口映射到公网。详细边界见[安全策略](SECURITY.md)。
 
 ## 主要能力
 
-- 微信接入：监听指定私聊或群聊，发送文本、图片和文件，并监控微信与监听窗口状态。
-- AI 助手：支持多个模型供应商、独立 API Key、任务路由、角色、Judge 主动回复、内置网页搜索和连续对话。
-- 聊天记录：按聊天保存文本、图片、链接和引用消息，并可在后台补充图片的视觉内容与可见文字。
-- 聊天级权限：每个联系人或群聊可以分别选择允许使用的插件，群聊还可设置是否必须 `@机器人`。
-- 插件系统：内置链接摘要、翻译、汇率、周报、磁链检查和菜单翻译，并支持按 Manifest v2 规范继续扩展。
-- 本地管理：通过 Mabobot 管理面板维护聊天、插件、模型、任务路由、角色、Judge 和记忆设置。
+- 微信接入：监听指定私聊或群聊，发送文本、图片和文件，并监控微信连接与监听窗口状态。
+- 核心 AI 助手：由应用直接托管，最终回复统一经过 Codex；支持角色、Judge、连续对话、原生网页搜索、图片输入和本地长期记忆。
+- Codex 运行中心：管理当前本机配置、独立 Profile、会话、任务、额度、进程池和文件工具状态。
+- 辅助模型：Judge、记忆、图片理解、翻译、摘要和脑图等任务可分别选择主模型与备用模型。
+- 聊天策略：按聊天控制监听、助手、Codex Profile、访问范围、角色、记忆和插件授权；群聊插件可要求 `@Bot`。
+- 插件系统：内置链接摘要、翻译、汇率、周报、磁链检查和菜单翻译，并支持 Manifest v2 扩展与统一消息顺序。
 - 运行恢复：提供 GUI 启动器、日志查看、微信在线检查、监听恢复和 Windows 登录后自动启动脚本。
 
-首次启动不会预置模型、API Key 或聊天绑定。AI 长期记忆默认关闭，需要时再由用户开启。项目内置“默认助手”“刘局-和联胜”角色以及“默认 Judge”“刘局-和联胜 Judge”。
+首次启动不会预置辅助模型连接、API Key 或聊天绑定；核心 AI 助手默认沿用当前 Codex 配置。AI 长期记忆默认关闭，需要时再由用户开启。项目内置“默认助手”“刘局-和联胜”角色以及“默认 Judge”“刘局-和联胜 Judge”。
 
 ## 系统架构
 
@@ -24,9 +24,14 @@ flowchart LR
     W <--> B[wx_bot.py<br/>微信桥接 :5555]
     B -->|消息事件| A[start.py / FastAPI<br/>主应用 :8888]
     A --> E[EventBus]
+    E --> S[核心 AI 助手]
     E --> P[Manifest v2 插件]
-    P --> L[AI 模型 / 外部服务]
-    P -->|回复| M[WeChatManager]
+    S --> X[Codex 运行时 / Profile]
+    S --> L[辅助模型路由]
+    P --> L
+    P --> O[外部服务]
+    S -->|最终回复| M[WeChatManager]
+    P -->|插件回复| M
     M --> B
     C[Mabobot 管理面板] <--> A
     A <--> D[(SQLite / 本地配置)]
@@ -35,9 +40,10 @@ flowchart LR
 | 组件 | 入口 | 主要职责 |
 |---|---|---|
 | 微信桥接 | `wx_bot.py`，默认端口 `5555` | 操作微信窗口、接收消息、发送内容、维护监听对象 |
-| 主应用 | `start.py`，默认端口 `8888` | API、事件总线、插件、模型路由、后台任务和状态监控 |
-| Web 管理面板 | `web/` | 聊天授权、AI 助手、插件、模型和运行日志管理 |
-| 数据层 | `data/database.db` 等 | 系统设置、模型连接、权限、角色、Judge、聊天记录和记忆 |
+| 主应用 | `start.py`，默认端口 `8888` | API、核心助手、事件总线、插件、辅助模型路由、后台任务和状态监控 |
+| 核心助手 | `app/assistant/` | Codex 回复编排、角色、Judge、连续对话、上下文和长期记忆 |
+| Web 管理面板 | `web/` | Codex、聊天、助手、插件、辅助模型和运行日志管理 |
+| 数据层 | `data/database.db` 等 | 系统设置、聊天策略、模型连接、角色、Judge、聊天记录和记忆 |
 | GUI 启动器 | `launcher.py` | 在 Windows 中启动、停止和重启两个服务并查看输出 |
 
 消息主链路：
@@ -46,9 +52,9 @@ flowchart LR
 微信消息
   -> wx_bot.py
   -> POST /api/internal/wechat_message
-  -> EventBus 检查聊天权限与群聊 @ 条件
-  -> 按全局顺序执行插件监听器
-  -> 插件处理 / 调用任务路由中的 AI 模型
+  -> EventBus 与聊天策略过滤
+  -> 核心 AI 助手 / 已授权插件
+  -> Codex 最终回复 / 辅助模型与外部服务
   -> WeChatManager
   -> wx_bot.py
   -> 微信回复
@@ -61,11 +67,11 @@ flowchart LR
 - Windows 10/11，且当前用户拥有可交互的桌面会话。
 - 微信 4.1 客户端已经安装并登录。
 - 64 位 Python 3.11 或 3.12；安装 Python 时勾选 `Add Python to PATH`。
-- 使用 Git 获取和更新项目时，需要安装 [Git for Windows](https://git-scm.com/download/win)。
+- 使用 Git 获取项目时，需要安装 [Git for Windows](https://git-scm.com/download/win)。
 - `wxautox4` 可能需要单独购买并激活授权；依赖包会由安装脚本自动安装。
+- 使用 AI 助手或周报助手时，需要安装并登录 [Codex CLI](https://developers.openai.com/codex/cli/)；可运行在 Windows 或 WSL。
 - 菜单翻译和链接摘要需要本机安装 Chrome。首次使用时 Selenium 可能需要联网获取匹配的浏览器驱动。
 - 链接摘要的脑图渲染使用 Playwright Chromium，由一键安装脚本自动下载。
-- 周报助手需要另行安装、登录并配置 Codex CLI；不使用周报时无需安装 Codex。
 
 ## 获取、安装与启动
 
@@ -98,14 +104,14 @@ cd Mabobot
 
 1. 查找 64 位 Python 3.11/3.12。
 2. 在项目目录创建独立虚拟环境 `.venv`。
-3. 更新 `pip`、`setuptools` 和 `wheel`。
+3. 准备 `pip`、`setuptools` 和 `wheel`。
 4. 安装 `requirements.txt` 中的全部依赖，包括 `wxautox4`。
 5. 安装并验证链接摘要所需的 FFmpeg/FFprobe 与 Playwright Chromium。
 6. 从 `.env.example` 创建本地 `.env`，但不会覆盖已经存在的配置。
 7. 创建 `data/`、`logs/` 和 `tmp/` 运行目录。
 8. 打开 GUI 启动器，由启动器管理微信桥接和主应用。
 
-以后再次运行会复用 `.venv`；只有 `requirements.txt` 变化或环境不完整时才重新安装依赖。
+再次运行会复用 `.venv`；脚本会校验依赖声明和环境完整性，并在需要时安装依赖。
 
 如果只想安装或强制重装依赖，运行：
 
@@ -113,13 +119,7 @@ cd Mabobot
 Install.bat
 ```
 
-环境准备好后，也可以直接运行 `Start-GUI.bat`。日常使用继续运行 `一键启动.bat` 更省心，它会先检查依赖是否仍然完整。
-
-## 升级与更新记录
-
-面向使用者的版本公告发布在 [GitHub Releases](https://github.com/Maaboubou/Mabobot/releases)，仓库内的长期变更记录见 [CHANGELOG.md](CHANGELOG.md)。
-
-升级前建议先在“系统 → 备份与迁移”中创建并校验备份，然后停止正在执行的长任务、更新代码与依赖并重启 Mabobot。涉及插件接入方式或数据结构的版本会在 Release 公告中单独列出迁移提醒。
+环境准备好后，也可以直接运行 `Start-GUI.bat`。日常使用继续运行 `一键启动.bat` 更省心，它会先检查依赖是否完整。
 
 ## 首次配置
 
@@ -133,7 +133,16 @@ Install.bat
 
 激活码只应保留在本机，不要写入 README、`.env` 或提交到 Git。
 
-### 2. 启动服务并打开管理面板
+### 2. 准备 Codex 运行时
+
+AI 助手的最终回复和 `Weekly` 周报由 Codex 产生。请先按 [Codex CLI 官方文档](https://developers.openai.com/codex/cli/) 安装，并在实际运行 Codex 的环境中执行一次 `codex` 完成登录。
+
+- WSL：保持 `.env` 中 `CODEX_PROXY_USE_WSL=true`，按需填写 `CODEX_PROXY_WSL_BIN`；默认自动查找 `codex`。
+- Windows：设置 `CODEX_PROXY_USE_WSL=false`，按需填写 `CODEX_PROXY_BIN`；默认自动查找 `codex`。
+
+两种运行方式选择一种即可。Codex 可用后，管理面板的 `/codex` 会显示运行时、会话、任务、额度和文件工具状态。
+
+### 3. 启动服务并打开管理面板
 
 确认微信已经登录，在 GUI 启动器中启动全部服务。浏览器没有自动打开时，手动访问：
 
@@ -143,9 +152,15 @@ Install.bat
 - 微信桥接健康检查：<http://127.0.0.1:5555/health>
 - 微信桥接进程存活检查：<http://127.0.0.1:5555/live>
 
-### 3. 添加模型连接
+### 4. 选择 Codex Profile
 
-进入“模型与调用 -> 模型连接”，创建要使用的模型：
+默认情况下，AI 助手沿用当前 Codex 的登录、模型和设置。也可以在“Codex”页面新建独立 Profile，为兼容 OpenAI Responses API 的模型保存独立地址、模型 ID 和凭据，再把 Profile 设为系统默认或分配给指定聊天。
+
+Codex Profile 决定最终回复运行时；“辅助模型”页面中的模型连接用于 Judge、记忆和插件任务，两者分别管理。
+
+### 5. 添加辅助模型连接
+
+进入“辅助模型 -> 模型连接”，创建任务需要的模型：
 
 1. 选择供应商或 OpenAI 兼容接口。
 2. 填写一个便于识别且不重复的连接名称。
@@ -154,16 +169,19 @@ Install.bat
 
 同一供应商可以创建多个模型连接，每个连接分别保存自己的 Key、API 地址和参数。例如可以同时创建“DeepSeek-个人”和“DeepSeek-团队”，互不覆盖。管理页面不会回显已经保存的原始密钥。
 
-模型配置不是项目自带内容，首次安装时列表为空。没有添加模型并保存成功前，任务路由不会出现可选模型。
+辅助模型配置不是项目自带内容，首次安装时列表为空。核心 AI 助手可以在 Codex 可用且聊天已启用时直接回复；Judge、长期记忆和声明了模型任务的插件需要相应的辅助模型路由。
 
-### 4. 配置任务路由
+### 6. 配置任务路由
 
-进入“模型与调用 -> 任务路由”，为插件声明的 AI 任务选择模型连接。常见任务包括：
+进入“辅助模型 -> 任务路由”，为核心 Assistant 和插件声明的辅助任务选择模型连接。页面按“核心组件 / 插件”展示路由主体，只列出各组件实际声明的任务：
 
 | 任务 | 用途 |
 |---|---|
-| `builtin_chatbot.chat` | 普通聊天回复 |
-| `builtin_chatbot.judge` | 群聊主动回复判断 |
+| `assistant.judge` | 判断 AI 助手是否主动参与群聊 |
+| `assistant.followup_judge` | 判断未再次 `@` 的消息是否延续当前对话 |
+| `assistant.memory_generate` | 从聊天消息提取事件与人物证据 |
+| `assistant.memory_review` | 复核证据、关系和人物投影 |
+| `assistant.memory_synthesize` | 归纳阶段摘要与人物资料；高级可选路由 |
 | `builtin_chat_logger.image_understanding` | 为聊天记录图片补充场景、对象和可见文字 |
 | `builtin_translation.translate` | 文本翻译 |
 | `menu_translator.vision` | 菜单图片识别与翻译 |
@@ -172,46 +190,43 @@ Install.bat
 | `summary_plus.bilibili_mindmap` | B站视频字幕思维导图 |
 | `summary_plus.youtube_mindmap` | YouTube 字幕思维导图 |
 
-搜索不再需要独立模型路由。普通对话模型先用同一个 `builtin_chatbot.chat` 判断是否需要搜索，再由程序内置的 DDGS 执行检索；DDGS 不需要账号、API Key 或独立服务维护。本地 Codex 作为聊天模型时会跳过 DDGS，继续使用 Codex 原生搜索；“启用网页搜索”是两条路径共用的总开关。
-
-引用图片回复也不再使用 Chatbot 的独立 `ocr` 或 `vision` 路由。聊天模型支持视觉时直接接收图片；不支持视觉时使用 `builtin_chat_logger.image_understanding` 生成的文字补充，补充失败则明确说明无法判断图片。
+任务路由只负责辅助工作，面向微信发送的 AI 助手最终回复固定经过 Codex。网页搜索由 Codex 原生搜索处理；当前引用图片可直接作为本轮输入，`builtin_chat_logger.image_understanding` 则为历史图片补充可检索的场景、对象和文字说明。
 
 如果任务路由中没有模型选项，先确认“模型连接”页面已有保存成功的连接并通过测试，然后刷新任务路由页面。微信桥接、聊天记录、汇率和磁链检查等非 AI 功能不依赖模型。
 
-### 5. 添加聊天并分配能力
+### 7. 添加聊天并配置策略
 
 进入“聊天”页面：
 
 1. 添加需要监听的联系人或群聊，名称应与微信窗口中显示的名称一致。
-2. 为该聊天勾选允许使用的插件。
-3. 群聊按需要设置是否必须 `@机器人`。
-4. 启动该聊天的监听。
+2. 开启“接收消息”，并按需启用“AI 助手”。
+3. 为助手选择 Codex Profile、角色、访问范围和长期记忆策略。
+4. 为该聊天勾选允许使用的独立插件；群聊可为每个插件设置“仅在 `@Bot` 时触发”。
+5. 群聊按需开启“主动参与群聊”并选择 Judge，也可开启连续对话。
 
 手动停止某个聊天后，健康检查不会自动把它恢复；需要再次使用时，在管理面板中手动启动监听。
 
-### 6. 设置角色、Judge 和记忆
+### 8. 设置角色、Judge 和记忆
 
-进入“AI 助手”页面，为启用 Chatbot 的聊天选择：
+进入“AI 助手”页面维护：
 
 - 角色：决定回答身份、语气和行为。
 - Judge：决定群聊中没有明确 `@` 时是否主动参与。
 - 主动回复：按聊天独立开启。
 - 长期记忆：首次安装默认关闭，可全局或按聊天开启。
 
-不需要主动插话时保持主动回复关闭。Judge 不替代任务路由；`builtin_chatbot.judge` 仍需要配置可用模型。
+私聊中的助手直接回复；群聊可由明确 `@`、连续对话或 Judge 触发。不需要主动参与时保持对应开关关闭。启用 Judge 或长期记忆后，应在“辅助模型 -> 任务路由”为其配置可用模型。
 
 ## Web 管理面板
 
 | 工作区 | 路径 | 用途 |
 |---|---|---|
 | 概览 | `/` | 查看服务、微信、模型调用和近期活动 |
-| 聊天 | `/chats` | 管理监听对象、插件权限、`@` 条件和聊天覆盖 |
-| AI 助手 | `/assistant` | 管理聊天角色、Judge、主动回复和长期记忆 |
-| 插件 | `/plugins` | 修改插件全局配置、定时任务和消息执行顺序 |
-| 模型连接 | `/ai/models` | 添加模型、独立凭据和默认参数 |
-| 任务路由 | `/ai/mappings` | 为各插件 AI 任务选择主模型和备用模型 |
-| 用量统计 | `/ai/usage` | 查看模型调用统计 |
-| 调用记录 | `/ai/calls` | 排查模型请求、响应和错误 |
+| Codex | `/codex` | 管理 Profile、运行状态、任务、会话、额度和文件工具 |
+| 聊天 | `/chats` | 管理监听、助手策略、Codex 范围、记忆和插件授权 |
+| AI 助手 | `/assistant` | 管理概览、聊天、角色、Judge、记忆库和全局行为 |
+| 插件 | `/plugins` | 管理插件库、全局配置、消息执行顺序和聊天链路预览 |
+| 辅助模型 | `/ai` | 管理模型连接、任务路由、用量、调用诊断和网络 |
 | 运行与日志 | `/operations/logs` | 查看主应用和微信桥接日志 |
 | 系统 | `/system` | 查看运行环境、微信身份和高级设置 |
 
@@ -222,12 +237,13 @@ Install.bat
 | 层级 | 管理位置 | 内容 |
 |---|---|---|
 | 启动环境 | `.env` | 数据库地址、服务地址、端口、Codex 和可选通知参数 |
-| 模型连接 | 管理面板、本机数据库 | 供应商、模型 ID、API 地址、API Key 和模型参数 |
-| 任务路由 | 管理面板、本机配置 | 每项 AI 任务使用的主模型、备用模型和参数覆盖 |
-| 插件配置 | “插件”页面、`config.json` | 触发词、超时、提示词、定时任务和能力默认值 |
-| 聊天配置 | “聊天”“AI 助手”页面 | 插件权限、`@` 条件、角色、Judge、主动回复和记忆 |
+| Codex 运行时 | “Codex”页面、本机 Codex 配置与 Profile | 最终回复模型、账号、独立 Profile、会话和任务 |
+| AI 助手 | “AI 助手”页面、本机数据库 | 全局行为、角色、Judge、上下文和长期记忆 |
+| 辅助模型 | “辅助模型”页面、本机配置 | 模型连接、凭据、辅助任务路由、主备模型和参数覆盖 |
+| 插件配置 | “插件”页面、`config.json` 与 `manifest.json` | 触发词、超时、定时任务、传播方式和消息执行顺序 |
+| 聊天策略 | “聊天”页面、本机数据库 | 监听、助手、Profile、访问范围、记忆和插件授权 |
 
-`.env.example` 是可以提交的模板，`.env` 是本机实际配置并已被 Git 忽略。AI Key 推荐在管理面板中按模型连接填写，不需要把所有供应商密钥都写进 `.env`。
+`.env.example` 是可以提交的模板，`.env` 是本机实际配置并已被 Git 忽略。辅助模型的 Key 推荐在“模型连接”中填写；Codex 当前配置和独立 Profile 拥有各自的凭据边界。
 
 常用环境变量：
 
@@ -239,20 +255,21 @@ Install.bat
 | `WX_BOT_PORT` | `5555`，微信桥接端口 |
 | `WECHAT_BOT_NAME` | 机器人在微信中的显示名称 |
 | `WEB_CORS_ORIGINS` | 前后端分离时允许的明确来源，默认留空 |
-| `OPENAI_API_KEY` 等 | 可选的模型环境变量凭据；完整供应商字段见 `.env.example` |
-| `CODEX_PROXY_*` | 周报及本机 Codex 集成参数 |
+| `OPENAI_API_KEY` 等 | 可选的辅助模型环境变量凭据；完整供应商字段见 `.env.example` |
+| `CODEX_PROXY_*` | 核心 AI 助手、Codex Profile 和 Codex 工作流参数 |
 | `QQEMAIL_ADDR` / `QQEMAIL_CODE` | 可选的微信掉线或登录失败邮件通知 |
 | `TIKHUB_API_TOKEN` | 可选；TikTok 解析及抖音/小红书 yt-dlp 失败后的回退使用 |
 | `WECHAT_AUTOLOGIN_*` | Windows 登录后自动确认微信登录的等待与重试参数 |
 
-`.env.example` 会随 Git 更新，但安装脚本不会覆盖已有的 `.env`。更新后如果新增了需要使用的功能，请对照新版 `.env.example`，把对应字段手动补入自己的 `.env`；不使用的字段无需复制或填写。
+安装脚本只在 `.env` 不存在时复制 `.env.example`，不会覆盖本机配置。不使用的可选字段保持为空即可。
 
-## 内置插件
+## 核心助手与内置插件
+
+`assistant` 是应用直接托管的核心能力，通过聊天策略单独启用，不属于插件授权。公开版包含以下独立插件：
 
 | 插件 | 功能 | 典型触发 |
 |---|---|---|
 | `builtin_chat_logger` | 保存文本、图片、链接和引用消息，并可补充图片内容 | 已授权聊天中的消息 |
-| `builtin_chatbot` | AI 对话、角色、Judge、网页搜索和本地记忆 | 私聊、群聊 `@`、Judge 或回复续接 |
 | `builtin_translation` | 文本和引用消息翻译 | 已授权聊天中的非空文本 |
 | `boc_rate` | 中国银行牌价、历史走势和汇率异动提醒 | “汇率”、币种关键词；定时任务 |
 | `Weekly` | 根据聊天记录生成并推送周报 | 定时任务；管理员私聊命令 |
@@ -264,9 +281,9 @@ Install.bat
 
 链接摘要需要先为目标聊天授权 `summary_plus`，并在“任务路由”配置对应模型。普通网页和公众号链接使用独立的自动化 Chrome Profile；首次运行会创建 `tmp/chrome_data`。抖音和小红书优先使用 yt-dlp，并自动复用该调试 Chrome 中的登录态，无需手工维护 Cookie 文件；抖音失败后回退 TikHub，小红书失败后回退 TikHub/H5。小红书图文笔记保持单图输出 JPG、多图按配置合并成长图的效果。TikTok 解析及上述回退能力需要在 `.env` 填写可选的 `TIKHUB_API_TOKEN`。B站登录态也会尝试从该 Profile 自动获取，生成的 `cookies.txt` 已被 Git 忽略，不会上传。视频合并、转码和弹幕压制所需的 FFmpeg/FFprobe 由安装器放入 `.venv` 并自动使用，无需手动填路径。
 
-## 权限与消息执行顺序
+## 聊天策略与消息执行顺序
 
-每个聊天对每个插件都有独立权限。`require_mention` 只约束群聊：
+每个聊天分别控制“接收消息”“AI 助手”和独立插件。私聊中的助手直接响应；群聊中的助手支持明确 `@`、Judge 主动参与和连续对话。插件的 `require_mention` 只约束群聊：
 
 | 配置 | 私聊 | 群聊未 @ | 群聊已 @ |
 |---|---|---|---|
@@ -352,43 +369,23 @@ curl.exe http://127.0.0.1:5555/api/listeners/status
 |---|---|
 | `data/database.db` | 系统设置、聊天、权限、角色、Judge 和模型凭据 |
 | `data/chat_logs/` | 按聊天保存的消息记录和媒体索引 |
-| `data/llm_models.json` 等 | 模型、路由及运行配置 |
+| `data/codex_chat_scopes/` | 各聊天的 Codex 隔离工作空间 |
+| `data/llm_models.json` 等 | 辅助模型、任务路由及运行配置 |
 | `logs/` | 应用、桥接、启动器和自动登录日志 |
 | `tmp/` | 可删除的临时文件 |
 | 插件运行目录 | 汇率缓存、菜单图片/PDF、磁链报告等 |
 
 `data/`、`logs/`、`tmp/`、`.env` 及插件生成内容均已被 Git 忽略，不会随 `git pull` 被覆盖，也不会提交到 GitHub。
 
-这些目录可能包含聊天内容、密钥状态和个人信息，请按敏感数据处理。重要升级前，先在 GUI 中停止全部服务，再复制备份 `data/` 和 `.env`。不要在服务运行时直接删除或替换 SQLite 数据库。
+这些目录可能包含聊天内容、密钥状态和个人信息，请按敏感数据处理。执行备份时先在 GUI 中停止全部服务，再复制 `data/` 和 `.env` 并校验备份可读性。不要在服务运行时直接删除或替换 SQLite 数据库。
 
 ### Chrome Profile
 
-菜单翻译和链接摘要使用 Selenium 控制 Chrome。链接摘要的自动化 Profile 默认位于 `tmp/chrome_data`，会在运行时创建并与日常 Chrome 用户资料分开，通常不需要手动配置或迁移。Profile 或临时缓存被清理后，下次使用会重新创建，但网站登录态也会随之清除。
+菜单翻译和链接摘要使用 Selenium 控制 Chrome。链接摘要的自动化 Profile 默认位于 `tmp/chrome_data`，会在运行时创建并与日常 Chrome 用户资料分开，通常不需要手工干预。Profile 或临时缓存被清理后，下次使用会重新创建，但网站登录态也会随之清除。
 
 抖音和小红书下载会自动从该 Profile 的实时调试会话读取目标网站 Cookie，临时文件在每次调用后自动删除。如果登录态过期，`logs/app.log` 会记录 yt-dlp 的鉴权错误和 TikHub/H5 回退过程；在项目调试 Chrome 中重新登录对应网站即可，无需导出 `cookies.txt`。
 
 如果首次启动浏览器失败，请确认 Chrome 已安装、网络可以获取匹配驱动，并查看 `logs/app.log`。
-
-## 更新项目
-
-### Git 安装
-
-先在 GUI 中停止全部服务，然后在项目目录运行：
-
-```powershell
-cd C:\原来的\Mabobot
-git status
-git pull origin main
-.\一键启动.bat
-```
-
-`一键启动.bat` 会在依赖文件改变时自动更新虚拟环境。`data/` 和 `.env` 不会被 Git 覆盖。
-
-如果 `git status` 显示你修改了项目代码或插件自带的 `config.json`，先保存或提交这些改动，再执行 `git pull`，避免把本地改动直接覆盖。仅通过管理面板产生的数据库和运行数据不需要提交。
-
-### ZIP 安装
-
-下载新的 ZIP 并解压到新目录。停止旧服务后，把旧目录中的 `data/` 和 `.env` 复制到新目录，再运行 `一键启动.bat`。迁移前请保留旧目录作为备份，确认新版本运行正常后再删除。
 
 ## 常见问题
 
@@ -415,20 +412,24 @@ curl.exe http://127.0.0.1:5555/health
 
 仍失败时查看 `logs/gui_launcher.log`、`logs/app.log` 和 `logs/wx_bot.log`。如果端口被占用，可在 `.env` 中修改 `WEB_PORT` 和 `WX_BOT_PORT`，保存后重启全部服务。
 
+### Codex 页面显示运行时不可用
+
+确认已经在 Mabobot 实际使用的环境中完成 Codex 登录。WSL 模式可在 PowerShell 执行 `wsl.exe codex --version`，Windows 模式可执行 `codex --version`；再核对 `.env` 中的 `CODEX_PROXY_USE_WSL`、`CODEX_PROXY_WSL_BIN` 或 `CODEX_PROXY_BIN`。使用独立 Profile 时，还要确认该 Profile 的凭据状态可用。
+
 ### 任务路由没有可选模型
 
-先到“模型连接”创建并保存模型，点击“测试”确认连接可用，再刷新“任务路由”。同一供应商的不同 Key 应创建成不同连接，而不是反复修改同一个连接。
+先到“辅助模型 -> 模型连接”创建并保存模型，点击“测试”确认连接可用，再刷新“任务路由”。同一供应商的不同 Key 应创建成不同连接，而不是反复修改同一个连接。
 
 ### 已添加聊天但机器人不回复
 
 依次检查：
 
 1. 微信客户端是否在线，聊天名称是否完全一致。
-2. 对应聊天的监听是否已经启动。
-3. 聊天是否已获得目标插件权限。
-4. 群聊是否要求 `@机器人`。
-5. AI 任务是否配置了可用模型路由。
-6. “运行与日志”中是否有模型、权限或窗口错误。
+2. 该聊天是否开启“接收消息”，监听状态是否已生效。
+3. 使用 AI 助手时，确认助手开关、Codex 运行时和所选 Profile 可用。
+4. 群聊是否已明确 `@Bot`，或已正确配置连续对话 / Judge。
+5. 使用独立插件时，确认聊天已获得插件授权；需要 AI 的插件还要配置对应辅助模型路由。
+6. 在“运行与日志”中检查 Codex、模型、权限或窗口错误。
 
 ### 手动停止监听后又不想让它自动恢复
 
@@ -444,7 +445,7 @@ curl.exe http://127.0.0.1:5555/health
 
 ### 周报助手无法运行
 
-周报依赖本机 Codex CLI。确认 Codex 已安装并登录，然后根据实际安装位置设置 `CODEX_PROXY_USE_WSL`、`CODEX_PROXY_WSL_BIN` 或 `CODEX_PROXY_BIN`。不使用周报时可停用 `Weekly` 插件。
+周报依赖 Codex CLI。确认 Codex 已安装并登录，然后根据实际运行位置设置 `CODEX_PROXY_USE_WSL`、`CODEX_PROXY_WSL_BIN` 或 `CODEX_PROXY_BIN`，并在“Codex”页面确认运行时就绪。不使用周报时可停用 `Weekly` 插件。
 
 ## 项目结构
 
@@ -452,10 +453,11 @@ curl.exe http://127.0.0.1:5555/health
 Mabobot/
 ├── app/
 │   ├── api/                    # FastAPI 路由与管理 API
+│   ├── assistant/              # 核心 Codex 助手、角色、Judge、上下文与记忆
 │   ├── core/                   # 事件总线、插件管理、消息顺序、微信管理
 │   ├── models/                 # SQLAlchemy 数据模型
-│   ├── plugins/                # 8 个内置插件及 Manifest
-│   ├── services/               # AI、配置、记忆、监控和后台服务
+│   ├── plugins/                # 7 个公开版内置插件及 Manifest
+│   ├── services/               # Codex、辅助模型、配置、监控和后台服务
 │   └── utils/                  # 微信媒体、发送、配置等通用工具
 ├── data/                       # SQLite、聊天记录和本地运行数据
 ├── docs/                       # 模型与记忆专项文档
@@ -491,7 +493,7 @@ app/plugins/my_plugin/
 
 ## 相关文档
 
-- [模型连接与任务路由](docs/MODEL_CONFIGURATION.md)
+- [辅助模型连接与任务路由](docs/MODEL_CONFIGURATION.md)
 - [AI 助手记忆库](docs/MEMORY_LIBRARY.md)
 - [Manifest v2 插件开发指南](app/plugins/README.md)
 - [中国银行汇率插件](app/plugins/boc_rate/README.md)
@@ -506,7 +508,7 @@ app/plugins/my_plugin/
 - 公网部署必须放在带身份认证和 TLS 的反向代理之后。
 - 不要提交 `.env`、`data/`、聊天日志、下载媒体、数据库或任何真实凭据。
 - 分享日志前先检查其中是否包含聊天内容、联系人名称、API 地址或异常响应。
-- 升级和迁移前停止服务并备份 `data/` 与 `.env`。
+- 备份 `data/` 与 `.env` 前先停止服务，避免复制正在写入的数据库。
 
 ## 许可证
 

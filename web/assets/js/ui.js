@@ -1281,7 +1281,7 @@ const UI = {
         if (label) label.textContent = displayName;
         if (meta) meta.textContent = chatName
             ? `${typeLabel} · ${statusLabel}`
-            : '按需展开列表，不占用编辑空间';
+            : '尚未选择';
         if (avatar) avatar.innerHTML = `<i class="bi ${chatName ? (chat?.is_group ? 'bi-people' : 'bi-person') : 'bi-chat-square-text'}"></i>`;
         const memoryButton = document.getElementById('chatMemoryButton');
         const deleteButton = document.getElementById('chatDeleteButton');
@@ -1513,20 +1513,12 @@ const UI = {
         const grantByName = Object.fromEntries(grants.map(item => [item.plugin_name, item]));
         const roles = assistantOverview.roles || [];
         const judges = assistantOverview.judges || [];
-        const profiles = profilesData.profiles || [];
         const selectedProfile = assistant.codex_profile_id || '';
         const selectedPluginCount = grants.filter(item => !String(item.plugin_name).includes('#')).length;
-        const defaultProfileLabel = profilesData.default_profile_id
-            ? `继承默认 · ${profilesData.default_profile_id}`
-            : '继承 Codex 当前配置';
-        const profileSummary = selectedProfile || profilesData.default_profile_id || '继承当前配置';
         const formatLines = values => (values || []).join('\n');
         const roleOptions = roles.map(item => `<option value="${Number(item.id)}" ${Number(assistant.role_id) === Number(item.id) ? 'selected' : ''}>${this.escapeHtml(item.display_name || item.name)}</option>`).join('');
         const judgeOptions = judges.map(item => `<option value="${Number(item.id)}" ${Number(assistant.judge_id) === Number(item.id) ? 'selected' : ''}>${this.escapeHtml(item.display_name || item.name)}</option>`).join('');
-        const profileOptions = [
-            `<option value="" ${selectedProfile ? '' : 'selected'}>${this.escapeHtml(defaultProfileLabel)}</option>`,
-            ...profiles.filter(item => item.available).map(item => `<option value="${this.escapeHtml(item.name)}" ${selectedProfile === item.name ? 'selected' : ''}>${this.escapeHtml(item.name)} · ${this.escapeHtml(item.model)}</option>`)
-        ].join('');
+        const profileOptions = this.renderCodexProfileOptions(profilesData, selectedProfile);
         const pluginCards = [...(capabilities || [])]
             .sort((a, b) => Number(Boolean(grantByName[b.id])) - Number(Boolean(grantByName[a.id]))
                 || Number(b.featured) - Number(a.featured)
@@ -1565,11 +1557,9 @@ const UI = {
                         <input class="form-check-input" type="checkbox" name="listening_enabled" ${chat.listening_enabled ? 'checked' : ''}>
                     </label>
                     <label class="chat-policy-state-toggle">
-                        <span><i class="bi bi-stars"></i><span><strong>AI 助手</strong><small>核心回复能力</small></span></span>
+                        <span><i class="bi bi-stars"></i><span><strong>AI 助手</strong><small data-assistant-status>${assistant.enabled ? '已启用' : '已关闭'}</small></span></span>
                         <input class="form-check-input" type="checkbox" name="assistant_enabled" ${assistant.enabled ? 'checked' : ''}>
                     </label>
-                    <div class="chat-policy-fact"><span>Codex Profile</span><strong data-profile-summary>${this.escapeHtml(profileSummary)}</strong></div>
-                    <div class="chat-policy-fact"><span>独立插件</span><strong data-plugin-count>${selectedPluginCount} 项已启用</strong></div>
                 </section>
 
                 <nav class="chat-policy-tabs" role="tablist" aria-label="聊天配置分区">
@@ -1580,45 +1570,49 @@ const UI = {
 
                 <div class="chat-policy-pane ${activePane === 'assistant' ? 'active' : ''}" data-chat-policy-pane="assistant">
                     <section class="chat-policy-block">
-                        <div class="chat-policy-block-head"><div><h4>回复身份</h4><p>Assistant 是核心能力，不属于插件；最终回复只会从所选 Codex Profile 产生。</p></div></div>
+                        <div class="chat-policy-block-head"><h4>回复身份</h4></div>
                         <div class="chat-policy-field-grid three">
-                            <label><span>Codex Profile</span><select class="form-select" name="codex_profile_id">${profileOptions}</select><small><a href="/codex" onclick="event.preventDefault(); UI.switchTab('codex')">管理 Profiles</a></small></label>
-                            <label><span>角色</span><select class="form-select" name="role_id"><option value="">继承全局默认角色</option>${roleOptions}</select></label>
-                            <label><span>Codex 访问范围</span><select class="form-select" name="codex_mode" data-private-value="${this.escapeHtml(codex.mode || 'isolated')}" ${chat.is_group ? 'disabled' : ''}><option value="isolated" ${codex.mode === 'owner_full' ? '' : 'selected'}>隔离空间</option>${chat.is_group ? '' : `<option value="owner_full" ${codex.mode === 'owner_full' ? 'selected' : ''}>管理员 · 本机最大权限</option>`}</select><small class="field-help">${this.escapeHtml(codex.label || '隔离空间')} · ${this.escapeHtml(codex.workdir || '')}</small></label>
+                            <label><span class="chat-field-label"><span>Codex Profile</span><a href="/codex" onclick="event.preventDefault(); UI.switchTab('codex')">管理</a></span><select class="form-select" name="codex_profile_id">${profileOptions}</select></label>
+                            <label><span class="chat-field-label"><span>角色</span><a href="/assistant/roles" onclick="event.preventDefault(); App.openAssistantRoleManager()">管理</a></span><select class="form-select" name="role_id"><option value="">继承全局默认角色</option>${roleOptions}</select></label>
+                            <label><span>Codex 访问范围</span><select class="form-select" name="codex_mode" data-private-value="${this.escapeHtml(codex.mode || 'isolated')}" ${chat.is_group ? 'disabled' : ''}><option value="isolated" ${codex.mode === 'owner_full' ? '' : 'selected'}>隔离空间</option>${chat.is_group ? '' : `<option value="owner_full" ${codex.mode === 'owner_full' ? 'selected' : ''}>管理员 · 本机最大权限</option>`}</select><small class="field-help" title="${this.escapeHtml(codex.label || '隔离空间')} · ${this.escapeHtml(codex.workdir || '')}">${this.escapeHtml(codex.label || '隔离空间')} · ${this.escapeHtml(codex.workdir || '')}</small></label>
                         </div>
                     </section>
 
                     <section class="chat-policy-block">
-                        <div class="chat-policy-block-head"><div><h4>对话行为</h4><p>低频参数仅在对应能力开启时展开。</p></div></div>
-                        <div class="chat-policy-switch-grid">
-                            <label class="chat-policy-switch"><span><strong>允许连续对话</strong><small>回复后短时间内无需再次触发</small></span><input class="form-check-input" type="checkbox" name="followup_enabled" ${assistant.followup_enabled ? 'checked' : ''}></label>
-                            ${chat.is_group ? `<label class="chat-policy-switch"><span><strong>允许主动参与</strong><small>由 Judge 判断是否加入群聊</small></span><input class="form-check-input" type="checkbox" name="proactive_enabled" ${assistant.proactive_enabled ? 'checked' : ''} ${judges.length ? '' : 'disabled'}></label>` : ''}
+                        <div class="chat-policy-block-head"><h4>对话行为</h4></div>
+                        <div class="chat-setting-list">
+                            <div class="chat-setting-group">
+                                <label class="chat-setting-row"><span><strong>连续对话</strong><small>短时间内无需再次唤醒</small></span><input class="form-check-input" type="checkbox" name="followup_enabled" ${assistant.followup_enabled ? 'checked' : ''}></label>
+                                <div class="chat-policy-dependent" data-followup-settings>
+                                    <label><span>有效窗口（秒）</span><input class="form-control" name="followup_window_seconds" type="number" min="10" max="600" value="${Number(assistant.followup_window_seconds || 60)}" required></label>
+                                    <label><span>消息合并（秒）</span><input class="form-control" name="followup_merge_seconds" type="number" min="1" max="30" value="${Number(assistant.followup_merge_seconds || 3)}" required></label>
+                                    <label><span>最多轮数</span><input class="form-control" name="followup_max_turns" type="number" min="1" max="10" value="${Number(assistant.followup_max_turns || 3)}" required></label>
+                                </div>
+                            </div>
+                            ${chat.is_group ? `<div class="chat-setting-group">
+                                <label class="chat-setting-row"><span><strong>主动参与群聊</strong><small>${judges.length ? '由回复判断器决定是否加入对话' : '需要先创建回复判断器'}</small></span><input class="form-check-input" type="checkbox" name="proactive_enabled" ${assistant.proactive_enabled ? 'checked' : ''} ${judges.length ? '' : 'disabled'}></label>
+                                <div class="chat-policy-field-grid three chat-policy-group-settings">
+                                    <label data-judge-setting><span class="chat-field-label"><span>回复判断器</span><a href="/assistant/roles" onclick="event.preventDefault(); App.openAssistantRoleManager()">管理</a></span><select class="form-select" name="judge_id"><option value="">选择判断器</option>${judgeOptions}</select>${judges.length ? '' : '<small class="chat-field-status">尚未创建判断器</small>'}</label>
+                                    <label><span>群内机器人昵称</span><input class="form-control" name="bot_group_nickname" value="${this.escapeHtml(chat.bot_group_nickname || '')}" maxlength="128" placeholder="无需填写 @"><small>${chat.bot_group_nickname_detected ? `最近识别：${this.escapeHtml(chat.bot_group_nickname_detected)}` : '用于识别群内 @ 名称'}</small></label>
+                                    <label class="chat-policy-toggle-field"><span>自动校准</span><span class="chat-toggle-control"><small>从微信读取本群昵称</small><input class="form-check-input" type="checkbox" name="bot_group_nickname_auto_enabled" ${chat.bot_group_nickname_auto_enabled ? 'checked' : ''}></span></label>
+                                </div>
+                            </div>` : ''}
                         </div>
-                        <div class="chat-policy-dependent" data-followup-settings>
-                            <label><span>有效窗口（秒）</span><input class="form-control" name="followup_window_seconds" type="number" min="10" max="600" value="${Number(assistant.followup_window_seconds || 60)}" required></label>
-                            <label><span>消息合并（秒）</span><input class="form-control" name="followup_merge_seconds" type="number" min="1" max="30" value="${Number(assistant.followup_merge_seconds || 3)}" required></label>
-                            <label><span>最多轮数</span><input class="form-control" name="followup_max_turns" type="number" min="1" max="10" value="${Number(assistant.followup_max_turns || 3)}" required></label>
-                        </div>
-                        ${chat.is_group ? `<div class="chat-policy-group-settings">
-                            <label data-judge-setting><span>主动回复 Judge</span><select class="form-select" name="judge_id"><option value="">选择 Judge</option>${judgeOptions}</select><small>${judges.length ? '仅在主动参与开启时运行' : '请先在 AI 助手页创建 Judge'}</small></label>
-                            <label><span>群内 Bot 昵称</span><input class="form-control" name="bot_group_nickname" value="${this.escapeHtml(chat.bot_group_nickname || '')}" maxlength="128" placeholder="不需要填写 @"><small>${chat.bot_group_nickname_detected ? `最近识别：${this.escapeHtml(chat.bot_group_nickname_detected)}` : '用于准确识别群内 @ 名称'}</small></label>
-                            <label class="chat-policy-switch compact"><span><strong>自动校准群昵称</strong><small>从微信读取本群昵称</small></span><input class="form-check-input" type="checkbox" name="bot_group_nickname_auto_enabled" ${chat.bot_group_nickname_auto_enabled ? 'checked' : ''}></label>
-                        </div>` : ''}
                     </section>
 
                     <section class="chat-policy-block chat-policy-memory">
-                        <div class="chat-policy-block-head"><div><h4>长期记忆</h4><p>默认继承全局；只有自定义模式才展示聊天级参数。</p></div><div class="chat-policy-block-actions"><button class="btn btn-sm btn-light border" type="button" onclick="App.showCapabilitySettings('assistant', {focusGroup: 'memory'})"><i class="bi bi-globe2 me-1"></i>全局记忆默认</button><button class="btn btn-sm btn-light border" type="button" onclick="App.openSelectedChatMemory()"><i class="bi bi-database me-1"></i>查看记忆库</button></div></div>
+                        <div class="chat-policy-block-head"><div class="chat-policy-title-row"><h4>长期记忆</h4><button class="chat-policy-inline-action" type="button" onclick="App.showCapabilitySettings('assistant', {focusGroup: 'memory'})">全局设置</button></div><div class="chat-policy-block-actions"><button class="chat-policy-head-action" type="button" onclick="App.openSelectedChatMemory()"><i class="bi bi-database"></i>记忆库</button></div></div>
                         <div class="chat-memory-mode-grid">
-                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="inherit" ${memory.mode === 'inherit' ? 'checked' : ''}><span><i class="bi bi-diagram-2"></i><strong>继承全局</strong><small>随全局策略自动调整</small></span></label>
-                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="off" ${memory.mode === 'off' ? 'checked' : ''}><span><i class="bi bi-slash-circle"></i><strong>此聊天关闭</strong><small>不检索也不生成新记忆</small></span></label>
-                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="custom" ${memory.mode === 'custom' ? 'checked' : ''}><span><i class="bi bi-toggles"></i><strong>此聊天自定义</strong><small>仅覆盖下列常用参数</small></span></label>
+                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="inherit" ${memory.mode === 'inherit' ? 'checked' : ''}><span>继承全局</span></label>
+                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="off" ${memory.mode === 'off' ? 'checked' : ''}><span>关闭</span></label>
+                            <label class="chat-memory-mode"><input type="radio" name="memory_mode" value="custom" ${memory.mode === 'custom' ? 'checked' : ''}><span>自定义</span></label>
                         </div>
                         <div class="chat-memory-custom" data-memory-custom>
-                            <div class="chat-policy-switch-grid">
-                                <label class="chat-policy-switch compact"><span><strong>证据复核</strong><small>低可信内容先进入待复核区</small></span><input class="form-check-input" type="checkbox" name="memory_verification_enabled" ${memoryValue('memory_verification_enabled', true) ? 'checked' : ''}></label>
-                                <label class="chat-policy-switch compact"><span><strong>人物记忆</strong><small>维护有来源的人物事实与关系</small></span><input class="form-check-input" type="checkbox" name="memory_person_enabled" ${memoryValue('memory_person_enabled', true) ? 'checked' : ''}></label>
+                            <div class="chat-policy-field-grid two">
+                                <label class="chat-policy-toggle-field"><span>证据复核</span><span class="chat-toggle-control"><small>低可信内容进入待复核区</small><input class="form-check-input" type="checkbox" name="memory_verification_enabled" ${memoryValue('memory_verification_enabled', true) ? 'checked' : ''}></span></label>
+                                <label class="chat-policy-toggle-field"><span>人物记忆</span><span class="chat-toggle-control"><small>维护人物事实与关系</small><input class="form-check-input" type="checkbox" name="memory_person_enabled" ${memoryValue('memory_person_enabled', true) ? 'checked' : ''}></span></label>
                             </div>
-                            <div class="chat-policy-dependent two">
+                            <div class="chat-policy-field-grid two chat-memory-fields">
                                 <label><span>检索时间范围（天）</span><input class="form-control" name="memory_retention_days" type="number" min="0" max="3650" value="${Number(memoryValue('memory_retention_days', 365))}" required></label>
                                 <label><span>每次最多召回</span><input class="form-control" name="memory_retrieval_top_k" type="number" min="1" max="20" value="${Number(memoryValue('memory_retrieval_top_k', 6))}" required></label>
                             </div>
@@ -1628,7 +1622,7 @@ const UI = {
 
                 <div class="chat-policy-pane ${activePane === 'plugins' ? 'active' : ''}" data-chat-policy-pane="plugins">
                     <section class="chat-policy-block">
-                        <div class="chat-policy-block-head"><div><h4>独立插件</h4><p>与 AI 助手分开授权；默认只显示当前已启用项。</p></div></div>
+                        <div class="chat-policy-block-head"><h4>独立插件</h4><div class="chat-policy-block-actions"><a class="chat-policy-head-action" href="/plugins" onclick="event.preventDefault(); UI.switchTab('plugins')"><i class="bi bi-box-arrow-up-right"></i>管理插件</a></div></div>
                         <div class="chat-plugin-toolbar">
                             <label><i class="bi bi-search"></i><input type="search" data-plugin-search-input placeholder="搜索插件" autocomplete="off"></label>
                             <div><button type="button" class="active" data-plugin-filter="enabled">已启用</button><button type="button" data-plugin-filter="all">全部</button></div>
@@ -1639,29 +1633,53 @@ const UI = {
                 </div>
 
                 <div class="chat-policy-pane ${activePane === 'advanced' ? 'active' : ''}" data-chat-policy-pane="advanced">
-                    <section class="chat-policy-block chat-policy-type-block">
-                        <div class="chat-policy-block-head"><div><h4>聊天类型</h4><p>真实聊天名称用于微信匹配，不在管理面板中创建显示别名。</p></div></div>
+                    <section class="chat-policy-block chat-policy-type-block" aria-label="聊天类型设置">
                         <div class="chat-policy-field-grid compact">
-                            <label><span>聊天类型</span><select class="form-select" name="chat_type"><option value="private" ${chat.is_group ? '' : 'selected'}>私聊</option><option value="group" ${chat.is_group ? 'selected' : ''}>群聊</option></select><small data-chat-type-note>改变类型后将重新加载对应设置</small></label>
+                            <label><span>聊天类型</span><select class="form-select" name="chat_type"><option value="private" ${chat.is_group ? '' : 'selected'}>私聊</option><option value="group" ${chat.is_group ? 'selected' : ''}>群聊</option></select><small class="chat-field-status" data-chat-type-note hidden></small></label>
                         </div>
                     </section>
                     <section class="chat-policy-block">
-                        <div class="chat-policy-block-head"><div><h4>忽略规则</h4><p>区分整条处理链与仅 AI 助手，避免重复配置。</p></div></div>
+                        <div class="chat-policy-block-head"><h4>忽略规则</h4></div>
                         <div class="chat-policy-field-grid two">
-                            <label><span>全局发送者黑名单</span><textarea class="form-control" name="sender_blacklist" rows="5" placeholder="每行一个名称">${this.escapeHtml(formatLines(chat.sender_blacklist))}</textarea><small>消息将被所有插件与助手忽略</small></label>
-                            <label><span>仅 AI 助手忽略</span><textarea class="form-control" name="assistant_ignored_senders" rows="5" placeholder="每行一个名称">${this.escapeHtml(formatLines(assistant.ignored_senders))}</textarea><small>其他插件仍可处理这些发送者</small></label>
+                            <label><span>全链路忽略</span><textarea class="form-control" name="sender_blacklist" rows="5" placeholder="每行一个发送者名称">${this.escapeHtml(formatLines(chat.sender_blacklist))}</textarea></label>
+                            <label><span>仅 AI 助手忽略</span><textarea class="form-control" name="assistant_ignored_senders" rows="5" placeholder="每行一个发送者名称">${this.escapeHtml(formatLines(assistant.ignored_senders))}</textarea></label>
                         </div>
                     </section>
-                    <footer class="chat-policy-version"><i class="bi bi-shield-lock"></i><span>策略版本 ${Number(policy.version)}；检测到并发修改时不会覆盖其他页面。</span></footer>
                 </div>
             </form>`;
 
         const form = document.getElementById('chatPolicyForm');
         this.setManagedChatContext({ ...chat, user_id: policy.user_id });
-        this.bindChatPolicyForm(form, profilesData);
+        this.bindChatPolicyForm(form);
     },
 
-    bindChatPolicyForm(form, profilesData) {
+    renderCodexProfileOptions(profilesData = {}, selectedProfile = '') {
+        const profiles = Array.isArray(profilesData.profiles) ? profilesData.profiles : [];
+        const selected = String(selectedProfile || '');
+        const defaultLabel = profilesData.default_profile_id
+            ? `继承默认 · ${profilesData.default_profile_id}`
+            : '继承默认 · 当前本机 Codex';
+        const visibleProfiles = profiles.filter(item => item.available || item.name === selected);
+        return [
+            `<option value="" ${selected ? '' : 'selected'}>${this.escapeHtml(defaultLabel)}</option>`,
+            `<option value="__current__" ${selected === '__current__' ? 'selected' : ''}>当前本机 Codex</option>`,
+            ...visibleProfiles.map(item => `<option value="${this.escapeHtml(item.name)}" ${selected === item.name ? 'selected' : ''}>${this.escapeHtml(item.name)} · ${this.escapeHtml(item.model)}${item.available ? '' : ' · 尚不可用'}</option>`)
+        ].join('');
+    },
+
+    updateChatPolicyProfileOptions(profilesData) {
+        const form = document.getElementById('chatPolicyForm');
+        const select = form?.elements?.codex_profile_id;
+        if (!select) return;
+        const selected = select.value;
+        select.innerHTML = this.renderCodexProfileOptions(profilesData, selected);
+        if ([...select.options].some(option => option.value === selected)) {
+            select.value = selected;
+        }
+        this.syncChatPolicyDirty(form);
+    },
+
+    bindChatPolicyForm(form) {
         if (!form) return;
         const syncPlugin = toggle => {
             const card = toggle.closest('.chat-policy-plugin');
@@ -1707,21 +1725,17 @@ const UI = {
             }
             const typeChanged = groupSelected !== (form.dataset.originalGroup === 'true');
             const typeNote = form.querySelector('[data-chat-type-note]');
-            if (typeNote) typeNote.textContent = typeChanged
-                ? '保存后会重新加载对应的群聊 / 私聊设置'
-                : '改变类型后将重新加载对应设置';
+            if (typeNote) {
+                typeNote.hidden = !typeChanged;
+                typeNote.textContent = typeChanged ? '保存后将重新加载对应设置' : '';
+            }
         };
 
         const updateSummary = () => {
             const selectedCount = form.querySelectorAll('.chat-policy-plugin-toggle:checked').length;
-            form.querySelectorAll('[data-plugin-count]').forEach(item => { item.textContent = `${selectedCount} 项已启用`; });
             form.querySelectorAll('[data-plugin-tab-count]').forEach(item => { item.textContent = selectedCount; });
-            const profileSelect = form.elements.codex_profile_id;
-            const profileLabel = profileSelect.value
-                || profilesData.default_profile_id
-                || '继承当前配置';
-            const summary = form.querySelector('[data-profile-summary]');
-            if (summary) summary.textContent = profileLabel;
+            const assistantStatus = form.querySelector('[data-assistant-status]');
+            if (assistantStatus) assistantStatus.textContent = form.elements.assistant_enabled.checked ? '已启用' : '已关闭';
         };
 
         form.querySelectorAll('[data-chat-policy-tab]').forEach(button => {

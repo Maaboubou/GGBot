@@ -184,7 +184,25 @@ const API = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         }),
-        setDefault: profileId => API.put('/api/codex/profiles/default/selection', { profile_id: profileId })
+        setDefault: profileId => API.put('/api/codex/profiles/default/selection', { profile_id: profileId }),
+        startOAuth: (profileId, force = false) => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/oauth/start`,
+            { force }
+        ),
+        getOAuth: profileId => API.get(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/oauth`
+        ),
+        cancelOAuth: profileId => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/oauth/cancel`,
+            {}
+        ),
+        logoutOAuth: profileId => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/oauth/logout`,
+            {}
+        ),
+        getModels: profileId => API.get(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/models`
+        )
     },
 
     memory: {

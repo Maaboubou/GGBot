@@ -1915,13 +1915,14 @@ class AssistantHandler:
         """Use authoritative Codex runtime telemetry when it is available."""
         if self.context_window_auto_detect:
             try:
-                from app.services.codex_profile_service import get_codex_profile_service
+                from app.services.codex_profile_service import (
+                    CodexProfileService,
+                    get_codex_profile_service,
+                )
 
-                profile_id = str(
+                profile_id = CodexProfileService.resolve_assistant_profile_id(
                     self._get_user_permission_config(chat_name).get("codex_profile_id")
-                    or self._default_codex_profile_id()
-                    or ""
-                ).strip()
+                )
                 if profile_id:
                     profile = get_codex_profile_service().get_profile(profile_id)
                     context_window = int((profile or {}).get("context_window") or 0)
@@ -2836,14 +2837,14 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             }
 
         def call_codex(call_messages: List[Dict], *, retry: bool = False) -> str:
+            from app.services.codex_profile_service import CodexProfileService
+
             result = get_assistant_reply_gateway().reply(
                 CodexReplyRequest(
                     chat_name=chat_name,
                     role_name=role_name,
-                    codex_profile_id=str(
+                    codex_profile_id=CodexProfileService.resolve_assistant_profile_id(
                         self._get_user_permission_config(chat_name).get("codex_profile_id")
-                        or self._default_codex_profile_id()
-                        or ""
                     ),
                     messages=call_messages,
                     persistent_session=self.codex_persistent_session_enabled,
@@ -2859,6 +2860,17 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
                     output_schema=output_schema,
                     input_files=kwargs.get("_wxautox_input_files") or (),
                     allow_image_input=bool(kwargs.get("_wxautox_allow_image_input")),
+                    memory_trace=(
+                        kwargs.get("_wxautox_memory_trace")
+                        if isinstance(kwargs.get("_wxautox_memory_trace"), dict)
+                        else None
+                    ),
+                    history_mode=str(kwargs.get("_wxautox_history_mode") or "full"),
+                    usage_capture=(
+                        kwargs.get("_wxautox_usage_capture")
+                        if isinstance(kwargs.get("_wxautox_usage_capture"), list)
+                        else None
+                    ),
                 )
             )
             attachment_capture = kwargs.get("_wxautox_attachment_capture")

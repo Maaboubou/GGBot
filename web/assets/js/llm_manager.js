@@ -1,12 +1,12 @@
 /**
  * LLM Manager - Frontend Logic
- * Handles model configuration, plugin mappings, prompts, and statistics
+ * Handles model connections, task routes, prompts, and statistics
  */
 
 const LLMManager = {
     currentModels: {},
     currentMappings: {},
-    currentCapabilities: {},
+    currentRouteOwners: {},
     currentStats: {},
     catalogProviders: [],
     catalogModels: [],
@@ -120,24 +120,24 @@ const LLMManager = {
         return `MABOBOT_MODEL_${stem}_${hash.toString(16).padStart(8, '0').toUpperCase()}_API_KEY`;
     },
 
-    mergeDeclaredTaskMappings(rawMappings, capabilities) {
+    mergeDeclaredTaskMappings(rawMappings, routeOwners) {
         const merged = {};
-        Object.entries(rawMappings || {}).forEach(([pluginName, mappings]) => {
+        Object.entries(rawMappings || {}).forEach(([ownerId, mappings]) => {
             if (!mappings || typeof mappings !== 'object' || Array.isArray(mappings)) return;
-            merged[pluginName] = {};
+            merged[ownerId] = {};
             Object.entries(mappings).forEach(([callType, mapping]) => {
-                merged[pluginName][callType] = mapping && typeof mapping === 'object'
+                merged[ownerId][callType] = mapping && typeof mapping === 'object'
                     ? {...mapping}
                     : { primary: '', fallback: [], override_params: {} };
             });
         });
-        Object.entries(capabilities || {}).forEach(([pluginName, capability]) => {
-            const tasks = capability?.llm_tasks;
+        Object.entries(routeOwners || {}).forEach(([ownerId, owner]) => {
+            const tasks = owner?.tasks;
             if (!tasks || typeof tasks !== 'object' || Array.isArray(tasks) || !Object.keys(tasks).length) return;
-            const pluginMappings = merged[pluginName] ||= {};
+            const ownerMappings = merged[ownerId] ||= {};
             Object.keys(tasks).forEach(callType => {
-                if (!pluginMappings[callType]) {
-                    pluginMappings[callType] = { primary: '', fallback: [], override_params: {} };
+                if (!ownerMappings[callType]) {
+                    ownerMappings[callType] = { primary: '', fallback: [], override_params: {} };
                 }
             });
         });
@@ -250,14 +250,14 @@ const LLMManager = {
         return Number.isInteger(num) ? num.toFixed(1) : String(value);
     },
 
-    getTaskRouteMeta(pluginName, callType) {
-        const capability = this.currentCapabilities[pluginName] || {};
-        const declared = capability.llm_tasks?.[callType];
+    getTaskRouteMeta(ownerId, callType) {
+        const owner = this.currentRouteOwners[ownerId] || {};
+        const declared = owner.tasks?.[callType];
         if (declared && typeof declared === 'object') {
             const declaredOrder = Number(declared.order);
             return {
                 label: declared.label || callType,
-                description: declared.description || '该插件未补充任务用途说明。',
+                description: declared.description || '尚未补充这项模型任务的用途说明。',
                 category: declared.category || '模型任务',
                 order: Number.isFinite(declaredOrder) ? declaredOrder : 500,
                 advanced: Boolean(declared.advanced),
@@ -270,7 +270,7 @@ const LLMManager = {
             .replace(/\b\w/g, value => value.toUpperCase());
         return {
             label: readable ? `自定义任务 · ${readable}` : '未命名任务',
-            description: '插件尚未声明这项模型任务的用途。',
+            description: '尚未声明这项模型任务的用途。',
             category: '自定义',
             order: 900,
             advanced: false,
@@ -278,19 +278,24 @@ const LLMManager = {
         };
     },
 
-    getRouteCapabilityMeta(pluginName) {
-        const capability = this.currentCapabilities[pluginName] || {};
-        const readable = String(pluginName || '')
+    getRouteOwnerMeta(ownerId) {
+        const owner = this.currentRouteOwners[ownerId] || {};
+        const readable = String(ownerId || '')
             .replace(/[_-]+/g, ' ')
             .trim()
             .replace(/\b\w/g, value => value.toUpperCase());
-        const icon = /^bi-[a-z0-9-]+$/.test(String(capability.icon || ''))
-            ? capability.icon
-            : 'bi-puzzle';
+        const icon = /^bi-[a-z0-9-]+$/.test(String(owner.icon || ''))
+            ? owner.icon
+            : 'bi-diagram-3';
+        const ownerKind = ['core', 'plugin', 'unknown'].includes(owner.owner_kind)
+            ? owner.owner_kind
+            : 'unknown';
         return {
-            displayName: capability.display_name || readable || '未命名能力',
-            description: capability.description || '该插件尚未声明能力说明。',
+            displayName: owner.display_name || readable || '未命名路由主体',
+            description: owner.description || '该路由主体尚未声明说明。',
             icon,
+            ownerKind,
+            kindLabel: {core: '核心组件', plugin: '插件', unknown: '历史路由'}[ownerKind],
         };
     },
 
@@ -1394,19 +1399,19 @@ const LLMManager = {
     },
 
     /**
-     * Load plugin mappings
+     * Load task model routes and their owning components
      */
     async loadMappings() {
         try {
-            const [response, capabilityPayload] = await Promise.all([
+            const [response, ownerResponse] = await Promise.all([
                 fetch('/api/llm/mappings'),
-                fetch('/api/capabilities/')
-                    .then(capabilityResponse => capabilityResponse.ok
-                        ? capabilityResponse.json()
-                        : { capabilities: [] })
+                fetch('/api/llm/route-owners')
+                    .then(routeOwnerResponse => routeOwnerResponse.ok
+                        ? routeOwnerResponse.json()
+                        : { status: 'error', data: [] })
                     .catch(error => {
-                        console.warn('Capability metadata is unavailable:', error);
-                        return { capabilities: [] };
+                        console.warn('Route owner metadata is unavailable:', error);
+                        return { status: 'error', data: [] };
                     }),
             ]);
             if (!response.ok) {
@@ -1415,14 +1420,14 @@ const LLMManager = {
             const result = await response.json();
 
             if (result.status === 'success') {
-                this.currentCapabilities = Object.fromEntries(
-                    (capabilityPayload.capabilities || [])
-                        .filter(capability => capability?.id)
-                        .map(capability => [capability.id, capability])
+                this.currentRouteOwners = Object.fromEntries(
+                    (ownerResponse.status === 'success' ? ownerResponse.data : [])
+                        .filter(owner => owner?.id)
+                        .map(owner => [owner.id, owner])
                 );
                 this.currentMappings = this.mergeDeclaredTaskMappings(
                     result.data || {},
-                    this.currentCapabilities,
+                    this.currentRouteOwners,
                 );
                 this.renderMappings();
             } else {
@@ -1438,7 +1443,7 @@ const LLMManager = {
     },
 
     /**
-     * Render plugin mappings
+     * Render task model routes grouped by their owning component
      */
     renderMappings() {
         const container = document.getElementById('llmMappingsList');
@@ -1448,56 +1453,57 @@ const LLMManager = {
             container.innerHTML = `
                 <div class="text-center py-5 text-muted">
                     <i class="bi bi-diagram-3 fs-1 mb-3 d-block"></i>
-                    <p>尚未配置插件映射。</p>
+                    <p>尚未声明可配置的任务模型路由。</p>
                 </div>
             `;
             return;
         }
 
-        const pluginEntries = Object.entries(this.currentMappings).sort(([leftName], [rightName]) => {
-            const left = this.currentCapabilities[leftName] || {};
-            const right = this.currentCapabilities[rightName] || {};
+        const ownerEntries = Object.entries(this.currentMappings).sort(([leftName], [rightName]) => {
+            const left = this.currentRouteOwners[leftName] || {};
+            const right = this.currentRouteOwners[rightName] || {};
             if (Boolean(left.featured) !== Boolean(right.featured)) return left.featured ? -1 : 1;
             const categoryDelta = Number(left.category_order || 500) - Number(right.category_order || 500);
             if (categoryDelta !== 0) return categoryDelta;
-            return this.getRouteCapabilityMeta(leftName).displayName.localeCompare(
-                this.getRouteCapabilityMeta(rightName).displayName,
+            return this.getRouteOwnerMeta(leftName).displayName.localeCompare(
+                this.getRouteOwnerMeta(rightName).displayName,
                 'zh-CN'
             );
         });
 
         let html = '<div class="llm-route-groups">';
-        for (const [pluginName, mappings] of pluginEntries) {
-            const safePluginName = this.escapeHtml(pluginName);
-            const capability = this.getRouteCapabilityMeta(pluginName);
+        for (const [ownerId, mappings] of ownerEntries) {
+            const safeOwnerId = this.escapeHtml(ownerId);
+            const owner = this.getRouteOwnerMeta(ownerId);
             const taskEntries = Object.entries(mappings || {}).sort(([leftType], [rightType]) => {
-                const left = this.getTaskRouteMeta(pluginName, leftType);
-                const right = this.getTaskRouteMeta(pluginName, rightType);
+                const left = this.getTaskRouteMeta(ownerId, leftType);
+                const right = this.getTaskRouteMeta(ownerId, rightType);
                 return left.order - right.order || left.label.localeCompare(right.label, 'zh-CN');
             });
             const advancedTaskCount = taskEntries.filter(([callType]) => (
-                this.getTaskRouteMeta(pluginName, callType).advanced
+                this.getTaskRouteMeta(ownerId, callType).advanced
             )).length;
             const commonTaskCount = taskEntries.length - advancedTaskCount;
             html += `
                 <section class="llm-route-group">
                     <header class="llm-route-group-header">
-                        <div class="llm-route-capability">
-                            <span class="llm-route-capability-icon"><i class="bi ${this.escapeHtml(capability.icon)}"></i></span>
+                        <div class="llm-route-owner">
+                            <span class="llm-route-owner-icon"><i class="bi ${this.escapeHtml(owner.icon)}"></i></span>
                             <div>
-                                <div class="llm-route-capability-title">
-                                    <h6>${this.escapeHtml(capability.displayName)}</h6>
-                                    <span>${commonTaskCount} 项常用${advancedTaskCount ? ` · ${advancedTaskCount} 项高级` : ''}</span>
+                                <div class="llm-route-owner-title">
+                                    <h6>${this.escapeHtml(owner.displayName)}</h6>
+                                    <span class="llm-route-owner-kind is-${this.escapeHtml(owner.ownerKind)}">${this.escapeHtml(owner.kindLabel)}</span>
+                                    <span class="llm-route-task-count">${commonTaskCount} 项常用${advancedTaskCount ? ` · ${advancedTaskCount} 项高级` : ''}</span>
                                 </div>
-                                <p>${this.escapeHtml(capability.description)}</p>
-                                <small>内部标识：<code>${safePluginName}</code></small>
+                                <p>${this.escapeHtml(owner.description)}</p>
+                                <small>路由主体标识：<code>${safeOwnerId}</code></small>
                             </div>
                         </div>
                         ${advancedTaskCount ? `
-                        <button class="btn btn-sm btn-outline-secondary llm-route-advanced-toggle" data-plugin-name="${safePluginName}" aria-expanded="false">
+                        <button class="btn btn-sm btn-outline-secondary llm-route-advanced-toggle" data-owner-id="${safeOwnerId}" aria-expanded="false">
                             <i class="bi bi-sliders me-1"></i>显示高级路由
                         </button>` : ''}
-                        <button class="btn btn-sm btn-outline-secondary llm-prompts-button" data-plugin-name="${safePluginName}">
+                        <button class="btn btn-sm btn-outline-secondary llm-prompts-button" data-owner-id="${safeOwnerId}">
                             <i class="bi bi-chat-quote me-1"></i>管理提示词
                         </button>
                     </header>
@@ -1516,7 +1522,7 @@ const LLMManager = {
             `;
 
             for (const [callType, mapping] of taskEntries) {
-                const task = this.getTaskRouteMeta(pluginName, callType);
+                const task = this.getTaskRouteMeta(ownerId, callType);
                 const fallbackModels = Array.isArray(mapping.fallback) ? mapping.fallback : [];
                 const fallback = fallbackModels[0] || '';
                 const overrideParams = mapping.override_params && typeof mapping.override_params === 'object'
@@ -1524,15 +1530,15 @@ const LLMManager = {
                     : {};
                 const overrideKeys = Object.keys(overrideParams);
                 const safeCallType = this.escapeHtml(callType);
-                const routeKey = `${pluginName}.${callType}`;
+                const routeKey = `${ownerId}.${callType}`;
 
                 html += `
-                    <tr class="llm-route-row${task.declared ? '' : ' is-undeclared'}${task.advanced ? ' is-advanced d-none' : ''}" data-plugin-name="${safePluginName}">
+                    <tr class="llm-route-row${task.declared ? '' : ' is-undeclared'}${task.advanced ? ' is-advanced d-none' : ''}" data-owner-id="${safeOwnerId}">
                         <td class="llm-route-task-cell">
                             <div class="llm-route-task-title">
                                 <strong>${this.escapeHtml(task.label)}</strong>
                                 <span class="llm-route-category">${this.escapeHtml(task.category)}</span>
-                                ${task.declared ? '' : '<span class="llm-route-declaration-warning">待插件补充声明</span>'}
+                                ${task.declared ? '' : '<span class="llm-route-declaration-warning">待补充任务声明</span>'}
                             </div>
                             <p>${this.escapeHtml(task.description)}</p>
                             <code class="llm-route-key" title="${this.escapeHtml(routeKey)}">${safeCallType}</code>
@@ -1548,7 +1554,7 @@ const LLMManager = {
                                 : '<span class="llm-route-overrides is-empty">模型默认</span>'}
                         </td>
                         <td class="llm-route-row-action">
-                            <button class="btn btn-sm btn-outline-primary llm-mapping-edit" data-plugin-name="${safePluginName}" data-call-type="${safeCallType}">
+                            <button class="btn btn-sm btn-outline-primary llm-mapping-edit" data-owner-id="${safeOwnerId}" data-call-type="${safeCallType}">
                                 <i class="bi bi-pencil-square me-1"></i>配置
                             </button>
                         </td>
@@ -1567,15 +1573,15 @@ const LLMManager = {
 
         container.innerHTML = html;
         container.querySelectorAll('.llm-prompts-button').forEach(button => {
-            button.addEventListener('click', () => this.showPromptsModal(button.dataset.pluginName));
+            button.addEventListener('click', () => this.showPromptsModal(button.dataset.ownerId));
         });
         container.querySelectorAll('.llm-mapping-edit').forEach(button => {
-            button.addEventListener('click', () => this.editMapping(button.dataset.pluginName, button.dataset.callType));
+            button.addEventListener('click', () => this.editMapping(button.dataset.ownerId, button.dataset.callType));
         });
         container.querySelectorAll('.llm-route-advanced-toggle').forEach(button => {
             button.addEventListener('click', () => {
-                const pluginName = button.dataset.pluginName;
-                const rows = container.querySelectorAll(`.llm-route-row.is-advanced[data-plugin-name="${CSS.escape(pluginName)}"]`);
+                const ownerId = button.dataset.ownerId;
+                const rows = container.querySelectorAll(`.llm-route-row.is-advanced[data-owner-id="${CSS.escape(ownerId)}"]`);
                 const expanded = button.getAttribute('aria-expanded') !== 'true';
                 rows.forEach(row => row.classList.toggle('d-none', !expanded));
                 button.setAttribute('aria-expanded', String(expanded));
@@ -1587,14 +1593,14 @@ const LLMManager = {
     },
 
     /**
-     * Show Prompts Modal for a plugin
+     * Show prompt settings for one route owner
      */
-    async showPromptsModal(pluginName) {
-        const modal = new bootstrap.Modal(document.getElementById('pluginPromptsModal'));
-        const container = document.getElementById('pluginPromptsModalBody');
-        const title = document.getElementById('pluginPromptsModalTitle');
+    async showPromptsModal(ownerId) {
+        const modal = new bootstrap.Modal(document.getElementById('routePromptsModal'));
+        const container = document.getElementById('routePromptsModalBody');
+        const title = document.getElementById('routePromptsModalTitle');
 
-        title.textContent = `提示词 · ${this.getRouteCapabilityMeta(pluginName).displayName}`;
+        title.textContent = `提示词 · ${this.getRouteOwnerMeta(ownerId).displayName}`;
         container.innerHTML = `
             <div class="text-center py-5">
                 <div class="spinner-border text-primary" role="status"></div>
@@ -1605,7 +1611,7 @@ const LLMManager = {
         modal.show();
 
         try {
-            const settings = await API.capabilities.getSettings(pluginName);
+            const settings = await API.capabilities.getSettings(ownerId);
             const prompts = Object.fromEntries(
                 (settings.groups || [])
                     .flatMap(group => group.fields || [])
@@ -1617,7 +1623,7 @@ const LLMManager = {
                 container.innerHTML = `
                     <div class="text-center py-5 text-muted">
                         <i class="bi bi-chat-quote fs-1 mb-3 d-block"></i>
-                        <p>未找到此插件的提示词。</p>
+                        <p>未找到此路由主体的提示词。</p>
                     </div>
                 `;
                 return;
@@ -1632,7 +1638,7 @@ const LLMManager = {
                         <textarea class="form-control font-monospace mb-2" rows="6" id="prompt_${UI.escapeHtml(key)}">${UI.escapeHtml(value)}</textarea>
                         <div class="d-flex justify-content-end gap-2">
                              <button class="btn btn-sm btn-outline-secondary" type="button" data-prompt-reset="${UI.escapeHtml(key)}">重置</button>
-                             <button class="btn btn-sm btn-primary llm-prompt-save" type="button" data-plugin-name="${UI.escapeHtml(pluginName)}" data-prompt-key="${UI.escapeHtml(key)}">保存</button>
+                             <button class="btn btn-sm btn-primary llm-prompt-save" type="button" data-owner-id="${UI.escapeHtml(ownerId)}" data-prompt-key="${UI.escapeHtml(key)}">保存</button>
                         </div>
                     </div>
                 `;
@@ -1646,7 +1652,7 @@ const LLMManager = {
                 });
             });
             container.querySelectorAll('.llm-prompt-save').forEach(button => {
-                button.addEventListener('click', () => this.savePrompt(button.dataset.pluginName, button.dataset.promptKey));
+                button.addEventListener('click', () => this.savePrompt(button.dataset.ownerId, button.dataset.promptKey));
             });
 
         } catch (error) {
@@ -1662,12 +1668,12 @@ const LLMManager = {
     /**
      * Save specific prompt
      */
-    async savePrompt(capabilityId, key) {
+    async savePrompt(ownerId, key) {
         try {
             const textarea = document.getElementById(`prompt_${key}`);
             const newValue = textarea.value;
 
-            await API.capabilities.updateSettings(capabilityId, { [key]: newValue });
+            await API.capabilities.updateSettings(ownerId, { [key]: newValue });
             UI.showSuccess('提示词已保存并应用');
 
         } catch (error) {
@@ -2495,20 +2501,20 @@ const LLMManager = {
     /**
      * Edit mapping - opens modal with current mapping data
      */
-    async editMapping(pluginName, callType) {
+    async editMapping(ownerId, callType) {
         try {
-            const mapping = this.currentMappings[pluginName]?.[callType];
+            const mapping = this.currentMappings[ownerId]?.[callType];
             if (!mapping) {
                 UI.showError('未找到映射');
                 return;
             }
-            const capability = this.getRouteCapabilityMeta(pluginName);
-            const task = this.getTaskRouteMeta(pluginName, callType);
+            const owner = this.getRouteOwnerMeta(ownerId);
+            const task = this.getTaskRouteMeta(ownerId, callType);
 
-            document.getElementById('mappingPluginName').value = pluginName;
+            document.getElementById('mappingOwnerId').value = ownerId;
             document.getElementById('mappingCallType').value = callType;
-            document.getElementById('mappingFullName').value = `${capability.displayName} · ${task.label}`;
-            document.getElementById('mappingInternalName').textContent = `${pluginName}.${callType}`;
+            document.getElementById('mappingFullName').value = `${owner.displayName} · ${task.label}`;
+            document.getElementById('mappingRouteKey').textContent = `${ownerId}.${callType}`;
             document.getElementById('editMappingModalTitle').textContent = `配置模型路由 · ${task.label}`;
 
             const availableModelIds = Object.keys(this.currentModels);
@@ -2567,7 +2573,7 @@ const LLMManager = {
      */
     async saveMappingEdit() {
         try {
-            const pluginName = document.getElementById('mappingPluginName').value;
+            const ownerId = document.getElementById('mappingOwnerId').value;
             const callType = document.getElementById('mappingCallType').value;
             const primary = document.getElementById('mappingPrimary').value;
             const fallbackModel = document.getElementById('mappingFallback').value.trim();
@@ -2614,7 +2620,7 @@ const LLMManager = {
             }
 
             // Save via API
-            const response = await fetch(`/api/llm/mappings/${pluginName}/${callType}`, {
+            const response = await fetch(`/api/llm/mappings/${ownerId}/${callType}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(mapping)
@@ -2628,7 +2634,7 @@ const LLMManager = {
                 const modal = bootstrap.Modal.getInstance(modalEl);
                 if (modal) modal.hide();
 
-                const task = this.getTaskRouteMeta(pluginName, callType);
+                const task = this.getTaskRouteMeta(ownerId, callType);
                 UI.showSuccess(`“${task.label}”的模型路由已更新`);
                 await this.loadMappings();
             } else {

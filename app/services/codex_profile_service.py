@@ -17,6 +17,10 @@ from app.services.file_tools_runtime import _as_wsl_path, _default_use_wsl, get_
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROFILE_SCRIPT = PROJECT_ROOT / "scripts" / "file_tools" / "manage_codex_profiles.py"
 DEFAULT_ASSISTANT_PROFILE_KEY = "ASSISTANT_CODEX_PROFILE_ID"
+# Stored on a chat policy when it must bypass the administrator-selected
+# default and explicitly use the local Codex installation. Profile names must
+# start with an alphanumeric character, so this value cannot collide with one.
+CURRENT_CODEX_PROFILE_ID = "__current__"
 
 
 class CodexProfileError(RuntimeError):
@@ -35,6 +39,8 @@ def public_profile(value: Any) -> Optional[dict[str, Any]]:
         "reasoning_effort",
         "model_verbosity",
         "context_window",
+        "supports_vision",
+        "supports_web_search",
         "wire_api",
         "codex_bin",
         "wrapper_path",
@@ -123,7 +129,9 @@ class CodexProfileService:
             raise CodexProfileError("新建 Profile 返回内容不完整")
         self.invalidate_cache()
         get_file_tools_runtime(use_wsl=self.use_wsl, force=True)
-        if bool(payload.get("make_default", True)):
+        # A ChatGPT profile is not usable until device authorization finishes.
+        # The UI selects it only after the account and model have been verified.
+        if bool(payload.get("make_default", True)) and profile.get("auth_type") != "chatgpt":
             self.set_default_profile(str(profile["name"]))
         return profile
 
@@ -152,6 +160,14 @@ class CodexProfileService:
             return str(get_setting(DEFAULT_ASSISTANT_PROFILE_KEY, "") or "").strip()
         except Exception:
             return ""
+
+    @classmethod
+    def resolve_assistant_profile_id(cls, configured_profile_id: Any) -> str:
+        """Resolve inherit/current/specific chat choices to a runtime profile id."""
+        normalized = str(configured_profile_id or "").strip()
+        if normalized == CURRENT_CODEX_PROFILE_ID:
+            return ""
+        return normalized or cls.default_profile_id()
 
     def set_default_profile(self, name: str) -> None:
         normalized = str(name or "").strip()

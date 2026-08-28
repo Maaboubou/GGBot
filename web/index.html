@@ -40,7 +40,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
 
     <!-- App CSS -->
-    <link href="/static/assets/css/style.css?v=3.6.15" rel="stylesheet">
+    <link href="/static/assets/css/style.css?v=3.6.24" rel="stylesheet">
     <link href="/static/assets/css/dashboard.css?v=3.5.3" rel="stylesheet">
 </head>
 
@@ -245,27 +245,90 @@
                     </div>
                 </div>
 
-                <div class="modal fade" id="codexProfileModal" tabindex="-1" aria-hidden="true">
-                    <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal fade" id="codexProfileModal" tabindex="-1" aria-labelledby="codexProfileModalTitle" aria-hidden="true">
+                    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
                         <div class="modal-content">
                             <div class="modal-header">
-                                <div><h5 class="modal-title">新建 Codex Profile</h5><p class="modal-subtitle mb-0">为兼容 OpenAI Responses API 的模型创建独立 Codex 环境。</p></div>
-                                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                                <div><h5 class="modal-title" id="codexProfileModalTitle">新建 Codex Profile</h5><p class="modal-subtitle mb-0" id="codexProfileModalSubtitle">使用 ChatGPT 官方登录或连接 Responses 兼容接口。</p></div>
+                                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
                             </div>
                             <div class="modal-body">
-                                <form id="codexProfileForm" class="row g-3" autocomplete="off">
-                                    <div class="col-md-5"><label class="form-label">Profile 名称</label><input class="form-control" name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}" placeholder="例如 deepseek-main" required></div>
-                                    <div class="col-md-7"><label class="form-label">模型 ID</label><input class="form-control" name="model" maxlength="128" placeholder="例如 deepseek-chat" required></div>
-                                    <div class="col-md-5"><label class="form-label">供应商名称</label><input class="form-control" name="provider_name" maxlength="100" value="OpenAI Responses compatible"></div>
-                                    <div class="col-md-7"><label class="form-label">Responses API Base URL</label><input class="form-control" name="base_url" type="url" placeholder="https://api.example.com/v1" required></div>
-                                    <div class="col-12"><label class="form-label">API Key</label><input class="form-control" name="api_key" type="password" maxlength="4096" autocomplete="new-password" required><div class="form-text">密钥通过标准输入交给 WSL，并存入权限为 0600 的独立文件；不会写入 Profile 清单或返回网页。</div></div>
+                                <form id="codexProfileForm" class="row g-2 codex-profile-form" autocomplete="off">
+                                    <div class="col-12">
+                                        <div class="codex-profile-source-choice" role="radiogroup" aria-label="配置方式">
+                                            <label><input type="radio" name="profile_source" value="oauth" checked><span><i class="bi bi-qr-code"></i><strong>ChatGPT 官方登录</strong><small>扫码连接当前 ChatGPT 套餐</small></span></label>
+                                            <label><input type="radio" name="profile_source" value="catalog"><span><i class="bi bi-grid"></i><strong>LiteLLM 目录</strong><small>选择供应商和模型后快速回填</small></span></label>
+                                            <label><input type="radio" name="profile_source" value="manual"><span><i class="bi bi-pencil"></i><strong>手动填写</strong><small>直接配置 Responses 兼容接口</small></span></label>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-5 codex-profile-name-field"><label class="form-label" for="codexProfileName">Profile 名称</label><input class="form-control" id="codexProfileName" name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}" placeholder="例如 deepseek-main" required><div class="form-text">仅限字母、数字、连字符和下划线。</div></div>
+                                    <div class="col-md-7 codex-profile-oauth-field"><div class="codex-oauth-explainer"><i class="bi bi-shield-check"></i><span><strong>由 Codex 完成授权</strong><small>凭据只保存在该 Profile 的独立目录中。</small></span></div></div>
+                                    <div class="col-md-7 codex-profile-api-field codex-profile-catalog-field d-none"><label class="form-label" for="codexProfileCatalogProvider">LiteLLM 供应商</label><select class="form-select" id="codexProfileCatalogProvider"><option value="">正在读取目录…</option></select><div class="form-text" id="codexProfileProviderHint">从本机 LiteLLM 目录加载。</div></div>
+                                    <div class="col-12 codex-profile-api-field codex-profile-model-field d-none">
+                                        <label class="form-label" for="codexProfileModel">模型 ID</label>
+                                        <div class="model-catalog-picker codex-profile-model-picker">
+                                            <input class="form-control" id="codexProfileModel" name="model" maxlength="128" placeholder="输入或从 LiteLLM 目录选择" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="codexProfileCatalogMenu" required>
+                                            <button type="button" class="model-catalog-toggle codex-profile-catalog-field" id="codexProfileCatalogToggle" aria-label="展开模型目录" onclick="CodexCenter.toggleProfileCatalog()"><i class="bi bi-chevron-down"></i></button>
+                                            <div class="model-catalog-menu d-none" id="codexProfileCatalogMenu" role="listbox"></div>
+                                        </div>
+                                        <div class="codex-profile-model-meta">
+                                            <div class="form-text" id="codexProfileCatalogHint">选择供应商后读取模型目录；目录外模型仍可直接输入。</div>
+                                            <div class="codex-profile-capability-toggles" aria-label="模型能力">
+                                                <label class="form-check form-switch codex-profile-capability-toggle" for="codexProfileSupportsVision">
+                                                    <input class="form-check-input" id="codexProfileSupportsVision" name="supports_vision" type="checkbox">
+                                                    <span class="form-check-label">图片输入</span>
+                                                </label>
+                                                <label class="form-check form-switch codex-profile-capability-toggle" for="codexProfileSupportsWebSearch">
+                                                    <input class="form-check-input" id="codexProfileSupportsWebSearch" name="supports_web_search" type="checkbox">
+                                                    <span class="form-check-label">原生 Web 搜索</span>
+                                                </label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-5 codex-profile-api-field d-none"><label class="form-label" for="codexProfileProviderName">供应商名称</label><input class="form-control" id="codexProfileProviderName" name="provider_name" maxlength="100" placeholder="例如 DeepSeek"></div>
+                                    <div class="col-md-7 codex-profile-api-field d-none"><label class="form-label" for="codexProfileBaseUrl">Responses API Base URL</label><input class="form-control" id="codexProfileBaseUrl" name="base_url" type="url" placeholder="https://api.example.com/v1" required><div class="form-text">目录只负责快速选型；接口本身必须兼容 OpenAI Responses API。</div></div>
+                                    <div class="col-12 codex-profile-api-field d-none"><label class="form-label" for="codexProfileApiKey">API Key</label><div class="input-group"><input class="form-control" id="codexProfileApiKey" name="api_key" type="password" maxlength="4096" autocomplete="new-password" required><button class="btn btn-outline-secondary" type="button" onclick="UI.togglePassword('codexProfileApiKey')" aria-label="显示或隐藏 API Key"><i class="bi bi-eye"></i></button></div><div class="form-text" id="codexProfileApiKeyHint">密钥通过标准输入交给 WSL，并存入权限为 0600 的独立文件；不会写入 Profile 清单或返回网页。</div></div>
                                     <div class="col-md-4"><label class="form-label">推理强度</label><select class="form-select" name="reasoning_effort"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option></select></div>
                                     <div class="col-md-4"><label class="form-label">输出详细度</label><select class="form-select" name="model_verbosity"><option selected>inherit</option><option>low</option><option>medium</option><option>high</option></select></div>
                                     <div class="col-md-4"><label class="form-label">上下文窗口</label><input class="form-control" name="context_window" type="number" min="4096" max="10000000" value="128000"></div>
                                     <div class="col-12"><label class="form-check form-switch"><input class="form-check-input" type="checkbox" name="make_default" checked><span class="form-check-label">设为 Assistant 默认 Profile</span></label></div>
                                 </form>
                             </div>
-                            <div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="saveCodexProfileButton" onclick="CodexCenter.createProfile()">创建 Profile</button></div>
+                            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" id="saveCodexProfileButton" onclick="CodexCenter.saveProfile()">创建 Profile</button></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="modal fade" id="codexOAuthModal" tabindex="-1" aria-labelledby="codexOAuthModalTitle" aria-hidden="true" data-bs-backdrop="static">
+                    <div class="modal-dialog modal-md modal-dialog-centered">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <div><h5 class="modal-title" id="codexOAuthModalTitle">绑定 ChatGPT</h5><p class="modal-subtitle mb-0" id="codexOAuthSubtitle">扫码完成 Codex 官方授权。</p></div>
+                                <button type="button" class="btn-close" aria-label="关闭" onclick="CodexCenter.closeOAuth()"></button>
+                            </div>
+                            <div class="modal-body">
+                                <div class="alert alert-danger d-none" id="codexOAuthAlert" role="alert"></div>
+                                <div class="codex-oauth-pending" id="codexOAuthPending">
+                                    <div class="codex-oauth-qr-frame"><img id="codexOAuthQr" alt="ChatGPT Codex 授权二维码"></div>
+                                    <div class="codex-oauth-instructions">
+                                        <span class="codex-inline-badge busy">等待授权</span>
+                                        <h6>扫码后输入验证码</h6>
+                                        <button type="button" class="codex-oauth-code" id="codexOAuthCode" onclick="CodexCenter.copyOAuthCode()" title="点击复制"></button>
+                                        <a id="codexOAuthLink" target="_blank" rel="noopener noreferrer">在浏览器中打开</a>
+                                        <small id="codexOAuthCountdown">15:00 后过期</small>
+                                    </div>
+                                </div>
+                                <div class="codex-oauth-connected d-none" id="codexOAuthConnected">
+                                    <div class="codex-oauth-success"><i class="bi bi-check-circle-fill"></i><span><strong>ChatGPT 已连接</strong><small id="codexOAuthAccount"></small></span></div>
+                                    <label class="form-label mt-3" for="codexOAuthModel">Profile 模型</label>
+                                    <select class="form-select" id="codexOAuthModel"></select>
+                                    <div class="form-text">模型来自当前账号的 Codex 目录。</div>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-outline-secondary" id="codexOAuthCancel" onclick="CodexCenter.cancelOAuth()">取消授权</button>
+                                <button type="button" class="btn btn-primary d-none" id="codexOAuthFinish" onclick="CodexCenter.finishOAuth()">保存并使用</button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -289,14 +352,13 @@
                                 <span class="chat-picker-avatar" id="selectedChatAvatar"><i class="bi bi-chat-square-text"></i></span>
                                 <span class="chat-picker-current">
                                     <strong id="selectedChatLabel">选择一个聊天</strong>
-                                    <small id="selectedChatMeta">按需展开列表，不占用编辑空间</small>
+                                    <small id="selectedChatMeta">尚未选择</small>
                                 </span>
                                 <i class="bi bi-chevron-down chat-picker-chevron" aria-hidden="true"></i>
                             </summary>
                             <div class="chat-picker-popover">
                                 <div class="chat-picker-head">
                                     <div><strong>聊天</strong><span class="chat-count-pill" id="managedChatsCount">0</span></div>
-                                    <small>选择后在同一工作台完成全部配置</small>
                                 </div>
                                 <label class="chat-picker-search" for="chatListSearch">
                                     <i class="bi bi-search"></i>
@@ -311,7 +373,7 @@
                             </div>
                         </details>
                         <div class="chat-workspace-actions">
-                            <button type="button" class="btn btn-light border" onclick="App.showAddUserModal()">
+                            <button type="button" class="btn btn-surface" onclick="App.showAddUserModal()">
                                 <i class="bi bi-plus-lg me-1"></i>添加聊天
                             </button>
                             <button type="button" class="btn btn-surface chat-toolbar-icon" id="chatMemoryButton"
@@ -332,7 +394,7 @@
                         <div class="chat-policy-empty" id="userPermissionsPanel">
                             <i class="bi bi-chat-square-text"></i>
                             <h6>选择一个聊天</h6>
-                            <p>会话列表仅在需要切换时展开，编辑区始终保持完整宽度。</p>
+                            <p>从上方选择器打开聊天配置。</p>
                         </div>
                     </div>
                 </section>
@@ -591,12 +653,12 @@
                         </div>
                     </div>
 
-                    <!-- Plugin Mappings Section -->
+                    <!-- Task Model Routes Section -->
                     <div class="tab-pane fade d-none workspace-section" id="llm-mappings">
                         <div class="llm-route-workbench-intro">
                             <div>
-                                <h5><i class="bi bi-diagram-3 me-2"></i>能力任务与模型路由</h5>
-                                <p>插件声明任务用途；在这里为每项任务选择主模型和失败后的备用模型。内部标识仅用于排障。</p>
+                                <h5><i class="bi bi-diagram-3 me-2"></i>插件与任务模型路由</h5>
+                                <p>核心 Assistant 与插件声明辅助模型任务；在这里选择主模型和失败后的备用模型。路由主体标识仅用于排障。</p>
                             </div>
                         </div>
                         <div id="llmMappingsList">
@@ -1278,15 +1340,15 @@
         </div>
     </div>
 
-    <!-- Plugin Prompts Modal -->
-    <div class="modal fade" id="pluginPromptsModal" tabindex="-1">
+    <!-- Route Owner Prompts Modal -->
+    <div class="modal fade" id="routePromptsModal" tabindex="-1">
         <div class="modal-dialog modal-lg modal-dialog-scrollable">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title" id="pluginPromptsModalTitle">管理提示词</h5>
+                    <h5 class="modal-title" id="routePromptsModalTitle">管理提示词</h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
-                <div class="modal-body" id="pluginPromptsModalBody">
+                <div class="modal-body" id="routePromptsModalBody">
                     <!-- Prompts will be loaded here -->
                     <div class="text-center py-5">
                         <div class="spinner-border text-primary" role="status"></div>
@@ -1309,13 +1371,13 @@
                 </div>
                 <div class="modal-body">
                     <form id="editMappingForm">
-                        <input type="hidden" id="mappingPluginName">
+                        <input type="hidden" id="mappingOwnerId">
                         <input type="hidden" id="mappingCallType">
 
                         <div class="mb-3">
                             <label class="form-label">任务</label>
                             <input type="text" class="form-control" id="mappingFullName" readonly disabled>
-                            <div class="form-text">内部标识：<code id="mappingInternalName"></code></div>
+                            <div class="form-text">路由键：<code id="mappingRouteKey"></code></div>
                         </div>
 
                         <div class="mb-3">
@@ -1375,12 +1437,12 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
     <!-- App Scripts -->
-    <script src="/static/assets/js/api.js?v=3.5.8"></script>
-    <script src="/static/assets/js/ui.js?v=3.4.7"></script>
+    <script src="/static/assets/js/api.js?v=3.5.9"></script>
+    <script src="/static/assets/js/ui.js?v=3.4.10"></script>
     <script src="/static/assets/js/system_operations.js?v=1.3.1"></script>
-    <script src="/static/assets/js/llm_manager.js?v=3.4.4"></script>
-    <script src="/static/assets/js/codex_center.js?v=1.0.2"></script>
-    <script src="/static/assets/js/main.js?v=3.6.7"></script>
+    <script src="/static/assets/js/llm_manager.js?v=3.4.5"></script>
+    <script src="/static/assets/js/codex_center.js?v=1.0.6"></script>
+    <script src="/static/assets/js/main.js?v=3.6.9"></script>
     <script src="/static/assets/js/memory_console.js?v=1.0.3"></script>
 
     <!-- ==================== Judge History Modal ==================== -->

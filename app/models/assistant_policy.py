@@ -37,8 +37,9 @@ class AssistantChatPolicy(Base):
     followup_max_turns = Column(Integer, default=3, nullable=False)
     memory_profile = Column(Text, nullable=True)
     ignored_senders = Column(Text, nullable=True)
-    # Empty means the administrator-selected default Codex Profile. A concrete
-    # id is resolved for each request and never mutates the global runtime.
+    # Empty means inherit the administrator-selected default. ``__current__``
+    # explicitly bypasses that default and uses the local Codex installation;
+    # a concrete id selects an isolated Profile for each request.
     codex_profile_id = Column(String, nullable=True)
     version = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

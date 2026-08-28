@@ -1,18 +1,24 @@
 """Codex-only reply boundary for the first-class chat assistant.
 
-This module deliberately bypasses :class:`LLMManager`.  Auxiliary assistant
+This module deliberately bypasses :meth:`LLMManager.call`.  Auxiliary assistant
 tasks (Judge, memory and media enrichment) still use the generic model router,
 but a message that will be sent as the assistant's final reply must cross this
-gateway and can therefore only be produced by the local Codex runtime.
+gateway and can therefore only be produced by the local Codex runtime.  The
+gateway may still publish telemetry to LLMManager's history store; telemetry is
+not a model-routing path.
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
+
+
+logger = logging.getLogger(__name__)
 
 
 class AssistantReplyError(RuntimeError):
@@ -36,6 +42,9 @@ class CodexReplyRequest:
     output_schema: Optional[Dict[str, Any]] = None
     input_files: Sequence[Dict[str, Any]] = field(default_factory=tuple)
     allow_image_input: bool = False
+    memory_trace: Optional[Dict[str, Any]] = None
+    history_mode: str = "full"
+    usage_capture: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass(frozen=True)
@@ -72,10 +81,12 @@ class CodexReplyGateway:
         *,
         model_resolver: Optional[Callable[[], str]] = None,
         runtime_resolver: Optional[Callable[[str], Any]] = None,
+        telemetry_recorder: Optional[Callable[..., None]] = None,
     ) -> None:
         self._runtime = runtime
         self._model_resolver = model_resolver or _default_model
         self._runtime_resolver = runtime_resolver
+        self._telemetry_recorder = telemetry_recorder
 
     @property
     def runtime(self) -> Any:
@@ -187,6 +198,16 @@ class CodexReplyGateway:
                 persistent_session=bool(request.persistent_session),
             )
         except Exception as exc:
+            self._record_telemetry(
+                request=request,
+                model=model,
+                response=None,
+                response_text="",
+                response_time=time.monotonic() - started_at,
+                backend="codex_runtime",
+                success=False,
+                error=str(exc),
+            )
             raise AssistantReplyError(f"Codex assistant reply failed: {exc}") from exc
         duration = time.monotonic() - started_at
 
@@ -196,18 +217,82 @@ class CodexReplyGateway:
         message = _read(first_choice, "message", {}) or {}
         text = str(_read(message, "content", "") or "").strip()
         attachments = self._extract_attachments(response)
+        response_model = str(_read(response, "model", model) or model)
+        backend = str(_read(response, "backend", "codex_runtime") or "codex_runtime")
         if not text and not attachments:
+            self._record_telemetry(
+                request=request,
+                model=response_model,
+                response=normalized_response,
+                response_text="",
+                response_time=duration,
+                backend=backend,
+                success=False,
+                error="Codex assistant returned an empty response",
+            )
             raise AssistantReplyError("Codex assistant returned an empty response")
+
+        self._record_telemetry(
+            request=request,
+            model=response_model,
+            response=normalized_response,
+            response_text=text,
+            response_time=duration,
+            backend=backend,
+            success=True,
+        )
 
         return CodexReplyResult(
             text=text,
             attachments=attachments,
             usage=self._extract_usage(response),
-            model=str(_read(response, "model", model) or model),
-            backend=str(_read(response, "backend", "codex_runtime") or "codex_runtime"),
+            model=response_model,
+            backend=backend,
             duration_seconds=duration,
             raw_response=copy.deepcopy(normalized_response),
         )
+
+    def _record_telemetry(
+        self,
+        *,
+        request: CodexReplyRequest,
+        model: str,
+        response: Optional[Dict[str, Any]],
+        response_text: str,
+        response_time: float,
+        backend: str,
+        success: bool,
+        error: str = "",
+    ) -> None:
+        """Publish history without allowing telemetry failures to block replies."""
+        if self._telemetry_recorder is None:
+            return
+        memory_trace = (
+            copy.deepcopy(request.memory_trace)
+            if isinstance(request.memory_trace, dict)
+            else None
+        )
+        try:
+            self._telemetry_recorder(
+                messages=copy.deepcopy(list(request.messages)),
+                response=copy.deepcopy(response) if isinstance(response, dict) else None,
+                response_text=response_text,
+                response_time=max(0.0, float(response_time or 0.0)),
+                model_id=str(model or "unknown"),
+                backend=str(backend or "codex_runtime"),
+                success=bool(success),
+                error=str(error or ""),
+                metadata={
+                    "chat_name": str(request.chat_name or ""),
+                    "role_name": str(request.role_name or ""),
+                    "trace_id": str((memory_trace or {}).get("trace_id") or ""),
+                    "memory_trace": memory_trace,
+                    "history_mode": str(request.history_mode or "full"),
+                    "_usage_capture": request.usage_capture,
+                },
+            )
+        except Exception as exc:
+            logger.warning("记录 Codex 回复调用历史失败：%s", exc)
 
     @staticmethod
     def _resolve_profile_runtime(profile_id: str) -> Any:
@@ -268,5 +353,12 @@ _assistant_reply_gateway: Optional[CodexReplyGateway] = None
 def get_assistant_reply_gateway() -> CodexReplyGateway:
     global _assistant_reply_gateway
     if _assistant_reply_gateway is None:
-        _assistant_reply_gateway = CodexReplyGateway()
+        def record_telemetry(**kwargs: Any) -> None:
+            from app.services.llm_manager import get_llm_manager
+
+            get_llm_manager().record_codex_reply(**kwargs)
+
+        _assistant_reply_gateway = CodexReplyGateway(
+            telemetry_recorder=record_telemetry,
+        )
     return _assistant_reply_gateway

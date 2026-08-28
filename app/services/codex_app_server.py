@@ -24,7 +24,7 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from app.services.codex_job_manager import codex_job_manager
 from app.services.file_tools_runtime import (
@@ -417,6 +417,8 @@ class CodexAppServerManager:
         self._chat_locks_lock = threading.Lock()
         self._chat_locks: Dict[str, threading.Lock] = {}
         self._pending: Dict[int, _PendingRequest] = {}
+        self._notification_lock = threading.RLock()
+        self._notification_handlers: Dict[str, List[Callable[[Dict[str, Any]], None]]] = {}
         self._turns: Dict[str, _TurnTracker] = {}
         self._loaded_threads: Dict[str, str] = {}
         self._request_id = 0
@@ -990,6 +992,14 @@ class CodexAppServerManager:
         return True
 
     def _handle_notification(self, method: str, params: Dict[str, Any]) -> None:
+        with self._notification_lock:
+            handlers = list(self._notification_handlers.get(method, ()))
+        for handler in handlers:
+            try:
+                handler(dict(params))
+            except Exception:
+                logger.exception("Codex notification handler failed: %s", method)
+
         turn_id = str(params.get("turnId") or "")
         turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
         if not turn_id:
@@ -1092,6 +1102,28 @@ class CodexAppServerManager:
 
     def _notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
         self._send({"method": method, "params": params or {}})
+
+    def add_notification_handler(
+        self,
+        method: str,
+        handler: Callable[[Dict[str, Any]], None],
+    ) -> Callable[[], None]:
+        """Register a lightweight notification callback and return its remover."""
+        normalized = str(method or "").strip()
+        if not normalized:
+            raise ValueError("Notification method is required")
+        with self._notification_lock:
+            self._notification_handlers.setdefault(normalized, []).append(handler)
+
+        def remove() -> None:
+            with self._notification_lock:
+                values = self._notification_handlers.get(normalized, [])
+                if handler in values:
+                    values.remove(handler)
+                if not values:
+                    self._notification_handlers.pop(normalized, None)
+
+        return remove
 
     def _request(
         self,
@@ -1338,6 +1370,42 @@ class CodexAppServerManager:
     def read_rate_limits(self, timeout: int = 30) -> Dict[str, Any]:
         """Read account limits through the initialized shared connection."""
         result = self._request("account/rateLimits/read", {}, timeout=max(1, int(timeout)))
+        return result if isinstance(result, dict) else {}
+
+    def read_account(self, *, refresh_token: bool = False, timeout: int = 30) -> Dict[str, Any]:
+        result = self._request(
+            "account/read",
+            {"refreshToken": bool(refresh_token)},
+            timeout=max(1, int(timeout)),
+        )
+        return result if isinstance(result, dict) else {}
+
+    def start_chatgpt_device_login(self, timeout: int = 30) -> Dict[str, Any]:
+        result = self._request(
+            "account/login/start",
+            {"type": "chatgptDeviceCode"},
+            timeout=max(1, int(timeout)),
+        )
+        return result if isinstance(result, dict) else {}
+
+    def cancel_account_login(self, login_id: str, timeout: int = 30) -> Dict[str, Any]:
+        result = self._request(
+            "account/login/cancel",
+            {"loginId": str(login_id or "")},
+            timeout=max(1, int(timeout)),
+        )
+        return result if isinstance(result, dict) else {}
+
+    def logout_account(self, timeout: int = 30) -> Dict[str, Any]:
+        result = self._request("account/logout", {}, timeout=max(1, int(timeout)))
+        return result if isinstance(result, dict) else {}
+
+    def list_models(self, *, include_hidden: bool = False, timeout: int = 30) -> Dict[str, Any]:
+        result = self._request(
+            "model/list",
+            {"limit": 200, "includeHidden": bool(include_hidden)},
+            timeout=max(1, int(timeout)),
+        )
         return result if isinstance(result, dict) else {}
 
     def _chat_locked(

@@ -2407,6 +2407,50 @@ class LLMManager:
         except Exception as e:
             logger.warning(f"⚠️ 保存 LLM 调用历史失败: {e}")
 
+    def record_codex_reply(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        response: Optional[Dict[str, Any]],
+        response_text: str,
+        response_time: float,
+        model_id: str,
+        backend: str,
+        success: bool,
+        error: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record first-class Codex replies without routing them through LiteLLM."""
+        safe_response = response if isinstance(response, dict) else {}
+        token_usage = self._extract_token_usage(safe_response)
+        actual_model = f"local_codex_{str(backend or 'runtime')}/{str(model_id or 'unknown')}"
+        if success:
+            self._record_stats(
+                "assistant",
+                "chat",
+                str(model_id or "unknown"),
+                safe_response,
+                max(0.0, float(response_time or 0.0)),
+                token_usage=token_usage,
+            )
+        else:
+            self._record_error("assistant", "chat", str(model_id or "unknown"))
+        self._record_call_history(
+            "assistant",
+            "chat",
+            str(model_id or "unknown"),
+            messages,
+            response_text,
+            max(0.0, float(response_time or 0.0)),
+            actual_model,
+            int(token_usage.get("total_tokens", 0) or 0),
+            success=bool(success),
+            error=str(error or ""),
+            reasoning_text=self._extract_reasoning_from_response(safe_response),
+            token_usage=token_usage,
+            metadata=metadata,
+        )
+
     def _record_call_history(self, plugin_name: str, call_type: str, model_id: str,
                              messages: list, response_text: str, response_time: float,
                              actual_model: str, tokens: int, success: bool, error: str = "",
@@ -2978,7 +3022,7 @@ class LLMManager:
             self._rename_model_unlocked(old_id, new_id)
 
     def _rename_model_unlocked(self, old_id: str, new_id: str):
-        """重命名模型 ID，并同步更新插件映射"""
+        """重命名模型 ID，并同步更新任务模型路由。"""
         if "models" not in self.config or old_id not in self.config["models"]:
             return
 
@@ -3047,7 +3091,7 @@ class LLMManager:
                 logger.info(f"🗑️ 模型配置已删除: {model_id}")
 
     def update_mapping(self, plugin_name: str, call_type: str, mapping: Dict):
-        """更新插件映射"""
+        """更新一个路由主体的任务模型路由。"""
         if plugin_name in {"assistant", "builtin_chatbot"} and call_type == "chat":
             raise ValueError("AI 助手最终回复不支持通用模型路由")
         with self._config_lock:
@@ -3064,7 +3108,7 @@ class LLMManager:
                     _strip_gemini_3_sampling_parameters_inplace(overrides)
             self.config["plugin_mappings"][plugin_name][call_type] = mapping
             self.save_config()
-        logger.info(f"✅ 插件映射已更新: {plugin_name}.{call_type}")
+        logger.info(f"✅ 任务模型路由已更新: {plugin_name}.{call_type}")
 
     def _get_default_config(self) -> Dict:
         """公开版仅声明辅助任务槽位，不内置模型、密钥或模型绑定。"""

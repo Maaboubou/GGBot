@@ -403,9 +403,15 @@ class AssistantConsoleService:
                 if field_name == "codex_profile_id":
                     value = str(value or "").strip() or None
                     if value:
-                        from app.services.codex_profile_service import get_codex_profile_service
+                        from app.services.codex_profile_service import (
+                            CURRENT_CODEX_PROFILE_ID,
+                            get_codex_profile_service,
+                        )
 
-                        if get_codex_profile_service().get_profile(value) is None:
+                        if (
+                            value != CURRENT_CODEX_PROFILE_ID
+                            and get_codex_profile_service().get_profile(value) is None
+                        ):
                             raise AssistantConsoleError("Codex Profile 不存在")
                 setattr(permission, field_name, value)
             if "ignored_senders" in changes:

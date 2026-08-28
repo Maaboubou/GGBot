@@ -1449,6 +1449,21 @@ def _reasoning_summary_config_args(reasoning_summary: str) -> List[str]:
     ]
 
 
+def _config_isolation_args(
+    config_policy: str,
+    *,
+    managed_runtime_profile: bool = False,
+) -> List[str]:
+    if config_policy not in {"isolated", "managed"}:
+        return []
+    # A managed Profile keeps its provider/base URL in an isolated CODEX_HOME.
+    # Stateless exec must load that generated config; otherwise Codex silently
+    # falls back to the built-in OpenAI provider. CLI permission overrides and
+    # --ignore-rules still enforce the chat sandbox boundary.
+    args = [] if managed_runtime_profile else ["--ignore-user-config"]
+    return [*args, "--ignore-rules"]
+
+
 class CodexCliClient:
     """Thin backend that calls the authenticated Codex CLI."""
 
@@ -1938,8 +1953,12 @@ class CodexCliClient:
         if not permission_profile:
             args.extend(["-s", sandbox_mode])
         args.extend(["--skip-git-repo-check", "--ephemeral"])
-        if config_policy in {"isolated", "managed"}:
-            args.extend(["--ignore-user-config", "--ignore-rules"])
+        args.extend(
+            _config_isolation_args(
+                config_policy,
+                managed_runtime_profile=bool(request.get("codex_runtime_profile")),
+            )
+        )
         args.extend([
             "-C",
             runtime_workdir,

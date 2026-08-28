@@ -40,7 +40,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
 
     <!-- App CSS -->
-    <link href="/static/assets/css/style.css?v=3.6.24" rel="stylesheet">
+    <link href="/static/assets/css/style.css?v=3.6.27" rel="stylesheet">
     <link href="/static/assets/css/dashboard.css?v=3.5.3" rel="stylesheet">
 </head>
 
@@ -96,7 +96,7 @@
                 <li class="nav-item">
                     <a href="/ai" class="nav-link" data-tab="llm">
                         <i class="bi bi-cpu"></i>
-                        <span>辅助模型</span>
+                        <span>模型配置</span>
                     </a>
                 </li>
 
@@ -261,9 +261,40 @@
                                             <label><input type="radio" name="profile_source" value="manual"><span><i class="bi bi-pencil"></i><strong>手动填写</strong><small>直接配置 Responses 兼容接口</small></span></label>
                                         </div>
                                     </div>
-                                    <div class="col-md-5 codex-profile-name-field"><label class="form-label" for="codexProfileName">Profile 名称</label><input class="form-control" id="codexProfileName" name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}" placeholder="例如 deepseek-main" required><div class="form-text">仅限字母、数字、连字符和下划线。</div></div>
-                                    <div class="col-md-7 codex-profile-oauth-field"><div class="codex-oauth-explainer"><i class="bi bi-shield-check"></i><span><strong>由 Codex 完成授权</strong><small>凭据只保存在该 Profile 的独立目录中。</small></span></div></div>
-                                    <div class="col-md-7 codex-profile-api-field codex-profile-catalog-field d-none"><label class="form-label" for="codexProfileCatalogProvider">LiteLLM 供应商</label><select class="form-select" id="codexProfileCatalogProvider"><option value="">正在读取目录…</option></select><div class="form-text" id="codexProfileProviderHint">从本机 LiteLLM 目录加载。</div></div>
+                                    <div class="col-12 codex-profile-api-field codex-profile-catalog-field d-none">
+                                        <section class="litellm-update-card codex-profile-litellm-update" id="codexProfileLiteLLMUpdateCard" data-litellm-update-surface aria-live="polite">
+                                            <div class="litellm-update-main">
+                                                <span class="litellm-update-icon"><i class="bi bi-box-seam"></i></span>
+                                                <div>
+                                                    <div class="litellm-update-title">
+                                                        <strong>本机 LiteLLM</strong>
+                                                        <span class="litellm-update-badge" id="codexProfileLiteLLMUpdateBadge" data-litellm-update-badge>读取中</span>
+                                                    </div>
+                                                    <p id="codexProfileLiteLLMUpdateSummary" data-litellm-update-summary>正在读取当前模型适配器版本…</p>
+                                                </div>
+                                            </div>
+                                            <div class="litellm-update-actions">
+                                                <button type="button" class="btn btn-outline-secondary btn-sm" id="codexProfileLiteLLMCheckButton" data-litellm-check
+                                                    onclick="LLMManager.checkLiteLLMUpdate()">
+                                                    <i class="bi bi-arrow-clockwise me-1"></i>检查更新
+                                                </button>
+                                                <button type="button" class="btn btn-primary btn-sm d-none" id="codexProfileLiteLLMUpdateButton" data-litellm-update
+                                                    onclick="LLMManager.startLiteLLMUpdate()">
+                                                    <i class="bi bi-download me-1"></i>立即更新
+                                                </button>
+                                                <button type="button" class="btn btn-warning btn-sm d-none" id="codexProfileLiteLLMRestartButton" data-litellm-restart
+                                                    onclick="App.restartSystem()">
+                                                    <i class="bi bi-power me-1"></i>重启后生效
+                                                </button>
+                                            </div>
+                                            <div class="litellm-update-progress d-none" id="codexProfileLiteLLMUpdateProgress" data-litellm-progress>
+                                                <div><i id="codexProfileLiteLLMUpdateProgressBar" data-litellm-progress-bar></i></div>
+                                                <span id="codexProfileLiteLLMUpdateMessage" data-litellm-message>准备更新…</span>
+                                            </div>
+                                        </section>
+                                    </div>
+                                    <div class="col-md-5 codex-profile-name-field"><label class="form-label" for="codexProfileName">Profile 名称</label><input class="form-control" id="codexProfileName" name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}" placeholder="例如 deepseek-main" required></div>
+                                    <div class="col-md-7 codex-profile-api-field codex-profile-catalog-field d-none"><label class="form-label" for="codexProfileCatalogProvider">LiteLLM 供应商</label><select class="form-select" id="codexProfileCatalogProvider"><option value="">正在读取目录…</option></select></div>
                                     <div class="col-12 codex-profile-api-field codex-profile-model-field d-none">
                                         <label class="form-label" for="codexProfileModel">模型 ID</label>
                                         <div class="model-catalog-picker codex-profile-model-picker">
@@ -272,7 +303,6 @@
                                             <div class="model-catalog-menu d-none" id="codexProfileCatalogMenu" role="listbox"></div>
                                         </div>
                                         <div class="codex-profile-model-meta">
-                                            <div class="form-text" id="codexProfileCatalogHint">选择供应商后读取模型目录；目录外模型仍可直接输入。</div>
                                             <div class="codex-profile-capability-toggles" aria-label="模型能力">
                                                 <label class="form-check form-switch codex-profile-capability-toggle" for="codexProfileSupportsVision">
                                                     <input class="form-check-input" id="codexProfileSupportsVision" name="supports_vision" type="checkbox">
@@ -288,7 +318,7 @@
                                     <div class="col-md-5 codex-profile-api-field d-none"><label class="form-label" for="codexProfileProviderName">供应商名称</label><input class="form-control" id="codexProfileProviderName" name="provider_name" maxlength="100" placeholder="例如 DeepSeek"></div>
                                     <div class="col-md-7 codex-profile-api-field d-none"><label class="form-label" for="codexProfileBaseUrl">Responses API Base URL</label><input class="form-control" id="codexProfileBaseUrl" name="base_url" type="url" placeholder="https://api.example.com/v1" required><div class="form-text">目录只负责快速选型；接口本身必须兼容 OpenAI Responses API。</div></div>
                                     <div class="col-12 codex-profile-api-field d-none"><label class="form-label" for="codexProfileApiKey">API Key</label><div class="input-group"><input class="form-control" id="codexProfileApiKey" name="api_key" type="password" maxlength="4096" autocomplete="new-password" required><button class="btn btn-outline-secondary" type="button" onclick="UI.togglePassword('codexProfileApiKey')" aria-label="显示或隐藏 API Key"><i class="bi bi-eye"></i></button></div><div class="form-text" id="codexProfileApiKeyHint">密钥通过标准输入交给 WSL，并存入权限为 0600 的独立文件；不会写入 Profile 清单或返回网页。</div></div>
-                                    <div class="col-md-4"><label class="form-label">推理强度</label><select class="form-select" name="reasoning_effort"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option></select></div>
+                                    <div class="col-md-4"><label class="form-label">推理强度</label><select class="form-select" name="reasoning_effort"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></div>
                                     <div class="col-md-4"><label class="form-label">输出详细度</label><select class="form-select" name="model_verbosity"><option selected>inherit</option><option>low</option><option>medium</option><option>high</option></select></div>
                                     <div class="col-md-4"><label class="form-label">上下文窗口</label><input class="form-control" name="context_window" type="number" min="4096" max="10000000" value="128000"></div>
                                     <div class="col-12"><label class="form-check form-switch"><input class="form-check-input" type="checkbox" name="make_default" checked><span class="form-check-label">设为 Assistant 默认 Profile</span></label></div>
@@ -565,16 +595,16 @@
                     </li>
 
                     <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="llm-stats-tab" data-bs-toggle="pill" data-bs-target="#llm-stats"
-                            type="button">
-                            <i class="bi bi-graph-up me-1"></i> 用量
+                        <button class="nav-link" id="llm-history-tab" data-bs-toggle="pill"
+                            data-bs-target="#llm-history" type="button">
+                            <i class="bi bi-journal-text me-1"></i> 调用记录
                         </button>
                     </li>
 
                     <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="llm-history-tab" data-bs-toggle="pill"
-                            data-bs-target="#llm-history" type="button">
-                            <i class="bi bi-journal-text me-1"></i> 调用诊断
+                        <button class="nav-link" id="llm-stats-tab" data-bs-toggle="pill" data-bs-target="#llm-stats"
+                            type="button">
+                            <i class="bi bi-graph-up me-1"></i> 用量
                         </button>
                     </li>
 
@@ -1093,34 +1123,34 @@
 
                         <div class="model-config-layout">
                             <div class="model-config-main">
-                                <section class="litellm-update-card" id="litellmUpdateCard" aria-live="polite">
+                                <section class="litellm-update-card" id="litellmUpdateCard" data-litellm-update-surface aria-live="polite">
                                     <div class="litellm-update-main">
                                         <span class="litellm-update-icon"><i class="bi bi-box-seam"></i></span>
                                         <div>
                                             <div class="litellm-update-title">
                                                 <strong>本机 LiteLLM</strong>
-                                                <span class="litellm-update-badge" id="litellmUpdateBadge">读取中</span>
+                                                <span class="litellm-update-badge" id="litellmUpdateBadge" data-litellm-update-badge>读取中</span>
                                             </div>
-                                            <p id="litellmUpdateSummary">正在读取当前模型适配器版本…</p>
+                                            <p id="litellmUpdateSummary" data-litellm-update-summary>正在读取当前模型适配器版本…</p>
                                         </div>
                                     </div>
                                     <div class="litellm-update-actions">
-                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="litellmCheckButton"
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="litellmCheckButton" data-litellm-check
                                             onclick="LLMManager.checkLiteLLMUpdate()">
                                             <i class="bi bi-arrow-clockwise me-1"></i>检查更新
                                         </button>
-                                        <button type="button" class="btn btn-primary btn-sm d-none" id="litellmUpdateButton"
+                                        <button type="button" class="btn btn-primary btn-sm d-none" id="litellmUpdateButton" data-litellm-update
                                             onclick="LLMManager.startLiteLLMUpdate()">
                                             <i class="bi bi-download me-1"></i>立即更新
                                         </button>
-                                        <button type="button" class="btn btn-warning btn-sm d-none" id="litellmRestartButton"
+                                        <button type="button" class="btn btn-warning btn-sm d-none" id="litellmRestartButton" data-litellm-restart
                                             onclick="App.restartSystem()">
                                             <i class="bi bi-power me-1"></i>重启后生效
                                         </button>
                                     </div>
-                                    <div class="litellm-update-progress d-none" id="litellmUpdateProgress">
-                                        <div><i id="litellmUpdateProgressBar"></i></div>
-                                        <span id="litellmUpdateMessage">准备更新…</span>
+                                    <div class="litellm-update-progress d-none" id="litellmUpdateProgress" data-litellm-progress>
+                                        <div><i id="litellmUpdateProgressBar" data-litellm-progress-bar></i></div>
+                                        <span id="litellmUpdateMessage" data-litellm-message>准备更新…</span>
                                     </div>
                                 </section>
                                 <section class="model-form-section">
@@ -1286,6 +1316,7 @@
                                                     <option value="low">低</option>
                                                     <option value="high">高</option>
                                                     <option value="xhigh">极高</option>
+                                                    <option value="max">最大</option>
                                                 </select>
                                             </div>
                                             <div class="col-sm-6 col-lg-4 d-none" id="modelCodexProfileGroup">
@@ -1437,12 +1468,12 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
     <!-- App Scripts -->
-    <script src="/static/assets/js/api.js?v=3.5.9"></script>
-    <script src="/static/assets/js/ui.js?v=3.4.10"></script>
+    <script src="/static/assets/js/api.js?v=3.5.10"></script>
+    <script src="/static/assets/js/ui.js?v=3.4.12"></script>
     <script src="/static/assets/js/system_operations.js?v=1.3.1"></script>
-    <script src="/static/assets/js/llm_manager.js?v=3.4.5"></script>
-    <script src="/static/assets/js/codex_center.js?v=1.0.6"></script>
-    <script src="/static/assets/js/main.js?v=3.6.9"></script>
+    <script src="/static/assets/js/llm_manager.js?v=3.4.8"></script>
+    <script src="/static/assets/js/codex_center.js?v=1.0.8"></script>
+    <script src="/static/assets/js/main.js?v=3.6.10"></script>
     <script src="/static/assets/js/memory_console.js?v=1.0.3"></script>
 
     <!-- ==================== Judge History Modal ==================== -->

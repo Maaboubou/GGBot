@@ -141,8 +141,11 @@ def _invalidate_codex_thread(chat_name: str) -> None:
         from app.services.agent_runtime import get_agent_runtime
         from app.services.codex_profile_service import get_codex_runtime_registry
 
-        get_agent_runtime().invalidate_chat(chat_name)
-        get_codex_runtime_registry().invalidate_chat(chat_name)
+        get_agent_runtime().invalidate_chat(chat_name, reason="access_policy_changed")
+        get_codex_runtime_registry().invalidate_chat(
+            chat_name,
+            reason="access_policy_changed",
+        )
     except Exception:
         pass
 

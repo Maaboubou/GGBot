@@ -95,7 +95,8 @@
         "low",
         "medium",
         "high",
-        "xhigh"
+        "xhigh",
+        "max"
       ],
       "enum_labels": {
         "inherit": "继承 Codex 运行配置",
@@ -103,7 +104,8 @@
         "low": "低",
         "medium": "中",
         "high": "高",
-        "xhigh": "超高（最慢）"
+        "xhigh": "超高",
+        "max": "最大（最慢）"
       }
     },
     "codex_reasoning_summary": {

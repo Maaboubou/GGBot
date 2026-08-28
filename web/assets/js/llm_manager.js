@@ -495,8 +495,9 @@ const LLMManager = {
 
     scheduleLiteLLMUpdatePoll() {
         this.clearLiteLLMUpdatePoll();
-        const modal = document.getElementById('addModelModal');
-        if (!modal?.classList.contains('show')) return;
+        const updateSurfaceVisible = ['addModelModal', 'codexProfileModal']
+            .some(id => document.getElementById(id)?.classList.contains('show'));
+        if (!updateSurfaceVisible) return;
         this.litellmUpdatePollTimer = setTimeout(() => {
             this.loadLiteLLMUpdateStatus({ quiet: true, poll: true });
         }, 1200);
@@ -504,16 +505,6 @@ const LLMManager = {
 
     renderLiteLLMUpdateStatus(status = {}) {
         this.litellmUpdateStatus = status || {};
-        const badge = document.getElementById('litellmUpdateBadge');
-        const summary = document.getElementById('litellmUpdateSummary');
-        const checkButton = document.getElementById('litellmCheckButton');
-        const updateButton = document.getElementById('litellmUpdateButton');
-        const restartButton = document.getElementById('litellmRestartButton');
-        const progress = document.getElementById('litellmUpdateProgress');
-        const progressBar = document.getElementById('litellmUpdateProgressBar');
-        const message = document.getElementById('litellmUpdateMessage');
-        if (!badge || !summary || !checkButton || !updateButton || !restartButton || !progress) return;
-
         const operation = status.operation || {};
         const running = Boolean(status.operation_running || ['queued', 'running'].includes(operation.status));
         const failed = operation.status === 'failed';
@@ -522,50 +513,61 @@ const LLMManager = {
         const runtimeVersion = status.runtime_version || this.catalogVersion || '未知';
         const installedVersion = status.installed_version || runtimeVersion;
         const availableVersion = status.available_version || '';
-
-        badge.className = 'litellm-update-badge';
-        if (running) {
-            badge.textContent = '更新中';
-            badge.classList.add('running');
-        } else if (failed) {
-            badge.textContent = '更新失败';
-            badge.classList.add('failed');
-        } else if (restartRequired) {
-            badge.textContent = '等待重启';
-            badge.classList.add('available');
-        } else if (updateAvailable) {
-            badge.textContent = `可更新 ${availableVersion}`;
-            badge.classList.add('available');
-        } else if (availableVersion) {
-            badge.textContent = '已是最新';
-            badge.classList.add('ready');
-        } else {
-            badge.textContent = '尚未检查';
-        }
-
         const environment = status.environment_label || '当前 Python 环境';
-        if (restartRequired && runtimeVersion !== installedVersion) {
-            summary.textContent = `运行中 ${runtimeVersion} · 已安装 ${installedVersion}；重启全部服务后切换新版。`;
-        } else {
-            summary.textContent = `当前 ${runtimeVersion} · ${environment}${availableVersion ? ` · PyPI ${availableVersion}` : ''}`;
-        }
+        document.querySelectorAll('[data-litellm-update-surface]').forEach(surface => {
+            const badge = surface.querySelector('[data-litellm-update-badge]');
+            const summary = surface.querySelector('[data-litellm-update-summary]');
+            const checkButton = surface.querySelector('[data-litellm-check]');
+            const updateButton = surface.querySelector('[data-litellm-update]');
+            const restartButton = surface.querySelector('[data-litellm-restart]');
+            const progress = surface.querySelector('[data-litellm-progress]');
+            const progressBar = surface.querySelector('[data-litellm-progress-bar]');
+            const message = surface.querySelector('[data-litellm-message]');
+            if (!badge || !summary || !checkButton || !updateButton || !restartButton || !progress) return;
 
-        checkButton.disabled = running || this.litellmUpdateChecking;
-        checkButton.innerHTML = this.litellmUpdateChecking
-            ? '<span class="spinner-border spinner-border-sm me-1"></span>检查中'
-            : '<i class="bi bi-arrow-clockwise me-1"></i>检查更新';
-        updateButton.classList.toggle('d-none', !updateAvailable || running || restartRequired);
-        updateButton.disabled = running;
-        if (updateAvailable && availableVersion) {
-            updateButton.innerHTML = `<i class="bi bi-download me-1"></i>更新到 ${this.escapeHtml(availableVersion)}`;
-        }
-        restartButton.classList.toggle('d-none', !restartRequired || running);
-        progress.classList.toggle('d-none', !running);
-        if (running) {
-            const percent = Math.max(0, Math.min(Number(operation.progress || 0), 100));
-            if (progressBar) progressBar.style.width = `${percent}%`;
-            if (message) message.textContent = operation.message || '正在更新 LiteLLM…';
-        }
+            badge.className = 'litellm-update-badge';
+            if (running) {
+                badge.textContent = '更新中';
+                badge.classList.add('running');
+            } else if (failed) {
+                badge.textContent = '更新失败';
+                badge.classList.add('failed');
+            } else if (restartRequired) {
+                badge.textContent = '等待重启';
+                badge.classList.add('available');
+            } else if (updateAvailable) {
+                badge.textContent = `可更新 ${availableVersion}`;
+                badge.classList.add('available');
+            } else if (availableVersion) {
+                badge.textContent = '已是最新';
+                badge.classList.add('ready');
+            } else {
+                badge.textContent = '尚未检查';
+            }
+
+            if (restartRequired && runtimeVersion !== installedVersion) {
+                summary.textContent = `运行中 ${runtimeVersion} · 已安装 ${installedVersion}；重启全部服务后切换新版。`;
+            } else {
+                summary.textContent = `当前 ${runtimeVersion} · ${environment}${availableVersion ? ` · PyPI ${availableVersion}` : ''}`;
+            }
+
+            checkButton.disabled = running || this.litellmUpdateChecking;
+            checkButton.innerHTML = this.litellmUpdateChecking
+                ? '<span class="spinner-border spinner-border-sm me-1"></span>检查中'
+                : '<i class="bi bi-arrow-clockwise me-1"></i>检查更新';
+            updateButton.classList.toggle('d-none', !updateAvailable || running || restartRequired);
+            updateButton.disabled = running;
+            if (updateAvailable && availableVersion) {
+                updateButton.innerHTML = `<i class="bi bi-download me-1"></i>更新到 ${this.escapeHtml(availableVersion)}`;
+            }
+            restartButton.classList.toggle('d-none', !restartRequired || running);
+            progress.classList.toggle('d-none', !running);
+            if (running) {
+                const percent = Math.max(0, Math.min(Number(operation.progress || 0), 100));
+                if (progressBar) progressBar.style.width = `${percent}%`;
+                if (message) message.textContent = operation.message || '正在更新 LiteLLM…';
+            }
+        });
     },
 
     async loadLiteLLMUpdateStatus(options = {}) {
@@ -3107,6 +3109,7 @@ const LLMManager = {
             medium: '中',
             high: '高',
             xhigh: '超高',
+            max: '最大',
             inherit: '继承默认值'
         }[normalized] || normalized || '-';
     },
@@ -3206,10 +3209,11 @@ const LLMManager = {
             const labels = {
                 queued: '等待中', starting: '准备中', running: '运行中', completed: '已完成', failed: '失败',
                 timeout: '已超时', cancelling: '正在中断', cancelled: '已取消', idle: '空闲',
+                pending_replay: '待回放', rotation_pending: '待新线程',
             };
             const classes = {
                 queued: 'busy', starting: 'busy', running: 'busy', completed: 'ready', failed: 'failed',
-                timeout: 'warning', cancelling: 'warning', cancelled: '', idle: '',
+                timeout: 'warning', cancelling: 'warning', cancelled: '', idle: '', pending_replay: 'warning', rotation_pending: 'warning',
             };
             return { label: labels[key] || key, className: classes[key] || '' };
         };
@@ -3229,9 +3233,32 @@ const LLMManager = {
             const summary = String(job?.current_item_summary || '').trim();
             return summary ? `${base} · ${summary}` : base;
         };
+        const usageMeta = accuracy => {
+            const normalized = String(accuracy || 'unknown').toLowerCase();
+            if (normalized === 'reported') return { label: '', className: '', available: true };
+            if (normalized === 'estimated') return { label: '含估算', className: 'warning', available: true };
+            if (normalized === 'partial') return { label: '部分统计', className: 'warning', available: true };
+            return { label: '', className: '', available: false };
+        };
+        const usageText = (totals, meta) => meta.available
+            ? `${formatK(totals?.total_tokens || 0)} Token${meta.label ? ` · ${meta.label}` : ''}`
+            : 'Token 未上报';
+        const rotationLabel = reason => ({
+            no_saved_thread: '首次创建', runtime_profile_changed: 'Profile 已变更', access_policy_changed: '权限策略已变更',
+            model_changed: '模型已变更', reasoning_effort_changed: '推理强度已变更', max_turns_reached: '达到轮数上限',
+            soft_token_limit: '达到上下文软上限', compaction_limit: '达到压缩次数上限', idle_timeout: '空闲超时',
+            message_prefix_changed: '消息前缀已变化', resume_failed: '原线程无法恢复', manual_reset: '手动重置',
+            chat_policy_changed: '聊天策略已变更', discarded_followup: '未发送的跟进已丢弃',
+        }[String(reason || '')] || String(reason || '-'));
+        const fallbackLabel = reason => ({
+            runtime_unavailable: 'App Server 未就绪', circuit_open: 'App Server 熔断保护',
+            explicit_stateless: '显式无状态请求',
+        }[String(reason || '')] || String(reason || '-').replace('app_server_unavailable:', 'App Server 异常：'));
 
         const pools = runtime.pools || {};
         const poolValues = Object.values(pools);
+        const runtimeWorkers = poolValues.flatMap(pool => Array.isArray(pool.workers) ? pool.workers : []);
+        const lifecyclePolicy = runtimeWorkers[0] || {};
         const workerCount = poolValues.reduce((sum, pool) => sum + Number(pool.size || 0), 0);
         const queueCount = poolValues.reduce((sum, pool) => sum + Number(pool.waiting || 0), 0);
         const activeCount = Number(stats.active_count ?? active.length ?? 0);
@@ -3303,34 +3330,50 @@ const LLMManager = {
             const rows = sessions.map(session => {
                 const chatId = String(session.chat_id || '');
                 const activeJob = activeByChat.get(chatId);
-                const status = statusMeta(activeJob?.status || session.status);
+                const continuityStatus = String(session.continuity_status || 'synchronized');
+                const status = statusMeta(activeJob?.status || (['pending_replay', 'rotation_pending'].includes(continuityStatus) ? continuityStatus : session.status));
                 const input = Number(session.last_input_tokens || 0);
+                const contextInput = Number(session.context_input_tokens ?? input);
                 const cached = Number(session.last_cached_input_tokens || 0);
                 const completion = Number(session.last_completion_tokens || 0);
                 const total = Number(session.last_total_tokens || 0);
+                const usage = usageMeta(session.usage_accuracy);
+                const hasUsage = usage.available;
                 const contextWindow = Number(session.model_context_window || 0);
                 const contextPercent = session.context_usage_percent === null || session.context_usage_percent === undefined
                     ? null : Number(session.context_usage_percent);
                 const safePercent = Math.max(0, Math.min(contextPercent || 0, 100));
-                const cacheRate = input > 0 ? cached / input * 100 : null;
+                const cacheRate = session.usage_cache_available && input > 0 ? cached / input * 100 : null;
                 const roleName = !session.role_name || session.role_name === 'default' ? '默认' : session.role_name;
                 const expanded = this.codexExpandedSessions.has(chatId);
                 const sessionTotal = session.session_total || {};
+                const lifetimeTotal = session.lifetime_total || {};
+                const sessionUsage = usageMeta(session.session_usage_accuracy);
+                const lifetimeUsage = usageMeta(session.lifetime_usage_accuracy);
                 const contextClass = safePercent >= 90 ? 'danger' : safePercent >= 75 ? 'warning' : '';
-                const contextHtml = contextWindow ? `
+                const contextHtml = contextWindow && contextPercent !== null && Number.isFinite(contextPercent) ? `
                     <div class="codex-context">
-                        <div class="codex-context-label"><span>${formatK(input)}</span><span>${contextPercent.toFixed(1)}%</span></div>
+                        <div class="codex-context-label"><span>${formatK(contextInput)}</span><span>${contextPercent.toFixed(1)}%</span></div>
                         <div class="codex-context-track ${contextClass}"><i style="width:${safePercent}%"></i></div>
-                    </div>` : '<span class="codex-cell-sub">尚无数据</span>';
+                    </div>` : contextWindow
+                    ? `<span class="codex-cell-sub">未知 / ${formatK(contextWindow)}</span>`
+                    : '<span class="codex-cell-sub">窗口未知</span>';
                 const detailHtml = expanded ? `
                     <tr class="codex-detail-row"><td colspan="7">
                         <div class="codex-detail-grid">
                             <div><small>Thread ID</small><span title="${this.escapeHtml(session.thread_id || '')}">${this.escapeHtml(session.thread_id || '-')}</span></div>
                             <div><small>最近 Turn</small><span title="${this.escapeHtml(session.turn_id || '')}">${this.escapeHtml(session.turn_id || '-')}</span></div>
                             <div><small>最近一轮</small><span>输入 ${formatK(input)} · 输出 ${formatK(completion)} · 缓存 ${formatK(cached)}</span></div>
-                            <div><small>线程累计</small><span>${formatK(sessionTotal.total_tokens || 0)} Token</span></div>
+                            <div><small>当前线程累计</small><span>${usageText(sessionTotal, sessionUsage)}</span></div>
+                            <div><small>逻辑会话累计</small><span>${usageText(lifetimeTotal, lifetimeUsage)}</span></div>
+                            <div><small>线程生命周期</small><span>第 ${Number(session.thread_generation || 0).toLocaleString()} 代 · 当前 ${Number(session.turn_count || 0).toLocaleString()} 轮 · 总计 ${Number(session.lifetime_turn_count || 0).toLocaleString()} 轮</span></div>
+                            <div><small>上下文压缩</small><span>当前 ${Number(session.compaction_count || 0)} 次 · 累计 ${Number(session.lifetime_compaction_count || 0)} 次</span></div>
                             <div><small>推理 / 搜索</small><span>${this.escapeHtml(this.reasoningEffortLabel(session.reasoning_effort))} · ${session.web_search_mode ? this.escapeHtml(session.web_search_mode) : '关闭'}</span></div>
-                            <div><small>统计来源</small><span>${this.escapeHtml(session.usage_source || '-')}</span></div>
+                            <div><small>运行后端</small><span>${this.escapeHtml(session.backend || '-')} · ${this.escapeHtml(session.runtime_profile || '当前 Codex')} · ${this.escapeHtml(session.access_mode || '-')}</span></div>
+                            <div><small>统计来源</small><span>${this.escapeHtml(session.usage_source || '未提供')}${usage.label ? ` · ${this.escapeHtml(usage.label)}` : ''}</span></div>
+                            <div><small>上下文窗口来源</small><span>${session.model_context_window_source === 'provider_usage' ? '提供方上报' : session.model_context_window_source === 'profile_metadata' ? 'Profile 元数据' : '未知'}</span></div>
+                            <div><small>最近轮换</small><span>${this.escapeHtml(rotationLabel(session.last_rotation_reason))}</span></div>
+                            <div><small>Exec 回退</small><span>${Number(session.fallback_count || 0)} 次 · ${this.escapeHtml(fallbackLabel(session.last_fallback_reason))}${continuityStatus === 'pending_replay' ? ' · 下一轮自动回放' : ''}</span></div>
                             <div><small>Schema</small><span>${this.escapeHtml(session.schema_hash || runtime.schema_hash || '-')}</span></div>
                             <div><small>最近活动</small><span>${this.formatJobTime(session.updated_at)}</span></div>
                         </div>
@@ -3343,15 +3386,15 @@ const LLMManager = {
                         </td>
                         <td>
                             <span class="codex-inline-badge ${status.className}">${this.escapeHtml(status.label)}</span>
-                            <div class="codex-cell-sub">${activeJob ? this.escapeHtml(activityLabel(activeJob)) : '等待消息'}</div>
+                            <div class="codex-cell-sub">${activeJob ? this.escapeHtml(activityLabel(activeJob)) : continuityStatus === 'pending_replay' ? '等待下次触发自动回放' : continuityStatus === 'rotation_pending' ? '下次触发创建新线程' : '等待消息'}</div>
                         </td>
                         <td>
                             <div class="codex-cell-main">${this.escapeHtml(session.model || '-')}</div>
-                            <div class="codex-cell-sub">${Number(session.turn_count || 0).toLocaleString()} 轮</div>
+                            <div class="codex-cell-sub">${this.escapeHtml(session.runtime_profile || '当前 Codex')} · ${Number(session.lifetime_turn_count || session.turn_count || 0).toLocaleString()} 轮</div>
                         </td>
                         <td>${contextHtml}</td>
                         <td>
-                            <div class="codex-cell-main codex-mono">${formatK(total)} Token</div>
+                            <div class="codex-cell-main codex-mono">${hasUsage ? `${formatK(total)} Token` : 'Token 未上报'}${usage.label ? ` <span class="codex-inline-badge ${usage.className}">${this.escapeHtml(usage.label)}</span>` : ''}</div>
                             <div class="codex-cell-sub">缓存 ${cacheRate === null ? '-' : `${cacheRate.toFixed(1)}%`}</div>
                         </td>
                         <td><span class="codex-mono">${this.formatJobTime(session.updated_at)}</span></td>
@@ -3386,7 +3429,7 @@ const LLMManager = {
                     <tr>
                         <td><div class="codex-cell-main">${this.escapeHtml(identity)}</div><div class="codex-cell-sub">${this.escapeHtml(sourceType || '来源未记录')} · <span class="codex-mono" title="${this.escapeHtml(requestId)}">${this.escapeHtml(requestId.slice(0, 12))}</span></div></td>
                         <td><span class="codex-inline-badge ${status.className}">${this.escapeHtml(status.label)}</span><div class="codex-cell-sub">${this.escapeHtml(activityLabel(job))}</div></td>
-                        <td><div class="codex-cell-main">${this.escapeHtml(job.model || '-')}</div><div class="codex-cell-sub">${this.escapeHtml(job.pool_worker || job.backend || '')}</div></td>
+                        <td><div class="codex-cell-main">${this.escapeHtml(job.model || '-')}</div><div class="codex-cell-sub">${this.escapeHtml(job.pool_worker || job.backend || '')}${job.fallback_reason ? ` · ${this.escapeHtml(fallbackLabel(job.fallback_reason))}` : ''}</div></td>
                         <td><span class="codex-mono">${formatK(job.total_tokens || 0)}</span></td>
                         <td><span class="codex-mono">${this.formatJobDuration(job)}</span>${error}</td>
                         <td><span class="codex-mono">${this.formatJobTime(job.started_at)}</span></td>
@@ -3427,6 +3470,7 @@ const LLMManager = {
                             </div>
                             <div><small>安装方式</small><span>${this.escapeHtml(upgrade.installation?.method_label || '-')}</span></div>
                             <div><small>Worker</small><span>${workerCount} 个进程</span></div>
+                            <div><small>会话轮换</small><span>输入 ${formatK(lifecyclePolicy.rotate_tokens || 0)} · 压缩 ${Number(lifecyclePolicy.max_compactions || 0)} 次 · 空闲 ${Number(lifecyclePolicy.idle_rotate_seconds || 0) ? `${Math.round(Number(lifecyclePolicy.idle_rotate_seconds) / 86400)} 天` : '关闭'}</span></div>
                             <div><small>Schema</small><span class="codex-mono">${this.escapeHtml(schemaShort)}</span></div>
                             <div><small>可用命令</small><span>${this.escapeHtml(fileToolNames.join(' · ') || '未探测到')}</span></div>
                             <div><small>工具目录</small><span class="codex-mono">${this.escapeHtml(fileToolRoots.join(' · ') || '使用系统工具')}</span></div>
@@ -3442,7 +3486,7 @@ const LLMManager = {
                 </details>
                 ${active.length ? `<section class="codex-section"><div class="codex-section-head"><h6>正在执行</h6><small>${active.length} 个任务</small></div>${renderJobs(active, true)}</section>` : ''}
                 <section class="codex-section">
-                    <div class="codex-section-head"><h6>会话</h6><small>${sessionCount} 个持久上下文 · ${Number(sessionStats.total_turn_count || 0).toLocaleString()} 轮</small></div>
+                    <div class="codex-section-head"><h6>会话</h6><small>${sessionCount} 个持久上下文 · 累计 ${Number(sessionStats.lifetime_turn_count || sessionStats.total_turn_count || 0).toLocaleString()} 轮 · 已记录 ${formatK(sessionStats.logical_lifetime_total_tokens || 0)} Token${Number(sessionStats.unknown_usage_session_count || 0) ? ` · ${Number(sessionStats.unknown_usage_session_count)} 个会话统计不完整` : Number(sessionStats.estimated_usage_session_count || 0) ? ` · ${Number(sessionStats.estimated_usage_session_count)} 个会话含估算` : ''}</small></div>
                     ${renderSessions()}
                 </section>
                 <details class="codex-section codex-history" ${this.codexHistoryOpen ? 'open' : ''}>
@@ -3543,6 +3587,10 @@ const LLMManager = {
     async showCodexJobDetails(requestId) {
         if (!requestId) return;
         try {
+            const fallbackLabel = reason => ({
+                runtime_unavailable: 'App Server 未就绪', circuit_open: 'App Server 熔断保护',
+                explicit_stateless: '显式无状态请求',
+            }[String(reason || '')] || String(reason || '-').replace('app_server_unavailable:', 'App Server 异常：'));
             const response = await API.codexJobs.events(requestId);
             const job = response.data?.job || {};
             const events = response.data?.events || [];
@@ -3551,6 +3599,7 @@ const LLMManager = {
                 item_completed: '完成步骤', token_usage: '更新 Token', process_started: '进程启动',
                 process_completed: '进程结束', response_ready: '结果就绪', error: '发生错误',
                 cancel_requested: '请求中断', turn_completed: 'Turn 完成', job_finished: '任务结束',
+                context_compaction: '上下文已压缩',
                 thread_identified: '识别任务线程', image_generation_completed: '首张图片生成完成',
                 single_image_limit_reached: '停止后续图片生成', image_artifact_validated: '图片文件校验通过',
             };
@@ -3671,6 +3720,9 @@ const LLMManager = {
                     ${job.chat_type ? `<span>类型 <strong class="text-body">${this.escapeHtml(job.chat_type === 'group' ? '群聊' : (job.chat_type === 'private' ? '私聊' : job.chat_type))}</strong></span>` : ''}
                     <span>模型 <strong class="text-body">${this.escapeHtml(job.model || '-')}</strong></span>
                     <span>Worker <strong class="text-body">${this.escapeHtml(job.pool_worker || job.backend || '-')}</strong></span>
+                    ${job.config_profile ? `<span>Profile <strong class="text-body">${this.escapeHtml(job.config_profile)}</strong></span>` : ''}
+                    ${job.fallback_reason ? `<span>Exec 原因 <strong class="text-body">${this.escapeHtml(fallbackLabel(job.fallback_reason))}</strong></span>` : ''}
+                    ${job.continuity_status === 'pending_replay' ? '<span>连续性 <strong class="text-warning">待下轮自动回放</strong></span>' : ''}
                     <span>耗时 <strong class="text-body">${this.formatJobDuration(job)}</strong></span>
                     <span>Token <strong class="text-body">${Number(job.total_tokens || 0).toLocaleString()}</strong></span>
                 </div>

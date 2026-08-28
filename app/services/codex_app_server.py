@@ -82,6 +82,8 @@ class _TurnTracker:
     commentary_messages: List[str] = field(default_factory=list)
     reasoning: List[str] = field(default_factory=list)
     usage: Dict[str, Any] = field(default_factory=dict)
+    usage_source: str = ""
+    compacted: bool = False
     status: str = "running"
     error: Optional[str] = None
     request_id: str = ""
@@ -151,19 +153,48 @@ def _plan_message_delta(
     retry: bool = False,
     rotate_tokens: int = 0,
     max_turns: int = 0,
+    runtime_profile: str = "",
+    access_signature: str = "",
+    max_compactions: int = 0,
+    idle_rotate_seconds: int = 0,
 ) -> _MessageDelta:
     """Return the unsent message suffix or explain why a new thread is needed."""
     stable, ephemeral = _split_message_fingerprints(messages)
     if not state or not state.get("thread_id"):
-        return _MessageDelta(list(messages), stable, ephemeral, False, "no_saved_thread")
+        return _MessageDelta(
+            list(messages),
+            stable,
+            ephemeral,
+            False,
+            str((state or {}).get("pending_rotation_reason") or "no_saved_thread"),
+        )
+    if str(state.get("runtime_profile") or "") != str(runtime_profile or ""):
+        return _MessageDelta(list(messages), stable, ephemeral, False, "runtime_profile_changed")
+    if access_signature and str(state.get("access_signature") or "") != access_signature:
+        return _MessageDelta(list(messages), stable, ephemeral, False, "access_policy_changed")
     if str(state.get("model") or "") != model:
         return _MessageDelta(list(messages), stable, ephemeral, False, "model_changed")
     if str(state.get("reasoning_effort") or "") != reasoning_effort:
         return _MessageDelta(list(messages), stable, ephemeral, False, "reasoning_effort_changed")
     if max_turns > 0 and int(state.get("turn_count") or 0) >= max_turns:
         return _MessageDelta(list(messages), stable, ephemeral, False, "max_turns_reached")
-    if rotate_tokens > 0 and int(state.get("last_input_tokens") or 0) >= rotate_tokens:
+    thread_input_tokens = int(
+        state.get("thread_input_tokens")
+        if state.get("thread_input_tokens") is not None
+        else state.get("last_input_tokens")
+        or 0
+    )
+    if rotate_tokens > 0 and thread_input_tokens >= rotate_tokens:
         return _MessageDelta(list(messages), stable, ephemeral, False, "soft_token_limit")
+    if max_compactions > 0 and int(state.get("compaction_count") or 0) >= max_compactions:
+        return _MessageDelta(list(messages), stable, ephemeral, False, "compaction_limit")
+    if idle_rotate_seconds > 0:
+        try:
+            updated_at = datetime.fromisoformat(str(state.get("updated_at") or ""))
+            if time.time() - updated_at.timestamp() >= idle_rotate_seconds:
+                return _MessageDelta(list(messages), stable, ephemeral, False, "idle_timeout")
+        except (TypeError, ValueError):
+            pass
 
     sent_stable = list(state.get("stable_fingerprints") or [])
     if len(stable) < len(sent_stable) or stable[: len(sent_stable)] != sent_stable:
@@ -188,24 +219,119 @@ def _plan_message_delta(
     return _MessageDelta(suffix, stable, ephemeral, True)
 
 
-def _normalize_app_server_usage(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize authoritative App Server per-turn usage for LLMManager."""
+def _normalize_app_server_usage(
+    raw: Dict[str, Any],
+    *,
+    source: str = "codex_app_server.thread/tokenUsage/updated",
+) -> Dict[str, Any]:
+    """Normalize official and third-party App Server usage shapes."""
     if not isinstance(raw, dict):
         return {}
-    last = raw.get("last") if isinstance(raw.get("last"), dict) else {}
-    total = raw.get("total") if isinstance(raw.get("total"), dict) else {}
+    nested_usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+    payload = nested_usage or raw
+    last = next(
+        (
+            value
+            for value in (
+                raw.get("last"),
+                raw.get("lastUsage"),
+                raw.get("last_usage"),
+                payload,
+            )
+            if isinstance(value, dict)
+        ),
+        {},
+    )
+    total = next(
+        (
+            value
+            for value in (
+                raw.get("total"),
+                raw.get("sessionTotal"),
+                raw.get("session_total"),
+                payload.get("sessionTotal"),
+                payload.get("session_total"),
+            )
+            if isinstance(value, dict)
+        ),
+        {},
+    )
 
-    def number(source: Dict[str, Any], key: str) -> int:
-        try:
-            return max(0, int(source.get(key) or 0))
-        except (TypeError, ValueError):
-            return 0
+    def number(value: Dict[str, Any], *keys: str) -> int:
+        for key in keys:
+            try:
+                if value.get(key) is not None:
+                    return max(0, int(value.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+        return 0
 
-    input_tokens = number(last, "inputTokens")
-    cached_tokens = min(number(last, "cachedInputTokens"), input_tokens)
-    output_tokens = number(last, "outputTokens")
-    reasoning_tokens = min(number(last, "reasoningOutputTokens"), output_tokens)
-    total_tokens = number(last, "totalTokens") or input_tokens + output_tokens
+    prompt_details = last.get("prompt_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = last.get("input_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    completion_details = last.get("completion_tokens_details")
+    if not isinstance(completion_details, dict):
+        completion_details = last.get("output_tokens_details")
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+
+    cache_data_available = any(
+        key in last
+        for key in (
+            "cachedInputTokens",
+            "cached_input_tokens",
+            "cachedTokens",
+            "cached_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cachedContentTokenCount",
+        )
+    ) or any(key in prompt_details for key in ("cached_tokens", "cachedTokens"))
+
+    input_tokens = number(
+        last,
+        "inputTokens",
+        "input_tokens",
+        "promptTokens",
+        "prompt_tokens",
+        "promptTokenCount",
+    )
+    anthropic_cache_read = number(last, "cache_read_input_tokens")
+    anthropic_cache_write = number(last, "cache_creation_input_tokens")
+    if anthropic_cache_read or anthropic_cache_write:
+        input_tokens += anthropic_cache_read + anthropic_cache_write
+    cached_tokens = number(
+        last,
+        "cachedInputTokens",
+        "cached_input_tokens",
+        "cachedTokens",
+        "cached_tokens",
+        "cachedContentTokenCount",
+    ) or anthropic_cache_read
+    cached_tokens = min(cached_tokens or number(prompt_details, "cached_tokens", "cachedTokens"), input_tokens)
+    output_tokens = number(
+        last,
+        "outputTokens",
+        "output_tokens",
+        "completionTokens",
+        "completion_tokens",
+        "candidatesTokenCount",
+    )
+    reasoning_tokens = number(
+        last,
+        "reasoningOutputTokens",
+        "reasoning_output_tokens",
+        "reasoningTokens",
+        "reasoning_tokens",
+        "thoughtsTokenCount",
+    )
+    reasoning_tokens = min(
+        reasoning_tokens or number(completion_details, "reasoning_tokens", "reasoningTokens"),
+        output_tokens,
+    )
+    total_tokens = number(last, "totalTokens", "total_tokens", "totalTokenCount") or input_tokens + output_tokens
     if not any((input_tokens, output_tokens, total_tokens)):
         return {}
 
@@ -217,20 +343,121 @@ def _normalize_app_server_usage(raw: Dict[str, Any]) -> Dict[str, Any]:
         "prompt_tokens_details": {"cached_tokens": cached_tokens},
         "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
         "estimated": False,
-        "source": "codex_app_server.thread/tokenUsage/updated",
+        "source": str(raw.get("source") or source),
+        "cache_data_available": cache_data_available,
     }
-    context_window = raw.get("modelContextWindow")
-    if isinstance(context_window, int) and context_window > 0:
+    context_window = number(
+        raw,
+        "modelContextWindow",
+        "model_context_window",
+        "contextWindow",
+        "context_window",
+    ) or number(
+        payload,
+        "modelContextWindow",
+        "model_context_window",
+        "contextWindow",
+        "context_window",
+    )
+    if context_window > 0:
         usage["model_context_window"] = context_window
     if total:
+        total_input = number(
+            total,
+            "inputTokens",
+            "input_tokens",
+            "promptTokens",
+            "prompt_tokens",
+            "promptTokenCount",
+        )
+        total_cache_read = number(total, "cache_read_input_tokens")
+        total_cache_write = number(total, "cache_creation_input_tokens")
+        if total_cache_read or total_cache_write:
+            total_input += total_cache_read + total_cache_write
+        total_cached = min(
+            number(
+                total,
+                "cachedInputTokens",
+                "cached_input_tokens",
+                "cachedTokens",
+                "cached_tokens",
+                "cachedContentTokenCount",
+            )
+            or total_cache_read,
+            total_input,
+        )
+        total_output = number(
+            total,
+            "outputTokens",
+            "output_tokens",
+            "completionTokens",
+            "completion_tokens",
+            "candidatesTokenCount",
+        )
+        total_reasoning = min(
+            number(
+                total,
+                "reasoningOutputTokens",
+                "reasoning_output_tokens",
+                "reasoningTokens",
+                "reasoning_tokens",
+                "thoughtsTokenCount",
+            ),
+            total_output,
+        )
         usage["session_total"] = {
-            "input_tokens": number(total, "inputTokens"),
-            "cached_input_tokens": number(total, "cachedInputTokens"),
-            "output_tokens": number(total, "outputTokens"),
-            "reasoning_output_tokens": number(total, "reasoningOutputTokens"),
-            "total_tokens": number(total, "totalTokens"),
+            "input_tokens": total_input,
+            "cached_input_tokens": total_cached,
+            "output_tokens": total_output,
+            "reasoning_output_tokens": total_reasoning,
+            "total_tokens": number(total, "totalTokens", "total_tokens", "totalTokenCount")
+            or total_input + total_output,
         }
     return usage
+
+
+def _accumulate_usage_total(
+    previous: Optional[Dict[str, Any]],
+    usage: Dict[str, Any],
+) -> Dict[str, int]:
+    """Add one normalized turn to a logical-session token total."""
+    base = previous if isinstance(previous, dict) else {}
+    prompt_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    completion_details = usage.get("completion_tokens_details")
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    cached = int(prompt_details.get("cached_tokens") or 0)
+    reasoning = int(completion_details.get("reasoning_tokens") or 0)
+    values = {
+        "input_tokens": int(usage.get("prompt_tokens") or 0),
+        "cached_input_tokens": cached,
+        "output_tokens": int(usage.get("completion_tokens") or 0),
+        "reasoning_output_tokens": reasoning,
+        "total_tokens": int(usage.get("total_tokens") or 0),
+    }
+    return {
+        key: max(0, int(base.get(key) or 0)) + max(0, value)
+        for key, value in values.items()
+    }
+
+
+def _merge_usage_accuracy(previous: Any, current: Any) -> str:
+    """Describe whether an accumulated total is reported, estimated or partial."""
+    prior = str(previous or "").strip().lower()
+    latest = str(current or "unknown").strip().lower()
+    if prior not in {"reported", "estimated", "partial", "unknown"}:
+        prior = ""
+    if latest not in {"reported", "estimated", "partial", "unknown"}:
+        latest = "unknown"
+    if not prior:
+        return latest
+    if "partial" in {prior, latest} or "unknown" in {prior, latest}:
+        return "partial" if prior != "unknown" or latest != "unknown" else "unknown"
+    if "estimated" in {prior, latest}:
+        return "estimated"
+    return "reported"
 
 
 class CodexThreadStateStore:
@@ -378,6 +605,38 @@ class CodexThreadStateStore:
             )
         return bool(cursor.rowcount)
 
+    def request_rotation(self, chat_id: str, *, reason: str = "manual_reset") -> bool:
+        """Detach the physical thread while retaining logical-session totals."""
+        normalized = str(chat_id or "").strip()
+        with self._lock:
+            state = self.get(normalized)
+            if not state:
+                return False
+            if not state.get("thread_id") and state.get("pending_rotation_reason"):
+                return True
+            zero_total = _accumulate_usage_total(None, {})
+            state.update(
+                {
+                    "thread_id": None,
+                    "last_turn_id": None,
+                    "stable_fingerprints": [],
+                    "last_input_stable_fingerprints": [],
+                    "last_ephemeral_fingerprints": [],
+                    "turn_count": 0,
+                    "compaction_count": 0,
+                    "thread_input_tokens": 0,
+                    "session_total": zero_total,
+                    "session_usage_accuracy": "unknown",
+                    "thread_usage_accuracy": "unknown",
+                    "continuity_status": "rotation_pending",
+                    "pending_rotation_reason": str(reason or "manual_reset"),
+                    "rotation_requested_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat(),
+                }
+            )
+            self.put(normalized, state)
+            return True
+
 
 class CodexAppServerManager:
     """Own a Codex App Server process and multiplex persistent chat threads."""
@@ -403,6 +662,18 @@ class CodexAppServerManager:
         self.rotate_tokens = _nonnegative_int(
             os.getenv("CODEX_APP_SERVER_ROTATE_TOKENS", "220000"),
             220000,
+        )
+        self.max_compactions = _nonnegative_int(
+            os.getenv("CODEX_APP_SERVER_MAX_COMPACTIONS", "2"),
+            2,
+        )
+        self.idle_rotate_seconds = _nonnegative_int(
+            os.getenv("CODEX_APP_SERVER_IDLE_ROTATE_SECONDS", "2592000"),
+            2592000,
+        )
+        self.context_safety_tokens = _nonnegative_int(
+            os.getenv("CODEX_APP_SERVER_CONTEXT_SAFETY_TOKENS", "32768"),
+            32768,
         )
         self.state_store = state_store or CodexThreadStateStore(state_path)
         self.instance_name = str(instance_name or "codex")
@@ -473,13 +744,16 @@ class CodexAppServerManager:
             "api_surface": "experimental" if self.experimental_api else "stable",
             "approval_policy": CODEX_APPROVAL_POLICY,
             "approvals_reviewer": CODEX_APPROVALS_REVIEWER,
+            "rotate_tokens": self.rotate_tokens,
+            "max_compactions": self.max_compactions,
+            "idle_rotate_seconds": self.idle_rotate_seconds,
             "last_error": self._last_error or None,
             "last_diagnostic": self._stderr_tail[-1] if self._stderr_tail else None,
         }
 
-    def invalidate_chat(self, chat_id: str) -> None:
+    def invalidate_chat(self, chat_id: str, *, reason: str = "manual_reset") -> None:
         """Forget a chat mapping so the next call starts a clean thread."""
-        self.state_store.delete(str(chat_id or ""))
+        self.state_store.request_rotation(str(chat_id or ""), reason=reason)
 
     def delete_thread(self, thread_id: str, *, timeout: int = 30) -> None:
         """Permanently delete a persisted Codex thread from the local runtime."""
@@ -518,21 +792,45 @@ class CodexAppServerManager:
                 if isinstance(state.get("session_total"), dict)
                 else {}
             )
+            lifetime_total = (
+                state.get("lifetime_total")
+                if isinstance(state.get("lifetime_total"), dict)
+                else session_total
+            )
             last_input = int(state.get("last_input_tokens") or 0)
+            context_input = int(
+                state.get("thread_input_tokens")
+                if state.get("thread_input_tokens") is not None
+                else last_input
+                or 0
+            )
             last_cached = min(int(state.get("last_cached_input_tokens") or 0), last_input)
             last_completion = int(
                 state.get("last_completion_tokens")
                 or max(int(state.get("last_total_tokens") or 0) - last_input, 0)
             )
             context_window = int(state.get("model_context_window") or 0)
+            usage_accuracy = str(state.get("usage_accuracy") or "").strip().lower()
+            if usage_accuracy not in {"reported", "estimated", "unknown"}:
+                usage_accuracy = (
+                    "estimated"
+                    if state.get("usage_estimated")
+                    else "reported"
+                    if state.get("usage_source") and int(state.get("last_total_tokens") or 0) > 0
+                    else "unknown"
+                )
+            cache_available = bool(state.get("usage_cache_available", False))
+            thread_usage_accuracy = str(
+                state.get("thread_usage_accuracy") or usage_accuracy
+            ).strip().lower()
             context_usage_percent = (
-                round(last_input / context_window * 100, 2)
-                if context_window > 0
+                round(context_input / context_window * 100, 2)
+                if context_window > 0 and thread_usage_accuracy != "unknown"
                 else None
             )
             cache_hit_rate = (
                 round(last_cached / last_input, 6)
-                if last_input > 0
+                if last_input > 0 and cache_available
                 else None
             )
             sessions.append(
@@ -543,12 +841,23 @@ class CodexAppServerManager:
                     "turn_id": active.get("turn_id") or state.get("last_turn_id"),
                     "request_id": active.get("request_id"),
                     "status": str(active.get("status") or "idle"),
-                    "model": active.get("model") or state.get("model"),
+                    "model": active.get("model") or state.get("last_model") or state.get("model"),
                     "reasoning_effort": active.get("reasoning_effort") or state.get("reasoning_effort"),
                     "reasoning_summary": active.get("reasoning_summary") or state.get("reasoning_summary"),
                     "web_search_mode": active.get("web_search_mode") or state.get("web_search_mode"),
                     "turn_count": int(state.get("turn_count") or 0),
+                    "lifetime_turn_count": int(
+                        state.get("lifetime_turn_count") or state.get("turn_count") or 0
+                    ),
+                    "thread_generation": int(state.get("thread_generation") or 0),
+                    "compaction_count": int(state.get("compaction_count") or 0),
+                    "lifetime_compaction_count": int(
+                        state.get("lifetime_compaction_count")
+                        or state.get("compaction_count")
+                        or 0
+                    ),
                     "last_input_tokens": last_input,
+                    "context_input_tokens": context_input,
                     "last_cached_input_tokens": last_cached,
                     "last_cache_miss_input_tokens": max(last_input - last_cached, 0),
                     "last_completion_tokens": last_completion,
@@ -556,10 +865,34 @@ class CodexAppServerManager:
                     "last_total_tokens": int(state.get("last_total_tokens") or 0),
                     "cache_hit_rate": cache_hit_rate,
                     "model_context_window": context_window or None,
+                    "model_context_window_source": state.get("model_context_window_source"),
                     "context_usage_percent": context_usage_percent,
                     "session_total": session_total,
+                    "lifetime_total": lifetime_total,
                     "usage_source": state.get("usage_source"),
-                    "usage_estimated": bool(state.get("usage_estimated", False)),
+                    "usage_accuracy": usage_accuracy,
+                    "thread_usage_accuracy": thread_usage_accuracy,
+                    "session_usage_accuracy": state.get("session_usage_accuracy")
+                    or usage_accuracy,
+                    "lifetime_usage_accuracy": state.get("lifetime_usage_accuracy")
+                    or usage_accuracy,
+                    "usage_estimated": usage_accuracy == "estimated",
+                    "usage_cache_available": cache_available,
+                    "runtime_profile": active.get("config_profile")
+                    or state.get("pending_runtime_profile")
+                    or state.get("runtime_profile"),
+                    "access_mode": active.get("access_mode") or state.get("access_mode"),
+                    "backend": active.get("backend") or state.get("last_backend"),
+                    "continuity_status": active.get("continuity_status")
+                    or state.get("continuity_status")
+                    or "synchronized",
+                    "last_rotation_reason": state.get("last_rotation_reason"),
+                    "last_rotation_at": state.get("last_rotation_at"),
+                    "last_compacted_at": state.get("last_compacted_at"),
+                    "fallback_count": int(state.get("fallback_count") or 0),
+                    "last_fallback_at": state.get("last_fallback_at"),
+                    "last_fallback_reason": state.get("last_fallback_reason"),
+                    "schema_hash": state.get("schema_hash"),
                     "active_prompt_chars": int(active.get("prompt_chars") or 0),
                     "updated_at": state.get("updated_at") or active.get("started_at"),
                 }
@@ -583,14 +916,40 @@ class CodexAppServerManager:
             int((item.get("session_total") or {}).get("cached_input_tokens") or 0)
             for item in sessions
         )
+        logical_lifetime_total = sum(
+            int((item.get("lifetime_total") or {}).get("total_tokens") or 0)
+            for item in sessions
+        )
         return {
             "sessions": sessions,
             "stats": {
                 "session_count": len(sessions),
                 "active_session_count": sum(1 for item in sessions if item["status"] != "idle"),
                 "total_turn_count": sum(int(item.get("turn_count") or 0) for item in sessions),
+                "lifetime_turn_count": sum(
+                    int(item.get("lifetime_turn_count") or 0) for item in sessions
+                ),
                 "current_thread_total_tokens": current_thread_total,
                 "current_thread_cached_tokens": current_thread_cached,
+                "logical_lifetime_total_tokens": logical_lifetime_total,
+                "fallback_session_count": sum(
+                    1 for item in sessions if int(item.get("fallback_count") or 0) > 0
+                ),
+                "pending_replay_count": sum(
+                    1
+                    for item in sessions
+                    if item.get("continuity_status") == "pending_replay"
+                ),
+                "unknown_usage_session_count": sum(
+                    1
+                    for item in sessions
+                    if item.get("lifetime_usage_accuracy") in {"unknown", "partial"}
+                ),
+                "estimated_usage_session_count": sum(
+                    1
+                    for item in sessions
+                    if item.get("lifetime_usage_accuracy") == "estimated"
+                ),
             },
         }
 
@@ -821,6 +1180,9 @@ class CodexAppServerManager:
 
     def _read_completed_item(self, tracker: _TurnTracker, item: Dict[str, Any]) -> None:
         item_type = str(item.get("type") or "")
+        if item_type == "contextCompaction":
+            tracker.compacted = True
+            return
         if item_type == "agentMessage":
             phase = str(item.get("phase") or "").strip().lower()
             if phase == "final_answer":
@@ -1005,6 +1367,17 @@ class CodexAppServerManager:
         if not turn_id:
             turn_id = str(turn.get("id") or "")
         if not turn_id:
+            thread_id = str(params.get("threadId") or params.get("thread_id") or "")
+            if thread_id:
+                with self._turn_lock:
+                    matching = [
+                        key
+                        for key, value in self._turns.items()
+                        if value.thread_id == thread_id and not value.completed.is_set()
+                    ]
+                if len(matching) == 1:
+                    turn_id = matching[0]
+        if not turn_id:
             return
         tracker = self._tracker(turn_id)
         if method == "turn/started":
@@ -1039,10 +1412,32 @@ class CodexAppServerManager:
                 current_item_status=public_item.get("status") or "completed",
                 current_item_summary=public_item.get("summary"),
             )
-        elif method == "thread/tokenUsage/updated":
-            tracker.usage = params.get("tokenUsage") if isinstance(params.get("tokenUsage"), dict) else {}
+        elif method == "thread/compacted":
+            tracker.compacted = True
+            self._record_turn_event(
+                tracker,
+                "context_compaction",
+                {"turn_id": turn_id, "thread_id": tracker.thread_id},
+            )
+        elif re.sub(r"[^a-z]", "", method.lower()).endswith("tokenusageupdated"):
+            tracker.usage = next(
+                (
+                    value
+                    for value in (
+                        params.get("tokenUsage"),
+                        params.get("token_usage"),
+                        params.get("usage"),
+                    )
+                    if isinstance(value, dict)
+                ),
+                {},
+            )
+            tracker.usage_source = f"codex_app_server.{method}"
             tracker.usage_ready.set()
-            normalized = _normalize_app_server_usage(tracker.usage)
+            normalized = _normalize_app_server_usage(
+                tracker.usage,
+                source=tracker.usage_source,
+            )
             self._record_turn_event(
                 tracker,
                 "token_usage",
@@ -1071,6 +1466,26 @@ class CodexAppServerManager:
             for item in turn.get("items") or []:
                 if isinstance(item, dict):
                     self._read_completed_item(tracker, item)
+            if not tracker.usage:
+                completed_usage = next(
+                    (
+                        value
+                        for value in (
+                            turn.get("tokenUsage"),
+                            turn.get("token_usage"),
+                            turn.get("usage"),
+                            params.get("tokenUsage"),
+                            params.get("token_usage"),
+                            params.get("usage"),
+                        )
+                        if isinstance(value, dict)
+                    ),
+                    {},
+                )
+                if completed_usage:
+                    tracker.usage = completed_usage
+                    tracker.usage_source = "codex_app_server.turn/completed"
+                    tracker.usage_ready.set()
             tracker.status = str(turn.get("status") or "completed")
             error = turn.get("error") if isinstance(turn.get("error"), dict) else {}
             if error:
@@ -1498,15 +1913,32 @@ class CodexAppServerManager:
 
         runtime_profile = str(request.get("codex_runtime_profile") or "").strip()
         state = None if ephemeral else self.state_store.get(chat_id)
-        if state and str(state.get("runtime_profile") or "") != runtime_profile:
-            # A thread belongs to the Profile and credentials that created it.
-            state = None
+        access_signature = str(request.get("codex_access_signature") or "").strip()
+        context_window_hint = _nonnegative_int(
+            request.get(
+                "codex_model_context_window",
+                extra_body.get("codex_model_context_window"),
+            ),
+            0,
+        )
         effective_rotate_tokens = self.rotate_tokens
         state_context_window = int((state or {}).get("model_context_window") or 0)
-        if state_context_window > 0:
+        state_matches_profile = str((state or {}).get("runtime_profile") or "") == runtime_profile
+        effective_context_window = (
+            state_context_window
+            if state_matches_profile
+            and state_context_window > 0
+            and (state or {}).get("model_context_window_source") == "provider_usage"
+            else context_window_hint
+            or (state_context_window if state_matches_profile else 0)
+        )
+        if effective_context_window > 0:
             # Keep a final safety band even when an old environment override
             # was tuned for a previous 1M-context model.
-            runtime_soft_limit = max(4096, state_context_window - 32768)
+            runtime_soft_limit = max(
+                4096,
+                effective_context_window - self.context_safety_tokens,
+            )
             effective_rotate_tokens = (
                 min(effective_rotate_tokens, runtime_soft_limit)
                 if effective_rotate_tokens > 0
@@ -1520,6 +1952,10 @@ class CodexAppServerManager:
             retry=retry,
             rotate_tokens=effective_rotate_tokens,
             max_turns=max_turns,
+            runtime_profile=runtime_profile,
+            access_signature=access_signature,
+            max_compactions=self.max_compactions,
+            idle_rotate_seconds=self.idle_rotate_seconds,
         )
         thread_id = str(state.get("thread_id") or "") if delta.resume and state else ""
         if thread_id:
@@ -1552,6 +1988,24 @@ class CodexAppServerManager:
                     "resume_failed",
                 )
                 thread_id = ""
+
+        previous_generation = int((state or {}).get("thread_generation") or 0)
+        if previous_generation <= 0 and state and state.get("thread_id"):
+            previous_generation = 1
+        thread_generation = (
+            max(1, previous_generation)
+            if delta.resume
+            else max(
+                1,
+                previous_generation
+                + (
+                    1
+                    if state
+                    and (state.get("thread_id") or state.get("pending_rotation_reason"))
+                    else 0
+                ),
+            )
+        )
 
         if not thread_id:
             thread_id = self._start_thread(
@@ -1646,6 +2100,12 @@ class CodexAppServerManager:
                 "chat_name": str(request.get("codex_source_chat_name") or chat_id),
                 "chat_type": str(request.get("codex_source_chat_type") or ""),
                 "thread_id": thread_id,
+                "thread_generation": thread_generation,
+                "resumed": bool(delta.resume),
+                "rotation_reason": None if delta.resume else delta.rotation_reason,
+                "continuity_status": str(
+                    (state or {}).get("continuity_status") or "synchronized"
+                ),
                 "workdir": str(workdir),
                 "sandbox": None if permission_profile else sandbox,
                 "permission_profile": permission_profile or None,
@@ -1749,20 +2209,100 @@ class CodexAppServerManager:
                 text = _default_text_for_attachments(attachments)
             if not text:
                 raise CodexAppServerError("Codex App Server returned an empty response")
-            usage = _normalize_app_server_usage(tracker.usage)
+            usage = _normalize_app_server_usage(
+                tracker.usage,
+                source=(
+                    tracker.usage_source
+                    or "codex_app_server.thread/tokenUsage/updated"
+                ),
+            )
             if not usage:
                 usage = estimate_codex_usage(prompt, text)
-                usage["source"] = "codex_app_server_local_estimate_missing_notification"
+                usage["estimated"] = bool(usage)
+                usage["source"] = (
+                    "codex_app_server_local_estimate_missing_notification"
+                    if usage
+                    else "codex_app_server_usage_unavailable"
+                )
+                usage["cache_data_available"] = False
+            reported_context_window = int(usage.get("model_context_window") or 0)
+            if effective_context_window > 0 and not usage.get("model_context_window"):
+                usage["model_context_window"] = effective_context_window
+            usage_available = any(
+                int(usage.get(key) or 0) > 0
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            )
+            usage_accuracy = (
+                "estimated"
+                if usage.get("estimated") and usage_available
+                else "reported"
+                if tracker.usage and usage_available
+                else "unknown"
+            )
+            previous_session_total = (
+                state.get("session_total")
+                if state and delta.resume and isinstance(state.get("session_total"), dict)
+                else None
+            )
+            reported_session_total = usage.get("session_total")
+            session_total = (
+                dict(reported_session_total)
+                if isinstance(reported_session_total, dict)
+                else _accumulate_usage_total(previous_session_total, usage)
+            )
+            previous_lifetime_total = (
+                state.get("lifetime_total")
+                if state and isinstance(state.get("lifetime_total"), dict)
+                else state.get("session_total")
+                if state and isinstance(state.get("session_total"), dict)
+                else None
+            )
+            lifetime_total = _accumulate_usage_total(previous_lifetime_total, usage)
+            previous_usage_accuracy = str((state or {}).get("usage_accuracy") or "").strip()
+            if not previous_usage_accuracy and state:
+                previous_usage_accuracy = (
+                    "estimated"
+                    if state.get("usage_estimated")
+                    else "reported"
+                    if int(state.get("last_total_tokens") or 0) > 0
+                    else "unknown"
+                )
+            session_usage_accuracy = (
+                _merge_usage_accuracy(
+                    (state or {}).get("session_usage_accuracy") or previous_usage_accuracy,
+                    usage_accuracy,
+                )
+                if delta.resume
+                else usage_accuracy
+            )
+            lifetime_usage_accuracy = _merge_usage_accuracy(
+                (state or {}).get("lifetime_usage_accuracy") or previous_usage_accuracy,
+                usage_accuracy,
+            )
+            prompt_details = usage.get("prompt_tokens_details")
+            if not isinstance(prompt_details, dict):
+                prompt_details = {}
+            completion_details = usage.get("completion_tokens_details")
+            if not isinstance(completion_details, dict):
+                completion_details = {}
             reasoning_text = "\n\n".join(tracker.reasoning).strip()
 
             assistant_fingerprint = _message_fingerprint(
                 {"role": "assistant", "content": text}
             )
             previous_turn_count = int(state.get("turn_count") or 0) if state and delta.resume else 0
+            previous_compaction_count = (
+                int(state.get("compaction_count") or 0)
+                if state and delta.resume
+                else 0
+            )
+            now_iso = datetime.now().isoformat()
             state_payload = {
                 "thread_id": thread_id,
+                "thread_generation": thread_generation,
                 "runtime_profile": runtime_profile or None,
                 "model": model,
+                "last_model": model,
                 "reasoning_effort": reasoning_effort,
                 "reasoning_summary": reasoning_summary,
                 "web_search_mode": web_search_mode,
@@ -1771,21 +2311,75 @@ class CodexAppServerManager:
                 "last_input_stable_fingerprints": delta.stable_fingerprints,
                 "last_ephemeral_fingerprints": delta.ephemeral_fingerprints,
                 "turn_count": previous_turn_count + 1,
-                "last_input_tokens": int(usage.get("prompt_tokens") or 0),
-                "last_cached_input_tokens": int(
-                    (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+                "lifetime_turn_count": int(
+                    (state or {}).get("lifetime_turn_count")
+                    or (state or {}).get("turn_count")
+                    or 0
+                )
+                + 1,
+                "compaction_count": previous_compaction_count + int(tracker.compacted),
+                "lifetime_compaction_count": int(
+                    (state or {}).get("lifetime_compaction_count")
+                    or (state or {}).get("compaction_count")
+                    or 0
+                )
+                + int(tracker.compacted),
+                "last_compacted_at": (
+                    now_iso
+                    if tracker.compacted
+                    else (state or {}).get("last_compacted_at")
+                    if delta.resume
+                    else None
                 ),
+                "last_input_tokens": int(usage.get("prompt_tokens") or 0),
+                "thread_input_tokens": int(usage.get("prompt_tokens") or 0),
+                "last_cached_input_tokens": int(prompt_details.get("cached_tokens") or 0),
                 "last_cache_miss_input_tokens": int(usage.get("cache_miss_input_tokens") or 0),
                 "last_completion_tokens": int(usage.get("completion_tokens") or 0),
-                "last_reasoning_tokens": int(
-                    (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
-                ),
+                "last_reasoning_tokens": int(completion_details.get("reasoning_tokens") or 0),
                 "last_total_tokens": int(usage.get("total_tokens") or 0),
-                "model_context_window": usage.get("model_context_window"),
-                "session_total": usage.get("session_total"),
+                "model_context_window": (
+                    usage.get("model_context_window")
+                    or effective_context_window
+                    or None
+                ),
+                "model_context_window_source": (
+                    "provider_usage"
+                    if reported_context_window > 0
+                    or (
+                        state_matches_profile
+                        and state_context_window > 0
+                        and (state or {}).get("model_context_window_source") == "provider_usage"
+                    )
+                    else "profile_metadata"
+                    if context_window_hint > 0
+                    else (state or {}).get("model_context_window_source")
+                ),
+                "session_total": session_total,
+                "lifetime_total": lifetime_total,
                 "usage_source": usage.get("source"),
-                "usage_estimated": bool(usage.get("estimated", False)),
+                "usage_accuracy": usage_accuracy,
+                "thread_usage_accuracy": usage_accuracy,
+                "session_usage_accuracy": session_usage_accuracy,
+                "lifetime_usage_accuracy": lifetime_usage_accuracy,
+                "usage_estimated": usage_accuracy == "estimated",
+                "usage_cache_available": bool(usage.get("cache_data_available", False)),
                 "last_turn_id": turn_id,
+                "last_backend": "codex_app_server",
+                "continuity_status": "synchronized",
+                "last_rotation_reason": (
+                    (state or {}).get("last_rotation_reason")
+                    if delta.resume
+                    else delta.rotation_reason
+                ),
+                "last_rotation_at": (
+                    (state or {}).get("last_rotation_at")
+                    if delta.resume
+                    else now_iso
+                ),
+                "fallback_count": int((state or {}).get("fallback_count") or 0),
+                "last_fallback_at": (state or {}).get("last_fallback_at"),
+                "last_fallback_reason": (state or {}).get("last_fallback_reason"),
                 "codex_version": self.codex_version,
                 "schema_hash": self.schema_hash,
                 "config_signature": self._runtime_config_signature(
@@ -1794,8 +2388,10 @@ class CodexAppServerManager:
                     permission_profile=permission_profile,
                     approval_policy=approval_policy,
                 ),
-                "access_signature": request.get("codex_access_signature"),
-                "updated_at": datetime.now().isoformat(),
+                "access_signature": access_signature or None,
+                "access_mode": request.get("codex_access_mode"),
+                "created_at": (state or {}).get("created_at") or now_iso,
+                "updated_at": now_iso,
             }
             if not ephemeral:
                 self.state_store.put(chat_id, state_payload)
@@ -1805,9 +2401,12 @@ class CodexAppServerManager:
                 text_chars=len(text),
                 attachment_count=len(attachments),
                 prompt_tokens=usage.get("prompt_tokens", 0),
-                cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+                cached_tokens=prompt_details.get("cached_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
                 total_tokens=usage.get("total_tokens", 0),
+                usage_accuracy=usage_accuracy,
+                compacted=tracker.compacted,
+                continuity_status="synchronized",
             )
             logger.info(
                 "Codex App Server turn finished: chat=%s thread=%s turn=%s resumed=%s "
@@ -1818,7 +2417,7 @@ class CodexAppServerManager:
                 delta.resume,
                 time.time() - started_at,
                 usage.get("prompt_tokens", 0),
-                (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+                prompt_details.get("cached_tokens", 0),
                 usage.get("completion_tokens", 0),
                 usage.get("total_tokens", 0),
             )
@@ -1832,6 +2431,10 @@ class CodexAppServerManager:
                 "pool_worker": self.instance_name,
                 "thread_id": thread_id,
                 "turn_id": turn_id,
+                "thread_generation": thread_generation,
+                "resumed": bool(delta.resume),
+                "rotation_reason": None if delta.resume else delta.rotation_reason,
+                "continuity_status": "synchronized",
                 "choices": [
                     {
                         "index": 0,

@@ -218,7 +218,7 @@ async def reset_codex_session(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="该会话仍有运行中的任务，请先中断任务")
     from app.services.agent_runtime import get_agent_runtime
 
-    get_agent_runtime().invalidate_chat(chat_id)
+    get_agent_runtime().invalidate_chat(chat_id, reason="manual_reset")
     return {"status": "success", "data": {"chat_id": chat_id, "reset": True}}
 
 

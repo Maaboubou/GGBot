@@ -268,7 +268,7 @@ const UI = {
             'settings': '系统',
             'wechat': 'WeChat 状态',
             'logs': '运行与日志',
-            'llm': '辅助模型'
+            'llm': '模型配置'
         };
         document.getElementById('pageTitle').textContent = titleMap[tabId] || '概览';
     },
@@ -1515,6 +1515,13 @@ const UI = {
         const judges = assistantOverview.judges || [];
         const selectedProfile = assistant.codex_profile_id || '';
         const selectedPluginCount = grants.filter(item => !String(item.plugin_name).includes('#')).length;
+        const chatLogCapability = (capabilities || []).find(item => item.id === 'builtin_chat_logger');
+        const chatLogEnabled = Boolean(chatLogCapability?.enabled);
+        const chatLogStatus = !chatLogCapability
+            ? '插件不可用'
+            : (chatLogEnabled
+                ? (chatLogCapability.loaded ? '持续记录新消息' : '已启用，但加载异常')
+                : '已关闭，助手仍可正常回复');
         const formatLines = values => (values || []).join('\n');
         const roleOptions = roles.map(item => `<option value="${Number(item.id)}" ${Number(assistant.role_id) === Number(item.id) ? 'selected' : ''}>${this.escapeHtml(item.display_name || item.name)}</option>`).join('');
         const judgeOptions = judges.map(item => `<option value="${Number(item.id)}" ${Number(assistant.judge_id) === Number(item.id) ? 'selected' : ''}>${this.escapeHtml(item.display_name || item.name)}</option>`).join('');
@@ -1559,6 +1566,10 @@ const UI = {
                     <label class="chat-policy-state-toggle">
                         <span><i class="bi bi-stars"></i><span><strong>AI 助手</strong><small data-assistant-status>${assistant.enabled ? '已启用' : '已关闭'}</small></span></span>
                         <input class="form-check-input" type="checkbox" name="assistant_enabled" ${assistant.enabled ? 'checked' : ''}>
+                    </label>
+                    <label class="chat-policy-state-toggle">
+                        <span><i class="bi bi-journal-text"></i><span><strong>启用聊天记录</strong><small data-chat-log-plugin-status>${this.escapeHtml(chatLogStatus)}</small></span></span>
+                        <input class="form-check-input" type="checkbox" data-chat-log-plugin-toggle ${chatLogEnabled ? 'checked' : ''} ${chatLogCapability ? '' : 'disabled'} aria-label="启用聊天记录插件">
                     </label>
                 </section>
 
@@ -1692,6 +1703,21 @@ const UI = {
         form.querySelectorAll('.chat-policy-plugin-toggle').forEach(toggle => {
             toggle.addEventListener('change', () => syncPlugin(toggle));
             syncPlugin(toggle);
+        });
+        const chatLogPluginToggle = form.querySelector('[data-chat-log-plugin-toggle]');
+        chatLogPluginToggle?.addEventListener('change', async event => {
+            event.stopPropagation();
+            const requested = Boolean(chatLogPluginToggle.checked);
+            chatLogPluginToggle.disabled = true;
+            const applied = await App.togglePlugin('builtin_chat_logger', requested, {
+                displayName: '聊天记录',
+                refreshWorkbench: false
+            });
+            if (!applied) chatLogPluginToggle.checked = !requested;
+            const enabled = Boolean(chatLogPluginToggle.checked);
+            const status = form.querySelector('[data-chat-log-plugin-status]');
+            if (status) status.textContent = enabled ? '持续记录新消息' : '已关闭，助手仍可正常回复';
+            chatLogPluginToggle.disabled = false;
         });
 
         const syncDependentControls = () => {

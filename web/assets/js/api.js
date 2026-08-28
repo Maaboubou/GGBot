@@ -184,6 +184,7 @@ const API = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         }),
+        delete: profileId => API.delete(`/api/codex/profiles/${encodeURIComponent(profileId)}`),
         setDefault: profileId => API.put('/api/codex/profiles/default/selection', { profile_id: profileId }),
         startOAuth: (profileId, force = false) => API.post(
             `/api/codex/profiles/${encodeURIComponent(profileId)}/oauth/start`,

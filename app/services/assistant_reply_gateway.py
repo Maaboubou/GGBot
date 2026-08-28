@@ -71,7 +71,7 @@ def _read(value: Any, key: str, default: Any = None) -> Any:
 class CodexReplyGateway:
     """Execute final assistant replies exclusively through CodexAgentRuntime."""
 
-    _REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+    _REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
     _REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
     _WEB_SEARCH_MODES = {"disabled", "cached", "indexed", "live"}
 
@@ -185,6 +185,15 @@ class CodexReplyGateway:
             payload["extra_body"]["wxautox_allow_image_input"] = True
         if requested_profile:
             payload["codex_runtime_profile"] = requested_profile
+        try:
+            profile_context_window = int((profile or {}).get("context_window") or 0)
+        except (TypeError, ValueError):
+            profile_context_window = 0
+        if profile_context_window >= 4096:
+            # App Server token notifications are optional on third-party
+            # providers. Persist the Profile metadata as the authoritative
+            # context-window fallback for rotation and monitoring.
+            payload["codex_model_context_window"] = profile_context_window
 
         started_at = time.monotonic()
         try:

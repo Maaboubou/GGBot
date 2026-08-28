@@ -238,8 +238,14 @@ class ChatPolicyService:
                 from app.services.agent_runtime import get_agent_runtime
                 from app.services.codex_profile_service import get_codex_runtime_registry
 
-                get_agent_runtime().invalidate_chat(user.chat_name)
-                get_codex_runtime_registry().invalidate_chat(user.chat_name)
+                get_agent_runtime().invalidate_chat(
+                    user.chat_name,
+                    reason="chat_policy_changed",
+                )
+                get_codex_runtime_registry().invalidate_chat(
+                    user.chat_name,
+                    reason="chat_policy_changed",
+                )
             except Exception:
                 side_effect_errors.append("Codex 会话将在下次请求时刷新")
         if assistant_effect:

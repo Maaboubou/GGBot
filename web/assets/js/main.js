@@ -1208,15 +1208,33 @@ const App = {
         }
     },
 
-    async togglePlugin(name, checked) {
+    async togglePlugin(name, checked, options = {}) {
+        const displayName = options.displayName || name;
         try {
             await API.plugins.toggle(name, checked);
-            UI.showSuccess(`${name} ${checked ? '已启用' : '已禁用'}`);
-            await this.loadPlugins(false);
+            UI.showSuccess(`${displayName} ${checked ? '已启用' : '已禁用'}`);
+            if (this._managedChatReferenceData) {
+                const capability = (this._managedChatReferenceData.capabilities || [])
+                    .find(item => item.id === name);
+                if (capability) {
+                    capability.enabled = checked;
+                    capability.loaded = checked;
+                    capability.status = checked ? 'running' : 'disabled';
+                }
+            }
         } catch (e) {
             UI.showError(e.message);
-            await this.loadPlugins(false);
+            return false;
         }
+        if (options.refreshWorkbench !== false) {
+            try {
+                await this.loadPlugins(false);
+            } catch (refreshError) {
+                console.warn('Plugin workbench refresh failed:', refreshError);
+                UI.showInfo('插件状态已更新，列表将在下次打开时刷新');
+            }
+        }
+        return true;
     },
 
     async reloadPlugin(name) {

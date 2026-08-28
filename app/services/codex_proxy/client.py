@@ -1980,6 +1980,14 @@ class CodexCliClient:
                 "request_id": request_id,
                 "status": "starting",
                 "backend": "codex_exec",
+                "config_profile": request.get("codex_runtime_profile") or None,
+                "fallback": bool(
+                    request.get("codex_fallback_reason")
+                    and request.get("codex_fallback_reason") != "explicit_stateless"
+                ),
+                "fallback_from": request.get("codex_fallback_from") or None,
+                "fallback_reason": request.get("codex_fallback_reason") or None,
+                "continuity_status": request.get("codex_session_continuity") or None,
                 "chat_id": source_chat_name or None,
                 "chat_name": source_chat_name or None,
                 "chat_type": source_chat_type or None,
@@ -2026,6 +2034,7 @@ class CodexCliClient:
             output_dir,
         )
 
+        usage: Dict[str, Any] = {}
         try:
             try:
                 subprocess_kwargs: Dict[str, Any] = {}
@@ -2161,11 +2170,26 @@ class CodexCliClient:
                     _tail_text(stderr),
                 )
                 raise CodexProxyError("Codex CLI returned an empty response")
+            usage = reported_usage or estimate_codex_usage(prompt, text)
+            usage_accuracy = (
+                "estimated"
+                if usage.get("estimated")
+                else "reported"
+                if int(usage.get("total_tokens") or 0) > 0
+                else "unknown"
+            )
             _update_running_request(
                 request_id,
                 status="completed",
                 text_chars=len(text or ""),
                 attachment_count=len(attachments or []),
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                cached_tokens=int(
+                    (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+                ),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+                total_tokens=int(usage.get("total_tokens") or 0),
+                usage_accuracy=usage_accuracy,
             )
             codex_job_manager.record_event(
                 request_id,
@@ -2173,6 +2197,8 @@ class CodexCliClient:
                 {
                     "text_chars": len(text or ""),
                     "attachment_count": len(attachments or []),
+                    "total_tokens": int(usage.get("total_tokens") or 0),
+                    "usage_accuracy": usage_accuracy,
                 },
             )
         except Exception as exc:
@@ -2236,7 +2262,7 @@ class CodexCliClient:
                 codex_job_manager.finish(request_id, status=final_status, **final_updates)
 
         now = int(time.time())
-        usage = reported_usage or estimate_codex_usage(prompt, text)
+        usage = usage or reported_usage or estimate_codex_usage(prompt, text)
         logger.info(
             "Codex request %s finished: model=%s elapsed=%.2fs text_chars=%s attachments=%s "
             "tokens=%s usage_source=%s",
@@ -2254,6 +2280,13 @@ class CodexCliClient:
             "created": now,
             "model": model,
             "backend": "codex_exec",
+            "fallback": bool(
+                request.get("codex_fallback_reason")
+                and request.get("codex_fallback_reason") != "explicit_stateless"
+            ),
+            "fallback_from": request.get("codex_fallback_from") or None,
+            "fallback_reason": request.get("codex_fallback_reason") or None,
+            "continuity_status": request.get("codex_session_continuity") or None,
             "choices": [
                 {
                     "index": 0,

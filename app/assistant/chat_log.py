@@ -90,6 +90,39 @@ class ChatLogManager:
             logger.error(f"❌ 统计聊天记录行数失败: {e}")
             return 0
 
+    def _retained_sequence_high_water(self, chat_name: str) -> int:
+        """Recover the latest stored sequence even if the counter file was stale.
+
+        Only a bounded tail is read. New-format rows always carry their own
+        sequence, so a crash between the JSONL append and counter-file replace
+        cannot cause a sequence number to be reused after restart.
+        """
+        log_path = self.log_dir / f"{chat_name}.jsonl"
+        if not log_path.exists():
+            return 0
+        try:
+            with open(log_path, "rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                remaining = stream.tell()
+                tail = b""
+                while remaining > 0 and len(tail) < 1024 * 1024:
+                    chunk_size = min(65536, remaining)
+                    remaining -= chunk_size
+                    stream.seek(remaining)
+                    tail = stream.read(chunk_size) + tail
+                    for raw_line in reversed(tail.splitlines()):
+                        try:
+                            row = json.loads(raw_line.decode("utf-8"))
+                            sequence = int(row.get("log_sequence") or 0)
+                        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                            continue
+                        if sequence > 0:
+                            return sequence
+            return 0
+        except Exception as exc:
+            logger.warning(f"⚠️ 恢复聊天消息序号失败: {exc}")
+            return 0
+
     def _message_count_floor(self, chat_name: str) -> int:
         with _COUNTS_LOCK:
             counts = self._load_counts()
@@ -97,11 +130,18 @@ class ChatLogManager:
                 int(counts.get(chat_name, 0) or 0),
                 int(_COUNT_HIGH_WATER.get(chat_name, 0) or 0),
                 self._count_log_lines(chat_name),
+                self._retained_sequence_high_water(chat_name),
             )
             _COUNT_HIGH_WATER[chat_name] = floor
             return floor
 
     def _increment_message_count(self, chat_name: str) -> int:
+        """Advance the durable sequence for legacy callers.
+
+        New rows allocate their sequence before they are appended so the cursor
+        is stored in the JSONL row itself.  Keep this helper for compatibility
+        with older call sites and data-repair utilities.
+        """
         with _COUNTS_LOCK:
             counts = self._load_counts()
             # save_message appends the new JSONL row before incrementing the
@@ -112,12 +152,24 @@ class ChatLogManager:
                 int(counts.get(chat_name, 0) or 0),
                 int(_COUNT_HIGH_WATER.get(chat_name, 0) or 0),
                 previous_log_lines,
+                self._retained_sequence_high_water(chat_name),
             )
             next_count = current_count + 1
             counts[chat_name] = next_count
             _COUNT_HIGH_WATER[chat_name] = next_count
             self._save_counts(counts)
             return next_count
+
+    def _next_message_sequence(self, chat_name: str) -> tuple[Dict[str, int], int]:
+        """Return the next monotonic per-chat log sequence while holding the lock."""
+        counts = self._load_counts()
+        current_count = max(
+            int(counts.get(chat_name, 0) or 0),
+            int(_COUNT_HIGH_WATER.get(chat_name, 0) or 0),
+            self._count_log_lines(chat_name),
+            self._retained_sequence_high_water(chat_name),
+        )
+        return counts, current_count + 1
 
     def ensure_minimum_count(self, chat_name: str, minimum: int) -> int:
         """Persist a known cumulative-count floor without decrementing it."""
@@ -127,6 +179,7 @@ class ChatLogManager:
                 int(counts.get(chat_name, 0) or 0),
                 int(_COUNT_HIGH_WATER.get(chat_name, 0) or 0),
                 self._count_log_lines(chat_name),
+                self._retained_sequence_high_water(chat_name),
             )
             repaired_count = max(current_count, max(0, int(minimum or 0)))
             _COUNT_HIGH_WATER[chat_name] = repaired_count
@@ -156,12 +209,18 @@ class ChatLogManager:
 
         with _COUNTS_LOCK:
             try:
+                counts, log_sequence = self._next_message_sequence(chat_name)
                 with open(log_path, "a", encoding="utf-8") as f:
                     row = {
                         "id": row_id,
                         "time": timestamp,
                         "sender": sender,
-                        "content": content
+                        "content": content,
+                        # Unlike a physical line number, this sequence survives
+                        # retention cleanup and lets the assistant request the
+                        # exact A->B suffix without relying on a tail-length
+                        # guess.
+                        "log_sequence": log_sequence,
                     }
                     if str(sender_id or "").strip():
                         row["sender_id"] = str(sender_id).strip()
@@ -178,8 +237,11 @@ class ChatLogManager:
                     if image_enrichment:
                         row["image_enrichment"] = dict(image_enrichment)
                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    f.flush()
 
-                self._increment_message_count(chat_name)
+                counts[chat_name] = log_sequence
+                _COUNT_HIGH_WATER[chat_name] = log_sequence
+                self._save_counts(counts)
                 logger.debug(f"📝 保存聊天记录成功: {chat_name} - {sender}")
                 return row_id
             except Exception as e:
@@ -343,6 +405,68 @@ class ChatLogManager:
         except Exception as e:
             logger.error(f"❌ 读取聊天记录失败: {e}")
             return []
+
+    def get_messages_after_sequence(
+        self,
+        chat_name: str,
+        *,
+        after_sequence: int,
+        through_sequence: Optional[int] = None,
+        limit: int = 20000,
+    ) -> List[Dict]:
+        """Read the retained messages in a durable per-chat sequence range.
+
+        Rows created before ``log_sequence`` was introduced are assigned a
+        deterministic sequence from the cumulative high-water mark and their
+        physical position.  This keeps persisted anchors created by older
+        versions resumable after an upgrade and after normal retention cleanup.
+        """
+        log_path = self.log_dir / f"{chat_name}.jsonl"
+        if not log_path.exists() or limit <= 0:
+            return []
+
+        start = max(0, int(after_sequence or 0))
+        end = (
+            max(start, int(through_sequence))
+            if through_sequence is not None
+            else self.count_messages(chat_name)
+        )
+        if end <= start:
+            return []
+
+        with _COUNTS_LOCK:
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    raw_lines = [line for line in f if line.strip()]
+
+                cumulative = max(self.count_messages(chat_name), len(raw_lines))
+                legacy_base = max(0, cumulative - len(raw_lines))
+                messages: List[Dict[str, Any]] = []
+                for index, line in enumerate(raw_lines, start=1):
+                    try:
+                        message = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        logger.warning(f"⚠️ 跳过损坏的聊天记录行: {exc}")
+                        continue
+
+                    try:
+                        sequence = int(message.get("log_sequence") or 0)
+                    except (TypeError, ValueError):
+                        sequence = 0
+                    if sequence <= 0:
+                        sequence = legacy_base + index
+                    if sequence <= start or sequence > end:
+                        continue
+                    if self._is_internal_action_message(message):
+                        continue
+                    message["_log_sequence"] = sequence
+                    messages.append(message)
+                    if len(messages) >= limit:
+                        break
+                return messages
+            except Exception as exc:
+                logger.error(f"❌ 按消息序号读取聊天记录失败: {exc}")
+                return []
 
     def count_log_messages(self, chat_name: str) -> int:
         """Return the physical JSONL cursor, independent of cumulative counters."""

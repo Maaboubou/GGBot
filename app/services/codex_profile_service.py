@@ -143,6 +143,66 @@ class CodexProfileService:
         get_codex_runtime_registry().invalidate(str(profile["name"]))
         return profile
 
+    def delete_profile(self, name: str) -> dict[str, Any]:
+        """Delete a Profile and reset every first-party binding before removal."""
+        normalized = str(name or "").strip()
+        profile = self.get_profile(normalized)
+        if not profile:
+            raise CodexProfileError("Codex Profile 不存在")
+
+        default_cleared = self.default_profile_id() == normalized
+        if default_cleared:
+            self.set_default_profile("")
+        chat_bindings_cleared = self._clear_chat_profile_bindings(normalized)
+        model_bindings_cleared = self._clear_model_profile_bindings(normalized)
+
+        get_codex_runtime_registry().invalidate(normalized)
+        result = self._run("delete", {"name": normalized})
+        self.invalidate_cache()
+        return {
+            "name": normalized,
+            "deleted": bool(result.get("deleted", True)),
+            "default_cleared": default_cleared,
+            "chat_bindings_cleared": chat_bindings_cleared,
+            "model_bindings_cleared": model_bindings_cleared,
+        }
+
+    @staticmethod
+    def _clear_chat_profile_bindings(profile_id: str) -> int:
+        from app.models.assistant_policy import AssistantChatPolicy
+        from app.models.base import SessionLocal
+        from app.models.user_permission import WeChatUser
+
+        with SessionLocal() as db:
+            try:
+                policies = (
+                    db.query(AssistantChatPolicy)
+                    .filter(AssistantChatPolicy.codex_profile_id == profile_id)
+                    .all()
+                )
+                if not policies:
+                    return 0
+                user_ids = [int(policy.user_id) for policy in policies]
+                for policy in policies:
+                    policy.codex_profile_id = None
+                    policy.version = int(policy.version or 0) + 1
+                for user in db.query(WeChatUser).filter(WeChatUser.id.in_(user_ids)).all():
+                    user.policy_version = int(user.policy_version or 1) + 1
+                db.commit()
+                return len(policies)
+            except Exception as exc:
+                db.rollback()
+                raise CodexProfileError(f"重置聊天中的 Profile 引用失败：{exc}") from exc
+
+    @staticmethod
+    def _clear_model_profile_bindings(profile_id: str) -> int:
+        try:
+            from app.services.llm_manager import get_llm_manager
+
+            return int(get_llm_manager().unbind_codex_profile(profile_id))
+        except Exception as exc:
+            raise CodexProfileError(f"重置模型中的 Profile 引用失败：{exc}") from exc
+
     def get_profile(self, name: str) -> Optional[dict[str, Any]]:
         normalized = str(name or "").strip()
         if not normalized:
@@ -228,11 +288,11 @@ class CodexProfileRuntimeRegistry:
         if cached:
             cached[1].stop()
 
-    def invalidate_chat(self, chat_id: str) -> None:
+    def invalidate_chat(self, chat_id: str, *, reason: str = "manual_reset") -> None:
         with self._lock:
             runtimes = [item[1] for item in self._runtimes.values()]
         for runtime in runtimes:
-            runtime.invalidate_chat(chat_id)
+            runtime.invalidate_chat(chat_id, reason=reason)
 
     def stop_all(self) -> None:
         with self._lock:

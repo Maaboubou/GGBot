@@ -200,8 +200,8 @@ def normalize_model_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any], se
             cleared.add(key)
 
     reasoning_effort = normalized.get("codex_reasoning_effort")
-    if reasoning_effort not in (None, "") and reasoning_effort not in {"low", "medium", "high", "xhigh"}:
-        raise ValueError("Codex 推理强度必须是 low、medium、high 或 xhigh")
+    if reasoning_effort not in (None, "") and reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}:
+        raise ValueError("Codex 推理强度必须是 low、medium、high、xhigh 或 max")
 
     credential_mode = normalized.get("credential_mode")
     if credential_mode not in (None, "") and credential_mode not in {"environment", "direct", "none"}:

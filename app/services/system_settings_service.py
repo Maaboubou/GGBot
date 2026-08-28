@@ -129,6 +129,26 @@ FIELD_SPECS: Dict[str, Dict[str, Any]] = {
         "description": "承载周报、记忆和代理请求的 Codex 进程数量。",
         "source": ".env / 启动环境", "editable": False, "environment_only": True,
     },
+    "CODEX_APP_SERVER_ROTATE_TOKENS": {
+        "group": "runtime", "section": "Codex 会话", "title": "线程 Token 软上限",
+        "description": "当前线程输入达到该值后，在下一轮用完整锚点创建新线程。",
+        "source": ".env / 启动环境", "editable": False, "environment_only": True,
+    },
+    "CODEX_APP_SERVER_MAX_COMPACTIONS": {
+        "group": "runtime", "section": "Codex 会话", "title": "线程压缩次数上限",
+        "description": "默认 2 次；达到后在下一轮轮换线程，0 表示关闭此条件。",
+        "source": ".env / 启动环境", "editable": False, "environment_only": True,
+    },
+    "CODEX_APP_SERVER_IDLE_ROTATE_SECONDS": {
+        "group": "runtime", "section": "Codex 会话", "title": "空闲轮换时间",
+        "description": "默认 2592000 秒（30 天）；超过后下一次消息创建新线程，0 表示关闭。",
+        "source": ".env / 启动环境", "editable": False, "environment_only": True,
+    },
+    "CODEX_APP_SERVER_CONTEXT_SAFETY_TOKENS": {
+        "group": "runtime", "section": "Codex 会话", "title": "上下文安全余量",
+        "description": "根据 Profile 或提供方上报的窗口计算线程软上限时预留的 Token。",
+        "source": ".env / 启动环境", "editable": False, "environment_only": True,
+    },
     # These integrations currently read the process environment directly.
     # Present their state, but do not offer a database input that cannot work.
     "TIKHUB_API_TOKEN": {

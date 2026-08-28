@@ -342,6 +342,11 @@ class CodexOAuthService:
             self._sessions.pop(profile_name, None)
         return self.status(profile_name)
 
+    def forget(self, profile_name: str) -> None:
+        """Drop completed/cancelled in-memory state after its Profile is deleted."""
+        with self._lock:
+            self._sessions.pop(str(profile_name or "").strip(), None)
+
 
 _oauth_service: Optional[CodexOAuthService] = None
 _oauth_service_lock = threading.Lock()

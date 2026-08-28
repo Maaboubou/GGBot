@@ -6,7 +6,6 @@ const CodexCenter = {
     editingProfile: null,
     catalogProviders: [],
     profileCatalogModels: [],
-    catalogVersion: '',
     profileCatalogRequestId: 0,
     oauthProfile: '',
     oauthMakeDefault: false,
@@ -94,6 +93,7 @@ const CodexCenter = {
                         ${profile.auth_type === 'chatgpt' && !ready
                             ? `<button class="btn btn-sm btn-outline-primary" type="button" data-profile-login="${this.escape(profile.name)}">完成登录</button>`
                             : (selected ? '' : `<button class="btn btn-sm btn-outline-primary" type="button" data-default-profile="${this.escape(profile.name)}" ${ready ? '' : 'disabled'}>设为默认</button>`)}
+                        <button class="btn btn-sm btn-outline-danger" type="button" data-delete-profile="${this.escape(profile.name)}"><i class="bi bi-trash3"></i> 删除</button>
                     </div>
                 </article>`;
         }).join('');
@@ -107,6 +107,9 @@ const CodexCenter = {
         });
         container.querySelectorAll('[data-edit-profile]').forEach(button => {
             button.addEventListener('click', () => this.openProfileModal(button.dataset.editProfile || ''));
+        });
+        container.querySelectorAll('[data-delete-profile]').forEach(button => {
+            button.addEventListener('click', () => this.deleteProfile(button.dataset.deleteProfile || '', button));
         });
     },
 
@@ -159,6 +162,10 @@ const CodexCenter = {
             }
             this.editingProfile = null;
             this.closeProfileCatalog();
+            if (!document.getElementById('addModelModal')?.classList.contains('show')
+                && typeof LLMManager !== 'undefined') {
+                LLMManager.clearLiteLLMUpdatePoll();
+            }
         });
     },
 
@@ -176,9 +183,6 @@ const CodexCenter = {
         form.querySelectorAll('.codex-profile-api-field').forEach(element => {
             element.classList.toggle('d-none', oauthMode);
         });
-        form.querySelectorAll('.codex-profile-oauth-field').forEach(element => {
-            element.classList.toggle('d-none', !oauthMode);
-        });
         form.querySelectorAll('.codex-profile-catalog-field').forEach(element => {
             element.classList.toggle('d-none', !catalogMode);
         });
@@ -186,7 +190,6 @@ const CodexCenter = {
         const baseUrl = document.getElementById('codexProfileBaseUrl');
         const apiKey = document.getElementById('codexProfileApiKey');
         const nameInput = document.getElementById('codexProfileName');
-        const hint = document.getElementById('codexProfileCatalogHint');
         if (modelInput) modelInput.required = !oauthMode;
         if (baseUrl) baseUrl.required = !oauthMode;
         if (apiKey) apiKey.required = !oauthMode && !this.editingProfile;
@@ -202,10 +205,12 @@ const CodexCenter = {
         }
         if (!catalogMode) {
             this.closeProfileCatalog();
-            if (hint) hint.textContent = '直接填写 Responses API 接受的模型 ID。';
             return;
         }
         if (!load) return;
+        if (typeof LLMManager !== 'undefined') {
+            void LLMManager.loadLiteLLMUpdateStatus({ quiet: true });
+        }
         if (!this.catalogProviders.length) await this.loadProfileCatalogProviders();
         const providerSelect = document.getElementById('codexProfileCatalogProvider');
         const providerKey = providerSelect?.value
@@ -216,7 +221,6 @@ const CodexCenter = {
 
     async loadProfileCatalogProviders() {
         const select = document.getElementById('codexProfileCatalogProvider');
-        const hint = document.getElementById('codexProfileProviderHint');
         if (select) {
             select.disabled = true;
             select.innerHTML = '<option value="">正在读取目录…</option>';
@@ -229,8 +233,6 @@ const CodexCenter = {
             }
             this.catalogProviders = Array.isArray(result.data?.providers) ? result.data.providers : [];
             if (!this.catalogProviders.length) throw new Error('LiteLLM 目录没有可用供应商');
-            this.catalogVersion = result.data?.version || '';
-            if (hint) hint.textContent = `本机 LiteLLM ${this.catalogVersion || '目录'} · ${this.catalogProviders.length} 个供应商`;
         } catch (error) {
             console.warn('Codex Profile LiteLLM providers unavailable:', error);
             this.catalogProviders = [
@@ -238,7 +240,6 @@ const CodexCenter = {
                 { id: 'deepseek', label: 'DeepSeek', model_count: 0 },
                 { id: 'openrouter', label: 'OpenRouter', model_count: 0 }
             ];
-            if (hint) hint.textContent = '目录暂时不可用；可选择供应商后手动输入模型。';
         } finally {
             if (select) {
                 const selected = select.value;
@@ -290,10 +291,6 @@ const CodexCenter = {
 
     async loadProfileCatalog(providerKey) {
         const requestId = ++this.profileCatalogRequestId;
-        const hint = document.getElementById('codexProfileCatalogHint');
-        if (hint && this.getProfileSource() === 'catalog') {
-            hint.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>正在读取本机 LiteLLM 模型目录…';
-        }
         try {
             const response = await fetch(`/api/llm/models/catalog?provider=${encodeURIComponent(providerKey)}&limit=300`);
             const result = await response.json();
@@ -302,16 +299,10 @@ const CodexCenter = {
                 throw new Error(result.detail || result.message || '模型目录加载失败');
             }
             this.profileCatalogModels = Array.isArray(result.data?.models) ? result.data.models : [];
-            this.catalogVersion = result.data?.version || this.catalogVersion;
-            const version = this.catalogVersion ? ` · LiteLLM ${this.catalogVersion}` : '';
-            if (hint && this.getProfileSource() === 'catalog') {
-                hint.textContent = `可选择 ${this.profileCatalogModels.length} 个模型${version}；目录外模型仍可直接输入。`;
-            }
         } catch (error) {
             if (requestId !== this.profileCatalogRequestId) return;
             console.warn(`Codex Profile catalog unavailable for ${providerKey}:`, error);
             this.profileCatalogModels = [];
-            if (hint && this.getProfileSource() === 'catalog') hint.textContent = '目录暂时不可用，仍可手动输入模型 ID。';
         }
         this.renderProfileCatalog(document.getElementById('codexProfileModel')?.value || '');
     },
@@ -600,6 +591,41 @@ const CodexCenter = {
             await this.load();
         } catch (error) {
             UI.showError(`切换失败：${error.message}`);
+        }
+    },
+
+    async deleteProfile(profileName, button = null) {
+        const profile = this.profiles.find(item => item.name === profileName);
+        if (!profile) {
+            UI.showError('Codex Profile 不存在，请刷新后重试');
+            return;
+        }
+        const defaultNotice = profile.is_default
+            ? '\n它当前是默认 Profile；删除后默认设置会恢复为当前本机 Codex。'
+            : '';
+        const confirmed = await UI.confirm(
+            `确定永久删除 Codex Profile “${profileName}”吗？${defaultNotice}\n引用它的聊天和模型配置会恢复为默认或当前本机 Codex。此操作无法撤销。`,
+            {
+                title: '删除 Codex Profile',
+                confirmText: '永久删除',
+                variant: 'danger'
+            }
+        );
+        if (!confirmed) return;
+        if (button) button.disabled = true;
+        try {
+            const result = await API.codexProfiles.delete(profileName);
+            await this.load();
+            const resetCount = Number(result.chat_bindings_cleared || 0)
+                + Number(result.model_bindings_cleared || 0);
+            UI.showSuccess(
+                resetCount
+                    ? `Codex Profile 已删除，并重置 ${resetCount} 处引用`
+                    : 'Codex Profile 已删除'
+            );
+        } catch (error) {
+            UI.showError(`删除 Profile 失败：${error.message}`);
+            if (button) button.disabled = false;
         }
     },
 

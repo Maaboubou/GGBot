@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
@@ -19,7 +20,7 @@ from urllib.parse import urlsplit
 
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
-REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 VERBOSITY_VALUES = {"inherit", "low", "medium", "high"}
 AUTH_TYPES = {"api_key", "chatgpt"}
 SECRET_ENV_NAME = "WXAUTOX_CODEX_PROFILE_API_KEY"
@@ -178,7 +179,7 @@ def _model_catalog(profile: dict[str, Any]) -> dict[str, Any]:
                 "default_reasoning_level": profile["reasoning_effort"],
                 "supported_reasoning_levels": [
                     {"effort": item, "description": f"{item} reasoning"}
-                    for item in ("minimal", "low", "medium", "high", "xhigh")
+                    for item in ("minimal", "low", "medium", "high", "xhigh", "max")
                 ],
                 "shell_type": "shell_command",
                 "visibility": "list",
@@ -396,6 +397,44 @@ def update_profile(payload: dict[str, Any], *, home: Path) -> dict[str, Any]:
     return profile
 
 
+def delete_profile(payload: dict[str, Any], *, home: Path) -> dict[str, Any]:
+    """Delete one managed profile and only its validated, profile-scoped files."""
+    name = _required(payload, "name", "Profile 名称", 48)
+    if not PROFILE_NAME_RE.fullmatch(name):
+        raise ProfileError("Profile 名称格式不正确")
+
+    paths = _paths(home.resolve(), name)
+    manifest = paths["manifest"]
+    if manifest.is_symlink() or not manifest.is_file():
+        raise ProfileError("Codex Profile 不存在或清单不安全")
+    try:
+        profile = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ProfileError("Codex Profile 不存在或清单已损坏") from exc
+    if not isinstance(profile, dict) or str(profile.get("name") or "") != name:
+        raise ProfileError("Codex Profile 清单与名称不匹配")
+
+    codex_home = paths["codex_home"]
+    if codex_home.is_symlink():
+        raise ProfileError("Codex Profile 目录不安全，已拒绝删除")
+    if codex_home.exists() and not codex_home.is_dir():
+        raise ProfileError("Codex Profile 目录格式不正确")
+
+    try:
+        if codex_home.exists():
+            shutil.rmtree(codex_home)
+        wrapper = paths["wrapper"]
+        if wrapper.exists() or wrapper.is_symlink():
+            wrapper.unlink()
+        # Remove the manifest last so an interrupted deletion remains visible
+        # and can be retried instead of leaving an undiscoverable launcher.
+        manifest.unlink()
+    except OSError as exc:
+        raise ProfileError(f"删除 Codex Profile 失败：{exc}") from exc
+
+    return {"name": name, "deleted": True}
+
+
 def list_profiles(*, home: Path) -> dict[str, Any]:
     metadata = home.resolve() / ".codex" / "wxautox-profiles"
     profiles: list[dict[str, Any]] = []
@@ -447,7 +486,7 @@ def _request() -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--action", choices=("list", "create", "update"), required=True)
+    parser.add_argument("--action", choices=("list", "create", "update", "delete"), required=True)
     parser.add_argument("--home", help=argparse.SUPPRESS)
     options = parser.parse_args()
     home = Path(options.home).expanduser() if options.home else Path.home()
@@ -456,8 +495,10 @@ def main() -> int:
             result = list_profiles(home=home)
         elif options.action == "create":
             result = create_profile(_request(), home=home)
-        else:
+        elif options.action == "update":
             result = update_profile(_request(), home=home)
+        else:
+            result = delete_profile(_request(), home=home)
         print(json.dumps({"status": "success", "data": result}, ensure_ascii=False, separators=(",", ":")))
         return 0
     except (ProfileError, OSError) as exc:

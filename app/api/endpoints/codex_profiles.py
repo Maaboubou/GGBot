@@ -21,7 +21,7 @@ class CodexProfileCreate(BaseModel):
     provider_name: str = Field(default="OpenAI Responses compatible", max_length=100)
     base_url: str = Field(default="", max_length=1000)
     api_key: str = Field(default="", max_length=4096)
-    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = "high"
+    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh", "max"] = "high"
     model_verbosity: Literal["inherit", "low", "medium", "high"] = "inherit"
     context_window: int = Field(default=128000, ge=4096, le=10_000_000)
     supports_vision: bool = False
@@ -34,7 +34,7 @@ class CodexProfileUpdate(BaseModel):
     provider_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     base_url: Optional[str] = Field(default=None, min_length=1, max_length=1000)
     api_key: Optional[str] = Field(default=None, min_length=1, max_length=4096)
-    reasoning_effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh"]] = None
+    reasoning_effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
     model_verbosity: Optional[Literal["inherit", "low", "medium", "high"]] = None
     context_window: Optional[int] = Field(default=None, ge=4096, le=10_000_000)
     supports_vision: Optional[bool] = None
@@ -89,6 +89,26 @@ def update_profile(profile_id: str, request: CodexProfileUpdate) -> Dict[str, An
     try:
         return get_codex_profile_service().update_profile(profile_id, _dump_set(request))
     except CodexProfileError as exc:
+        raise _error(exc) from exc
+
+
+@router.delete("/{profile_id}")
+async def delete_profile(profile_id: str) -> Dict[str, Any]:
+    from app.services.codex_app_server import CodexAppServerError
+    from app.services.codex_oauth_service import get_codex_oauth_service
+
+    service = get_codex_profile_service()
+    profile = service.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Codex Profile 不存在")
+    oauth_service = get_codex_oauth_service()
+    try:
+        if profile.get("auth_type") == "chatgpt":
+            await asyncio.to_thread(oauth_service.cancel, profile_id)
+        result = await asyncio.to_thread(service.delete_profile, profile_id)
+        oauth_service.forget(profile_id)
+        return result
+    except (CodexProfileError, CodexAppServerError) as exc:
         raise _error(exc) from exc
 
 

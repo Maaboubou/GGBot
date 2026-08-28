@@ -21,6 +21,8 @@ from app.services.codex_app_server import (
     CodexAppServerError,
     CodexAppServerManager,
     CodexThreadStateStore,
+    _accumulate_usage_total,
+    _merge_usage_accuracy,
 )
 from app.services.codex_proxy.client import CodexCliClient, CodexProxyError, _as_bool, _as_runtime_path
 from app.services.codex_access_service import codex_access_service
@@ -98,6 +100,8 @@ class CodexCompatibilityProbe:
         '"account/rateLimits/read"',
         '"ephemeral"',
         '"outputSchema"',
+        '"runtimeWorkspaceRoots"',
+        '"permissions"',
     )
 
     def __init__(self, *, codex_bin: Optional[str] = None, workdir: Optional[str] = None) -> None:
@@ -396,7 +400,10 @@ class CodexAgentRuntime:
             instance_name=f"{pool_name}-{index + 1}",
             codex_version=identity.version,
             schema_hash=identity.schema_hash,
-            experimental_api=False,
+            # Isolated persistent chats require runtimeWorkspaceRoots, which is
+            # capability-gated by Codex even though the rest of the protocol is
+            # stable. The compatibility probe above guarantees the field exists.
+            experimental_api=True,
         )
 
     def _build_pools(self, identity: CodexBinaryIdentity) -> Dict[str, CodexProcessPool]:
@@ -630,6 +637,163 @@ class CodexAgentRuntime:
             raise error[0]
         return result["value"]
 
+    def _fallback_exec(
+        self,
+        payload: Dict[str, Any],
+        *,
+        reason: str,
+        chat_id: str = "",
+        role_name: Optional[str] = None,
+        track_continuity: bool = False,
+        is_fallback: bool = True,
+    ) -> Dict[str, Any]:
+        """Run exec with an explicit reason and preserve logical-session telemetry."""
+        request = dict(payload)
+        request["codex_fallback_from"] = "codex_app_server"
+        request["codex_fallback_reason"] = str(reason or "runtime_unavailable")
+        request["codex_session_continuity"] = (
+            "pending_replay" if track_continuity else "not_applicable"
+        )
+        response = self._exec(request)
+        if not isinstance(response, dict):
+            return response
+
+        response["fallback"] = bool(is_fallback)
+        response["fallback_from"] = "codex_app_server"
+        response["fallback_reason"] = request["codex_fallback_reason"]
+        response["continuity_status"] = request["codex_session_continuity"]
+        if not chat_id or not track_continuity:
+            return response
+
+        try:
+            state = self.state_store.get(chat_id) or {}
+        except Exception:
+            logger.exception("Failed to read Codex fallback state for %s", chat_id)
+            return response
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        prompt_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = {}
+        completion_details = usage.get("completion_tokens_details")
+        if not isinstance(completion_details, dict):
+            completion_details = {}
+        previous_lifetime_total = (
+            state.get("lifetime_total")
+            if isinstance(state.get("lifetime_total"), dict)
+            else state.get("session_total")
+            if isinstance(state.get("session_total"), dict)
+            else None
+        )
+        lifetime_total = _accumulate_usage_total(previous_lifetime_total, usage)
+        total_tokens = int(usage.get("total_tokens") or 0)
+        usage_accuracy = (
+            "estimated"
+            if usage.get("estimated") and total_tokens > 0
+            else "reported"
+            if total_tokens > 0
+            else "unknown"
+        )
+        previous_usage_accuracy = str(state.get("usage_accuracy") or "").strip()
+        if not previous_usage_accuracy and state:
+            previous_usage_accuracy = (
+                "estimated"
+                if state.get("usage_estimated")
+                else "reported"
+                if int(state.get("last_total_tokens") or 0) > 0
+                else "unknown"
+            )
+        cached_tokens = int(prompt_details.get("cached_tokens") or 0)
+        input_tokens = int(usage.get("prompt_tokens") or 0)
+        now = _iso_now()
+        has_bound_thread = bool(state.get("thread_id"))
+        requested_runtime_profile = request.get("codex_runtime_profile") or None
+        requested_access_signature = request.get("codex_access_signature") or None
+        response_model = response.get("model") or request.get("model") or state.get("model")
+        state_payload = dict(state)
+        state_payload.update(
+            {
+                # Keep fields that bind an existing App Server thread intact.
+                # The next planner call must still see a Profile or permission
+                # change and rotate instead of resuming that old thread.
+                "runtime_profile": (
+                    state.get("runtime_profile") if has_bound_thread else requested_runtime_profile
+                ),
+                "pending_runtime_profile": requested_runtime_profile,
+                "model": state.get("model") if has_bound_thread else response_model,
+                "last_model": response_model,
+                "role_name": role_name or state.get("role_name"),
+                "last_input_tokens": input_tokens,
+                "last_cached_input_tokens": min(cached_tokens, input_tokens),
+                "last_cache_miss_input_tokens": int(
+                    usage.get("cache_miss_input_tokens")
+                    or max(input_tokens - min(cached_tokens, input_tokens), 0)
+                ),
+                "last_completion_tokens": int(usage.get("completion_tokens") or 0),
+                "last_reasoning_tokens": int(completion_details.get("reasoning_tokens") or 0),
+                "last_total_tokens": total_tokens,
+                "model_context_window": (
+                    usage.get("model_context_window")
+                    or request.get("codex_model_context_window")
+                    or state.get("model_context_window")
+                ),
+                "model_context_window_source": (
+                    "provider_usage"
+                    if usage.get("model_context_window")
+                    else "profile_metadata"
+                    if request.get("codex_model_context_window")
+                    else state.get("model_context_window_source")
+                ),
+                "session_total": (
+                    state.get("session_total")
+                    if isinstance(state.get("session_total"), dict)
+                    else _accumulate_usage_total(None, {})
+                ),
+                "lifetime_total": lifetime_total,
+                "lifetime_turn_count": int(
+                    state.get("lifetime_turn_count") or state.get("turn_count") or 0
+                )
+                + 1,
+                "usage_source": usage.get("source") or usage.get("encoding") or "codex_exec_usage_unavailable",
+                "usage_accuracy": usage_accuracy,
+                "thread_usage_accuracy": state.get("thread_usage_accuracy")
+                or previous_usage_accuracy
+                or "unknown",
+                "session_usage_accuracy": state.get("session_usage_accuracy")
+                or previous_usage_accuracy
+                or "unknown",
+                "lifetime_usage_accuracy": _merge_usage_accuracy(
+                    state.get("lifetime_usage_accuracy") or previous_usage_accuracy,
+                    usage_accuracy,
+                ),
+                "usage_estimated": usage_accuracy == "estimated",
+                "usage_cache_available": bool(
+                    "cached_tokens" in prompt_details and usage_accuracy == "reported"
+                ),
+                "last_backend": "codex_exec",
+                "continuity_status": "pending_replay",
+                "fallback_count": int(state.get("fallback_count") or 0) + 1,
+                "last_fallback_at": now,
+                "last_fallback_reason": request["codex_fallback_reason"],
+                "access_signature": (
+                    state.get("access_signature")
+                    if has_bound_thread
+                    else requested_access_signature
+                ),
+                "pending_access_signature": requested_access_signature,
+                "access_mode": request.get("codex_access_mode") or state.get("access_mode"),
+                "created_at": state.get("created_at") or now,
+                "updated_at": now,
+            }
+        )
+        try:
+            self.state_store.put(chat_id, state_payload)
+        except Exception:
+            # The reply itself is still valid. Handler-level anchored history
+            # will replay it on the next persistent turn even if telemetry
+            # persistence is temporarily unavailable.
+            logger.exception("Failed to persist Codex exec fallback state for %s", chat_id)
+        return response
+
     def chat(
         self,
         payload: Dict[str, Any],
@@ -647,17 +811,41 @@ class CodexAgentRuntime:
         request = access.apply(request)
         fallback = profile.allow_exec_fallback if allow_exec_fallback is None else allow_exec_fallback
 
-        # Restricted chats deliberately use a fresh exec process. Unlike the
-        # shared App Server, exec can ignore user config and execpolicy rules,
-        # so a broad local allow rule cannot pierce the per-chat boundary.
+        # Explicitly stateless requests still use exec. Normal isolated chats
+        # are safe to persist because access.apply() injects the administrator-
+        # owned permission profile, cwd and runtime workspace roots after all
+        # untrusted payload fields have been constructed.
         if not persistent_session or not access.persistent_thread:
-            return self._exec(request)
+            return self._fallback_exec(
+                request,
+                reason="explicit_stateless",
+                chat_id=chat_id,
+                role_name=role_name,
+                track_continuity=False,
+                is_fallback=False,
+            )
 
         pool = self._pool(profile.pool)
-        if pool is None or self._circuit_open():
+        if pool is None:
             if fallback:
-                return self._exec(request)
+                return self._fallback_exec(
+                    request,
+                    reason="runtime_unavailable",
+                    chat_id=chat_id,
+                    role_name=role_name,
+                    track_continuity=True,
+                )
             raise CodexProxyError(self._last_refresh_error or "Codex runtime is unavailable")
+        if self._circuit_open():
+            if fallback:
+                return self._fallback_exec(
+                    request,
+                    reason="circuit_open",
+                    chat_id=chat_id,
+                    role_name=role_name,
+                    track_continuity=True,
+                )
+            raise CodexProxyError("Codex runtime circuit is temporarily open")
         try:
             with pool.acquire(
                 _positive_int(request.get("timeout"), 600),
@@ -675,7 +863,13 @@ class CodexAgentRuntime:
         except CodexAppServerError as exc:
             self._record_failure()
             if fallback and self._fallback_is_safe(exc):
-                return self._exec(request)
+                return self._fallback_exec(
+                    request,
+                    reason=f"app_server_unavailable:{type(exc).__name__}",
+                    chat_id=chat_id,
+                    role_name=role_name,
+                    track_continuity=True,
+                )
             raise
 
     def run(
@@ -689,10 +883,14 @@ class CodexAgentRuntime:
         request = self._prepare_payload(payload, profile)
         fallback = profile.allow_exec_fallback if allow_exec_fallback is None else allow_exec_fallback
         pool = self._pool(profile.pool)
-        if pool is None or self._circuit_open():
+        if pool is None:
             if fallback:
-                return self._exec(request)
+                return self._fallback_exec(request, reason="runtime_unavailable")
             raise CodexProxyError(self._last_refresh_error or "Codex runtime is unavailable")
+        if self._circuit_open():
+            if fallback:
+                return self._fallback_exec(request, reason="circuit_open")
+            raise CodexProxyError("Codex runtime circuit is temporarily open")
         try:
             with pool.acquire(
                 _positive_int(request.get("timeout"), 600),
@@ -704,7 +902,10 @@ class CodexAgentRuntime:
         except CodexAppServerError as exc:
             self._record_failure()
             if fallback and self._fallback_is_safe(exc):
-                return self._exec(request)
+                return self._fallback_exec(
+                    request,
+                    reason=f"app_server_unavailable:{type(exc).__name__}",
+                )
             raise
 
     def read_rate_limits(self, timeout: int = 30) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -714,13 +915,34 @@ class CodexAgentRuntime:
         with pool.acquire(timeout, priority=100) as manager:
             return manager.read_rate_limits(timeout), manager.status()
 
-    def invalidate_chat(self, chat_id: str) -> None:
-        self.state_store.delete(str(chat_id or ""))
+    def invalidate_chat(self, chat_id: str, *, reason: str = "manual_reset") -> None:
+        self.state_store.request_rotation(str(chat_id or ""), reason=reason)
 
     def delete_chat(self, chat_id: str) -> Dict[str, Any]:
         """Delete the managed session and its persisted Codex thread."""
         normalized = str(chat_id or "").strip()
         state = self.state_store.get(normalized)
+        if not state:
+            return {"chat_id": normalized, "deleted": False, "thread_deleted": False}
+
+        runtime_profile = str(state.get("runtime_profile") or "").strip()
+        if runtime_profile:
+            from app.services.codex_profile_service import get_codex_runtime_registry
+
+            profile_runtime, _profile = get_codex_runtime_registry().resolve(runtime_profile)
+            if profile_runtime is not self:
+                return profile_runtime._delete_chat_local(normalized, state=state)
+        return self._delete_chat_local(normalized, state=state)
+
+    def _delete_chat_local(
+        self,
+        chat_id: str,
+        *,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Delete through this runtime, whose Codex home owns the thread."""
+        normalized = str(chat_id or "").strip()
+        state = state or self.state_store.get(normalized)
         if not state:
             return {"chat_id": normalized, "deleted": False, "thread_deleted": False}
 

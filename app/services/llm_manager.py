@@ -2104,6 +2104,16 @@ class LLMManager:
             "messages": messages,
             "extra_body": extra_body,
         }
+        try:
+            configured_context_window = int(
+                model_config.get("context_window")
+                or model_config.get("context_window_tokens")
+                or 0
+            )
+        except (TypeError, ValueError):
+            configured_context_window = 0
+        if configured_context_window >= 4096:
+            payload["codex_model_context_window"] = configured_context_window
         configured_reasoning_effort = str(
             model_config.get("codex_reasoning_effort") or ""
         ).strip().lower()
@@ -2147,6 +2157,12 @@ class LLMManager:
             runtime, codex_profile = get_codex_runtime_registry().resolve(codex_profile_id)
             payload["model"] = str(codex_profile.get("model") or payload["model"])
             payload["codex_runtime_profile"] = codex_profile_id
+            try:
+                profile_context_window = int(codex_profile.get("context_window") or 0)
+            except (TypeError, ValueError):
+                profile_context_window = 0
+            if profile_context_window >= 4096:
+                payload["codex_model_context_window"] = profile_context_window
             if "reasoning_effort" not in payload:
                 payload["reasoning_effort"] = str(
                     codex_profile.get("reasoning_effort") or "high"
@@ -3089,6 +3105,30 @@ class LLMManager:
                 del self.config["models"][model_id]
                 self.save_config()
                 logger.info(f"🗑️ 模型配置已删除: {model_id}")
+
+    def unbind_codex_profile(self, profile_id: str) -> int:
+        """Reset local-Codex model bindings that reference a deleted Profile."""
+        normalized = str(profile_id or "").strip()
+        if not normalized:
+            return 0
+        changed = 0
+        with self._config_lock:
+            for model_config in self.config.get("models", {}).values():
+                if not isinstance(model_config, dict):
+                    continue
+                if str(model_config.get("codex_profile_id") or "").strip() != normalized:
+                    continue
+                model_config.pop("codex_profile_id", None)
+                changed += 1
+            if changed:
+                self.save_config()
+        if changed:
+            logger.info(
+                "🧹 已将 %s 个模型配置从已删除的 Codex Profile %s 恢复为本机 Codex",
+                changed,
+                normalized,
+            )
+        return changed
 
     def update_mapping(self, plugin_name: str, call_type: str, mapping: Dict):
         """更新一个路由主体的任务模型路由。"""

@@ -113,7 +113,7 @@ class AssistantHandler:
         ).strip().lower()
         self.codex_reasoning_effort = (
             codex_effort
-            if codex_effort in {"inherit", "minimal", "low", "medium", "high", "xhigh"}
+            if codex_effort in {"inherit", "minimal", "low", "medium", "high", "xhigh", "max"}
             else "inherit"
         )
         codex_summary = str(
@@ -1259,8 +1259,14 @@ class AssistantHandler:
                 from app.services.agent_runtime import get_agent_runtime
                 from app.services.codex_profile_service import get_codex_runtime_registry
 
-                get_agent_runtime().invalidate_chat(chat_name)
-                get_codex_runtime_registry().invalidate_chat(chat_name)
+                get_agent_runtime().invalidate_chat(
+                    chat_name,
+                    reason="discarded_followup",
+                )
+                get_codex_runtime_registry().invalidate_chat(
+                    chat_name,
+                    reason="discarded_followup",
+                )
             except Exception as exc:
                 logger.warning(
                     "🔗 Failed to invalidate stale Codex thread for %s: %s",
@@ -1914,6 +1920,8 @@ class AssistantHandler:
     def _get_active_model_context_window(self, chat_name: str) -> int:
         """Use authoritative Codex runtime telemetry when it is available."""
         if self.context_window_auto_detect:
+            profile_id = ""
+            profile = None
             try:
                 from app.services.codex_profile_service import (
                     CodexProfileService,
@@ -1925,9 +1933,6 @@ class AssistantHandler:
                 )
                 if profile_id:
                     profile = get_codex_profile_service().get_profile(profile_id)
-                    context_window = int((profile or {}).get("context_window") or 0)
-                    if context_window > 0:
-                        return context_window
             except Exception as e:
                 logger.debug("Codex Profile context metadata unavailable for %s: %s", chat_name, e)
             try:
@@ -1935,10 +1940,23 @@ class AssistantHandler:
 
                 state = get_agent_runtime().state_store.get(chat_name) or {}
                 context_window = int(state.get("model_context_window") or 0)
-                if context_window > 0:
+                state_profile = str(state.get("runtime_profile") or "")
+                if (
+                    context_window > 0
+                    and state_profile == profile_id
+                    and state.get("model_context_window_source") == "provider_usage"
+                ):
                     return context_window
             except Exception as e:
                 logger.debug("Codex context telemetry unavailable for %s: %s", chat_name, e)
+                state = {}
+
+            profile_context_window = int((profile or {}).get("context_window") or 0)
+            if profile_context_window > 0:
+                return profile_context_window
+            state_context_window = int((state or {}).get("model_context_window") or 0)
+            if state_context_window > 0 and str((state or {}).get("runtime_profile") or "") == profile_id:
+                return state_context_window
 
         return 0
 
@@ -2534,6 +2552,7 @@ class AssistantHandler:
         state = {
             "messages": formatted,
             "log_count": total_count,
+            "log_sequence": total_count,
             "anchor_message_count": anchor_count,
             "memory_checkpoint": checkpoint_text,
             "memory_checkpoint_tokens": checkpoint_tokens,
@@ -2551,7 +2570,7 @@ class AssistantHandler:
         content: str,
         total_count: int,
     ) -> Dict[str, Any]:
-        last_count = int(state.get("log_count") or 0)
+        last_count = int(state.get("log_sequence") or state.get("log_count") or 0)
         if total_count < last_count:
             logger.warning(
                 "🤖 Ignoring regressed chat count for %s: observed=%s < anchored=%s; "
@@ -2567,10 +2586,25 @@ class AssistantHandler:
 
         delta = total_count - last_count
         if delta > 0:
-            new_messages = self.chat_log_manager.get_context_messages(chat_name, delta)
+            sequence_reader = getattr(
+                self.chat_log_manager,
+                "get_messages_after_sequence",
+                None,
+            )
+            if callable(sequence_reader):
+                new_messages = sequence_reader(
+                    chat_name,
+                    after_sequence=last_count,
+                    through_sequence=total_count,
+                    limit=max(delta, 1),
+                )
+            else:
+                # Compatibility for injected/legacy ChatLogManager doubles.
+                new_messages = self.chat_log_manager.get_context_messages(chat_name, delta)
             formatted = self.chat_log_manager.format_messages_array(new_messages, bot_name=self.bot_name)
             state["messages"] = list(state.get("messages") or []) + formatted
             state["log_count"] = total_count
+            state["log_sequence"] = total_count
 
         state["messages"] = self._ensure_current_formatted_present(
             list(state.get("messages") or []),
@@ -2628,6 +2662,10 @@ class AssistantHandler:
         state["log_count"] = max(
             int(state.get("log_count") or 0),
             self.chat_log_manager.count_messages(chat_name),
+        )
+        state["log_sequence"] = max(
+            int(state.get("log_sequence") or 0),
+            int(state.get("log_count") or 0),
         )
         state["pending_messages"] = None
         self._save_anchored_context(chat_name, state)
@@ -2700,6 +2738,9 @@ class AssistantHandler:
             )
             state["messages"] = cleaned_messages
             state["pending_messages"] = None
+            state["log_sequence"] = int(
+                state.get("log_sequence") or state.get("log_count") or 0
+            )
             self._anchored_contexts[chat_name] = state
             if removed_images:
                 logger.warning(
@@ -2709,10 +2750,10 @@ class AssistantHandler:
                 )
                 self._save_anchored_context(chat_name, state)
             logger.info(
-                "🤖 Loaded persisted anchored context for %s: messages=%s, log_count=%s, tokens≈%s",
+                "🤖 Loaded persisted anchored context for %s: messages=%s, log_sequence=%s, tokens≈%s",
                 chat_name,
                 len(state.get("messages") or []),
-                state.get("log_count"),
+                state.get("log_sequence"),
                 self._estimate_messages_tokens(state.get("messages") or []),
             )
             return state
@@ -2728,7 +2769,7 @@ class AssistantHandler:
                 state.get("messages") or []
             )
             payload = {
-                "version": 1,
+                "version": 2,
                 "chat_name": chat_name,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
                 "state": {
@@ -2736,6 +2777,9 @@ class AssistantHandler:
                         persistent_messages
                     ),
                     "log_count": int(state.get("log_count") or 0),
+                    "log_sequence": int(
+                        state.get("log_sequence") or state.get("log_count") or 0
+                    ),
                     "anchor_message_count": int(state.get("anchor_message_count") or 0),
                     "memory_checkpoint": str(state.get("memory_checkpoint") or ""),
                     "memory_checkpoint_tokens": int(

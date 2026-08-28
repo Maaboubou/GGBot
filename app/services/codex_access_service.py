@@ -23,7 +23,7 @@ OWNER_FULL_ACCESS = "owner_full"
 SUPPORTED_ACCESS_MODES = {ISOLATED_ACCESS, OWNER_FULL_ACCESS}
 ISOLATED_PERMISSION_PROFILE = "wxautox-chat-isolated"
 OWNER_PERMISSION_PROFILE = ":danger-full-access"
-ACCESS_POLICY_VERSION = "chat-scope-v1"
+ACCESS_POLICY_VERSION = "chat-scope-v2-persistent"
 
 
 def normalize_codex_access_mode(value: Any) -> str:
@@ -115,19 +115,18 @@ class CodexAccessContext:
                 "codex_access_signature": self.signature,
                 "codex_workdir": str(self.workdir),
                 "codex_artifact_root": str(self.artifact_root),
-                # Stable App Server sessions express unrestricted owner access
-                # with the legacy sandbox field.  The `permissions` field is
-                # experimental and is reserved for isolated `codex exec` runs.
+                # Owner access uses the legacy sandbox mode. Isolated chats use
+                # the fail-closed permission profile plus a runtime workspace
+                # root on every App Server thread/turn.
                 "codex_permission_profile": "" if self.is_owner else self.permission_profile,
                 "codex_approval_policy": self.approval_policy,
                 "codex_config_policy": self.config_policy,
                 "codex_persistent_thread": self.persistent_thread,
             }
         )
-        # runtimeWorkspaceRoots is an experimental App Server field.  Isolated
-        # chats need the explicit boundary and run through `codex exec`; the
-        # owner App Server profile is deliberately unrestricted and must not
-        # receive this field on stable API sessions.
+        # The owner profile is deliberately unrestricted and must not receive a
+        # restricted workspace root. Every other chat gets its stable scope as
+        # the sole runtime workspace root.
         if self.is_owner:
             result["codex_sandbox"] = "danger-full-access"
         else:
@@ -212,7 +211,10 @@ class CodexAccessService:
             permission_profile=ISOLATED_PERMISSION_PROFILE,
             approval_policy="never",
             config_policy="isolated",
-            persistent_thread=False,
+            # The App Server applies this permission profile to the chat's
+            # stable cwd. Group members share the chat scope and logical thread;
+            # separate chats retain separate filesystem boundaries.
+            persistent_thread=True,
         )
 
 

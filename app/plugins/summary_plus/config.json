@@ -44,20 +44,25 @@
         "description": "SenseVoice F32 本地转写开关、时长限制与资源路径",
         "order": 20
       },
+      "douyin": {
+        "title": "抖音",
+        "description": "抖音短视频下载与长视频脑图分流",
+        "order": 30
+      },
       "bilibili": {
         "title": "B站",
         "description": "B站视频下载、字幕、脑图与弹幕处理",
-        "order": 30
+        "order": 40
       },
       "xiaohongshu": {
         "title": "小红书",
         "description": "小红书视频与多图笔记处理",
-        "order": 40
+        "order": 50
       },
       "youtube": {
         "title": "YouTube",
         "description": "YouTube 字幕、代理与脑图生成",
-        "order": 50
+        "order": 60
       },
       "media": {
         "title": "媒体工具",
@@ -188,6 +193,13 @@
       "description": "长音频静音检测与切段使用的 GGUF 模型路径",
       "level": "developer",
       "default": "data/models/sensevoice/fsmn-vad.gguf"
+    },
+    "douyin_max_download_duration": {
+      "type": "integer",
+      "title": "抖音视频最大下载时长（秒）",
+      "description": "不超过该时长时发送视频；超过后不发送视频，改用本地 ASR 生成脑图",
+      "minimum": 1,
+      "default": 120
     },
     "danmaku_font_size": {
       "type": "integer",
@@ -391,6 +403,7 @@
     "local_asr_runtime_path": "data/models/sensevoice/llama-funasr-sensevoice.exe",
     "local_asr_model_path": "data/models/sensevoice/sensevoice-small-f32.gguf",
     "local_asr_vad_path": "data/models/sensevoice/fsmn-vad.gguf",
+    "douyin_max_download_duration": 120,
     "danmaku_font_size": 30,
     "danmaku_line_spacing": 1.2,
     "danmaku_display_region_ratio": 0.8,

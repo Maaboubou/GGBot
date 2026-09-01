@@ -21,7 +21,7 @@ from app.services.wechat_file_store import PROJECT_ROOT, safe_path_component
 ISOLATED_ACCESS = "isolated"
 OWNER_FULL_ACCESS = "owner_full"
 SUPPORTED_ACCESS_MODES = {ISOLATED_ACCESS, OWNER_FULL_ACCESS}
-ISOLATED_PERMISSION_PROFILE = "wxautox-chat-isolated"
+ISOLATED_PERMISSION_PROFILE = "mabobot-chat-isolated"
 OWNER_PERMISSION_PROFILE = ":danger-full-access"
 ACCESS_POLICY_VERSION = "chat-scope-v2-persistent"
 
@@ -44,7 +44,28 @@ def chat_scope_path(chat_name: str, *, root: Optional[Path] = None) -> Path:
     normalized_name = str(chat_name or "").strip()
     digest = hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()[:10]
     readable = safe_path_component(normalized_name, fallback="chat", max_length=72)
-    return (Path(root or _scope_base()) / f"{readable}--{digest}").resolve()
+    base = Path(root or _scope_base()).resolve()
+    # Keep the final component lexical so ensure_directories() can detect a
+    # pre-existing link instead of resolving it into a newly trusted scope.
+    return base / f"{readable}--{digest}"
+
+
+def _is_link_like(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(callable(is_junction) and is_junction())
+    except OSError:
+        return True
+
+
+def _ensure_unlinked_directory(path: Path) -> None:
+    if _is_link_like(path):
+        raise RuntimeError(f"Codex 隔离目录不能是符号链接或联接点：{path}")
+    path.mkdir(parents=True, exist_ok=True)
+    if _is_link_like(path) or not path.is_dir():
+        raise RuntimeError(f"Codex 隔离目录不安全：{path}")
 
 
 @dataclass(frozen=True)
@@ -98,9 +119,9 @@ class CodexAccessContext:
     def ensure_directories(self) -> None:
         if self.is_owner:
             return
-        self.scope_root.mkdir(parents=True, exist_ok=True)
-        (self.scope_root / "workspace").mkdir(exist_ok=True)
-        (self.scope_root / "requests").mkdir(exist_ok=True)
+        _ensure_unlinked_directory(self.scope_root)
+        _ensure_unlinked_directory(self.scope_root / "workspace")
+        _ensure_unlinked_directory(self.scope_root / "requests")
 
     def apply(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Apply administrator-owned values after untrusted request construction."""
@@ -145,6 +166,9 @@ class CodexAccessContext:
                 "group_members_share_scope": bool(self.is_group and not self.is_owner),
                 "skills_read_only": not self.is_owner,
                 "local_command_network": "unrestricted" if self.is_owner else "disabled",
+                "browser_access": "public_web_ephemeral",
+                "browser_private_network": "blocked",
+                "browser_local_files": "current_chat_scope_only",
                 "persistent_thread": self.persistent_thread,
             }
         )

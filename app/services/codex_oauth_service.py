@@ -50,6 +50,15 @@ def _public_models(result: Dict[str, Any]) -> list[dict[str, Any]]:
                     for value in item.get("inputModalities") or ["text", "image"]
                     if str(value)
                 ],
+                "supports_web_search": any(
+                    item.get(key) is True
+                    for key in (
+                        "supportsSearchTool",
+                        "supportsWebSearch",
+                        "supports_search_tool",
+                        "supports_web_search",
+                    )
+                ),
                 "is_default": bool(item.get("isDefault")),
             }
         )
@@ -127,6 +136,149 @@ class CodexOAuthService:
             experimental_api=False,
         )
 
+    def _read_connected_account(
+        self,
+        profile_name: str,
+        manager: CodexAppServerManager,
+        *,
+        refresh_token: bool,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Validate one isolated login and persist only public account metadata."""
+        account = _account_public(manager.read_account(refresh_token=refresh_token))
+        if not account.get("connected"):
+            raise CodexAppServerError("Codex 未识别到可用的 ChatGPT 账号")
+        models = _public_models(manager.list_models())
+        if not models:
+            raise CodexAppServerError("当前 ChatGPT 账号没有返回可用的 Codex 模型")
+
+        profile = self._profile(profile_name)
+        selected = str(profile.get("model") or "")
+        available_ids = {str(item.get("id") or "") for item in models}
+        if selected not in available_ids:
+            default = next((item for item in models if item.get("is_default")), models[0])
+            selected = str(default["id"])
+        update: dict[str, Any] = {
+            "account_email": account.get("email") or "",
+            "plan_type": account.get("plan_type") or "",
+            "model": selected,
+        }
+        selected_model = next((item for item in models if item.get("id") == selected), None)
+        if selected_model:
+            effort = str(selected_model.get("default_reasoning_effort") or "")
+            supported = selected_model.get("supported_reasoning_efforts") or []
+            if effort and effort in supported:
+                update["reasoning_effort"] = effort
+            if int(selected_model.get("context_window") or 0) >= 4096:
+                update["context_window"] = int(selected_model["context_window"])
+            update["supports_vision"] = "image" in (
+                selected_model.get("input_modalities") or []
+            )
+            update["supports_web_search"] = bool(
+                selected_model.get("supports_web_search")
+            )
+
+        profile_service = get_codex_profile_service()
+        profile_service.update_profile(profile_name, update)
+        if profile.get("setup_status") != "pending":
+            profile_service.ensure_default_profile(profile_name)
+        return account, models
+
+    def finalize_setup(
+        self,
+        profile_name: str,
+        payload: Dict[str, Any],
+    ) -> dict[str, Any]:
+        """Validate account-backed choices and make one wizard draft usable."""
+        profile = self._profile(profile_name)
+        if profile.get("setup_status") != "pending":
+            raise CodexProfileError("该 Profile 不是待完成的创建向导")
+        if not profile.get("auth_configured"):
+            raise CodexProfileError("请先完成 ChatGPT 官方登录")
+
+        status = self.account_status(profile_name)
+        if status.get("status") != "connected":
+            raise CodexProfileError("请先完成 ChatGPT 官方登录")
+        models = status.get("models") if isinstance(status.get("models"), list) else []
+        model_id = str(payload.get("model") or "").strip()
+        selected = next((item for item in models if item.get("id") == model_id), None)
+        if not selected:
+            raise CodexProfileError("所选模型不在当前 ChatGPT 账号的可用目录中")
+
+        supported_efforts = [
+            str(value)
+            for value in selected.get("supported_reasoning_efforts") or []
+            if str(value)
+        ]
+        reasoning_effort = str(
+            payload.get("reasoning_effort")
+            or selected.get("default_reasoning_effort")
+            or (supported_efforts[0] if supported_efforts else profile.get("reasoning_effort"))
+            or "high"
+        ).strip()
+        if supported_efforts and reasoning_effort not in supported_efforts:
+            raise CodexProfileError("所选模型不支持该推理强度")
+
+        context_window = int(selected.get("context_window") or 0)
+        if context_window < 4096:
+            context_window = int(profile.get("context_window") or 128000)
+        update = {
+            "model": model_id,
+            "reasoning_effort": reasoning_effort,
+            "model_verbosity": str(payload.get("model_verbosity") or "inherit"),
+            "context_window": context_window,
+            "supports_vision": "image" in (selected.get("input_modalities") or []),
+            "supports_web_search": bool(selected.get("supports_web_search")),
+            "setup_status": "ready",
+        }
+        profile_service = get_codex_profile_service()
+        ready_profile = profile_service.update_profile(profile_name, update)
+        try:
+            if bool(payload.get("make_default", True)):
+                profile_service.set_default_profile(profile_name)
+            else:
+                profile_service.ensure_default_profile(profile_name)
+        except Exception:
+            # Keep the wizard resumable if saving the global default fails.
+            profile_service.update_profile(profile_name, {"setup_status": "pending"})
+            raise
+        ready_profile = profile_service.get_profile(profile_name) or ready_profile
+        ready_profile["is_default"] = profile_service.default_profile_id() == profile_name
+        return {
+            "profile": ready_profile,
+            "account": status.get("account") or {},
+            "models": models,
+            "default_profile_id": profile_service.default_profile_id(),
+        }
+
+    def import_local_auth(self, profile_name: str) -> dict[str, Any]:
+        """Copy and validate the local file-backed Codex login in one Profile."""
+        profile = self._profile(profile_name)
+        if profile.get("auth_source") != "local_cache":
+            raise CodexProfileError("该 Profile 未选择导入本机 Codex 登录")
+        profile_service = get_codex_profile_service()
+        profile_service.import_local_auth(profile_name)
+        manager = self._manager(self._profile(profile_name))
+        try:
+            manager.start()
+            account, models = self._read_connected_account(
+                profile_name,
+                manager,
+                refresh_token=True,
+            )
+        except Exception:
+            # A failed validation must not leave an unverified credential copy.
+            profile_service.clear_profile_auth(profile_name)
+            raise
+        finally:
+            manager.stop()
+        return {
+            "profile_name": profile_name,
+            "status": "connected",
+            "account": account,
+            "models": models,
+            "expires_in": 0,
+        }
+
     def start_login(self, profile_name: str, *, force: bool = False) -> dict[str, Any]:
         profile = self._profile(profile_name)
         with self._lock:
@@ -135,6 +287,8 @@ class CodexOAuthService:
                 return existing.public()
         if profile.get("auth_configured") and not force:
             return self.account_status(profile_name)
+        if profile.get("auth_source") == "local_cache":
+            return self.import_local_auth(profile_name)
 
         manager = self._manager(profile)
         completion = threading.Event()
@@ -202,38 +356,11 @@ class CodexOAuthService:
                 session.error = str(payload.get("error") or "ChatGPT 授权失败")
                 return
 
-            account_result = session.manager.read_account(refresh_token=True)
-            session.account = _account_public(account_result)
-            if not session.account.get("connected"):
-                raise CodexAppServerError("授权完成，但 Codex 未识别到 ChatGPT 账号")
-            session.models = _public_models(session.manager.list_models())
-            profile = self._profile(session.profile_name)
-            selected = str(profile.get("model") or "")
-            available_ids = {str(item.get("id") or "") for item in session.models}
-            if selected not in available_ids and session.models:
-                default = next(
-                    (item for item in session.models if item.get("is_default")),
-                    session.models[0],
-                )
-                selected = str(default["id"])
-            update: dict[str, Any] = {
-                "account_email": session.account.get("email") or "",
-                "plan_type": session.account.get("plan_type") or "",
-            }
-            if selected:
-                update["model"] = selected
-                selected_model = next(
-                    (item for item in session.models if item.get("id") == selected),
-                    None,
-                )
-                if selected_model:
-                    effort = str(selected_model.get("default_reasoning_effort") or "")
-                    supported = selected_model.get("supported_reasoning_efforts") or []
-                    if effort and effort in supported:
-                        update["reasoning_effort"] = effort
-                    if int(selected_model.get("context_window") or 0) >= 4096:
-                        update["context_window"] = int(selected_model["context_window"])
-            get_codex_profile_service().update_profile(session.profile_name, update)
+            session.account, session.models = self._read_connected_account(
+                session.profile_name,
+                session.manager,
+                refresh_token=True,
+            )
             session.status = "connected"
         except Exception as exc:
             session.status = "failed"
@@ -275,6 +402,12 @@ class CodexOAuthService:
 
     def account_status(self, profile_name: str) -> dict[str, Any]:
         profile = self._profile(profile_name)
+        if (
+            profile.get("auth_source") == "local_cache"
+            and profile.get("auth_sync_status") in {"missing", "outdated", "invalid"}
+        ):
+            synced = get_codex_profile_service().sync_local_auth_if_needed(profile_name)
+            profile = synced.get("profile") or self._profile(profile_name)
         manager = self._manager(profile)
         try:
             manager.start()
@@ -328,13 +461,19 @@ class CodexOAuthService:
             session = self._sessions.get(profile_name)
         if session and session.status == "pending":
             self.cancel(profile_name)
-        manager = self._manager(profile)
-        try:
-            manager.start()
-            manager.logout_account()
-        finally:
-            manager.stop()
-        get_codex_profile_service().update_profile(
+        profile_service = get_codex_profile_service()
+        if profile.get("auth_source") == "local_cache":
+            # Only remove the Profile-scoped copy. Logging out through Codex
+            # could revoke or mutate the user's original local login.
+            profile_service.clear_profile_auth(profile_name)
+        else:
+            manager = self._manager(profile)
+            try:
+                manager.start()
+                manager.logout_account()
+            finally:
+                manager.stop()
+        profile_service.update_profile(
             profile_name,
             {"account_email": "", "plan_type": ""},
         )

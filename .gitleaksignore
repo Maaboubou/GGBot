@@ -1,0 +1,2 @@
+# tiktoken o200k tokenizer cache filename (content hash, not a credential).
+13841cd982b51315c853a70740cdd04752632862:app/services/codex_proxy/client.py:generic-api-key:593

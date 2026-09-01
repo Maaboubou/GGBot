@@ -59,7 +59,7 @@ def main() -> int:
     settings = {
         "TESSDATA_PREFIX": _first_existing(roots, "share/tessdata"),
         "MAGICK_CONFIGURE_PATH": _first_existing(roots, "etc/ImageMagick-7"),
-        "FONTCONFIG_FILE": _first_existing(roots, "etc/fonts/wxautox-fonts.conf", file=True),
+        "FONTCONFIG_FILE": _first_existing(roots, "etc/fonts/mabobot-fonts.conf", file=True),
         "MAGIC": _first_existing(roots, "share/misc/magic.mgc", file=True),
     }
     for name, value in settings.items():

@@ -91,9 +91,9 @@ const SystemOperations = {
                     <tbody>${plugins.length ? plugins.map(item => {
                         const storageBytes = (item.storage?.entries || []).reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
                         const healthState = item.health?.status || 'healthy';
-                        return `<tr><td><strong>${this.esc(item.plugin_id)}</strong><small>已接入统一管理</small></td>
-                            <td><span class="system-state-pill ${this.statusClass(healthState)}">${this.esc(this.statusLabel(healthState))}</span><small>${this.esc(item.health?.message || '')}</small></td>
-                            <td>${Number(item.active_tasks || 0)}</td><td>${this.formatBytes(storageBytes)}</td></tr>`;
+                        return `<tr><td data-label="插件"><strong>${this.esc(item.plugin_id)}</strong><small>已接入统一管理</small></td>
+                            <td data-label="健康"><span class="system-state-pill ${this.statusClass(healthState)}">${this.esc(this.statusLabel(healthState))}</span><small>${this.esc(item.health?.message || '')}</small></td>
+                            <td data-label="后台任务">${Number(item.active_tasks || 0)}</td><td data-label="数据占用">${this.formatBytes(storageBytes)}</td></tr>`;
                     }).join('') : '<tr><td colspan="4" class="text-muted py-4 text-center">暂无插件状态数据</td></tr>'}</tbody>
                 </table></div>
             </details>
@@ -130,10 +130,10 @@ const SystemOperations = {
         if (!items.length) return '<div class="system-empty-row">最近日志中没有需要关注的警告或错误。</div>';
         return `<div class="table-responsive"><table class="table system-compact-table align-middle mb-0">
             <thead><tr><th>事件</th><th>组件</th><th>级别</th><th>次数</th><th>最后发生</th></tr></thead>
-            <tbody>${items.map(item => `<tr><td><strong>${this.esc(item.message)}</strong><small>${this.esc(item.fingerprint)}</small></td>
-                <td><code>${this.esc(item.component)}</code></td>
-                <td><span class="system-state-pill ${item.level === 'WARNING' ? 'warning' : 'danger'}">${this.esc(item.level)}</span></td>
-                <td>${Number(item.count || 0)}</td><td>${this.esc(item.last_seen || '-')}</td></tr>`).join('')}</tbody>
+            <tbody>${items.map(item => `<tr><td data-label="事件"><strong>${this.esc(item.message)}</strong><small>${this.esc(item.fingerprint)}</small></td>
+                <td data-label="组件"><code>${this.esc(item.component)}</code></td>
+                <td data-label="级别"><span class="system-state-pill ${item.level === 'WARNING' ? 'warning' : 'danger'}">${this.esc(item.level)}</span></td>
+                <td data-label="次数">${Number(item.count || 0)}</td><td data-label="最后发生">${this.esc(item.last_seen || '-')}</td></tr>`).join('')}</tbody>
         </table></div>`;
     },
 
@@ -141,10 +141,10 @@ const SystemOperations = {
         if (!items.length) return '<div class="system-empty-row">暂无变更记录。</div>';
         return `<div class="table-responsive"><table class="table system-compact-table align-middle mb-0">
             <thead><tr><th>变更</th><th>对象</th><th>分类</th><th>结果</th><th>时间</th></tr></thead>
-            <tbody>${items.map(item => `<tr><td><strong>${this.esc(item.summary)}</strong><small>${this.esc(item.action)}</small></td>
-                <td><code>${this.esc(item.target)}</code></td><td>${this.esc(item.category)}</td>
-                <td><span class="system-state-pill ${item.status === 'success' ? 'success' : 'danger'}">${item.status === 'success' ? '成功' : '失败'}</span></td>
-                <td>${this.formatTime(item.created_at)}</td></tr>`).join('')}</tbody></table></div>`;
+            <tbody>${items.map(item => `<tr><td data-label="变更"><strong>${this.esc(item.summary)}</strong><small>${this.esc(item.action)}</small></td>
+                <td data-label="对象"><code>${this.esc(item.target)}</code></td><td data-label="分类">${this.esc(item.category)}</td>
+                <td data-label="结果"><span class="system-state-pill ${item.status === 'success' ? 'success' : 'danger'}">${item.status === 'success' ? '成功' : '失败'}</span></td>
+                <td data-label="时间">${this.formatTime(item.created_at)}</td></tr>`).join('')}</tbody></table></div>`;
     },
 
     renderOperationsTable(items) {
@@ -153,12 +153,12 @@ const SystemOperations = {
             <thead><tr><th>任务</th><th>所有者</th><th>状态</th><th>进度</th><th>更新时间</th><th></th></tr></thead>
             <tbody>${items.map(item => {
                 const active = ['queued', 'running', 'cancelling'].includes(item.status);
-                return `<tr><td><strong>${this.esc(item.title)}</strong><small>${this.esc(item.message || item.kind)}</small></td>
-                    <td><code>${this.esc(item.owner)}</code></td>
-                    <td><span class="system-state-pill ${this.statusClass(item.status)}">${this.esc(this.statusLabel(item.status))}</span></td>
-                    <td><div class="system-progress"><span style="width:${Math.max(0, Math.min(Number(item.progress || 0), 100))}%"></span></div><small>${Number(item.progress || 0)}%</small></td>
-                    <td>${this.formatTime(item.updated_at)}</td>
-                    <td>${active ? `<button class="btn btn-sm btn-light border" onclick="SystemOperations.cancelOperation('${this.esc(item.operation_id)}')">取消</button>` : ''}</td></tr>`;
+                return `<tr><td data-label="任务"><strong>${this.esc(item.title)}</strong><small>${this.esc(item.message || item.kind)}</small></td>
+                    <td data-label="所有者"><code>${this.esc(item.owner)}</code></td>
+                    <td data-label="状态"><span class="system-state-pill ${this.statusClass(item.status)}">${this.esc(this.statusLabel(item.status))}</span></td>
+                    <td data-label="进度"><div class="system-progress"><span style="width:${Math.max(0, Math.min(Number(item.progress || 0), 100))}%"></span></div><small>${Number(item.progress || 0)}%</small></td>
+                    <td data-label="更新时间">${this.formatTime(item.updated_at)}</td>
+                    <td data-label="操作" class="system-table-action-cell">${active ? `<button class="btn btn-sm btn-light border" onclick="SystemOperations.cancelOperation('${this.esc(item.operation_id)}')">取消</button>` : ''}</td></tr>`;
             }).join('')}</tbody></table></div>`;
     },
 
@@ -301,22 +301,26 @@ const SystemOperations = {
                         <span><strong>${backups.length}</strong> 个${backups[0] ? ` · 最近 ${this.formatTime(backups[0].created_at)}` : ' · 尚无备份'}</span>
                     </div>
                     <div class="backup-command-actions">
-                        <span class="backup-security-chip" title="${this.esc(overview.security?.warning || '')}"><i class="bi bi-shield-exclamation"></i>未加密</span>
-                        <label class="backup-profile-control"><span class="visually-hidden">备份类型</span><select id="backupProfile" class="form-select form-select-sm" onchange="SystemOperations.updateBackupProfileCopy()"><option value="state">状态备份</option><option value="migration">完整迁移</option></select></label>
-                        <span class="backup-profile-copy" id="backupProfileCopy">配置、数据库与插件数据</span>
-                        <details class="backup-options-menu">
-                            <summary class="btn btn-light border btn-sm"><i class="bi bi-sliders me-1"></i>范围<i class="bi bi-chevron-down backup-options-chevron"></i></summary>
-                            <div class="backup-options-popover">
-                                <strong>额外包含</strong>
-                                <label class="form-check"><input id="backupGenerated" class="form-check-input" type="checkbox" checked><span>生成内容</span></label>
-                                <label class="form-check"><input id="backupDiagnostics" class="form-check-input" type="checkbox"><span>调用诊断</span></label>
-                                <label class="form-check"><input id="backupModels" class="form-check-input" type="checkbox"><span>本地模型</span></label>
-                                <label class="form-check"><input id="backupMachineBound" class="form-check-input" type="checkbox"><span>机器绑定数据</span></label>
-                            </div>
-                        </details>
-                        <button class="btn btn-primary btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="SystemOperations.createBackup()"><i class="bi bi-archive me-1"></i>创建</button>
-                        <button class="btn btn-light border btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="document.getElementById('backupImportFile').click()"><i class="bi bi-upload me-1"></i>导入</button>
-                        <button class="btn btn-light border btn-sm backup-refresh-button" onclick="SystemOperations.loadBackups()" title="刷新" aria-label="刷新备份列表"><i class="bi bi-arrow-clockwise"></i></button>
+                        <div class="backup-command-config">
+                            <span class="backup-security-chip" title="${this.esc(overview.security?.warning || '')}"><i class="bi bi-shield-exclamation"></i>未加密</span>
+                            <label class="backup-profile-control"><span class="visually-hidden">备份类型</span><select id="backupProfile" class="form-select form-select-sm" onchange="SystemOperations.updateBackupProfileCopy()"><option value="state">状态备份</option><option value="migration">完整迁移</option></select></label>
+                            <span class="backup-profile-copy" id="backupProfileCopy">配置、数据库、聊天空间与附件</span>
+                            <details class="backup-options-menu">
+                                <summary class="btn btn-light border btn-sm"><i class="bi bi-sliders me-1"></i>范围<i class="bi bi-chevron-down backup-options-chevron"></i></summary>
+                                <div class="backup-options-popover">
+                                    <strong>额外包含</strong>
+                                    <label class="form-check"><input id="backupGenerated" class="form-check-input" type="checkbox" checked><span>生成内容</span></label>
+                                    <label class="form-check"><input id="backupDiagnostics" class="form-check-input" type="checkbox"><span>调用诊断</span></label>
+                                    <label class="form-check"><input id="backupModels" class="form-check-input" type="checkbox"><span>本地模型</span></label>
+                                    <label class="form-check"><input id="backupMachineBound" class="form-check-input" type="checkbox"><span>机器绑定数据</span></label>
+                                </div>
+                            </details>
+                        </div>
+                        <div class="backup-command-buttons">
+                            <button class="btn btn-primary btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="SystemOperations.createBackup()"><i class="bi bi-archive me-1"></i>创建</button>
+                            <button class="btn btn-light border btn-sm" data-backup-action ${active ? 'disabled' : ''} onclick="document.getElementById('backupImportFile').click()"><i class="bi bi-upload me-1"></i>导入</button>
+                            <button class="btn btn-light border btn-sm backup-refresh-button" onclick="SystemOperations.loadBackups()" title="刷新" aria-label="刷新备份列表"><i class="bi bi-arrow-clockwise"></i></button>
+                        </div>
                         <input id="backupImportFile" class="d-none" type="file" accept=".zip,.mabobot-backup.zip" onchange="SystemOperations.importBackup(this)">
                     </div>
                 </header>
@@ -364,8 +368,8 @@ const SystemOperations = {
         const profile = document.getElementById('backupProfile')?.value || 'state';
         const copy = document.getElementById('backupProfileCopy');
         if (copy) copy.textContent = profile === 'migration'
-            ? '包含当前代码和插件，适合整机迁移'
-            : '配置、数据库与插件数据';
+            ? '包含 mabowx 当前代码和完整状态，适合整机迁移'
+            : '配置、数据库、聊天空间与附件';
     },
 
     renderBackupsTable(backups, pendingRestoreName = null, actionsDisabled = false) {
@@ -376,11 +380,11 @@ const SystemOperations = {
                 const pending = item.name === pendingRestoreName;
                 const disabled = actionsDisabled ? 'disabled' : '';
                 return `<tr>
-                <td><strong>${this.esc(item.name)}</strong><small>${item.imported ? '已导入' : '本机创建'} · v${this.esc(item.app_version || '-')} · ${item.valid ? '结构正常' : '结构异常'}${pending ? ' · 待恢复' : ''}</small>${item.error ? `<small class="text-danger">${this.esc(item.error)}</small>` : ''}</td>
-                <td><span class="system-state-pill ${item.profile === 'migration' ? 'primary' : 'muted'}">${item.profile === 'migration' ? '完整迁移' : '状态备份'}</span></td>
-                <td>${Number(item.file_count || 0)} 个文件 · ${this.formatBytes(item.bytes)}${item.contains_plaintext_env ? '<small class="text-warning">包含明文 .env</small>' : ''}</td>
-                <td>${this.formatTime(item.created_at)}</td>
-                <td><div class="backup-row-actions">
+                <td data-label="备份"><strong>${this.esc(item.name)}</strong><small>${item.imported ? '已导入' : '本机创建'} · v${this.esc(item.app_version || '-')} · ${item.valid ? '结构正常' : '结构异常'}${pending ? ' · 待恢复' : ''}</small>${item.error ? `<small class="text-danger">${this.esc(item.error)}</small>` : ''}</td>
+                <td data-label="类型"><span class="system-state-pill ${item.profile === 'migration' ? 'primary' : 'muted'}">${item.profile === 'migration' ? '完整迁移' : '状态备份'}</span></td>
+                <td data-label="数据">${Number(item.file_count || 0)} 个文件 · ${this.formatBytes(item.bytes)}${item.contains_plaintext_env ? '<small class="text-warning">包含明文 .env</small>' : ''}</td>
+                <td data-label="创建时间">${this.formatTime(item.created_at)}</td>
+                <td data-label="操作" class="system-table-action-cell"><div class="backup-row-actions">
                     <a class="btn btn-sm btn-light border" href="${API.backups.downloadUrl(item.name)}" title="下载"><i class="bi bi-download"></i></a>
                     <button class="btn btn-sm btn-light border" data-backup-action ${disabled} onclick="SystemOperations.validateBackup('${this.esc(item.name)}')" title="完整校验"><i class="bi bi-check2-circle"></i></button>
                     <button class="btn btn-sm btn-light border" data-backup-action ${item.valid ? '' : 'data-backup-locked="true" disabled'} ${disabled} onclick="SystemOperations.selectRestore('${this.esc(item.name)}')" title="恢复"><i class="bi bi-arrow-counterclockwise"></i></button>

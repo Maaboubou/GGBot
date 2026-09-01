@@ -4,14 +4,17 @@ LLM 配置管理 API
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, SecretStr
 from typing import Dict, List, Optional, Any
 import asyncio
 from datetime import date
 from importlib.metadata import PackageNotFoundError, version as package_version
 import logging
 import math
+import mimetypes
 import os
+from pathlib import Path
 import re
 import unicodedata
 import time
@@ -24,6 +27,10 @@ from app.models.base import get_db
 from app.models.setting import Setting
 from app.dependencies import get_plugin_manager_instance
 from app.services.model_route_catalog_service import ModelRouteCatalogService
+from app.services.model_registry_service import (
+    DEFAULT_OPENAI_COMPATIBLE_BASES,
+    get_model_registry_service,
+)
 from app.services.llm_manager import (
     GEMINI_3_SAMPLING_PARAMETERS,
     get_llm_manager,
@@ -31,6 +38,7 @@ from app.services.llm_manager import (
     reload_llm_config,
 )
 from app.services.config_service import get_setting, update_setting
+from app.services.codex_access_service import codex_access_service
 
 logger = logging.getLogger(__name__)
 
@@ -529,6 +537,18 @@ class ReorderRequest(BaseModel):
     order: List[str]
 
 
+class ModelCatalogDiscoveryRequest(BaseModel):
+    """Connection details used only for an explicit model-catalog refresh."""
+    provider: str = ""
+    q: str = ""
+    limit: int = 300
+    model_id: str = ""
+    api_base: str = ""
+    credential_name: str = ""
+    api_key: SecretStr = SecretStr("")
+    refresh: bool = True
+
+
 # ==================== 模型配置接口 ====================
 
 @router.get("/models")
@@ -567,27 +587,203 @@ async def reorder_models(req: ReorderRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _resolve_catalog_reference(value: Any, db: Session) -> str:
+    """Resolve env:: references without exposing their values in API responses."""
+    text = str(value or "").strip()
+    match = ENV_REFERENCE_PATTERN.fullmatch(text)
+    if not match:
+        return text
+    name = match.group(1)
+    return str(get_setting(name, "", db=db) or os.getenv(name, "") or "").strip()
+
+
+def _same_catalog_base(left: str, right: str) -> bool:
+    try:
+        left_parts = urlsplit(str(left or "").strip())
+        right_parts = urlsplit(str(right or "").strip())
+    except ValueError:
+        return False
+    return (
+        left_parts.scheme.lower(),
+        left_parts.netloc.lower(),
+        left_parts.path.rstrip("/"),
+    ) == (
+        right_parts.scheme.lower(),
+        right_parts.netloc.lower(),
+        right_parts.path.rstrip("/"),
+    )
+
+
+def _resolve_catalog_connection(
+    *,
+    provider: str,
+    model_id: str,
+    api_base: str,
+    credential_name: str,
+    direct_api_key: str,
+    db: Session,
+) -> tuple[str, str, str]:
+    """Resolve a discovery connection while preventing stored-key endpoint overrides."""
+    provider_key = str(provider or "").strip().lower()
+    requested_base = _resolve_catalog_reference(api_base, db)
+    explicit_key = str(direct_api_key or "").strip()
+    models = get_llm_manager().config.get("models", {})
+    saved_config = models.get(str(model_id or "").strip())
+
+    if isinstance(saved_config, dict):
+        saved_provider = _infer_model_provider(saved_config)
+        saved_base = _resolve_catalog_reference(saved_config.get("api_base"), db)
+        saved_key = _resolve_catalog_reference(saved_config.get("api_key"), db)
+        # A newly entered key belongs to the form's endpoint. Otherwise the
+        # stored key may only be sent to the endpoint stored alongside it.
+        if explicit_key:
+            return provider_key or saved_provider, requested_base or saved_base, explicit_key
+        return saved_provider, saved_base, saved_key
+
+    if explicit_key:
+        return provider_key, requested_base, explicit_key
+
+    name = str(credential_name or "").strip() or CATALOG_PROVIDER_ENV_VARS.get(provider_key, "")
+    stored_key = ""
+    if name:
+        normalized_name = _validate_credential_name(name)
+        default_base = DEFAULT_OPENAI_COMPATIBLE_BASES.get(provider_key, "")
+        safe_default_target = not requested_base or (default_base and _same_catalog_base(requested_base, default_base))
+        if safe_default_target:
+            stored_key = str(get_setting(normalized_name, "", db=db) or os.getenv(normalized_name, "") or "").strip()
+    return provider_key, requested_base, stored_key
+
+
+async def _build_dynamic_model_catalog(
+    *,
+    provider: str,
+    query: str,
+    limit: int,
+    model_id: str,
+    api_base: str,
+    credential_name: str,
+    direct_api_key: str,
+    force_refresh: bool,
+    db: Session,
+) -> Dict[str, Any]:
+    provider_key = str(provider or "").strip().lower()
+    if not provider_key:
+        return {
+            "models": [],
+            "discovery": {
+                "status": "idle",
+                "attempted": False,
+                "models_count": 0,
+                "message": "选择供应商后可同步服务端模型",
+            },
+        }
+
+    resolved_provider, resolved_base, resolved_key = _resolve_catalog_connection(
+        provider=provider_key,
+        model_id=model_id,
+        api_base=api_base,
+        credential_name=credential_name,
+        direct_api_key=direct_api_key,
+        db=db,
+    )
+    registry = get_model_registry_service()
+    discovery = await registry.discover(
+        provider=resolved_provider,
+        api_base=resolved_base,
+        api_key=resolved_key,
+        force_refresh=force_refresh,
+    )
+    static_models = build_model_catalog(resolved_provider, query=query, limit=300)
+    models = registry.merge_catalog(
+        provider=resolved_provider,
+        static_models=static_models,
+        discovery=discovery,
+        query=query,
+        limit=limit,
+    )
+    public_discovery = {key: value for key, value in discovery.items() if key != "models"}
+    public_discovery["models_count"] = len(discovery.get("models") or [])
+    return {"models": models, "discovery": public_discovery}
+
+
 @router.get("/models/catalog")
 async def get_model_catalog(
     provider: str = Query("", max_length=80),
     q: str = Query("", max_length=120),
     limit: int = Query(120, ge=1, le=300),
+    model_id: str = Query("", max_length=80),
+    refresh: bool = Query(False),
+    db: Session = Depends(get_db),
 ):
-    """Return providers and chat models from the locally installed LiteLLM catalog."""
+    """Return a live-aware catalog enriched by the installed LiteLLM metadata."""
     try:
         provider_key = str(provider or "").strip().lower()
+        catalog = await _build_dynamic_model_catalog(
+            provider=provider_key,
+            query=q,
+            limit=limit,
+            model_id=model_id,
+            api_base="",
+            credential_name="",
+            direct_api_key="",
+            force_refresh=refresh,
+            db=db,
+        )
         return {
             "status": "success",
             "data": {
-                "source": "litellm-local",
+                "source": "dynamic-registry",
                 "version": get_litellm_version(),
                 "providers": list_catalog_providers(),
-                "models": build_model_catalog(provider_key, query=q, limit=limit) if provider_key else [],
+                **catalog,
             },
         }
+    except HTTPException:
+        raise
     except Exception as exc:
-        logger.error("获取 LiteLLM 模型目录失败: %s", exc)
-        raise HTTPException(status_code=500, detail="无法读取本地 LiteLLM 模型目录") from exc
+        logger.error("获取动态模型目录失败: %s", exc)
+        raise HTTPException(status_code=500, detail="无法读取模型目录") from exc
+
+
+@router.post("/models/catalog/discover")
+async def discover_model_catalog(
+    request: ModelCatalogDiscoveryRequest,
+    db: Session = Depends(get_db),
+):
+    """Explicitly refresh a provider catalog, including unsaved form credentials."""
+    direct_api_key = request.api_key.get_secret_value()
+    if len(request.provider) > 80 or len(request.q) > 120 or len(request.model_id) > 80:
+        raise HTTPException(status_code=422, detail="模型目录查询参数过长")
+    if len(request.api_base) > 1000 or len(request.credential_name) > 120 or len(direct_api_key) > 16384:
+        raise HTTPException(status_code=422, detail="模型连接参数过长")
+    if request.limit < 1 or request.limit > 300:
+        raise HTTPException(status_code=422, detail="limit 必须在 1–300 之间")
+    try:
+        catalog = await _build_dynamic_model_catalog(
+            provider=request.provider,
+            query=request.q,
+            limit=request.limit,
+            model_id=request.model_id,
+            api_base=request.api_base,
+            credential_name=request.credential_name,
+            direct_api_key=direct_api_key,
+            force_refresh=bool(request.refresh),
+            db=db,
+        )
+        return {
+            "status": "success",
+            "data": {
+                "source": "dynamic-registry",
+                "version": get_litellm_version(),
+                "providers": list_catalog_providers(),
+                **catalog,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("刷新动态模型目录失败: %s", exc)
+        raise HTTPException(status_code=500, detail="无法刷新模型目录") from exc
 
 
 def _validate_credential_name(name: str) -> str:
@@ -833,7 +1029,7 @@ async def test_model_connectivity(model_id: str):
         )
         # _build_single_model_params 会带上 Mabobot 内部元数据用于主调用链的视觉降级判断；
         # 这里是模型连通性测试，直接调用 LiteLLM 前必须移除，避免透传到 OpenAI client。
-        params.pop("_wxautox_supports_vision", None)
+        params.pop("_mabobot_supports_vision", None)
         params["drop_params"] = True
 
         t0 = time.perf_counter()
@@ -1179,6 +1375,89 @@ async def get_plugin_stats(plugin_name: str):
 
 # ==================== 调用历史 ====================
 
+CALL_HISTORY_INLINE_IMAGE_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff",
+})
+
+
+def _public_call_history_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Return history content without exposing server-local attachment paths."""
+    public_entry = dict(entry or {})
+    public_attachments = []
+    for index, item in enumerate(public_entry.get("response_attachments") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            size = max(0, int(item.get("size") or 0))
+        except (TypeError, ValueError):
+            size = 0
+        public_attachments.append({
+            "index": index,
+            "type": str(item.get("type") or "file"),
+            "mime_type": str(item.get("mime_type") or "application/octet-stream"),
+            "name": str(item.get("name") or "附件"),
+            "size": size,
+            "sha256": str(item.get("sha256") or ""),
+        })
+    public_entry["response_attachments"] = public_attachments
+    return public_entry
+
+
+def _history_path_is_link_like(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(callable(is_junction) and is_junction())
+    except OSError:
+        return True
+
+
+def _resolve_call_history_attachment(
+    entry: Dict[str, Any],
+    attachment_index: int,
+) -> tuple[Path, str, str, bool]:
+    """Resolve one recorded attachment inside its trusted per-chat artifact root."""
+    attachments = entry.get("response_attachments") or []
+    if not isinstance(attachments, list) or not 0 <= attachment_index < len(attachments):
+        raise HTTPException(status_code=404, detail="响应附件不存在")
+    attachment = attachments[attachment_index]
+    if not isinstance(attachment, dict):
+        raise HTTPException(status_code=404, detail="响应附件不存在")
+
+    chat_name = str(entry.get("chat_name") or "").strip()
+    raw_path = str(attachment.get("path") or "").strip()
+    if not chat_name or not raw_path:
+        raise HTTPException(status_code=404, detail="响应附件不存在")
+
+    try:
+        access_context = codex_access_service.for_chat(chat_name, ensure=False)
+        configured_root = Path(access_context.artifact_root)
+        if _history_path_is_link_like(configured_root):
+            raise ValueError("unsafe artifact root")
+        allowed_root = configured_root.resolve(strict=True)
+        resolved = Path(raw_path).expanduser().resolve(strict=True)
+        resolved.relative_to(allowed_root)
+        if not resolved.is_file():
+            raise ValueError("attachment is not a file")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "拒绝读取不在聊天隔离输出目录内的调用历史附件: chat=%s index=%s",
+            chat_name,
+            attachment_index,
+        )
+        raise HTTPException(status_code=404, detail="响应附件不存在") from exc
+
+    raw_name = str(attachment.get("name") or resolved.name).strip().replace("\\", "/")
+    filename = raw_name.rsplit("/", 1)[-1] or resolved.name
+    guessed_mime = mimetypes.guess_type(resolved.name)[0]
+    mime_type = guessed_mime or "application/octet-stream"
+    inline_image = resolved.suffix.lower() in CALL_HISTORY_INLINE_IMAGE_SUFFIXES
+    return resolved, filename, mime_type, inline_image
+
+
 @router.get("/call-history/summary")
 async def get_call_history_summary():
     """获取调用历史概览：所有已记录的 plugin.call_type 列表"""
@@ -1209,7 +1488,11 @@ async def get_call_history(plugin_name: str = None, call_type: str = None, limit
             plugin_name=plugin_name,
             call_type=call_type
         )
-        return {"status": "success", "data": history}
+        public_history = {
+            key: [_public_call_history_entry(entry) for entry in entries]
+            for key, entries in history.items()
+        }
+        return {"status": "success", "data": public_history}
     except Exception as e:
         logger.error(f"获取调用历史失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1223,12 +1506,42 @@ async def get_call_history_entry(plugin_name: str, call_type: str, index: int = 
         entry = llm_manager.get_call_history_entry(plugin_name, call_type, index)
         if entry is None:
             raise HTTPException(status_code=404, detail="调用记录不存在")
-        return {"status": "success", "data": entry}
+        return {"status": "success", "data": _public_call_history_entry(entry)}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"获取调用历史详情失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/call-history/attachment")
+async def get_call_history_attachment(
+    plugin_name: str,
+    call_type: str,
+    index: int = Query(..., ge=0),
+    attachment_index: int = Query(..., ge=0),
+    download: bool = Query(False),
+):
+    """Preview or download a recorded response attachment within its chat boundary."""
+    llm_manager = get_llm_manager()
+    entry = llm_manager.get_call_history_entry(plugin_name, call_type, index)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="调用记录不存在")
+    path, filename, mime_type, inline_image = _resolve_call_history_attachment(
+        entry,
+        attachment_index,
+    )
+    return FileResponse(
+        path=path,
+        filename=filename,
+        media_type=mime_type,
+        content_disposition_type=("inline" if inline_image and not download else "attachment"),
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox",
+        },
+    )
 
 
 # ==================== 健康检查 ====================

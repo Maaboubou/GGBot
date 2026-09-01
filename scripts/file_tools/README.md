@@ -1,14 +1,14 @@
 # Chatbot file tools
 
 The chatbot's isolated Codex runtime uses user-level tools instead of requiring
-root access. Native binaries live under `~/.local/share/wxautox-file-tools`
-and ClamAV under `~/.local/share/wxautox-clamav`. The official Tesseract
-overlay uses the stable path `~/.local/share/wxautox-tesseract`; its version is
+root access. Native binaries live under `~/.local/share/mabobot-file-tools`
+and ClamAV under `~/.local/share/mabobot-clamav`. The official Tesseract
+overlay uses the stable path `~/.local/share/mabobot-tesseract`; its version is
 reported by the binary and is not encoded in the repository configuration.
 
 The launchers in this directory provide the required library/data paths and
 bounded ImageMagick resources. They are installed into `~/.local/bin`; native
-command names are symlinked to `wxautox-native-tool`.
+command names are symlinked to `mabobot-native-tool`.
 
 LibreOffice is intentionally not exposed to isolated chatbot runs: its Linux
 single-instance startup requires local IPC capabilities that the untrusted-file
@@ -19,15 +19,15 @@ Run `./scripts/file_tools/install_launchers.sh` once on each machine, and again
 after changing a launcher or replacing the native environment. The installer
 is idempotent: it detects an existing user-level tool environment (including a
 non-default `~/.local/share/*` prefix), preserves working direct launchers, and
-writes `~/.local/share/wxautox/runtime/file-tools.json`. Refresh ClamAV
+writes `~/.local/share/mabobot/runtime/file-tools.json`. Refresh ClamAV
 signatures with `freshclam`. Python-side tools are recorded separately in
 `requirements-file-tools.txt` so the main Windows chatbot environment is not
 forced to install WSL-only OCR dependencies.
 
 All defaults are derived from the runtime user's `$HOME`. Machines with a
-different layout can set `WXAUTOX_LOCAL_BIN`, `WXAUTOX_FILE_TOOLS_PREFIX`,
-`WXAUTOX_TESSERACT_PREFIX`, `WXAUTOX_CLAMAV_ROOT`,
-`WXAUTOX_CLAMAV_DATABASE`, or `WXAUTOX_CLAMAV_TEMP` before starting the
+different layout can set `MABOBOT_LOCAL_BIN`, `MABOBOT_FILE_TOOLS_PREFIX`,
+`MABOBOT_TESSERACT_PREFIX`, `MABOBOT_CLAMAV_ROOT`,
+`MABOBOT_CLAMAV_DATABASE`, or `MABOBOT_CLAMAV_TEMP` before starting the
 chatbot and running the launcher installer. A machine without
 these optional tools still starts normally; the chatbot probes the WSL runtime
 directly and only advertises commands it can actually find. The Codex 运行中心

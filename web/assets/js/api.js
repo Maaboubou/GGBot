@@ -65,7 +65,18 @@ const API = {
         },
         restart: (serviceName) => API.post(`/api/system/restart/${serviceName}`),
         getRestartCapabilities: () => API.get('/api/system/restart-capabilities'),
+        getProcesses: () => API.get('/api/system/processes'),
+        controlBot: (action) => API.post(`/api/system/control/bot/${encodeURIComponent(action)}`),
         checkHealth: () => API.get('/health')
+    },
+
+    systemTools: {
+        getOverview: (refresh = false) => API.get(`/api/system/tools${refresh ? '?refresh=true' : ''}`),
+        checkAll: () => API.post('/api/system/tools/check', {}),
+        check: toolId => API.post(`/api/system/tools/${encodeURIComponent(toolId)}/check`, {}),
+        update: toolId => API.post(`/api/system/tools/${encodeURIComponent(toolId)}/update`, {}),
+        rollback: toolId => API.post(`/api/system/tools/${encodeURIComponent(toolId)}/rollback`, {}),
+        repair: toolId => API.post(`/api/system/tools/${encodeURIComponent(toolId)}/repair`, {})
     },
 
     litellm: {
@@ -186,6 +197,10 @@ const API = {
         }),
         delete: profileId => API.delete(`/api/codex/profiles/${encodeURIComponent(profileId)}`),
         setDefault: profileId => API.put('/api/codex/profiles/default/selection', { profile_id: profileId }),
+        syncLocalAuth: profileId => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/auth/sync`,
+            {}
+        ),
         startOAuth: (profileId, force = false) => API.post(
             `/api/codex/profiles/${encodeURIComponent(profileId)}/oauth/start`,
             { force }
@@ -197,12 +212,55 @@ const API = {
             `/api/codex/profiles/${encodeURIComponent(profileId)}/oauth/cancel`,
             {}
         ),
+        finalizeSetup: (profileId, payload) => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/setup/finalize`,
+            payload
+        ),
+        cancelSetup: profileId => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/setup/cancel`,
+            {}
+        ),
         logoutOAuth: profileId => API.post(
             `/api/codex/profiles/${encodeURIComponent(profileId)}/oauth/logout`,
             {}
         ),
         getModels: profileId => API.get(
             `/api/codex/profiles/${encodeURIComponent(profileId)}/models`
+        )
+    },
+
+    codexSkills: {
+        list: profileId => API.get(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills`
+        ),
+        get: (profileId, scope, skillName) => API.get(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills/${encodeURIComponent(scope)}/${encodeURIComponent(skillName)}`
+        ),
+        create: (profileId, payload) => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills`,
+            payload
+        ),
+        installGithub: (profileId, payload) => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills/install/github`,
+            payload
+        ),
+        update: (profileId, skillName, content) => API.put(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills/profile/${encodeURIComponent(skillName)}`,
+            { content }
+        ),
+        setEnabled: (profileId, skillName, enabled) => API.put(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills/profile/${encodeURIComponent(skillName)}/enabled`,
+            { enabled }
+        ),
+        archive: (profileId, skillName) => API.delete(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills/profile/${encodeURIComponent(skillName)}`
+        ),
+        listTrash: profileId => API.get(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills/trash`
+        ),
+        restore: (profileId, trashId) => API.post(
+            `/api/codex/profiles/${encodeURIComponent(profileId)}/skills/trash/${encodeURIComponent(trashId)}/restore`,
+            {}
         )
     },
 

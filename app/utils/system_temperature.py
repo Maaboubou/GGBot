@@ -170,7 +170,7 @@ def _read_lhm_http_temperatures() -> List[Dict[str, Any]]:
     for address in addresses:
         request = Request(
             f"http://{address}:8085/data.json",
-            headers={"User-Agent": "wxautox4-system-monitor/1.0"},
+            headers={"User-Agent": "Mabobot-SystemMonitor/1.0"},
         )
         try:
             with urlopen(request, timeout=2) as response:

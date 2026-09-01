@@ -235,7 +235,7 @@ def _configured_roots(values: Iterable[str], home: Path, uid: Optional[int]) -> 
 
 
 def _registered_roots(home: Path, uid: Optional[int]) -> list[str]:
-    manifest = home / ".local/share/wxautox/runtime/file-tools.json"
+    manifest = home / ".local/share/mabobot/runtime/file-tools.json"
     try:
         metadata = manifest.stat()
         if uid is not None and metadata.st_uid != uid:
@@ -350,7 +350,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_PROXY_WSL_BIN", "codex"))
     parser.add_argument("--trusted-root", action="append", default=[])
-    parser.add_argument("--write-manifest", nargs="?", const="~/.local/share/wxautox/runtime/file-tools.json")
+    parser.add_argument("--write-manifest", nargs="?", const="~/.local/share/mabobot/runtime/file-tools.json")
     parser.add_argument("--json", action="store_true", help="Retained for an explicit machine-readable CLI contract.")
     args = parser.parse_args()
     snapshot = probe(codex_bin=args.codex_bin, configured_roots=args.trusted_root)

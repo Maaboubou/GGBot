@@ -37,6 +37,7 @@ from app.services.wechat_file_store import (
     local_path_from_external,
     safe_file_name,
 )
+from app.utils.subprocess_utils import hidden_process_kwargs
 
 try:
     import tiktoken
@@ -125,12 +126,12 @@ def _permission_profile_config_args(
     if not normalized:
         return []
     args = ["-c", f'default_permissions="{normalized}"'] if select_default else []
-    if normalized != "wxautox-chat-isolated":
+    if normalized != "mabobot-chat-isolated":
         return args
 
     # Root deny is intentional: :workspace alone permits broad reads. Missing
     # optional paths are harmless; portable per-user roots use ``~`` and custom
-    # tool installations can be supplied through the WXAUTOX_* variables.
+    # tool installations can be supplied through the MABOBOT_* variables.
     if runtime_uid is None:
         runtime_uid = _codex_runtime_uid(False)
     filesystem_permissions = [
@@ -150,17 +151,17 @@ def _permission_profile_config_args(
             ("~/.hermes/node/lib/node_modules/@openai/codex", "read"),
             ("~/.local/bin", "read"),
             ("~/.local/lib", "read"),
-            ("~/.local/share/wxautox-file-tools", "read"),
-            ("~/.local/share/wxautox-doc-tools", "read"),
-            ("~/.local/share/wxautox-tesseract", "read"),
-            ("~/.local/share/wxautox-clamav/usr/local", "read"),
-            ("~/.local/share/wxautox-clamav-db", "read"),
-            ("~/.local/share/wxautox/runtime", "read"),
+            ("~/.local/share/mabobot-file-tools", "read"),
+            ("~/.local/share/mabobot-doc-tools", "read"),
+            ("~/.local/share/mabobot-tesseract", "read"),
+            ("~/.local/share/mabobot-clamav/usr/local", "read"),
+            ("~/.local/share/mabobot-clamav-db", "read"),
+            ("~/.local/share/mabobot/runtime", "read"),
             ("~/.local/share/uv/tools", "read"),
-            ("~/.local/share/fonts/wxautox", "read"),
+            ("~/.local/share/fonts/mabobot", "read"),
             ("/usr/share/fonts", "read"),
-            ("/tmp/wxautox-clamav-tmp", "write"),
-            ("/tmp/wxautox-fontconfig-cache", "write"),
+            ("/tmp/mabobot-clamav-tmp", "write"),
+            ("/tmp/mabobot-fontconfig-cache", "write"),
             ("~/.codex/skills", "read"),
             ("~/.agents/skills", "read"),
             ("~/.codex/plugins/cache", "read"),
@@ -178,12 +179,19 @@ def _permission_profile_config_args(
     )
     args.extend(
         [
+            # The managed API provider reads its credential in the Codex
+            # process.  Never pass that credential (or other application
+            # secrets) on to model-controlled shell subprocesses.
             "-c",
-            'permissions.wxautox-chat-isolated.extends=":workspace"',
+            'shell_environment_policy.inherit="core"',
             "-c",
-            f"permissions.wxautox-chat-isolated.filesystem={{{filesystem_config}}}",
+            "shell_environment_policy.ignore_default_excludes=false",
             "-c",
-            "permissions.wxautox-chat-isolated.network.enabled=false",
+            'permissions.mabobot-chat-isolated.extends=":workspace"',
+            "-c",
+            f"permissions.mabobot-chat-isolated.filesystem={{{filesystem_config}}}",
+            "-c",
+            "permissions.mabobot-chat-isolated.network.enabled=false",
         ]
     )
     return args
@@ -407,6 +415,78 @@ def _is_within_path(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_link_like(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(callable(is_junction) and is_junction())
+    except OSError:
+        return True
+
+
+def _artifact_request_dir_is_safe(request_dir: Path) -> bool:
+    """Reject link-based escapes in one host-managed artifact request."""
+    request_dir = Path(request_dir)
+    artifact_root = request_dir.parent
+    try:
+        chain = (artifact_root, request_dir)
+        if any(_is_link_like(path) or not path.is_dir() for path in chain):
+            return False
+        resolved_root = artifact_root.resolve(strict=True)
+        resolved_request = request_dir.resolve(strict=True)
+        return resolved_request.parent == resolved_root
+    except OSError:
+        return False
+
+
+def _artifact_output_dir_is_safe(output_dir: Path) -> bool:
+    """Reject link-based escapes in the host-managed request/output chain."""
+    output_dir = Path(output_dir)
+    request_dir = output_dir.parent
+    if not _artifact_request_dir_is_safe(request_dir):
+        return False
+    try:
+        if _is_link_like(output_dir) or not output_dir.is_dir():
+            return False
+        return output_dir.resolve(strict=True).parent == request_dir.resolve(strict=True)
+    except OSError:
+        return False
+
+
+def _prepare_artifact_output_dir(
+    artifact_root: Path,
+    request_id: str,
+    *,
+    fail_closed: bool,
+) -> tuple[Path, Path]:
+    """Create a fresh host-owned output directory without following chat links."""
+    artifact_root = Path(artifact_root)
+    request_dir = artifact_root / request_id
+    output_dir = request_dir / "outputs"
+    if not fail_closed:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return request_dir, output_dir
+
+    try:
+        if _is_link_like(artifact_root.parent) or _is_link_like(artifact_root):
+            raise CodexProxyError("Codex artifact root must not be a symbolic link")
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        if _is_link_like(artifact_root) or not artifact_root.is_dir():
+            raise CodexProxyError("Codex artifact root is not a safe directory")
+        if request_dir.exists() or _is_link_like(request_dir):
+            raise CodexProxyError("Codex artifact request directory already exists")
+        request_dir.mkdir()
+        output_dir.mkdir()
+    except CodexProxyError:
+        raise
+    except OSError as exc:
+        raise CodexProxyError(f"Could not create safe Codex artifact directory: {exc}") from exc
+    if not _artifact_output_dir_is_safe(output_dir):
+        raise CodexProxyError("Codex artifact output directory failed safety validation")
+    return request_dir, output_dir
 
 
 def _path_for_wsl(path: Path) -> str:
@@ -673,7 +753,8 @@ def parse_codex_generated_image_paths(stdout: str) -> List[str]:
 
 
 _DIRECT_IMAGE_ACTION_RE = re.compile(
-    r"(?:生成|画|绘制|出|来|做|制作|创建|设计|编辑|修改|改成|修图|美化|换成).{0,16}"
+    r"(?:生成|画|绘制|出|来|做|制作|创建|设计|编辑|修改|改成|修图|美化|换成|"
+    r"添加|加上|加进|加入|放进|放入|放到|合成|融入|[Pp]图).{0,16}"
     r"(?:图片|图像|照片|海报|插画|头像|壁纸|封面|自拍|表情包|一张|[1１]张)"
     r"|(?:图片|图像|照片|海报|插画|头像|壁纸|封面|自拍|表情包).{0,16}"
     r"(?:生成|画|绘制|做|制作|创建|设计|编辑|修改|改成|修图|美化|换成)"
@@ -689,7 +770,8 @@ _MULTIPLE_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _IMAGE_EDIT_ACTION_RE = re.compile(
-    r"(?:改|修改|编辑|修|美化|换|去掉|去除|删除|添加|加上|抠图|扩图|重绘|变成)"
+    r"(?:改|修改|编辑|修|美化|换|去掉|去除|删除|添加|加上|加进|加入|放进|放入|"
+    r"放到|合成|融入|[Pp]图|抠图|扩图|重绘|变成)"
     r"|\b(?:edit|change|modify|retouch|remove|add|replace|transform)\b",
     re.IGNORECASE,
 )
@@ -850,10 +932,88 @@ def _is_trusted_generated_image_path(saved_path: str) -> bool:
     if any(part in {".", ".."} for part in parts):
         return False
     folded = [part.casefold() for part in parts]
-    return any(
-        folded[index] == ".codex" and folded[index + 1] == "generated_images"
-        for index in range(max(0, len(folded) - 1))
-    )
+    for index, part in enumerate(folded):
+        if part != ".codex":
+            continue
+        if index + 1 < len(folded) and folded[index + 1] == "generated_images":
+            return True
+        if (
+            index + 3 < len(folded)
+            and folded[index + 1] == "mabobot-profiles"
+            and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", folded[index + 2])
+            and folded[index + 3] == "generated_images"
+        ):
+            return True
+    return False
+
+
+def _materialize_codex_generated_image(
+    saved_path: str,
+    *,
+    output_dir: Path,
+    index: int,
+    use_wsl: bool,
+) -> Optional[Path]:
+    """Copy one trusted imagegen result into a managed attachment directory."""
+    if not _is_trusted_generated_image_path(saved_path):
+        logger.warning("Rejected untrusted Codex generated-image path")
+        return None
+    if not _artifact_output_dir_is_safe(output_dir):
+        logger.error("Rejected unsafe Codex generated-image output directory")
+        return None
+
+    suffix = Path(saved_path.replace("\\", "/")).suffix.casefold()
+    file_name = "generated-image" + (f"-{index}" if index > 1 else "") + suffix
+    destination = output_dir / file_name
+    temp_path = output_dir / f".{file_name}.{uuid.uuid4().hex}.tmp{suffix}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        max_bytes = max(
+            1,
+            int(os.getenv("CODEX_GENERATED_IMAGE_MAX_BYTES") or 64 * 1024 * 1024),
+        )
+    except (TypeError, ValueError):
+        max_bytes = 64 * 1024 * 1024
+    try:
+        if use_wsl and os.name == "nt":
+            source = _windows_path_for_wsl(saved_path)
+            if source.is_symlink() or not source.is_file():
+                return None
+        else:
+            source = Path(saved_path).expanduser()
+            source_was_symlink = source.is_symlink()
+            try:
+                source = source.resolve(strict=True)
+            except OSError:
+                return None
+            if (
+                source_was_symlink
+                or not source.is_file()
+                or not _is_trusted_generated_image_path(str(source))
+            ):
+                return None
+        source_size = source.stat().st_size
+        if source_size <= 0 or source_size > max_bytes:
+            logger.warning("Rejected empty or oversized Codex generated image")
+            return None
+        shutil.copyfile(source, temp_path)
+
+        if not temp_path.is_file() or temp_path.stat().st_size > max_bytes:
+            logger.warning("Rejected missing or oversized Codex generated image")
+            return None
+        if not _is_valid_image_file(temp_path):
+            logger.warning("Rejected structurally invalid Codex generated image")
+            return None
+        os.replace(temp_path, destination)
+        return destination
+    except OSError:
+        logger.exception("Failed to materialize Codex generated image")
+        return None
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _default_text_for_attachments(attachments: List[Dict[str, Any]]) -> str:
@@ -865,7 +1025,8 @@ def _default_text_for_attachments(attachments: List[Dict[str, Any]]) -> str:
 def _collect_artifact_attachments(output_dir: Path) -> List[Dict[str, Any]]:
     attachments: List[Dict[str, Any]] = []
     seen_hashes = set()
-    if not output_dir.exists():
+    if not _artifact_output_dir_is_safe(output_dir):
+        logger.error("Rejected unsafe Codex artifact output directory: %s", output_dir)
         return attachments
 
     for path in sorted(output_dir.rglob("*")):
@@ -914,6 +1075,9 @@ def _write_artifact_manifest(
 ) -> Optional[Path]:
     if not attachments:
         return None
+    if not _artifact_output_dir_is_safe(request_dir / "outputs"):
+        logger.error("Refusing to write a manifest through an unsafe artifact directory")
+        return None
     retention_days = max(1, int(os.getenv("CODEX_ARTIFACT_RETENTION_DAYS", "30")))
     created_at = datetime.now()
     manifest = {
@@ -957,6 +1121,9 @@ def _cleanup_expired_artifacts(
             return 0
         _ARTIFACT_CLEANUP_LAST_RUN = monotonic_now
 
+        if _is_link_like(artifact_root):
+            logger.error("Skipping cleanup for linked Codex artifact root: %s", artifact_root)
+            return 0
         root = artifact_root.resolve()
         if not root.exists() or not root.is_dir():
             return 0
@@ -965,7 +1132,7 @@ def _cleanup_expired_artifacts(
         for manifest_path in root.glob("*/manifest.json"):
             request_dir = manifest_path.parent
             try:
-                if request_dir.parent.resolve() != root:
+                if _is_link_like(request_dir) or request_dir.parent.resolve() != root:
                     continue
                 payload = json.loads(manifest_path.read_text(encoding="utf-8"))
                 request_id = str(payload.get("request_id") or "")
@@ -1304,7 +1471,7 @@ def parse_codex_json_usage(stdout: str) -> Dict[str, Any]:
 
 _O200K_ENCODING = None
 _O200K_ENCODING_LOCK = threading.Lock()
-_O200K_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790"
+_O200K_CACHE_FILENAME = "fb374d419588a4632f3f557e76b4b70aebbca790"
 
 
 def _bundled_o200k_cache_dir() -> Optional[Path]:
@@ -1317,7 +1484,7 @@ def _bundled_o200k_cache_dir() -> Optional[Path]:
         / "litellm_core_utils"
         / "tokenizers"
     )
-    if (cache_dir / _O200K_CACHE_KEY).is_file():
+    if (cache_dir / _O200K_CACHE_FILENAME).is_file():
         return cache_dir
     return None
 
@@ -1473,6 +1640,7 @@ class CodexCliClient:
         codex_bin: Optional[str] = None,
         workdir: Optional[str] = None,
         timeout_seconds: int = 600,
+        permission_read_roots: Optional[Iterable[str]] = None,
     ) -> None:
         self.workdir = str(Path(workdir or os.getenv("CODEX_PROXY_WORKDIR") or Path.cwd()).resolve())
         self.timeout_seconds = timeout_seconds
@@ -1486,6 +1654,13 @@ class CodexCliClient:
             )
         )
         self.codex_bin = self._resolve_codex_bin(configured_bin)
+        self.permission_read_roots = tuple(
+            dict.fromkeys(
+                str(path).strip()
+                for path in permission_read_roots or ()
+                if str(path).strip().startswith("/")
+            )
+        )
         self._generated_images_root_cache: Optional[str] = None
 
     @staticmethod
@@ -1530,6 +1705,7 @@ class CodexCliClient:
                     stderr=subprocess.DEVNULL,
                     timeout=10,
                     check=False,
+                    **hidden_process_kwargs(),
                 )
             except Exception:
                 try:
@@ -1559,6 +1735,7 @@ class CodexCliClient:
                         stderr=subprocess.DEVNULL,
                         timeout=10,
                         check=False,
+                        **hidden_process_kwargs(),
                     )
                 except Exception:
                     logger.exception("Codex request %s: failed to clean WSL codex children", request_id)
@@ -1596,56 +1773,27 @@ class CodexCliClient:
         index: int,
     ) -> Optional[Path]:
         """Copy an imagegen result byte-for-byte into the managed artifact directory."""
-        if not _is_trusted_generated_image_path(saved_path):
-            logger.warning("Rejected untrusted Codex generated-image path")
-            return None
-
-        suffix = Path(saved_path.replace("\\", "/")).suffix.casefold()
-        file_name = "generated-image" + (f"-{index}" if index > 1 else "") + suffix
-        destination = output_dir / file_name
-        temp_path = output_dir / f".{file_name}.{uuid.uuid4().hex}.tmp{suffix}"
-        output_dir.mkdir(parents=True, exist_ok=True)
         try:
             if self.use_wsl and os.name == "nt":
-                source = _windows_path_for_wsl(saved_path)
-                await asyncio.wait_for(
-                    asyncio.to_thread(shutil.copyfile, source, temp_path),
+                return await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _materialize_codex_generated_image,
+                        saved_path,
+                        output_dir=output_dir,
+                        index=index,
+                        use_wsl=True,
+                    ),
                     timeout=30,
                 )
-            else:
-                source = Path(saved_path).expanduser()
-                source_was_symlink = source.is_symlink()
-                try:
-                    source = source.resolve(strict=True)
-                except OSError:
-                    return None
-                if source_was_symlink or not source.is_file() or not _is_trusted_generated_image_path(str(source)):
-                    return None
-                shutil.copyfile(source, temp_path)
-
-            try:
-                max_bytes = max(
-                    1,
-                    int(os.getenv("CODEX_GENERATED_IMAGE_MAX_BYTES") or 64 * 1024 * 1024),
-                )
-            except (TypeError, ValueError):
-                max_bytes = 64 * 1024 * 1024
-            if not temp_path.is_file() or temp_path.stat().st_size > max_bytes:
-                logger.warning("Rejected missing or oversized Codex generated image")
-                return None
-            if not _is_valid_image_file(temp_path):
-                logger.warning("Rejected structurally invalid Codex generated image")
-                return None
-            os.replace(temp_path, destination)
-            return destination
-        except (OSError, asyncio.TimeoutError):
+            return _materialize_codex_generated_image(
+                saved_path,
+                output_dir=output_dir,
+                index=index,
+                use_wsl=False,
+            )
+        except asyncio.TimeoutError:
             logger.exception("Failed to materialize Codex generated image")
             return None
-        finally:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     async def _generated_images_root(self) -> str:
         """Resolve the generated_images root in the same runtime as Codex."""
@@ -1761,7 +1909,7 @@ class CodexCliClient:
         if reasoning_summary not in {"inherit", "none", "auto", "concise", "detailed"}:
             reasoning_summary = "inherit"
         allow_image_input = _as_bool(
-            request.get("wxautox_allow_image_input", extra_body.get("wxautox_allow_image_input")),
+            request.get("mabobot_allow_image_input", extra_body.get("mabobot_allow_image_input")),
             default=False,
         )
         messages = request.get("messages") or []
@@ -1778,7 +1926,7 @@ class CodexCliClient:
             or CODEX_APPROVAL_POLICY
         ).strip().lower()
         if approval_policy not in {"never", "on-request"}:
-            approval_policy = "never" if permission_profile == "wxautox-chat-isolated" else CODEX_APPROVAL_POLICY
+            approval_policy = "never" if permission_profile == "mabobot-chat-isolated" else CODEX_APPROVAL_POLICY
         config_policy = str(
             request.get("codex_config_policy")
             or extra_body.get("codex_config_policy")
@@ -1834,12 +1982,14 @@ class CodexCliClient:
         )
         if not artifact_root.is_absolute():
             artifact_root = Path(self.workdir) / artifact_root
+        request_dir, output_dir = _prepare_artifact_output_dir(
+            artifact_root,
+            request_id,
+            fail_closed=permission_profile == "mabobot-chat-isolated",
+        )
         _cleanup_expired_artifacts(artifact_root)
-        request_dir = artifact_root / request_id
-        output_dir = request_dir / "outputs"
-        output_dir.mkdir(parents=True, exist_ok=True)
         staged_input_files = _stage_input_files(
-            request.get("wxautox_input_files", extra_body.get("wxautox_input_files")),
+            request.get("mabobot_input_files", extra_body.get("mabobot_input_files")),
             request_dir=request_dir,
             use_wsl=self.use_wsl,
         )
@@ -1856,7 +2006,7 @@ class CodexCliClient:
         isolated_workdir_path: Optional[Path] = None
         if isolated_workdir:
             isolated_workdir_path = Path(
-                tempfile.mkdtemp(prefix="wxautox_codex_memory_")
+                tempfile.mkdtemp(prefix="mabobot_codex_memory_")
             ).resolve()
             workdir_path = isolated_workdir_path
         else:
@@ -1903,7 +2053,7 @@ class CodexCliClient:
         elif allow_image_input:
             logger.debug("Codex proxy image input enabled but no image_url parts found in latest user message")
 
-        image_staging_dir = request_dir / "inputs" if permission_profile == "wxautox-chat-isolated" else None
+        image_staging_dir = request_dir / "inputs" if permission_profile == "mabobot-chat-isolated" else None
         for image_url in image_urls:
             image_path = _write_image_url_to_file(
                 image_url,
@@ -1936,7 +2086,10 @@ class CodexCliClient:
                     if runtime_capabilities is not None
                     else _codex_runtime_uid(False)
                 ),
-                runtime_read_roots=runtime_permission_roots(runtime_capabilities),
+                runtime_read_roots=(
+                    *runtime_permission_roots(runtime_capabilities),
+                    *self.permission_read_roots,
+                ),
             )
         )
         args.extend(_reasoning_summary_config_args(reasoning_summary))
@@ -2122,6 +2275,13 @@ class CodexCliClient:
                 detail = (stderr or stdout).strip()
                 raise CodexProxyError(f"Codex CLI exited with {proc.returncode}: {detail[:1000]}")
 
+            if not _artifact_output_dir_is_safe(output_dir):
+                codex_job_manager.record_event(
+                    request_id,
+                    "artifact_boundary_violation",
+                    {},
+                )
+                raise CodexProxyError("Codex artifact output directory became unsafe")
             attachments = _collect_artifact_attachments(output_dir)
             valid_images = [item for item in attachments if item.get("type") == "image"]
             if image_request_mode and not valid_images:
@@ -2136,7 +2296,25 @@ class CodexCliClient:
                     )
                     if destination is not None:
                         recovered.append(destination)
-                if not recovered and codex_thread_id:
+                if selected_paths and len(recovered) != len(selected_paths):
+                    for path in recovered:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            logger.warning("Could not remove partial recovered image: %s", path)
+                    codex_job_manager.record_event(
+                        request_id,
+                        "image_artifact_recovery_failed",
+                        {
+                            "selected_path_count": len(selected_paths),
+                            "materialized_path_count": len(recovered),
+                            "request_mode": image_request_mode,
+                        },
+                    )
+                    raise CodexProxyError(
+                        "Codex generated image output was only partially materialized"
+                    )
+                if not selected_paths and codex_thread_id:
                     recovered = await self._recover_thread_images(
                         codex_thread_id,
                         output_dir=output_dir,
@@ -2210,15 +2388,17 @@ class CodexCliClient:
             )
             raise
         finally:
-            try:
-                output_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            if output_schema_path is not None:
+            request_dir_safe = _artifact_request_dir_is_safe(request_dir)
+            if request_dir_safe:
                 try:
-                    output_schema_path.unlink(missing_ok=True)
+                    output_path.unlink(missing_ok=True)
                 except Exception:
                     pass
+                if output_schema_path is not None:
+                    try:
+                        output_schema_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
             for image_path in temporary_image_paths:
                 try:
                     image_path.unlink(missing_ok=True)
@@ -2230,9 +2410,9 @@ class CodexCliClient:
                 except Exception:
                     pass
             try:
-                if output_dir.exists() and not any(output_dir.iterdir()):
+                if _artifact_output_dir_is_safe(output_dir) and not any(output_dir.iterdir()):
                     output_dir.rmdir()
-                if request_dir.exists() and not any(request_dir.iterdir()):
+                if _artifact_request_dir_is_safe(request_dir) and not any(request_dir.iterdir()):
                     request_dir.rmdir()
             except Exception:
                 pass

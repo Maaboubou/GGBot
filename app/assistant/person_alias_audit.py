@@ -82,11 +82,12 @@ ALIAS_CUES = (
     "giegie",
 )
 BOT_OR_DERIVED_SENDERS = {
-    "微信助手",
-    "AI助手",
+    "刘局",
     "OCR",
     "链接摘要",
     "总结Bot",
+    "新和联胜",
+    "污合之众",
 }
 
 

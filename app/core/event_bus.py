@@ -18,7 +18,11 @@ import time
 from sqlalchemy.orm import Session
 from app.models.assistant_policy import AssistantChatPolicy
 from app.models.user_permission import WeChatUser
-from app.utils.bot_mentions import bot_names_for_user, find_bot_mention
+from app.utils.bot_mentions import (
+    bot_names_for_user,
+    find_bot_mention,
+    tickle_self_flags,
+)
 
 
 def _parse_sender_blacklist(raw_value: Any) -> List[str]:
@@ -38,7 +42,7 @@ class EventType(str, Enum):
     """事件类型定义"""
     # 微信消息事件
     TEXT_MESSAGE_RECEIVED = "text_message_received"
-    IMAGE_MESSAGE_RECEIVED = "image_message_received"  
+    IMAGE_MESSAGE_RECEIVED = "image_message_received"
     LINK_MESSAGE_RECEIVED = "link_message_received"
     QUOTE_MESSAGE_RECEIVED = "quote_message_received"  # 保留原有的通用引用事件
     QUOTE_TEXT_MESSAGE_RECEIVED = "quote_text_message_received"  # 新增：引用文字消息
@@ -51,19 +55,20 @@ class EventType(str, Enum):
     MERGE_MESSAGE_RECEIVED = "merge_message_received"
     PERSONAL_CARD_MESSAGE_RECEIVED = "personal_card_message_received"
     NOTE_MESSAGE_RECEIVED = "note_message_received"
+    TICKLE_MESSAGE_RECEIVED = "tickle_message_received"
     OTHER_MESSAGE_RECEIVED = "other_message_received"
     CHATBOT_FOLLOWUP_APPROVED = "chatbot_followup_approved"
-    
+
     # 插件协作事件
     SUMMARY_COMPLETED = "summary_completed"
-    
+
     # 系统事件
     PLUGIN_LOADED = "plugin_loaded"
     PLUGIN_UNLOADED = "plugin_unloaded"
     SYSTEM_STARTUP = "system_startup"
     SYSTEM_SHUTDOWN = "system_shutdown"
     WECHAT_RECONNECTED = "wechat_reconnected"
-    
+
     # 用户配置事件
     USER_CONFIG_UPDATED = "user_config_updated"
     PLUGIN_CONFIG_UPDATED = "plugin_config_updated"
@@ -103,7 +108,7 @@ class EventListener:
 
 class EventBus:
     """事件总线核心类"""
-    
+
     def __init__(self, db_session_factory: Callable[[], Session]):
         self.logger = logging.getLogger(__name__)
         self._listeners: Dict[EventType, List[EventListener]] = {}
@@ -119,7 +124,7 @@ class EventBus:
             'events_processed': 0,
             'listeners_count': 0
         }
-        
+
         # Per-user async processing infrastructure
         self._user_queues: Dict[str, queue.Queue] = {}  # {chat_name: Queue}
         self._user_workers: Dict[str, threading.Thread] = {}  # {chat_name: Thread}
@@ -130,12 +135,12 @@ class EventBus:
         # sequence to discard stale Judge/model results.
         self._chat_ingress_sequences: Dict[str, int] = {}
         self._chat_latest_ingress: Dict[str, Dict[str, Any]] = {}
-        
+
         # Configuration
         self._max_concurrent_users = 50  # Maximum concurrent user workers
         self._user_queue_maxsize = 100  # Per-user queue size limit
         self._worker_idle_timeout = 300  # Worker cleanup timeout (5 minutes)
-    
+
     def subscribe(
         self,
         event_type: EventType,
@@ -156,7 +161,7 @@ class EventBus:
         with self._lock:
             if listener_id is None:
                 listener_id = f"{plugin_name}_{event_type}_{uuid.uuid4().hex[:8]}"
-            
+
             listener = EventListener(
                 id=listener_id,
                 plugin_name=plugin_name,
@@ -172,23 +177,23 @@ class EventBus:
                 permission_key=str(permission_key or ""),
                 display_name=str(display_name or ""),
             )
-            
+
             if event_type not in self._listeners:
                 self._listeners[event_type] = []
-            
+
             self._listeners[event_type].append(listener)
             self._listeners[event_type].sort(
                 key=lambda x: (x.owner_kind == "core", x.order_index, x.listener_key)
             )
-            
+
             self._stats['listeners_count'] += 1
-            
+
             self.logger.debug(
                 f"Plugin '{plugin_name}' subscribed to {event_type} "
                 f"(order: {order_index}, propagation: {propagation})"
             )
             return listener_id
-    
+
     def unsubscribe(self, listener_id: str) -> bool:
         """取消订阅"""
         with self._lock:
@@ -200,7 +205,7 @@ class EventBus:
                         self.logger.debug(f"Unsubscribed listener {listener_id} from {event_type}")
                         return True
             return False
-    
+
     def unsubscribe_plugin(self, plugin_name: str) -> int:
         """取消插件的所有订阅"""
         with self._lock:
@@ -210,12 +215,12 @@ class EventBus:
                 for listener in listeners_to_remove:
                     listeners.remove(listener)
                     count += 1
-            
+
             self._stats['listeners_count'] -= count
             if count > 0:
                 self.logger.debug(f"Unsubscribed {count} listeners for plugin '{plugin_name}'")
             return count
-    
+
     def _create_user_queue(self, chat_name: str) -> None:
         """Create queue and worker thread for a specific user"""
         with self._lock:
@@ -227,13 +232,13 @@ class EventBus:
                 )
                 # Try to cleanup idle workers
                 self._cleanup_idle_workers()
-            
+
             if chat_name not in self._user_queues:
                 # Create queue
                 self._user_queues[chat_name] = queue.Queue(maxsize=self._user_queue_maxsize)
                 self._user_locks[chat_name] = threading.Lock()
                 self._user_last_activity[chat_name] = time.time()
-                
+
                 # Create and start worker thread
                 worker = threading.Thread(
                     target=self._user_worker,
@@ -243,9 +248,9 @@ class EventBus:
                 )
                 self._user_workers[chat_name] = worker
                 worker.start()
-                
+
                 self.logger.debug(f"Created worker thread for user '{chat_name}'")
-    
+
     def _enqueue_user_event(self, chat_name: str, event: Event) -> None:
         """Enqueue event to user-specific queue"""
         if self._is_inbound_message_event(event):
@@ -267,10 +272,10 @@ class EventBus:
         # Ensure user queue exists
         if chat_name not in self._user_queues:
             self._create_user_queue(chat_name)
-        
+
         # Update last activity
         self._user_last_activity[chat_name] = time.time()
-        
+
         # Add event to user's queue
         try:
             self._user_queues[chat_name].put(event, block=False)
@@ -298,6 +303,7 @@ class EventBus:
             EventType.MERGE_MESSAGE_RECEIVED,
             EventType.PERSONAL_CARD_MESSAGE_RECEIVED,
             EventType.NOTE_MESSAGE_RECEIVED,
+            EventType.TICKLE_MESSAGE_RECEIVED,
             EventType.OTHER_MESSAGE_RECEIVED,
         }
 
@@ -310,25 +316,25 @@ class EventBus:
                 int(self._chat_ingress_sequences.get(chat_name, 0)),
             )
             return latest
-    
+
     def _user_worker(self, chat_name: str) -> None:
         """Worker thread for processing a specific user's events"""
         self.logger.debug(f"Worker thread started for user '{chat_name}'")
-        
+
         while self._running:
             try:
                 # Get event from user's queue with timeout
                 event = self._user_queues[chat_name].get(timeout=1.0)
-                
+
                 # Update last activity
                 self._user_last_activity[chat_name] = time.time()
-                
+
                 # Process event using existing sync logic
                 self._process_event_sync(event)
-                
+
                 # Mark task as done
                 self._user_queues[chat_name].task_done()
-                
+
             except queue.Empty:
                 # Check if we should cleanup due to idle timeout
                 idle_time = time.time() - self._user_last_activity.get(chat_name, time.time())
@@ -339,12 +345,12 @@ class EventBus:
                     self._cleanup_user_worker(chat_name)
                     break
                 continue
-                
+
             except Exception as e:
                 self.logger.error(f"Error in user worker for '{chat_name}': {e}", exc_info=True)
-        
+
         self.logger.debug(f"Worker thread stopped for user '{chat_name}'")
-    
+
     def _cleanup_user_worker(self, chat_name: str) -> None:
         """Cleanup resources for a specific user worker"""
         with self._lock:
@@ -356,34 +362,34 @@ class EventBus:
                 del self._user_locks[chat_name]
             if chat_name in self._user_last_activity:
                 del self._user_last_activity[chat_name]
-            
+
             self.logger.debug(f"Cleaned up worker resources for user '{chat_name}'")
-    
+
     def _cleanup_idle_workers(self) -> None:
         """Cleanup all idle workers that have exceeded timeout"""
         current_time = time.time()
         idle_users = []
-        
+
         with self._lock:
             for chat_name, last_activity in self._user_last_activity.items():
                 idle_time = current_time - last_activity
                 if idle_time > self._worker_idle_timeout:
                     idle_users.append(chat_name)
-        
+
         for chat_name in idle_users:
             # Check if queue is empty before cleanup
             if chat_name in self._user_queues and self._user_queues[chat_name].empty():
                 self._cleanup_user_worker(chat_name)
 
-    
+
     def publish(self, event: Event) -> None:
         """发布事件 - 根据用户路由到不同队列"""
         self._stats['events_published'] += 1
         self.logger.debug(f"Publishing event {event.type} from {event.source}")
-        
+
         # Check if this is a user event
         chat_name = event.data.get("chat_name")
-        
+
         if chat_name:
             # User event: route to user-specific queue for async processing
             self.logger.debug(f"Routing event {event.type} to user queue for '{chat_name}'")
@@ -392,7 +398,7 @@ class EventBus:
             # System event: process immediately (synchronous)
             self.logger.debug(f"Processing system event {event.type} synchronously")
             self._process_event_sync(event)
-    
+
     def _process_event_sync(self, event: Event) -> None:
         """同步处理事件（原publish方法的核心逻辑）"""
         # 获取对应事件类型的监听器
@@ -420,18 +426,27 @@ class EventBus:
 
                     # 获取机器人名称用于@检测
                     from app.services.config_service import get_setting
-                    bot_name = get_setting("WECHAT_BOT_NAME", "微信助手")
-                    
+                    bot_name = get_setting("WECHAT_BOT_NAME", "刘局")
+
                     # 检查消息内容是否@了机器人
                     message_content = event.data.get("message", "")
                     chat_type = event.data.get("chat_type", "")
+                    bot_names = bot_names_for_user(user, bot_name)
                     mention_name = find_bot_mention(
                         message_content,
-                        bot_names_for_user(user, bot_name),
+                        bot_names,
                     )
                     is_mentioned = mention_name is not None
                     event.data["bot_mentioned"] = is_mentioned
                     event.data["bot_mention_name"] = mention_name or ""
+                    if bool(event.data.get("is_tickle")):
+                        tickle_is_from_self, tickle_is_to_self = tickle_self_flags(
+                            event.data.get("tickle_from"),
+                            event.data.get("tickle_to"),
+                            bot_names,
+                        )
+                        event.data["tickle_is_from_self"] = tickle_is_from_self
+                        event.data["tickle_is_to_self"] = tickle_is_to_self
                     sequence = int(event.data.get("_chat_seq") or 0)
                     if sequence:
                         with self._lock:
@@ -439,10 +454,10 @@ class EventBus:
                             if latest and int(latest.get("sequence") or 0) == sequence:
                                 latest["bot_mentioned"] = is_mentioned
                                 latest["bot_mention_name"] = mention_name or ""
-                    
+
                     # 获取该用户的权限配置
                     user_permissions = {p.plugin_name: p for p in user.permissions}
-                    
+
                     # 支持多级目录插件名：既匹配完整键（如 feishu/xxx），也匹配末级简名（如 xxx）
                     def _has_permission_and_mention_check(listener: EventListener) -> bool:
                         if listener.owner_kind == "core":
@@ -472,7 +487,7 @@ class EventBus:
                                     if permission_base in {permission_name, plugin_base}:
                                         permission_config = permission
                                         break
-                        
+
                         if not permission_config:
                             return False  # 没有权限
 
@@ -487,12 +502,12 @@ class EventBus:
                                 self.logger.debug(f"Plugin '{permission_name}' requires mention but not mentioned for user '{chat_name}'")
                                 return False
                             # 私聊不需要@，群聊需要@且已经@了才通过
-                        
+
                         return True
 
                     # 筛选出有权限且满足@条件的监听器
                     final_listeners = [l for l in active_listeners if _has_permission_and_mention_check(l)]
-                    
+
                     allowed_plugins = set(user_permissions.keys())
                     self.logger.debug(
                         f"User '{chat_name}' has permissions: {allowed_plugins}. Mentioned: {is_mentioned}. Executing {len(final_listeners)} listeners after permission and mention check."
@@ -510,7 +525,7 @@ class EventBus:
         else:
             # 如果事件不涉及特定用户（如系统事件），则所有监听器都有权限
             final_listeners = active_listeners
-        
+
         # 同步执行所有有权限的监听器
         for listener in final_listeners:
             if (
@@ -564,7 +579,7 @@ class EventBus:
 
                             if not bot_display_name:
                                 from app.services.config_service import get_setting
-                                bot_display_name = get_setting("WECHAT_BOT_NAME", "微信助手")
+                                bot_display_name = get_setting("WECHAT_BOT_NAME", "刘局")
 
                             return bot_display_name
 
@@ -726,11 +741,11 @@ class EventBus:
                         f"Propagation stopped by plugin '{listener.id}' after handling {event.type.value}"
                     )
                     break
-    
+
     async def publish_async(self, event: Event) -> None:
         """发布事件（异步）"""
         await self._event_queue.put(event)
-    
+
     async def _process_events(self) -> None:
         """异步事件处理循环"""
         while self._running:
@@ -744,18 +759,18 @@ class EventBus:
                 continue
             except Exception as e:
                 self.logger.error(f"Error processing event: {e}")
-    
+
     async def start(self) -> None:
         """启动事件总线"""
         if self._running:
             return
-        
+
         self._running = True
         self._processor_task = asyncio.create_task(
             self._process_events(), name="event-bus-processor"
         )
         self.logger.info("Event bus started")
-        
+
         # 发布系统启动事件
         startup_event = Event(
             type=EventType.SYSTEM_STARTUP,
@@ -763,12 +778,12 @@ class EventBus:
             data={"timestamp": __import__('time').time()}
         )
         self.publish(startup_event)
-    
+
     async def stop(self) -> None:
         """停止事件总线"""
         if not self._running:
             return
-        
+
         # 发布系统关闭事件（同步处理）
         shutdown_event = Event(
             type=EventType.SYSTEM_SHUTDOWN,
@@ -779,12 +794,12 @@ class EventBus:
 
         # 等待所有异步入队的事件被处理完成
         await self._event_queue.join()
-        
+
         # Wait for all user queues to finish processing
         self.logger.info("Waiting for user workers to finish...")
         with self._lock:
             user_queues_copy = list(self._user_queues.items())
-        
+
         for chat_name, user_queue in user_queues_copy:
             try:
                 user_queue.join()  # Wait for queue to be empty
@@ -806,32 +821,32 @@ class EventBus:
         # Cleanup all user workers
         with self._lock:
             remaining_users = list(self._user_workers.keys())
-        
+
         for chat_name in remaining_users:
             self._cleanup_user_worker(chat_name)
-        
+
         self.logger.info("Event bus stopped")
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
         with self._lock:
             user_queue_sizes = {
-                chat_name: q.qsize() 
+                chat_name: q.qsize()
                 for chat_name, q in self._user_queues.items()
             }
             active_workers = len(self._user_workers)
-        
+
         return {
             **self._stats,
             'listeners_by_type': {
-                event_type.value: len(listeners) 
+                event_type.value: len(listeners)
                 for event_type, listeners in self._listeners.items()
             },
             'active_user_workers': active_workers,
             'user_queue_sizes': user_queue_sizes,
             'max_concurrent_users': self._max_concurrent_users
         }
-    
+
     def get_listeners(self, event_type: Optional[EventType] = None) -> Dict[str, List[Dict[str, Any]]]:
         """获取监听器信息"""
         if event_type:
@@ -855,7 +870,7 @@ class EventBus:
                     } for l in listeners
                 ]
             }
-        
+
         return {
             event_type.value: [
                 {
@@ -876,7 +891,7 @@ class EventBus:
             ]
             for event_type, listeners in self._listeners.items()
         }
-    
+
     def enable_listener(self, listener_id: str) -> bool:
         """启用监听器"""
         with self._lock:
@@ -886,7 +901,7 @@ class EventBus:
                         listener.enabled = True
                         return True
             return False
-    
+
     def disable_listener(self, listener_id: str) -> bool:
         """禁用监听器"""
         with self._lock:
@@ -896,7 +911,7 @@ class EventBus:
                         listener.enabled = False
                         return True
             return False
-    
+
     def update_event_order(self, event_type: EventType, listener_keys: List[str]) -> bool:
         """Atomically apply the complete visible order for one event type."""
         with self._lock:
@@ -916,7 +931,7 @@ class EventBus:
                 )
             )
             return True
-    
+
     def get_listener_info(self, listener_id: str) -> Optional[Dict[str, Any]]:
         """获取监听器信息"""
         with self._lock:
@@ -948,22 +963,22 @@ class EventBus:
         """
         申请“会话模式”权限：允许指定用户在一段时间内无需@就能触发指定插件。
         适用于多轮对话场景（如游戏、向导、数据收集）。
-        
+
         Args:
             chat_name: 用户标识 (WeChat Chat Name)
             plugin_name: 插件名称
             duration: 有效期（秒）
         """
         expiry = time.time() + duration
-        
+
         with self._lock:
             # 懒加载初始化字典
             if not hasattr(self, '_session_permissions'):
                 self._session_permissions: Dict[str, Dict[str, float]] = {}
-            
+
             if chat_name not in self._session_permissions:
                 self._session_permissions[chat_name] = {}
-            
+
             self._session_permissions[chat_name][plugin_name] = expiry
             self.logger.debug(f"Granted session permission for user '{chat_name}' -> plugin '{plugin_name}' (duration: {duration}s)")
 
@@ -974,26 +989,26 @@ class EventBus:
         with self._lock:
             if not hasattr(self, '_session_permissions'):
                 return
-            
+
             if chat_name in self._session_permissions:
                 if plugin_name in self._session_permissions[chat_name]:
                     del self._session_permissions[chat_name][plugin_name]
                     self.logger.debug(f"Released session permission for user '{chat_name}' -> plugin '{plugin_name}'")
-    
+
     def _check_session_permission(self, chat_name: str, plugin_name: str) -> bool:
         """检查是否存在有效的会话权限"""
         if not hasattr(self, '_session_permissions'):
             return False
-            
+
         with self._lock:
             user_perms = self._session_permissions.get(chat_name)
             if not user_perms:
                 return False
-                
+
             expiry = user_perms.get(plugin_name)
             if not expiry:
                 return False
-                
+
             if time.time() < expiry:
                 return True
             else:

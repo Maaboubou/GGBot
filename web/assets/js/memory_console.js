@@ -26,7 +26,7 @@
                 }
                 let savedUserId = 0;
                 try {
-                    savedUserId = Number(localStorage.getItem('wxauto.memoryLibraryUserId') || 0);
+                    savedUserId = Number(localStorage.getItem('mabobot.memoryLibraryUserId') || 0);
                 } catch (_error) {
                     // Storage is optional.
                 }
@@ -189,7 +189,7 @@
             this.prepareMemoryLibraryLoad();
             this.renderMemoryLibraryUserSwitcher(users, userId);
             try {
-                localStorage.setItem('wxauto.memoryLibraryUserId', String(Number(userId)));
+                localStorage.setItem('mabobot.memoryLibraryUserId', String(Number(userId)));
             } catch (_error) {
                 // Storage is optional.
             }
@@ -232,7 +232,7 @@
             this.prepareMemoryLibraryLoad();
             this.renderMemoryLibraryUserSwitcher(users, targetId);
             try {
-                localStorage.setItem('wxauto.memoryLibraryUserId', String(targetId));
+                localStorage.setItem('mabobot.memoryLibraryUserId', String(targetId));
             } catch (_error) {
                 // Storage is optional.
             }

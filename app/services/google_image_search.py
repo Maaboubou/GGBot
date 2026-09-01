@@ -22,6 +22,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
+from app.utils.subprocess_utils import hidden_process_kwargs
+
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +280,12 @@ class GoogleImageReverseSearchService:
             args.append(f"--profile-directory={self.chrome_profile_dir.strip()}")
 
         try:
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                **hidden_process_kwargs(),
+            )
         except Exception as e:
             logger.warning("尝试启动 Chrome 失败: %s", e)
 

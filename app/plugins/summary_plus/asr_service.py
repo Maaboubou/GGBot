@@ -13,10 +13,13 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
+from app.utils.subprocess_utils import hidden_creation_flags
+
 
 __all__ = [
     "LocalASRError",
     "bili_transcribe_local",
+    "douyin_transcribe_local",
     "srt_text_to_plain",
 ]
 
@@ -82,7 +85,7 @@ def _run_process(
             encoding="utf-8",
             errors="replace",
             timeout=max(1, int(timeout)),
-            creationflags=creationflags,
+            creationflags=hidden_creation_flags(creationflags),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -142,6 +145,43 @@ def _download_bilibili_audio(
     )
     if not candidates:
         raise LocalASRError("B站音频下载完成，但未找到输出文件")
+    return candidates[0]
+
+
+def _download_douyin_audio(
+    url: str,
+    *,
+    output_base: Path,
+    cookie_args: list[str],
+    yt_dlp_bin: str,
+    ffmpeg_bin: str,
+    logger=None,
+) -> Path:
+    _log(logger, "info", f"[*] 正在为本地 ASR 下载抖音音频: {url}")
+    command = [
+        yt_dlp_bin,
+        "--ignore-config",
+        "--no-playlist",
+        *cookie_args,
+        "--ffmpeg-location",
+        str(Path(ffmpeg_bin).parent if Path(ffmpeg_bin).is_file() else ffmpeg_bin),
+        "-f",
+        "bestaudio/best",
+        "-x",
+        "--audio-format",
+        "m4a",
+        "-o",
+        f"{output_base}.%(ext)s",
+        url,
+    ]
+    _run_process(command, label="抖音音频下载", timeout=300, logger=logger)
+    candidates = sorted(
+        path
+        for path in output_base.parent.glob(f"{output_base.name}.*")
+        if path.suffix.lower() not in {".part", ".ytdl"}
+    )
+    if not candidates:
+        raise LocalASRError("抖音音频下载完成，但未找到输出文件")
     return candidates[0]
 
 
@@ -211,7 +251,6 @@ def _transcribe_wav(
                 str(wav_path),
                 "--backend",
                 "cpu",
-                "--srt",
             ],
             label="本地 ASR",
             timeout=timeout_sec,
@@ -276,6 +315,78 @@ def bili_transcribe_local(
             url,
             output_base=output_base,
             cookies_path=cookies_path,
+            yt_dlp_bin=yt_dlp_bin,
+            ffmpeg_bin=ffmpeg_bin,
+            logger=logger,
+        )
+        _convert_to_wav(
+            source_path,
+            wav_path=wav_path,
+            ffmpeg_bin=ffmpeg_bin,
+            logger=logger,
+        )
+        transcript = _transcribe_wav(
+            wav_path,
+            runtime_path=runtime,
+            model_path=model,
+            vad_path=vad,
+            timeout_sec=max(30, int(timeout_sec)),
+            logger=logger,
+        )
+        if cache_enabled:
+            _write_cache(transcript_cache, transcript)
+        return transcript
+    finally:
+        for artifact in work_dir.glob(f"{output_base.name}*"):
+            try:
+                artifact.unlink()
+            except OSError:
+                _log(logger, "warning", f"[!] 无法清理本地 ASR 临时文件: {artifact}")
+
+
+def douyin_transcribe_local(
+    url: str,
+    *,
+    cookie_args: list[str],
+    yt_dlp_bin: str,
+    ffmpeg_bin: str,
+    runtime_path: str,
+    model_path: str,
+    vad_path: str,
+    timeout_sec: int = 600,
+    cache_enabled: bool = True,
+    cache_dir: Optional[str] = None,
+    logger=None,
+) -> str:
+    """Download one Douyin audio track and transcribe it locally."""
+    runtime = Path(runtime_path).expanduser().resolve()
+    model = Path(model_path).expanduser().resolve()
+    vad = Path(vad_path).expanduser().resolve()
+    missing = [str(path) for path in (runtime, model, vad) if not path.is_file()]
+    if missing:
+        raise LocalASRError(f"本地 ASR 资源不存在: {', '.join(missing)}")
+
+    resolved_cache_dir = Path(cache_dir or Path.cwd() / "data" / "asr_cache" / "summary_plus")
+    url_digest = hashlib.sha256((url or "").encode("utf-8")).hexdigest()[:20]
+    transcript_cache = (
+        resolved_cache_dir / f"douyin_{url_digest}_{_model_cache_token(model)}.txt"
+    )
+    if cache_enabled and transcript_cache.is_file():
+        cached = transcript_cache.read_text(encoding="utf-8").strip()
+        if cached:
+            _log(logger, "info", f"[+] 命中本地 ASR 缓存: {transcript_cache.name}")
+            return cached
+
+    work_dir = Path.cwd() / "tmp" / "videos"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    output_base = work_dir / f"douyin_asr_{uuid.uuid4().hex[:10]}"
+    wav_path = output_base.with_suffix(".wav")
+
+    try:
+        source_path = _download_douyin_audio(
+            url,
+            output_base=output_base,
+            cookie_args=list(cookie_args or []),
             yt_dlp_bin=yt_dlp_bin,
             ffmpeg_bin=ffmpeg_bin,
             logger=logger,

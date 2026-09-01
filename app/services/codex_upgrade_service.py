@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from app.services.agent_runtime import CodexAgentRuntime, get_agent_runtime
 from app.services.file_tools_runtime import get_file_tools_runtime
+from app.utils.subprocess_utils import hidden_process_kwargs
 
 
 logger = logging.getLogger(__name__)
@@ -197,6 +198,7 @@ class CodexUpgradeService:
             text=True,
             timeout=timeout,
             check=False,
+            **hidden_process_kwargs(),
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "command failed").strip()
@@ -214,6 +216,7 @@ class CodexUpgradeService:
             text=True,
             timeout=timeout,
             check=False,
+            **hidden_process_kwargs(),
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "command failed").strip()
@@ -246,6 +249,18 @@ class CodexUpgradeService:
                 realpath = str(Path(executable).resolve())
         except Exception:
             logger.debug("Unable to resolve Codex installation path", exc_info=True)
+
+        # A freshly started management process may know the selected WSL path
+        # before an App Server pool has reported its active identity. Ask that
+        # exact executable for its version so update controls do not disappear.
+        if not _version_number(version) and executable:
+            try:
+                version_result = self._run([executable, "--version"], timeout=30)
+                version_lines = str(version_result.stdout or "").strip().splitlines()
+                if version_lines:
+                    version = version_lines[-1].strip()
+            except Exception:
+                logger.debug("Unable to read Codex CLI version directly", exc_info=True)
 
         normalized = realpath.replace("\\", "/").lower()
         if "/node_modules/@openai/codex/" in normalized:
@@ -379,8 +394,12 @@ class CodexUpgradeService:
                 latest = self.check_latest()
                 target_version = str(latest["available_version"])
                 operation["target_version"] = target_version
-                if target_version == previous_version:
-                    self._complete_operation("succeeded", "当前已是最新版本", target_version)
+                if not latest.get("update_available"):
+                    self._complete_operation(
+                        "succeeded",
+                        "当前版本已不低于最新稳定版",
+                        previous_version,
+                    )
                     return
                 self._set_stage("install", 35, f"安装 Codex {target_version}")
                 install_attempted = True

@@ -101,6 +101,10 @@ FIELD_SPECS: Dict[str, Dict[str, Any]] = {
         "group": "integrations", "section": "通知与分享", "title": "GitHub Token",
         "description": "用于需要 GitHub Gist 等能力的功能。", "source": "本机数据库优先", "editable": True,
     },
+    "QQEMAIL_ADDR": {
+        "group": "integrations", "section": "通知与分享", "title": "QQ 邮箱地址",
+        "description": "邮件通知服务使用的发件和收件地址。", "source": "本机数据库优先", "editable": True,
+    },
     "QQEMAIL_CODE": {
         "group": "integrations", "section": "通知与分享", "title": "QQ 邮箱授权码",
         "description": "供邮件通知服务登录 SMTP；不是邮箱登录密码。", "source": "本机数据库优先", "editable": True,

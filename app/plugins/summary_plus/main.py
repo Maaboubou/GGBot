@@ -20,7 +20,7 @@ from app.services.email_service import get_email_service
 from app.services.plugin_runtime import PluginContext
 from app.services.runtime_operations import OperationContext
 from app.utils.plugin_config import get_config
-from .asr_service import bili_transcribe_local
+from .asr_service import bili_transcribe_local, douyin_transcribe_local
 from .browser_service import browser_summarize, open_blank_worker_tab
 from .browser_runtime import BrowserRuntimeMixin
 from .mindmap_service import (
@@ -46,6 +46,7 @@ from .runtime_support import (
 )
 from .subtitle_service import bili_get_subtitles
 from .yt_transcript import get_best_transcript_text
+from .ytdlp_cookie_service import ytdlp_browser_cookie_args
 from .xhs_service import (
     TIKHUB_ENDPOINT_XHS_IMAGE_NOTE,
     TIKHUB_ENDPOINT_XHS_VIDEO_NOTE,
@@ -206,7 +207,17 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
         self.danmaku_max_per_window = int(get_config("danmaku_max_per_window", plugin_name=plugin_name, default=20))
         self.bilibili_danmaku_webmask_enabled = bool(get_config("bilibili_danmaku_webmask_enabled", plugin_name=plugin_name, default=True))
         self.bilibili_video_crf = int(get_config("bilibili_video_crf", plugin_name=plugin_name, default=20))
-        self.bilibili_max_download_duration = int(get_config("bilibili_max_download_duration", plugin_name=plugin_name, default=120))
+        self.bilibili_max_download_duration = int(get_config("bilibili_max_download_duration", plugin_name=plugin_name, default=300))
+        self.douyin_max_download_duration = max(
+            1,
+            int(
+                get_config(
+                    "douyin_max_download_duration",
+                    plugin_name=plugin_name,
+                    default=300,
+                )
+            ),
+        )
         self.ffmpeg_bin = self._resolve_media_tool(
             "ffmpeg",
             plugin_name=plugin_name,
@@ -293,7 +304,7 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
 
         # XHS settings
         self.xhs_max_download_duration = int(
-            get_config("xhs_max_download_duration", plugin_name=plugin_name, default=120)
+            get_config("xhs_max_download_duration", plugin_name=plugin_name, default=300)
         )
         self.xhs_max_images = int(get_config("xhs_max_images", plugin_name=plugin_name, default=9))
 
@@ -651,7 +662,14 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
     # -------------------------
     # Delegated Services (subtitle/local ASR/mindmap/browser)
     # -------------------------
-    async def _generate_bilibili_mindmap_async(self, b_url: str, wx: Any, chat_name: str, article_text: Optional[str] = None):
+    async def _generate_bilibili_mindmap_async(
+        self,
+        b_url: str,
+        wx: Any,
+        chat_name: str,
+        article_text: Optional[str] = None,
+        output_prefix: str = "bili_map",
+    ):
         try:
             # 1. get subtitles ( if not provided )
             if not article_text:
@@ -697,7 +715,10 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
             os.makedirs(base_dir, exist_ok=True)
             uid = uuid.uuid4().hex[:8]
             layout = self._resolve_mindmap_layout()
-            png_file = os.path.join(base_dir, f"bili_map_{int(time.time())}_{uid}_{layout}.png")
+            png_file = os.path.join(
+                base_dir,
+                f"{output_prefix}_{int(time.time())}_{uid}_{layout}.png",
+            )
 
             self.logger.info(f"[*] 正在渲染并截取高清脑图（模式: {layout}）...")
             success = await self._render_mindmap_to_image(my_json, png_file)
@@ -718,6 +739,22 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
 
         except Exception as e:
             self.logger.error(f"[❌] 脑图生成流程执行出错: {e}", exc_info=True)
+
+    async def _generate_douyin_mindmap_async(
+        self,
+        douyin_url: str,
+        wx: Any,
+        chat_name: str,
+        article_text: str,
+    ):
+        """Render Douyin ASR text with the mature Bilibili mindmap pipeline."""
+        await self._generate_bilibili_mindmap_async(
+            douyin_url,
+            wx,
+            chat_name,
+            article_text=article_text,
+            output_prefix="douyin_map",
+        )
 
     async def _generate_youtube_mindmap_async(self, yt_url: str, wx: Any, chat_name: str):
         """异步处理 YouTube 脑图逻辑：获取字幕 -> LLM 总结 -> 生成脑图 -> 发送"""
@@ -810,6 +847,32 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
             ),
             logger=self.logger,
         )
+
+    def _douyin_transcribe_local(self, url: str) -> str:
+        with ytdlp_browser_cookie_args(
+            platform="douyin",
+            debug_port=self.chrome_debug_port,
+            user_data_dir=self.chrome_user_data_dir,
+            profile_dir=self.chrome_profile_dir,
+            logger=self.logger,
+        ) as cookie_args:
+            return douyin_transcribe_local(
+                url=url,
+                cookie_args=cookie_args,
+                yt_dlp_bin=self.yt_dlp_bin,
+                ffmpeg_bin=self.ffmpeg_bin,
+                runtime_path=self.local_asr_runtime_path,
+                model_path=self.local_asr_model_path,
+                vad_path=self.local_asr_vad_path,
+                timeout_sec=self.local_asr_timeout_seconds,
+                cache_enabled=True,
+                cache_dir=(
+                    str(self.context.storage.cache_path("asr/.keep").parent)
+                    if self.context is not None
+                    else None
+                ),
+                logger=self.logger,
+            )
 
     def _bili_get_subtitles(self, url: str) -> Optional[str]:
         return bili_get_subtitles(

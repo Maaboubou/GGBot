@@ -1,0 +1,120 @@
+{
+  "name": "magnet_search",
+  "display_name": "磁力搜索",
+  "version": "1.3.0",
+  "description": "检测关键词‘磁力’，从官方发布页解析实时入口后搜索磁力链接，并为前 5 条结果生成经 NudeNet 检测的图片预览 PDF。",
+  "author": "System",
+  "category": "utility",
+  "requires": [
+    "cloudscraper",
+    "beautifulsoup4",
+    "selenium",
+    "Pillow",
+    "NudeNet"
+  ],
+  "config_schema": {
+    "trigger_keyword": {
+      "type": "string",
+      "title": "搜索触发词",
+      "description": "消息包含该词且移除后仍有搜索内容时触发",
+      "group": "trigger",
+      "default": "磁力"
+    },
+    "entry_points": {
+      "type": "array",
+      "title": "磁力搜索站入口",
+      "description": "每行一个，按优先级从上到下尝试；支持官方地址发布页、实时入口和旧版搜索域名。",
+      "default": [
+        "https://磁力搜索.com/",
+        "https://www.1024btso.com/"
+      ]
+    },
+    "max_retries": {
+      "type": "integer",
+      "title": "每个入口重试次数",
+      "description": "单个搜索入口失败后的最大重试次数。",
+      "default": 3,
+      "minimum": 1,
+      "maximum": 10,
+      "step": 1
+    },
+    "retry_delay": {
+      "type": "integer",
+      "title": "重试间隔（秒）",
+      "description": "搜索入口重试前的等待时间。",
+      "default": 2,
+      "minimum": 0,
+      "maximum": 30,
+      "step": 1
+    },
+    "timeout": {
+      "type": "integer",
+      "title": "搜索超时时间（秒）",
+      "description": "磁力搜索站单次请求的超时时间。",
+      "default": 15,
+      "minimum": 3,
+      "maximum": 120,
+      "step": 1
+    },
+    "preview_result_limit": {
+      "type": "integer",
+      "title": "查询预览的结果数",
+      "description": "只对前几条磁链查询图片，上限 5 条。",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 5,
+      "step": 1
+    },
+    "preview_images_per_result": {
+      "type": "integer",
+      "title": "每条磁链的预览图数",
+      "description": "每条磁链最多展示的预览图数量，上限 8 张。",
+      "default": 8,
+      "minimum": 1,
+      "maximum": 8,
+      "step": 1
+    },
+    "detection_threshold": {
+      "type": "number",
+      "title": "NudeNet 检测阈值",
+      "description": "仅影响 magnet_search。越低检测越严格、0.05 最严，0.50 最宽松；建议 0.12。",
+      "default": 0.12,
+      "minimum": 0.05,
+      "maximum": 0.5,
+      "step": 0.01
+    },
+    "inference_resolution": {
+      "type": "integer",
+      "title": "NudeNet 推理分辨率",
+      "description": "仅影响 magnet_search。越高越容易识别小目标，但会增加 CPU 和内存占用；建议 960。",
+      "default": 960,
+      "minimum": 320,
+      "maximum": 1280,
+      "step": 32
+    },
+    "blur_strength": {
+      "type": "number",
+      "title": "敏感预览图模糊强度",
+      "description": "仅影响 magnet_search。0.10 代表 10%，1.00 代表 100%；当前默认 80%。",
+      "default": 0.8,
+      "minimum": 0.1,
+      "maximum": 1.0,
+      "step": 0.05
+    }
+  },
+  "config": {
+    "trigger_keyword": "磁力",
+    "entry_points": [
+      "https://磁力搜索.com/",
+      "https://www.1024btso.com/"
+    ],
+    "max_retries": 3,
+    "retry_delay": 2,
+    "timeout": 15,
+    "preview_result_limit": 5,
+    "preview_images_per_result": 8,
+    "detection_threshold": 0.15,
+    "inference_resolution": 960,
+    "blur_strength": 0.6
+  }
+}

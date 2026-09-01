@@ -607,7 +607,7 @@ def _infer_sender_ids_from_cross_source_twins(
     """Attach stable sender IDs to duplicate rows from another source.
 
     CipherTalk history may expose an account name and stable wxid while the
-    live wxauto log records the same message under a group nickname.  Exact
+    live WeChat logs record the same message under a group nickname. Exact
     cross-source message twins provide a deterministic bridge.  A single
     generic row is never enough: inference requires several timestamp-aligned
     duplicates and at least two distinct non-placeholder contents.

@@ -1934,15 +1934,15 @@ class ChatMemoryService:
                     plugin_name="assistant",
                     call_type=call_type,
                     messages=request_messages,
-                    _wxautox_chat_name=history_chat_name,
-                    _wxautox_memory_trace=(
+                    _mabobot_chat_name=history_chat_name,
+                    _mabobot_memory_trace=(
                         {"trace_id": trace_id}
                         if trace_id
                         else None
                     ),
-                    _wxautox_history_mode=self.llm_history_mode,
-                    _wxautox_usage_capture=usage_capture,
-                    _wxautox_codex_output_schema=codex_output_schema,
+                    _mabobot_history_mode=self.llm_history_mode,
+                    _mabobot_usage_capture=usage_capture,
+                    _mabobot_codex_output_schema=codex_output_schema,
                 )
             finally:
                 if self.llm_usage_callback is not None:

@@ -15,7 +15,7 @@ import time
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.services.codex_app_server import (
     CodexAppServerError,
@@ -31,6 +31,8 @@ from app.services.file_tools_runtime import (
     get_codex_bin_selection,
     get_file_tools_runtime,
 )
+from app.services.wsl_probe_guard import run_guarded_wsl_command
+from app.utils.subprocess_utils import apply_hidden_process_defaults
 
 
 logger = logging.getLogger(__name__)
@@ -131,12 +133,18 @@ class CodexCompatibilityProbe:
             snapshot=snapshot,
         )
 
+    def _run_probe_command(self, command: List[str], **kwargs: Any) -> Any:
+        kwargs = apply_hidden_process_defaults(kwargs)
+        if self.use_wsl:
+            return run_guarded_wsl_command(command, runner=subprocess.run, **kwargs)
+        return subprocess.run(command, **kwargs)
+
     def quick_signature(self) -> Tuple[str, str, int]:
         realpath = self.codex_bin
         mtime_ns = 0
         if self.use_wsl:
             runtime = get_file_tools_runtime(use_wsl=True, codex_bin=self.codex_bin)
-            result = subprocess.run(
+            result = self._run_probe_command(
                 self._command(["--version"]),
                 cwd=self.workdir,
                 capture_output=True,
@@ -159,7 +167,7 @@ class CodexCompatibilityProbe:
                 mtime_ns = Path(realpath).stat().st_mtime_ns
             except OSError:
                 pass
-        result = subprocess.run(
+        result = self._run_probe_command(
             self._command(["--version"]),
             cwd=self.workdir,
             capture_output=True,
@@ -191,10 +199,10 @@ class CodexCompatibilityProbe:
         capabilities: Dict[str, bool] = {}
         schema_hash = ""
         try:
-            with tempfile.TemporaryDirectory(prefix="wxautox_codex_schema_") as directory:
+            with tempfile.TemporaryDirectory(prefix="mabobot_codex_schema_") as directory:
                 output_dir = Path(directory)
                 runtime_dir = _as_runtime_path(output_dir, self.use_wsl)
-                result = subprocess.run(
+                result = self._run_probe_command(
                     self._command(["app-server", "generate-json-schema", "--out", runtime_dir]),
                     cwd=self.workdir,
                     capture_output=True,
@@ -372,9 +380,22 @@ class CodexProcessPool:
 class CodexAgentRuntime:
     """Single control plane for interactive, batch and fallback Codex calls."""
 
-    def __init__(self, *, workdir: Optional[str] = None, codex_bin: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        *,
+        workdir: Optional[str] = None,
+        codex_bin: Optional[str] = None,
+        permission_read_roots: Optional[Iterable[str]] = None,
+    ) -> None:
         self.workdir = str(Path(workdir or os.getenv("CODEX_PROXY_WORKDIR") or Path.cwd()).resolve())
         self.probe = CodexCompatibilityProbe(codex_bin=codex_bin, workdir=self.workdir)
+        self.permission_read_roots = tuple(
+            dict.fromkeys(
+                str(path).strip()
+                for path in permission_read_roots or ()
+                if str(path).strip().startswith("/")
+            )
+        )
         self.state_store = CodexThreadStateStore()
         self.profiles = dict(DEFAULT_PROFILES)
         self._lock = threading.RLock()
@@ -404,6 +425,7 @@ class CodexAgentRuntime:
             # capability-gated by Codex even though the rest of the protocol is
             # stable. The compatibility probe above guarantees the field exists.
             experimental_api=True,
+            permission_read_roots=self.permission_read_roots,
         )
 
     def _build_pools(self, identity: CodexBinaryIdentity) -> Dict[str, CodexProcessPool]:
@@ -615,6 +637,7 @@ class CodexAgentRuntime:
                 codex_bin=self.probe.codex_bin,
                 workdir=self.workdir,
                 timeout_seconds=timeout,
+                permission_read_roots=self.permission_read_roots,
             ).chat(payload)
 
         try:

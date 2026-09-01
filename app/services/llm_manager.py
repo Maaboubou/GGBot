@@ -374,11 +374,12 @@ class LLMManager:
             except Exception as e:
                 logger.error(f"❌ 迁移旧版配置失败: {e}")
 
-        # 4. 首次启动保持空模型列表，由用户在 Web 控制台自行添加。
+        # 4. 如果没有任何配置文件，加载默认配置
         if not self.config.get("models") and not self.config.get("plugin_mappings"):
-            logger.info("📄 未找到模型配置，初始化为空配置")
-            self.config["models"] = {}
-            self.config["plugin_mappings"] = {}
+            logger.info("📄 未找到任何配置，加载默认配置")
+            default_config = self._get_default_config()
+            self.config["models"] = default_config.get("models", {})
+            self.config["plugin_mappings"] = default_config.get("plugin_mappings", {})
             migration_needed = True
 
         # 自动清理 Gemini 3.x 已弃用采样参数。旧配置在首次加载新版
@@ -387,6 +388,13 @@ class LLMManager:
         for model_id, model_cfg in list(self.config.get("models", {}).items()):
             if not isinstance(model_cfg, dict):
                 continue
+            if str(model_cfg.get("codex_profile_id") or "").strip() == "__current__":
+                model_cfg.pop("codex_profile_id", None)
+                modified = True
+                logger.info(
+                    "🧹 已将模型 %s 的旧版当前 Codex 绑定迁移为默认 Profile",
+                    model_id,
+                )
             sanitized, removed = sanitize_gemini_3_model_config(model_cfg)
             if removed:
                 self.config["models"][model_id] = sanitized
@@ -461,92 +469,6 @@ class LLMManager:
                     "🧹 图片模型路由归属已调整为 builtin_chat_logger.image_understanding"
                 )
 
-        # 没有模型时不写入任何预设模型 ID 或任务映射，避免制造无效配置。
-        if not self.config.get("models"):
-            if migration_needed or modified:
-                self.save_config()
-            logger.info(
-                "📄 配置加载完成: models=0, mappings=%s",
-                len(self.config.get("plugin_mappings", {})),
-            )
-            return
-
-        # The public build does not inject preset routes, but an existing
-        # installation must still collapse its historical memory mappings.
-        chatbot_mappings = self.config.get("plugin_mappings", {}).get(
-            "builtin_chatbot",
-        )
-        if isinstance(chatbot_mappings, dict) and any(
-            str(key).startswith("memory_") for key in chatbot_mappings
-        ):
-            def existing_route(*call_types: str) -> Dict[str, Any]:
-                for call_type in call_types:
-                    mapping = chatbot_mappings.get(call_type)
-                    if (
-                        isinstance(mapping, dict)
-                        and str(mapping.get("primary") or "").strip()
-                    ):
-                        return mapping
-                return {}
-
-            first_model_id = next(iter(self.config.get("models", {})), "")
-            generate_route = existing_route(
-                "memory_generate",
-                "memory_event",
-                "memory_person_observe",
-                "chat",
-            )
-            review_route = existing_route(
-                "memory_review",
-                "memory_verify",
-                "memory_dedup",
-                "memory_person_observe",
-            ) or generate_route
-            synthesize_route = existing_route(
-                "memory_synthesize",
-                "memory_person_consolidate",
-                "memory_stage",
-                "memory_person_period",
-            ) or generate_route
-
-            def primary(mapping: Dict[str, Any]) -> str:
-                return str(mapping.get("primary") or first_model_id).strip()
-
-            def fallback(mapping: Dict[str, Any]) -> List[str]:
-                return list(mapping.get("fallback") or [])
-
-            memory_defaults = default_memory_route_mappings(
-                generate_primary=primary(generate_route),
-                review_primary=primary(review_route),
-                synthesize_primary=primary(synthesize_route),
-                generate_fallback=fallback(generate_route),
-                review_fallback=fallback(review_route),
-                synthesize_fallback=fallback(synthesize_route),
-            )
-            if migrate_memory_route_mappings(
-                chatbot_mappings,
-                memory_defaults,
-            ):
-                modified = True
-
-        legacy_defaults_enabled = str(
-            os.getenv("LLM_ENABLE_LEGACY_DEFAULT_MAPPINGS", "false")
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        if not legacy_defaults_enabled:
-            if migration_needed or modified:
-                self.save_config()
-            logger.info(
-                "📄 配置加载完成: models=%s, mappings=%s（未注入预设映射）",
-                len(self.config.get("models", {})),
-                len(self.config.get("plugin_mappings", {})),
-            )
-            return
-
-        # 自动补全可能缺失的配置项。
-        chatbot_mappings = self.config.setdefault("plugin_mappings", {}).setdefault(
-            "builtin_chatbot",
-            {},
-        )
         if (
             "followup_judge" not in assistant_mappings
             and "deepseek" in self.config.get("models", {})
@@ -859,7 +781,7 @@ class LLMManager:
             "model": model_str,
             "messages": messages,
         }
-        params["_wxautox_supports_vision"] = bool(
+        params["_mabobot_supports_vision"] = bool(
             model_cfg.get("supports_vision")
             or model_cfg.get("vision")
             or model_cfg.get("image_input")
@@ -1052,17 +974,17 @@ class LLMManager:
 
     @staticmethod
     def _strip_internal_provider_params(params: dict) -> None:
-        """Keep wxautox routing metadata out of external provider payloads."""
+        """Keep Mabobot routing metadata out of external provider payloads."""
 
         def clean(payload: dict) -> None:
             for key in list(payload):
-                if str(key).startswith("_wxautox_"):
+                if str(key).startswith("_mabobot_"):
                     payload.pop(key, None)
 
             extra_body = payload.get("extra_body")
             if isinstance(extra_body, dict):
                 for key in list(extra_body):
-                    if str(key).startswith(("_wxautox_", "wxautox_")):
+                    if str(key).startswith(("_mabobot_", "mabobot_")):
                         extra_body.pop(key, None)
                 if not extra_body:
                     payload.pop("extra_body", None)
@@ -1114,31 +1036,31 @@ class LLMManager:
 
         # ── 2. 从 kwargs 中提取特殊参数（不修改原始 kwargs）──
         caller_tools        = kwargs.get("tools")       # 调用方 tools（如 google_search）
-        attachment_capture  = kwargs.get("_wxautox_attachment_capture")
-        raw_input_files     = kwargs.get("_wxautox_input_files")
+        attachment_capture  = kwargs.get("_mabobot_attachment_capture")
+        raw_input_files     = kwargs.get("_mabobot_input_files")
         input_files         = [
             copy.deepcopy(item)
             for item in (raw_input_files or [])
             if isinstance(item, dict) and item.get("path")
         ] if isinstance(raw_input_files, list) else []
-        allow_image_input   = bool(kwargs.get("_wxautox_allow_image_input"))
-        require_image_input = bool(kwargs.get("_wxautox_require_image_input"))
+        allow_image_input   = bool(kwargs.get("_mabobot_allow_image_input"))
+        require_image_input = bool(kwargs.get("_mabobot_require_image_input"))
         disable_model_web_search = bool(
-            kwargs.get("_wxautox_disable_model_web_search")
+            kwargs.get("_mabobot_disable_model_web_search")
         )
-        codex_chat_id       = str(kwargs.get("_wxautox_chat_id") or "").strip()
-        codex_role_name     = str(kwargs.get("_wxautox_role_name") or "").strip()
+        codex_chat_id       = str(kwargs.get("_mabobot_chat_id") or "").strip()
+        codex_role_name     = str(kwargs.get("_mabobot_role_name") or "").strip()
         history_chat_name   = str(
-            kwargs.get("_wxautox_chat_name") or codex_chat_id
+            kwargs.get("_mabobot_chat_name") or codex_chat_id
         ).strip()
-        memory_trace        = kwargs.get("_wxautox_memory_trace")
+        memory_trace        = kwargs.get("_mabobot_memory_trace")
         history_mode        = str(
-            kwargs.get("_wxautox_history_mode") or "full"
+            kwargs.get("_mabobot_history_mode") or "full"
         ).strip().lower()
-        usage_capture       = kwargs.get("_wxautox_usage_capture")
+        usage_capture       = kwargs.get("_mabobot_usage_capture")
         codex_output_schema = (
-            copy.deepcopy(kwargs.get("_wxautox_codex_output_schema"))
-            if isinstance(kwargs.get("_wxautox_codex_output_schema"), dict)
+            copy.deepcopy(kwargs.get("_mabobot_codex_output_schema"))
+            if isinstance(kwargs.get("_mabobot_codex_output_schema"), dict)
             else None
         )
         history_metadata = {
@@ -1158,25 +1080,25 @@ class LLMManager:
             "input_file_count": len(input_files),
             "_usage_capture": usage_capture,
         }
-        codex_retry         = bool(kwargs.get("_wxautox_codex_retry"))
+        codex_retry         = bool(kwargs.get("_mabobot_codex_retry"))
         codex_reasoning_effort = str(
-            kwargs.get("_wxautox_codex_reasoning_effort") or "inherit"
+            kwargs.get("_mabobot_codex_reasoning_effort") or "inherit"
         ).strip().lower()
         codex_reasoning_summary = str(
-            kwargs.get("_wxautox_codex_reasoning_summary") or "inherit"
+            kwargs.get("_mabobot_codex_reasoning_summary") or "inherit"
         ).strip().lower()
         codex_web_search_mode = str(
-            kwargs.get("_wxautox_codex_web_search_mode") or "inherit"
+            kwargs.get("_mabobot_codex_web_search_mode") or "inherit"
         ).strip().lower()
         try:
-            codex_timeout_seconds = max(0, int(kwargs.get("_wxautox_codex_timeout_seconds") or 0))
+            codex_timeout_seconds = max(0, int(kwargs.get("_mabobot_codex_timeout_seconds") or 0))
         except (TypeError, ValueError):
             codex_timeout_seconds = 0
         try:
-            codex_max_turns = max(0, int(kwargs.get("_wxautox_codex_max_turns") or 0))
+            codex_max_turns = max(0, int(kwargs.get("_mabobot_codex_max_turns") or 0))
         except (TypeError, ValueError):
             codex_max_turns = 0
-        codex_exec_fallback = bool(kwargs.get("_wxautox_codex_exec_fallback", True))
+        codex_exec_fallback = bool(kwargs.get("_mabobot_codex_exec_fallback", True))
         mapping_overrides = mapping.get("override_params", {})
 
         # 映射覆盖参数来自用户配置；插件调用参数不能覆盖模型核心配置。
@@ -1185,25 +1107,25 @@ class LLMManager:
         _MODEL_CONFIG_ONLY_KEYS = {"temperature", "max_tokens", "timeout"}
         _HANDLED_KEYS = frozenset({
             "tools",
-            "_wxautox_attachment_capture",
-            "_wxautox_input_files",
-            "_wxautox_allow_image_input",
-            "_wxautox_require_image_input",
-            "_wxautox_disable_model_web_search",
-            "_wxautox_chat_id",
-            "_wxautox_chat_name",
-            "_wxautox_role_name",
-            "_wxautox_memory_trace",
-            "_wxautox_history_mode",
-            "_wxautox_usage_capture",
-            "_wxautox_codex_output_schema",
-            "_wxautox_codex_retry",
-            "_wxautox_codex_reasoning_effort",
-            "_wxautox_codex_reasoning_summary",
-            "_wxautox_codex_web_search_mode",
-            "_wxautox_codex_timeout_seconds",
-            "_wxautox_codex_max_turns",
-            "_wxautox_codex_exec_fallback",
+            "_mabobot_attachment_capture",
+            "_mabobot_input_files",
+            "_mabobot_allow_image_input",
+            "_mabobot_require_image_input",
+            "_mabobot_disable_model_web_search",
+            "_mabobot_chat_id",
+            "_mabobot_chat_name",
+            "_mabobot_role_name",
+            "_mabobot_memory_trace",
+            "_mabobot_history_mode",
+            "_mabobot_usage_capture",
+            "_mabobot_codex_output_schema",
+            "_mabobot_codex_retry",
+            "_mabobot_codex_reasoning_effort",
+            "_mabobot_codex_reasoning_summary",
+            "_mabobot_codex_web_search_mode",
+            "_mabobot_codex_timeout_seconds",
+            "_mabobot_codex_max_turns",
+            "_mabobot_codex_exec_fallback",
         } | _MODEL_CONFIG_ONLY_KEYS)
         for k, v in kwargs.items():
             if k not in _HANDLED_KEYS:
@@ -1296,11 +1218,11 @@ class LLMManager:
             t0 = time.time()
             safe_params = copy.deepcopy(params)
             safe_params["drop_params"] = True
-            configured_supports_vision = bool(safe_params.pop("_wxautox_supports_vision", False))
+            configured_supports_vision = bool(safe_params.pop("_mabobot_supports_vision", False))
             fallback_vision_flags = {}
             if "fallbacks" in safe_params and isinstance(safe_params["fallbacks"], list):
                 for fb in safe_params["fallbacks"]:
-                    fallback_vision_flags[id(fb)] = bool(fb.pop("_wxautox_supports_vision", False))
+                    fallback_vision_flags[id(fb)] = bool(fb.pop("_mabobot_supports_vision", False))
             self._strip_internal_provider_params(safe_params)
 
             # 视觉降级：主模型不支持视觉时剔除图片（fallback 由 litellm 处理）。
@@ -1462,6 +1384,7 @@ class LLMManager:
                 reasoning_text=self._extract_reasoning_from_response(response),
                 token_usage=token_usage,
                 metadata=history_metadata,
+                response_attachments=response_attachments,
             )
             logger.info(
                 f"✅ Fallback 成功: {len(result)} 字符 ({response_time:.2f}s) "
@@ -1589,6 +1512,7 @@ class LLMManager:
                     reasoning_text=self._extract_reasoning_from_response(response),
                     token_usage=token_usage,
                     metadata=history_metadata,
+                    response_attachments=response_attachments,
                 )
                 logger.info(
                     f"✅ Local Codex CLI 成功: {len(result)} 字符 ({response_time:.2f}s) "
@@ -1670,6 +1594,7 @@ class LLMManager:
                 reasoning_text=self._extract_reasoning_from_response(response),
                 token_usage=token_usage,
                 metadata=history_metadata,
+                response_attachments=response_attachments,
             )
 
             logger.info(
@@ -1757,7 +1682,7 @@ class LLMManager:
             stream_params["drop_params"] = True
             stream_params["stream"] = True
             stream_params.pop("fallbacks", None)
-            # primary_params 仍包含仅供 wxautox 内部路由使用的元数据；正常
+            # primary_params 仍包含仅供 Mabobot 内部路由使用的元数据；正常
             # 非流式调用会在 _do_call 中清理，流式补救也必须遵循同一边界。
             self._strip_internal_provider_params(stream_params)
 
@@ -2093,7 +2018,6 @@ class LLMManager:
         input_files: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple:
         """Call the shared Codex runtime using the appropriate workload profile."""
-        from app.services.agent_runtime import get_agent_runtime
         from app.services.codex_profile_service import get_codex_runtime_registry
 
         extra_body = copy.deepcopy(params.get("extra_body") or {})
@@ -2133,7 +2057,7 @@ class LLMManager:
         if codex_output_schema:
             payload["output_schema"] = copy.deepcopy(codex_output_schema)
         if input_files:
-            payload["wxautox_input_files"] = copy.deepcopy(input_files)
+            payload["mabobot_input_files"] = copy.deepcopy(input_files)
         # Preserve direct top-level flags if present.
         for key in ("reasoning_effort", "web_search", "codex_web_search"):
             if key in params:
@@ -2148,27 +2072,25 @@ class LLMManager:
             timeout = codex_timeout_seconds
             payload["timeout"] = timeout
         if allow_image_input:
-            payload["wxautox_allow_image_input"] = True
-            payload.setdefault("extra_body", {})["wxautox_allow_image_input"] = True
+            payload["mabobot_allow_image_input"] = True
+            payload.setdefault("extra_body", {})["mabobot_allow_image_input"] = True
 
         t0 = time.time()
         codex_profile_id = str(model_config.get("codex_profile_id") or "").strip()
-        if codex_profile_id:
-            runtime, codex_profile = get_codex_runtime_registry().resolve(codex_profile_id)
-            payload["model"] = str(codex_profile.get("model") or payload["model"])
-            payload["codex_runtime_profile"] = codex_profile_id
-            try:
-                profile_context_window = int(codex_profile.get("context_window") or 0)
-            except (TypeError, ValueError):
-                profile_context_window = 0
-            if profile_context_window >= 4096:
-                payload["codex_model_context_window"] = profile_context_window
-            if "reasoning_effort" not in payload:
-                payload["reasoning_effort"] = str(
-                    codex_profile.get("reasoning_effort") or "high"
-                )
-        else:
-            runtime = get_agent_runtime()
+        runtime, codex_profile = get_codex_runtime_registry().resolve(codex_profile_id)
+        resolved_profile_id = str(codex_profile.get("name") or "")
+        payload["model"] = str(codex_profile.get("model") or payload["model"])
+        payload["codex_runtime_profile"] = resolved_profile_id
+        try:
+            profile_context_window = int(codex_profile.get("context_window") or 0)
+        except (TypeError, ValueError):
+            profile_context_window = 0
+        if profile_context_window >= 4096:
+            payload["codex_model_context_window"] = profile_context_window
+        if "reasoning_effort" not in payload:
+            payload["reasoning_effort"] = str(
+                codex_profile.get("reasoning_effort") or "high"
+            )
         if chat_id:
             response = runtime.chat(
                 payload,
@@ -2439,6 +2361,7 @@ class LLMManager:
         """Record first-class Codex replies without routing them through LiteLLM."""
         safe_response = response if isinstance(response, dict) else {}
         token_usage = self._extract_token_usage(safe_response)
+        response_attachments = self._extract_attachments_from_response(safe_response)
         actual_model = f"local_codex_{str(backend or 'runtime')}/{str(model_id or 'unknown')}"
         if success:
             self._record_stats(
@@ -2465,13 +2388,15 @@ class LLMManager:
             reasoning_text=self._extract_reasoning_from_response(safe_response),
             token_usage=token_usage,
             metadata=metadata,
+            response_attachments=response_attachments,
         )
 
     def _record_call_history(self, plugin_name: str, call_type: str, model_id: str,
                              messages: list, response_text: str, response_time: float,
                              actual_model: str, tokens: int, success: bool, error: str = "",
                              reasoning_text: str = "", token_usage: dict = None,
-                             metadata: Optional[dict] = None):
+                             metadata: Optional[dict] = None,
+                             response_attachments: Optional[List[Dict[str, Any]]] = None):
         """记录每次 LLM 调用的请求/响应到内存和本地 JSONL。"""
         max_history_per_key = self._call_history_limit()
         key = f"{plugin_name}.{call_type}"
@@ -2498,6 +2423,7 @@ class LLMManager:
             "actual_model": actual_model,
             "messages": messages,
             "response_text": response_text if response_text else "",
+            "response_attachments": response_attachments or [],
             "reasoning_text": reasoning_text if reasoning_text else "",
             "response_time": round(response_time, 3),
             "tokens": tokens,
@@ -2535,6 +2461,7 @@ class LLMManager:
         if history_mode == "summary":
             entry["messages"] = []
             entry["response_text"] = ""
+            entry["response_attachments"] = []
             entry["reasoning_text"] = ""
         with self._call_history_lock:
             if key not in self.call_history:
@@ -2588,7 +2515,14 @@ class LLMManager:
     @classmethod
     def _sanitize_history_entry(cls, entry: Dict[str, Any]) -> Dict[str, Any]:
         sanitized = dict(entry)
-        for key in ("messages", "response_text", "reasoning_text", "memory_trace", "error"):
+        for key in (
+            "messages",
+            "response_text",
+            "response_attachments",
+            "reasoning_text",
+            "memory_trace",
+            "error",
+        ):
             if key in sanitized:
                 sanitized[key] = cls._sanitize_history_value(sanitized[key])
         return sanitized
@@ -2614,6 +2548,17 @@ class LLMManager:
     def _history_entry_summary(entry: dict, index: int) -> dict:
         messages = entry.get("messages") or []
         response_text = entry.get("response_text") or ""
+        response_attachments = [
+            item
+            for item in (entry.get("response_attachments") or [])
+            if isinstance(item, dict)
+        ]
+        image_count = sum(
+            1
+            for item in response_attachments
+            if str(item.get("type") or "").lower() == "image"
+            or str(item.get("mime_type") or "").lower().startswith("image/")
+        )
         reasoning_text = entry.get("reasoning_text") or ""
         memory_trace = (
             entry.get("memory_trace")
@@ -2644,6 +2589,10 @@ class LLMManager:
             "success": entry.get("success", False),
             "message_count": len(messages),
             "response_size": len(response_text),
+            "attachment_count": len(response_attachments),
+            "image_count": image_count,
+            "file_count": max(0, len(response_attachments) - image_count),
+            "has_attachments": bool(response_attachments),
             "reasoning_size": len(reasoning_text),
             "has_reasoning": bool(reasoning_text),
             "has_error": bool(entry.get("error")),
@@ -3124,7 +3073,7 @@ class LLMManager:
                 self.save_config()
         if changed:
             logger.info(
-                "🧹 已将 %s 个模型配置从已删除的 Codex Profile %s 恢复为本机 Codex",
+                "🧹 已将 %s 个模型配置从已删除的 Codex Profile %s 恢复为默认 Profile",
                 changed,
                 normalized,
             )
@@ -3151,17 +3100,75 @@ class LLMManager:
         logger.info(f"✅ 任务模型路由已更新: {plugin_name}.{call_type}")
 
     def _get_default_config(self) -> Dict:
-        """公开版仅声明辅助任务槽位，不内置模型、密钥或模型绑定。"""
+        """默认配置"""
         return {
-            "models": {},
+            "models": {
+                "gpt4": {
+                    "model": "gpt-4.1",
+                    "api_key": "env::OPENAI_API_KEY",
+                    "temperature": 0.7,
+                    "max_tokens": 2000,
+                },
+                "gemini-flash": {
+                    "model": "gemini/gemini-3-flash-preview",
+                    "api_key": "env::GEMINI_API_KEY",
+                    "temperature": 0.6,
+                },
+                "deepseek": {
+                    "model": "deepseek/deepseek-chat",
+                    "api_base": "env::DEEPSEEK_API_BASE",
+                    "api_key": "env::DEEPSEEK_API_KEY",
+                    "temperature": 0.1,
+                },
+                "deepseek-followup": {
+                    "model": "deepseek/deepseek-chat",
+                    "api_base": "env::DEEPSEEK_API_BASE",
+                    "api_key": "env::DEEPSEEK_API_KEY",
+                    "temperature": 0.1,
+                    "max_tokens": 200,
+                    "timeout": 15,
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                    "enable_web_search": False,
+                },
+            },
             "plugin_mappings": {
                 "assistant": {
-                    "judge": {},
-                    "followup_judge": {},
-                    "memory_generate": {},
-                    "memory_review": {},
-                    "memory_synthesize": {},
-                }
+                    "judge": {
+                        "primary": "deepseek",
+                    },
+                    "followup_judge": {
+                        "primary": "deepseek-followup",
+                        "fallback": ["gemini-flash"],
+                        "override_params": {
+                            "temperature": 0.1,
+                            "max_tokens": 200,
+                            "timeout": 15,
+                            "response_format": {"type": "json_object"},
+                        },
+                    },
+                    "memory_generate": {
+                        "primary": "gemini-flash",
+                        "fallback": ["deepseek"],
+                        "override_params": {},
+                    },
+                    "memory_review": {
+                        "primary": "deepseek-followup",
+                        "fallback": ["gemini-flash"],
+                        "override_params": {},
+                    },
+                    "memory_synthesize": {
+                        "primary": "gemini-flash",
+                        "fallback": ["deepseek"],
+                        "override_params": {},
+                    },
+                },
+                "builtin_chat_logger": {
+                    "image_understanding": {
+                        "primary": "gpt4",
+                        "fallback": ["gemini-flash"],
+                        "override_params": {},
+                    }
+                },
             },
         }
 

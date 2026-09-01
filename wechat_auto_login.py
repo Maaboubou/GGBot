@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-开机后自动处理微信登录确认，并在确认在线后启动 wxautox。
+开机后自动处理微信登录确认，并按需在确认在线后启动 Mabobot。
 
 流程：
 1. 等待 Windows / 微信自动启动稳定。
 2. 查找微信登录确认窗口，置前后发送 Enter。
-3. 用 wxautox4 的 WeChat().IsOnline() 校验是否真正在线。
-4. 在线后启动 Start-GUI.bat；超时仍未在线则发送邮件通知，通常是二维码登录场景。
+3. 通过 wx_bot 健康接口或微信主窗口确认已登录。
+4. 在线后通知统一启动器继续，或在独立运行时启动 START.bat；超时仍未在线则发送邮件通知。
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Iterable
 
 from dotenv import load_dotenv
+
+from app.utils.subprocess_utils import hidden_process_kwargs
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -281,11 +283,11 @@ def log_display_info() -> None:
     )
 
 
-def wxautox_already_running() -> bool:
+def mabobot_already_running() -> bool:
     try:
         import requests
 
-        bridge_port = (os.getenv("WX_BOT_PORT") or "5000").strip()
+        bridge_port = (os.getenv("WX_BOT_PORT") or "5555").strip()
         response = requests.get(f"http://127.0.0.1:{bridge_port}/health", timeout=2)
         if response.ok:
             data = response.json()
@@ -306,30 +308,21 @@ def python_executable_for_project() -> str:
     return sys.executable
 
 
-def start_wxautox(start_target: str) -> None:
-    if wxautox_already_running():
-        logging.info("wxautox 已经在线，跳过重复启动")
+def start_mabobot(start_target: str) -> None:
+    if mabobot_already_running():
+        logging.info("Mabobot 微信桥接已经在线，跳过重复启动")
         return
 
     target = (ROOT_DIR / start_target).resolve()
     if not target.exists():
-        raise FileNotFoundError(f"wxautox 启动目标不存在: {target}")
+        raise FileNotFoundError(f"Mabobot 启动目标不存在: {target}")
 
     if target.suffix.lower() == ".bat":
         command = ["cmd.exe", "/c", str(target)]
-        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
     elif target.suffix.lower() == ".py":
         command = [python_executable_for_project(), str(target)]
-        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
     else:
         command = [str(target)]
-        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
 
     subprocess.Popen(
         command,
@@ -337,9 +330,9 @@ def start_wxautox(start_target: str) -> None:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
+        **hidden_process_kwargs(new_process_group=True),
     )
-    logging.info("已启动 wxautox: %s", target)
+    logging.info("已启动 Mabobot: %s", target)
 
 
 def send_qr_required_email(reason: str) -> bool:
@@ -348,12 +341,12 @@ def send_qr_required_email(reason: str) -> bool:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     subject = "🚨 微信开机自动登录失败，需要扫码确认"
     body = (
-        "微信开机自动登录未成功，wxautox 未启动。\n\n"
+        "微信开机自动登录未成功，Mabobot 未启动。\n\n"
         f"时间：{now}\n"
         f"主机：{os.environ.get('COMPUTERNAME') or os.environ.get('HOSTNAME') or 'unknown'}\n"
         f"原因：{reason}\n\n"
         "常见情况：微信显示二维码登录界面，按 Enter 无法进入微信。\n"
-        "请远程到这台电脑扫码登录微信，登录完成后再启动 wxautox。"
+        "请远程到这台电脑扫码登录微信，登录完成后再启动 Mabobot。"
     )
     return send_alert_email(subject=subject, body=body)
 
@@ -364,7 +357,7 @@ def wait_and_login(args: argparse.Namespace) -> bool:
     enter_sent = False
 
     while time.monotonic() < deadline:
-        if wxautox_already_running():
+        if mabobot_already_running():
             return True
 
         main_window = find_main_window()
@@ -395,14 +388,15 @@ def wait_and_login(args: argparse.Namespace) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="自动确认微信登录并启动 wxautox")
+    parser = argparse.ArgumentParser(description="自动确认微信登录并启动 Mabobot")
     parser.add_argument("--initial-delay", type=int, default=int(os.getenv("WECHAT_AUTOLOGIN_INITIAL_DELAY", "60")))
     parser.add_argument("--login-timeout", type=int, default=int(os.getenv("WECHAT_AUTOLOGIN_TIMEOUT", "180")))
     parser.add_argument("--poll-interval", type=float, default=float(os.getenv("WECHAT_AUTOLOGIN_POLL_INTERVAL", "5")))
     parser.add_argument("--enter-interval", type=float, default=float(os.getenv("WECHAT_AUTOLOGIN_ENTER_INTERVAL", "20")))
     parser.add_argument("--display-timeout", type=int, default=int(os.getenv("WECHAT_AUTOLOGIN_DISPLAY_TIMEOUT", "180")))
     parser.add_argument("--start-delay", type=int, default=int(os.getenv("WECHAT_AUTOLOGIN_START_DELAY", "15")))
-    parser.add_argument("--start-target", default=os.getenv("WXAUTOX_START_TARGET", "Start-GUI.bat"))
+    parser.add_argument("--start-target", default=os.getenv("MABOBOT_START_TARGET", "START.bat"))
+    parser.add_argument("--no-start", action="store_true", help="只确认微信登录，不再创建启动器进程")
     parser.add_argument("--no-email", action="store_true", help="失败时不发邮件，仅写日志")
     return parser.parse_args()
 
@@ -430,20 +424,23 @@ def main() -> int:
                 send_qr_required_email(
                     reason=(
                         "微信已可进入，但显示环境低于 1280x720。"
-                        "为避免 wxautox 在 640x480/headless 桌面下错误调整窗口，本次未启动。"
+                        "为避免 mabowx 在 640x480/headless 桌面下错误调整窗口，本次未启动。"
                     )
                 )
             return 1
         if args.start_delay > 0:
-            logging.info("微信在线后等待 %ss 再启动 wxautox", args.start_delay)
+            logging.info("微信在线后等待 %ss 再启动 Mabobot", args.start_delay)
             time.sleep(args.start_delay)
-        start_wxautox(args.start_target)
+        if args.no_start:
+            logging.info("微信登录确认完成，交回桌面启动器继续启动服务")
+        else:
+            start_mabobot(args.start_target)
         return 0
 
     if not args.no_email:
         send_qr_required_email(
             reason=(
-                f"{args.login_timeout}s 内未通过 wxautox4 IsOnline() 校验。"
+                f"{args.login_timeout}s 内未确认微信已登录。"
                 "如果屏幕上是二维码登录界面，这是预期告警。"
             )
         )

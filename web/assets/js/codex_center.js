@@ -3,12 +3,15 @@ const CodexCenter = {
     loading: false,
     profileEditorBound: false,
     profiles: [],
+    localAuth: { available: false, storage: 'unavailable', reason: '本机登录不可导入' },
     editingProfile: null,
     catalogProviders: [],
     profileCatalogModels: [],
     profileCatalogRequestId: 0,
     oauthProfile: '',
     oauthMakeDefault: false,
+    oauthSetupDraft: false,
+    oauthAuthSource: '',
     oauthPollTimer: null,
     oauthModels: [],
     profileProviderBases: {
@@ -69,44 +72,90 @@ const CodexCenter = {
     renderProfiles(data) {
         const profiles = data.profiles || [];
         this.profiles = profiles;
+        this.localAuth = data.local_auth || this.localAuth;
+        this.updateLocalAuthChoice();
         const container = document.getElementById('codexProfilesGrid');
         if (!container) return;
-        const systemCard = `
-            <article class="codex-profile-card ${data.default_profile_id ? '' : 'selected'}" ${data.default_profile_id ? '' : 'aria-current="true"'}>
-                <div class="codex-profile-card-icon"><i class="bi bi-terminal"></i></div>
-                <div class="codex-profile-card-copy"><div><strong>当前配置</strong>${data.default_profile_id ? '' : '<span>默认</span>'}</div><p>沿用本机 Codex 的登录、模型与设置。</p><small>系统配置</small></div>
-                ${data.default_profile_id ? '<button class="btn btn-sm btn-outline-primary" data-default-profile="">设为默认</button>' : ''}
+        const setupCard = data.default_profile_id ? '' : `
+            <article class="codex-profile-card codex-profile-setup-card">
+                <header class="codex-profile-card-head">
+                    <strong>尚未配置默认 Profile</strong>
+                    <span class="codex-profile-status warning">待配置</span>
+                </header>
+                <p>Assistant 需要一个已完成凭据配置的 Profile。</p>
+                <footer class="codex-profile-card-actions">
+                    <button class="btn btn-sm btn-primary" type="button" data-open-profile>新建 Profile</button>
+                </footer>
             </article>`;
         const cards = profiles.map(profile => {
             const selected = profile.name === data.default_profile_id;
             const ready = Boolean(profile.available);
+            const official = profile.auth_type === 'chatgpt';
+            const contextWindow = Number(profile.context_window || 0);
+            const contextLabel = contextWindow >= 1_000_000
+                ? `${(contextWindow / 1_000_000).toFixed(contextWindow % 1_000_000 ? 1 : 0)}M`
+                : (contextWindow >= 1000 ? `${Math.round(contextWindow / 1000)}K` : '自动');
+            const sourceLabel = profile.auth_source === 'local_cache'
+                ? '本机登录副本'
+                : (official ? 'ChatGPT 登录' : (profile.provider_name || 'Responses API'));
+            const localCache = profile.auth_source === 'local_cache';
+            const syncStatus = String(profile.auth_sync_status || '');
+            const syncWarning = localCache && syncStatus && syncStatus !== 'synced';
+            const syncStatusLabel = syncStatus === 'outdated'
+                ? '登录待同步'
+                : (syncStatus === 'missing'
+                    ? '登录未同步'
+                    : (syncStatus === 'unavailable' || syncStatus === 'invalid' ? '登录需检查' : ''));
             return `
-                <article class="codex-profile-card ${selected ? 'selected' : ''}" ${selected ? 'aria-current="true"' : ''}>
-                    <div class="codex-profile-card-icon ${ready ? '' : 'warning'}"><i class="bi ${ready ? 'bi-person-badge' : 'bi-exclamation-triangle'}"></i></div>
-                    <div class="codex-profile-card-copy">
-                        <div><strong>${this.escape(profile.name)}</strong>${selected ? '<span>默认</span>' : ''}</div>
-                        <p>${this.escape(profile.model)} · ${this.escape(profile.provider_name || profile.auth_type || '')}</p>
-                        <small>${ready ? `${this.escape(profile.reasoning_effort || 'inherit')} 推理 · ${Number(profile.context_window || 0).toLocaleString()} context${profile.supports_vision ? ' · 图片' : ''}${profile.supports_web_search ? ' · 搜索' : ''}` : '尚未完成凭据配置'}</small>
+                <article class="codex-profile-card ${selected ? 'selected' : ''} ${ready ? '' : 'not-ready'}" ${selected ? 'aria-current="true"' : ''}>
+                    <header class="codex-profile-card-head">
+                        <div class="codex-profile-card-identity">
+                            <strong title="${this.escape(profile.name)}">${this.escape(profile.name)}</strong>
+                            <span class="codex-profile-kind">${official ? '官方 Codex' : 'API'}</span>
+                        </div>
+                        <div class="codex-profile-card-statuses">
+                            ${selected ? '<span class="codex-profile-status selected">默认</span>' : ''}
+                            <span class="codex-profile-status ${ready ? 'ready' : 'warning'}">${ready ? '可用' : '需登录'}</span>
+                            ${syncWarning ? `<span class="codex-profile-status warning" title="${this.escape(profile.auth_sync_reason || syncStatusLabel)}">${syncStatusLabel}</span>` : ''}
+                        </div>
+                    </header>
+                    <div class="codex-profile-card-model" title="${this.escape(profile.model)}">${this.escape(profile.model)}</div>
+                    <div class="codex-profile-card-meta" aria-label="Profile 配置摘要">
+                        ${ready ? `<span><b>推理</b>${this.escape(profile.reasoning_effort || 'inherit')}</span><span><b>上下文</b>${contextLabel}</span>` : '<span class="warning">完成凭据配置后可使用</span>'}
+                        ${profile.supports_vision ? '<span>图片</span>' : ''}
+                        ${profile.supports_web_search ? '<span>搜索</span>' : ''}
                     </div>
-                    <div class="codex-profile-card-actions">
-                        <button class="btn btn-sm btn-outline-secondary" type="button" data-edit-profile="${this.escape(profile.name)}"><i class="bi bi-pencil"></i> 编辑</button>
-                        ${profile.auth_type === 'chatgpt' && !ready
-                            ? `<button class="btn btn-sm btn-outline-primary" type="button" data-profile-login="${this.escape(profile.name)}">完成登录</button>`
+                    <footer class="codex-profile-card-actions">
+                        <span class="codex-profile-card-source" title="${this.escape(sourceLabel)}">${this.escape(sourceLabel)}</span>
+                        <div>
+                        <button class="btn btn-sm btn-outline-secondary" type="button" data-profile-skills="${this.escape(profile.name)}" title="管理此 Profile 的 Skills"><i class="bi bi-tools me-1"></i>Skills</button>
+                        <button class="btn btn-sm btn-outline-secondary codex-profile-icon-action" type="button" data-edit-profile="${this.escape(profile.name)}" aria-label="编辑 ${this.escape(profile.name)}" title="编辑"><i class="bi bi-pencil"></i></button>
+                        ${localCache ? `<button class="btn btn-sm ${syncWarning ? 'btn-outline-warning' : 'btn-outline-secondary'} codex-profile-icon-action" type="button" data-sync-local-auth="${this.escape(profile.name)}" aria-label="同步 ${this.escape(profile.name)} 的本机登录" title="同步本机登录"><i class="bi bi-arrow-repeat"></i></button>` : ''}
+                        ${official && !ready
+                            ? (localCache ? '' : `<button class="btn btn-sm btn-outline-primary" type="button" data-profile-login="${this.escape(profile.name)}">完成登录</button>`)
                             : (selected ? '' : `<button class="btn btn-sm btn-outline-primary" type="button" data-default-profile="${this.escape(profile.name)}" ${ready ? '' : 'disabled'}>设为默认</button>`)}
-                        <button class="btn btn-sm btn-outline-danger" type="button" data-delete-profile="${this.escape(profile.name)}"><i class="bi bi-trash3"></i> 删除</button>
-                    </div>
+                        <button class="btn btn-sm btn-outline-danger codex-profile-icon-action" type="button" data-delete-profile="${this.escape(profile.name)}" aria-label="删除 ${this.escape(profile.name)}" title="删除"><i class="bi bi-trash3"></i></button>
+                        </div>
+                    </footer>
                 </article>`;
         }).join('');
-        container.innerHTML = systemCard + cards + `
-            <button class="codex-profile-add" type="button" onclick="CodexCenter.openProfileModal()"><i class="bi bi-plus-lg"></i><span>新建 Profile</span><small>连接兼容 Responses API 的模型</small></button>`;
+        container.innerHTML = setupCard + cards + `
+            <button class="codex-profile-add" type="button" onclick="CodexCenter.openProfileModal()"><i class="bi bi-plus-lg"></i><span>新建 Profile</span><small>连接官方 Codex 或兼容 Responses API</small></button>`;
         container.querySelectorAll('[data-default-profile]').forEach(button => {
             button.addEventListener('click', () => this.setDefault(button.dataset.defaultProfile || ''));
         });
+        container.querySelector('[data-open-profile]')?.addEventListener('click', () => this.openProfileModal());
         container.querySelectorAll('[data-profile-login]').forEach(button => {
             button.addEventListener('click', () => this.startOAuth(button.dataset.profileLogin || '', false));
         });
+        container.querySelectorAll('[data-sync-local-auth]').forEach(button => {
+            button.addEventListener('click', () => this.syncLocalAuth(button.dataset.syncLocalAuth || '', button));
+        });
         container.querySelectorAll('[data-edit-profile]').forEach(button => {
             button.addEventListener('click', () => this.openProfileModal(button.dataset.editProfile || ''));
+        });
+        container.querySelectorAll('[data-profile-skills]').forEach(button => {
+            button.addEventListener('click', () => CodexSkills.open(button.dataset.profileSkills || ''));
         });
         container.querySelectorAll('[data-delete-profile]').forEach(button => {
             button.addEventListener('click', () => this.deleteProfile(button.dataset.deleteProfile || '', button));
@@ -167,10 +216,31 @@ const CodexCenter = {
                 LLMManager.clearLiteLLMUpdatePoll();
             }
         });
+        window.addEventListener('beforeunload', () => {
+            if (!this.oauthSetupDraft || !this.oauthProfile) return;
+            navigator.sendBeacon(
+                `/api/codex/profiles/${encodeURIComponent(this.oauthProfile)}/setup/cancel`
+            );
+        });
     },
 
     getProfileSource() {
         return document.querySelector('#codexProfileForm input[name="profile_source"]:checked')?.value || 'oauth';
+    },
+
+    updateLocalAuthChoice() {
+        const input = document.querySelector('#codexProfileForm input[name="auth_source"][value="local_cache"]');
+        const hint = document.getElementById('codexLocalAuthHint');
+        const choice = document.getElementById('codexLocalAuthChoice');
+        const available = Boolean(this.localAuth?.available);
+        if (hint) hint.textContent = this.localAuth?.reason || (available ? '可导入本机 Codex 登录' : '本机登录不可导入');
+        if (choice) choice.classList.toggle('opacity-50', !available);
+        if (!input) return;
+        input.disabled = Boolean(this.editingProfile) || !available;
+        if (!this.editingProfile && !available && input.checked) {
+            const device = document.querySelector('#codexProfileForm input[name="auth_source"][value="device_code"]');
+            if (device) device.checked = true;
+        }
     },
 
     async setProfileSource(source, { load = true } = {}) {
@@ -178,23 +248,38 @@ const CodexCenter = {
         if (!form) return;
         const oauthMode = source === 'oauth';
         const catalogMode = source === 'catalog';
+        const officialWizard = oauthMode && !this.editingProfile;
         form.classList.toggle('codex-profile-mode-manual', !catalogMode && !oauthMode);
         form.classList.toggle('codex-profile-mode-oauth', oauthMode);
         form.querySelectorAll('.codex-profile-api-field').forEach(element => {
             element.classList.toggle('d-none', oauthMode);
         });
+        form.querySelectorAll('.codex-profile-oauth-field').forEach(element => {
+            element.classList.toggle('d-none', !oauthMode);
+        });
         form.querySelectorAll('.codex-profile-catalog-field').forEach(element => {
             element.classList.toggle('d-none', !catalogMode);
+        });
+        form.querySelectorAll('.codex-profile-final-config-field').forEach(element => {
+            element.classList.toggle('d-none', officialWizard);
         });
         const modelInput = document.getElementById('codexProfileModel');
         const baseUrl = document.getElementById('codexProfileBaseUrl');
         const apiKey = document.getElementById('codexProfileApiKey');
         const nameInput = document.getElementById('codexProfileName');
+        const nameField = form.querySelector('.codex-profile-name-field');
+        const saveButton = document.getElementById('saveCodexProfileButton');
         if (modelInput) modelInput.required = !oauthMode;
         if (baseUrl) baseUrl.required = !oauthMode;
         if (apiKey) apiKey.required = !oauthMode && !this.editingProfile;
         if (nameInput) nameInput.placeholder = oauthMode ? '例如 chatgpt-main' : '例如 deepseek-main';
+        nameField?.classList.toggle('col-md-5', !officialWizard);
+        nameField?.classList.toggle('col-12', officialWizard);
+        if (saveButton && !this.editingProfile) {
+            saveButton.textContent = officialWizard ? '下一步' : '创建 Profile';
+        }
         if (oauthMode) {
+            this.updateLocalAuthChoice();
             this.closeProfileCatalog();
             return;
         }
@@ -426,6 +511,9 @@ const CodexCenter = {
         form.querySelectorAll('input[name="profile_source"]').forEach(input => {
             input.disabled = false;
         });
+        form.querySelectorAll('input[name="auth_source"]').forEach(input => {
+            input.disabled = false;
+        });
         const providerName = document.getElementById('codexProfileProviderName');
         const baseUrl = document.getElementById('codexProfileBaseUrl');
         const nameInput = document.getElementById('codexProfileName');
@@ -464,6 +552,10 @@ const CodexCenter = {
                 input.checked = input.value === source;
                 input.disabled = profile.auth_type === 'chatgpt' || input.value === 'oauth';
             });
+            form.querySelectorAll('input[name="auth_source"]').forEach(input => {
+                input.checked = input.value === (profile.auth_source || 'device_code');
+                input.disabled = true;
+            });
             if (apiKey) apiKey.placeholder = '留空则继续使用当前 API Key';
             if (apiKeyHint) apiKeyHint.textContent = '留空不会修改现有密钥；输入新 Key 后保存即可完成轮换。密钥仍只存入权限为 0600 的独立文件。';
             if (modalTitle) modalTitle.textContent = `编辑 Codex Profile · ${profile.name}`;
@@ -483,6 +575,7 @@ const CodexCenter = {
             if (modalSubtitle) modalSubtitle.textContent = '使用 ChatGPT 官方登录或连接 Responses 兼容接口。';
             if (saveButton) saveButton.textContent = '创建 Profile';
         }
+        this.updateLocalAuthChoice();
         await this.setProfileSource(source, { load: false });
         bootstrap.Modal.getOrCreateInstance(document.getElementById('codexProfileModal')).show();
     },
@@ -547,7 +640,8 @@ const CodexCenter = {
         const payload = {
             name: String(values.get('name') || '').trim(),
             auth_type: oauthMode ? 'chatgpt' : 'api_key',
-            model: oauthMode ? 'gpt-5.6-sol' : String(values.get('model') || '').trim(),
+            auth_source: oauthMode ? String(values.get('auth_source') || 'device_code') : 'device_code',
+            model: oauthMode ? '' : String(values.get('model') || '').trim(),
             provider_name: oauthMode ? 'ChatGPT 官方登录' : String(values.get('provider_name') || '').trim(),
             base_url: oauthMode ? '' : String(values.get('base_url') || '').trim(),
             api_key: oauthMode ? '' : String(values.get('api_key') || ''),
@@ -556,7 +650,8 @@ const CodexCenter = {
             context_window: Number(values.get('context_window') || 128000),
             supports_vision: oauthMode || values.get('supports_vision') === 'on',
             supports_web_search: oauthMode || values.get('supports_web_search') === 'on',
-            make_default: values.get('make_default') === 'on'
+            make_default: oauthMode ? false : values.get('make_default') === 'on',
+            setup_pending: oauthMode
         };
         const button = document.getElementById('saveCodexProfileButton');
         if (button) button.disabled = true;
@@ -569,10 +664,24 @@ const CodexCenter = {
                 : Promise.resolve();
             profileModal?.hide();
             await hidden;
-            await this.load();
-            if (result.requires_login) {
-                await this.startOAuth(result.profile?.name || payload.name, payload.make_default);
+            if (oauthMode && result.oauth_status) {
+                await this.startOAuth(
+                    result.profile?.name || payload.name,
+                    true,
+                    false,
+                    result.oauth_status,
+                    { setupDraft: true, authSource: payload.auth_source }
+                );
+            } else if (oauthMode && result.requires_login) {
+                await this.startOAuth(
+                    result.profile?.name || payload.name,
+                    true,
+                    false,
+                    null,
+                    { setupDraft: true, authSource: payload.auth_source }
+                );
             } else {
+                await this.load();
                 UI.showSuccess('Codex Profile 已创建');
             }
         } catch (error) {
@@ -585,12 +694,26 @@ const CodexCenter = {
     },
 
     async setDefault(profileId) {
+        if (!profileId) return;
         try {
             await API.codexProfiles.setDefault(profileId);
-            UI.showSuccess(profileId ? `默认 Profile 已切换为 ${profileId}` : '已恢复 Codex 当前配置');
+            UI.showSuccess(`默认 Profile 已切换为 ${profileId}`);
             await this.load();
         } catch (error) {
             UI.showError(`切换失败：${error.message}`);
+        }
+    },
+
+    async syncLocalAuth(profileName, button = null) {
+        if (!profileName) return;
+        if (button) button.disabled = true;
+        try {
+            await API.codexProfiles.syncLocalAuth(profileName);
+            await this.load();
+            UI.showSuccess(`已同步并验证 ${profileName} 的本机 Codex 登录`);
+        } catch (error) {
+            UI.showError(`同步本机登录失败：${error.message}`);
+            if (button) button.disabled = false;
         }
     },
 
@@ -601,10 +724,10 @@ const CodexCenter = {
             return;
         }
         const defaultNotice = profile.is_default
-            ? '\n它当前是默认 Profile；删除后默认设置会恢复为当前本机 Codex。'
+            ? '\n它当前是默认 Profile；删除后会自动选择另一个可用 Profile，如无可用项则需要重新配置。'
             : '';
         const confirmed = await UI.confirm(
-            `确定永久删除 Codex Profile “${profileName}”吗？${defaultNotice}\n引用它的聊天和模型配置会恢复为默认或当前本机 Codex。此操作无法撤销。`,
+            `确定永久删除 Codex Profile “${profileName}”吗？${defaultNotice}\n引用它的聊天和模型配置会恢复为继承默认 Profile。此操作无法撤销。`,
             {
                 title: '删除 Codex Profile',
                 confirmText: '永久删除',
@@ -639,18 +762,40 @@ const CodexCenter = {
         document.getElementById('codexOAuthFinish')?.classList.add('d-none');
         const cancel = document.getElementById('codexOAuthCancel');
         if (cancel) cancel.textContent = '取消授权';
+        const finish = document.getElementById('codexOAuthFinish');
+        if (finish) finish.textContent = this.oauthSetupDraft ? '完成创建' : '保存并使用';
+        const makeDefault = document.getElementById('codexOAuthMakeDefault');
+        if (makeDefault) makeDefault.checked = this.oauthMakeDefault;
+        const verbosity = document.getElementById('codexOAuthVerbosity');
+        if (verbosity) verbosity.value = 'inherit';
     },
 
-    async startOAuth(profileName, makeDefault = false, force = false) {
+    async startOAuth(
+        profileName,
+        makeDefault = false,
+        force = false,
+        initialStatus = null,
+        { setupDraft = false, authSource = '' } = {}
+    ) {
         if (!profileName) return;
         this.oauthProfile = profileName;
         this.oauthMakeDefault = Boolean(makeDefault);
+        this.oauthSetupDraft = Boolean(setupDraft);
         this.resetOAuthView();
+        const profile = this.profiles.find(item => item.name === profileName);
+        this.oauthAuthSource = authSource || profile?.auth_source || 'device_code';
+        const importedLogin = this.oauthAuthSource === 'local_cache';
+        const title = document.getElementById('codexOAuthModalTitle');
+        if (title) title.textContent = this.oauthSetupDraft
+            ? '配置官方 Codex Profile'
+            : '绑定 ChatGPT';
         const subtitle = document.getElementById('codexOAuthSubtitle');
-        if (subtitle) subtitle.textContent = `${profileName} · 扫码完成 Codex 官方授权`;
+        if (subtitle) subtitle.textContent = importedLogin
+            ? `${profileName} · 导入并验证本机 Codex 登录副本`
+            : `${profileName} · 扫码完成 Codex 官方授权`;
         bootstrap.Modal.getOrCreateInstance(document.getElementById('codexOAuthModal')).show();
         try {
-            const status = await API.codexProfiles.startOAuth(profileName, force);
+            const status = initialStatus || await API.codexProfiles.startOAuth(profileName, force);
             this.renderOAuthStatus(status);
         } catch (error) {
             this.showOAuthError(error.message);
@@ -684,17 +829,22 @@ const CodexCenter = {
             const accountLabel = [account.email, account.plan_type].filter(Boolean).join(' · ') || 'ChatGPT 账号';
             const accountElement = document.getElementById('codexOAuthAccount');
             if (accountElement) accountElement.textContent = accountLabel;
+            const subtitle = document.getElementById('codexOAuthSubtitle');
+            if (subtitle && this.oauthSetupDraft) {
+                subtitle.textContent = `${this.oauthProfile} · 登录完成，请选择账号可用配置`;
+            }
             this.oauthModels = Array.isArray(status.models) ? status.models : [];
             const select = document.getElementById('codexOAuthModel');
             if (select) {
                 select.innerHTML = this.oauthModels.map(model => `<option value="${this.escape(model.id)}" ${model.is_default ? 'selected' : ''}>${this.escape(model.display_name || model.id)} · ${this.escape(model.id)}</option>`).join('');
                 select.disabled = !this.oauthModels.length;
             }
+            this.syncOAuthModelConfig();
             const finish = document.getElementById('codexOAuthFinish');
             finish?.classList.remove('d-none');
             if (finish) finish.disabled = !this.oauthModels.length;
             const cancel = document.getElementById('codexOAuthCancel');
-            if (cancel) cancel.textContent = '稍后使用';
+            if (cancel) cancel.textContent = this.oauthSetupDraft ? '放弃创建' : '稍后使用';
             return;
         }
         this.showOAuthError(status?.error || (state === 'expired' ? '授权已过期，请重新发起登录。' : 'ChatGPT 授权未完成。'));
@@ -732,17 +882,62 @@ const CodexCenter = {
         }
     },
 
+    syncOAuthModelConfig() {
+        const modelId = document.getElementById('codexOAuthModel')?.value || '';
+        const model = this.oauthModels.find(item => item.id === modelId) || {};
+        const efforts = Array.isArray(model.supported_reasoning_efforts)
+            ? model.supported_reasoning_efforts.filter(Boolean)
+            : [];
+        const defaultEffort = efforts.includes(model.default_reasoning_effort)
+            ? model.default_reasoning_effort
+            : (efforts[0] || model.default_reasoning_effort || 'high');
+        const reasoning = document.getElementById('codexOAuthReasoning');
+        if (reasoning) {
+            const values = efforts.length ? efforts : [defaultEffort];
+            reasoning.innerHTML = values.map(value => `<option value="${this.escape(value)}">${this.escape(value)}</option>`).join('');
+            reasoning.value = defaultEffort;
+            reasoning.disabled = !modelId;
+        }
+        const contextWindow = Number(model.context_window || 0);
+        const context = document.getElementById('codexOAuthContextWindow');
+        if (context) context.value = contextWindow >= 4096
+            ? `${contextWindow.toLocaleString()} tokens`
+            : '由 Codex 账号配置决定';
+        const capabilities = [];
+        if ((model.input_modalities || []).includes('image')) capabilities.push('图片输入');
+        if (model.supports_web_search) capabilities.push('原生 Web 搜索');
+        const capabilityElement = document.getElementById('codexOAuthCapabilities');
+        if (capabilityElement) capabilityElement.textContent = capabilities.length
+            ? `账号目录声明的能力：${capabilities.join(' · ')}`
+            : '账号目录未声明额外能力。';
+        const description = document.getElementById('codexOAuthModelDescription');
+        if (description) description.textContent = model.description
+            || '模型来自当前账号的 Codex 目录。';
+    },
+
     async cancelOAuth() {
         clearTimeout(this.oauthPollTimer);
         this.oauthPollTimer = null;
+        const profileName = this.oauthProfile;
+        const setupDraft = this.oauthSetupDraft;
         const pending = !document.getElementById('codexOAuthPending')?.classList.contains('d-none');
-        if (pending && this.oauthProfile) {
+        if (profileName) {
             try {
-                await API.codexProfiles.cancelOAuth(this.oauthProfile);
+                if (setupDraft) {
+                    await API.codexProfiles.cancelSetup(profileName);
+                } else if (pending) {
+                    await API.codexProfiles.cancelOAuth(profileName);
+                }
             } catch (error) {
+                if (setupDraft) {
+                    this.showOAuthError(`清理未完成的 Profile 失败：${error.message}`);
+                    return;
+                }
                 // The app-server may already have completed or expired the login.
             }
         }
+        this.oauthSetupDraft = false;
+        this.oauthProfile = '';
         bootstrap.Modal.getInstance(document.getElementById('codexOAuthModal'))?.hide();
         await this.load();
     },
@@ -760,18 +955,35 @@ const CodexCenter = {
             return;
         }
         const model = this.oauthModels.find(item => item.id === modelId) || {};
-        const payload = { model: modelId };
+        const payload = {
+            model: modelId,
+            reasoning_effort: document.getElementById('codexOAuthReasoning')?.value || model.default_reasoning_effort || 'high',
+            model_verbosity: document.getElementById('codexOAuthVerbosity')?.value || 'inherit',
+            make_default: Boolean(document.getElementById('codexOAuthMakeDefault')?.checked)
+        };
         if (Number(model.context_window || 0) >= 4096) payload.context_window = Number(model.context_window);
-        if ((model.supported_reasoning_efforts || []).includes(model.default_reasoning_effort)) {
-            payload.reasoning_effort = model.default_reasoning_effort;
-        }
         payload.supports_vision = (model.input_modalities || []).includes('image');
+        payload.supports_web_search = Boolean(model.supports_web_search);
         if (button) button.disabled = true;
         try {
-            await API.codexProfiles.update(profileName, payload);
-            if (this.oauthMakeDefault) await API.codexProfiles.setDefault(profileName);
+            let result = null;
+            if (this.oauthSetupDraft) {
+                result = await API.codexProfiles.finalizeSetup(profileName, {
+                    model: payload.model,
+                    reasoning_effort: payload.reasoning_effort,
+                    model_verbosity: payload.model_verbosity,
+                    make_default: payload.make_default
+                });
+            } else {
+                await API.codexProfiles.update(profileName, payload);
+                if (payload.make_default) await API.codexProfiles.setDefault(profileName);
+            }
+            const madeDefault = payload.make_default
+                || result?.default_profile_id === profileName;
+            this.oauthSetupDraft = false;
+            this.oauthProfile = '';
             bootstrap.Modal.getInstance(document.getElementById('codexOAuthModal'))?.hide();
-            UI.showSuccess(this.oauthMakeDefault ? 'ChatGPT 已连接并设为默认 Profile' : 'ChatGPT Profile 已连接');
+            UI.showSuccess(madeDefault ? 'ChatGPT 已连接并设为默认 Profile' : 'ChatGPT Profile 已创建');
             await this.load();
         } catch (error) {
             this.showOAuthError(error.message);

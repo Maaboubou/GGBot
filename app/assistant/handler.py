@@ -18,8 +18,15 @@ from app.core.event_bus import Event, EventType
 from app.services.config_service import get_setting
 from app.services.codex_access_service import codex_access_service
 from app.services.assistant_reply_gateway import (
+    AssistantReplyError,
     CodexReplyRequest,
     get_assistant_reply_gateway,
+)
+from app.assistant.reply_completion import (
+    is_serialized_reply_protocol,
+    terminal_reply_output_schema,
+    validate_plain_terminal_reply,
+    validate_structured_terminal_reply,
 )
 from app.services.llm_manager import get_llm_manager
 from app.assistant.chat_log import ChatLogManager
@@ -34,7 +41,12 @@ from app.assistant.memory_config import (
 from app.assistant.role_manager import RoleManager
 from app.assistant.judge_manager import JudgeManager
 from app.utils.dashboard_events import append_dashboard_event
-from app.utils.bot_mentions import bot_names_for_user, find_bot_mention, strip_bot_mentions
+from app.utils.bot_mentions import (
+    bot_names_for_user,
+    bot_quote_names_for_user,
+    find_bot_mention,
+    strip_bot_mentions,
+)
 from app.utils.plugin_config import get_config
 
 
@@ -86,6 +98,47 @@ _FOLLOWUP_RELATION_ALIASES = {
     "不明确": "unclear",
 }
 
+_QUOTED_BOT_POSITIVE_RELATIONS = frozenset(
+    {
+        "followup_question",
+        "request",
+        "correction",
+        "clarification",
+        "elaboration",
+        "answer",
+        "requested_update",
+        "challenge",
+    }
+)
+_QUOTED_BOT_NEGATIVE_RELATIONS = frozenset(
+    {
+        "side_chat",
+        "new_topic",
+        "acknowledgement",
+        "reaction",
+        "quote_only",
+        "already_answered",
+        "unclear",
+    }
+)
+_QUOTED_BOT_RELATION_ALIASES = {
+    **_FOLLOWUP_RELATION_ALIASES,
+    "direct_question": "followup_question",
+    "question_to_bot": "followup_question",
+    "request_to_bot": "request",
+    "command": "request",
+    "请求": "request",
+    "要求": "request",
+    "challenge_to_bot": "challenge",
+    "质疑": "challenge",
+    "peer_chat": "side_chat",
+    "talking_to_others": "side_chat",
+    "quoted_side_chat": "side_chat",
+    "和群友交谈": "side_chat",
+    "quote_only": "quote_only",
+    "仅引用": "quote_only",
+}
+
 
 class AssistantHandler:
     """Application-owned message handler for the first-class Assistant."""
@@ -93,7 +146,7 @@ class AssistantHandler:
     def __init__(self, context=None):
         self.runtime_context = context
         # 从插件配置中读取参数
-        self.bot_name = get_setting("WECHAT_BOT_NAME", "微信助手")  # 保留全局配置
+        self.bot_name = get_setting("WECHAT_BOT_NAME", "刘局")  # 保留全局配置
         self.chat_log_manager = ChatLogManager()
         self.context_manager = ChatContextManager()
         self.memory_service = ChatMemoryService(
@@ -253,6 +306,78 @@ class AssistantHandler:
             logger.debug("🤖 读取群内机器人别名失败: %s", exc)
         return [self.bot_name]
 
+    def _bot_quote_names_for_chat(self, chat_name: str) -> List[str]:
+        """Return names that can authoritatively identify a quoted bot row.
+
+        Mention matching deliberately accepts historical aliases. Quote
+        attribution is stricter: it uses the current auto-detected group
+        nickname, the manual fallback and the account name, but never old
+        aliases.
+        """
+        try:
+            from app.models.base import SessionLocal
+            from app.models.user_permission import WeChatUser
+
+            with SessionLocal() as db:
+                user = db.query(WeChatUser).filter(WeChatUser.chat_name == chat_name).first()
+                if user:
+                    return bot_quote_names_for_user(user, self.bot_name)
+        except Exception as exc:
+            logger.debug("🤖 读取引用消息机器人身份失败: %s", exc)
+        return [self.bot_name]
+
+    @staticmethod
+    def _normalize_quote_match_text(value: Any) -> str:
+        return " ".join(str(value or "").replace("\r", "\n").split()).strip()
+
+    def _quoted_text_matches_recent_bot_reply(self, chat_name: str, quote_content: str) -> bool:
+        """Fallback for older ingress payloads that omit ``quote_nickname``."""
+        quote = self._normalize_quote_match_text(quote_content)
+        if not quote:
+            return False
+
+        truncated = quote.endswith("…") or quote.endswith("...")
+        if quote.endswith("…"):
+            prefix = quote[:-1].rstrip()
+        elif quote.endswith("..."):
+            prefix = quote[:-3].rstrip()
+        else:
+            prefix = quote
+        try:
+            messages = self.chat_log_manager.get_context_messages(chat_name, 60)
+        except Exception as exc:
+            logger.debug("🤖 读取近期机器人消息用于引用匹配失败: %s", exc)
+            return False
+
+        for message in reversed(messages):
+            if not message.get("is_bot"):
+                continue
+            bot_text = self._normalize_quote_match_text(message.get("content"))
+            if quote == bot_text:
+                return True
+            if truncated and len(prefix) >= 8 and bot_text.startswith(prefix):
+                return True
+        return False
+
+    def _event_quotes_bot(self, event: Event) -> bool:
+        """Return whether a text quote is attributable to this bot account."""
+        quote_content = str(event.data.get("quote_content") or "").strip()
+        if not quote_content or quote_content in {
+            "[图片]",
+            "图片",
+            "视频",
+            "[视频]",
+            "动画表情",
+            "[动画表情]",
+        }:
+            return False
+
+        quote_nickname = str(event.data.get("quote_nickname") or "").strip().lstrip("@").strip()
+        chat_name = str(event.data.get("chat_name") or "")
+        if quote_nickname:
+            return quote_nickname in self._bot_quote_names_for_chat(chat_name)
+        return self._quoted_text_matches_recent_bot_reply(chat_name, quote_content)
+
     def _bot_display_name_for_chat(self, chat_name: str) -> str:
         names = self._bot_names_for_chat(chat_name)
         return names[0] if names else self.bot_name
@@ -353,6 +478,7 @@ class AssistantHandler:
 
             # 初始化变量，防止在finally块中访问未定义变量
             is_mention = False
+            quoted_bot_approved = False
 
             # ✨ 检测是否为误识别的引用图片消息
             quote_detection = self._detect_misidentified_quote_image(content)
@@ -405,6 +531,17 @@ class AssistantHandler:
                 # ingress-sequence checks prevents an in-flight Judge from
                 # producing a second reply.
                 self._cancel_followup_pending(chat_name, reason="explicit_mention")
+            elif chat_type == "group" and self._event_quotes_bot(event):
+                # Quoting the bot is a directed signal, but not every quote asks
+                # for a response.  A narrow semantic Judge distinguishes a real
+                # question/request/correction from quoting the bot while talking
+                # to other group members.
+                role_name = self._get_user_role(chat_name)
+                if not self._consult_quoted_bot_reply(event, role_name):
+                    return False
+                self._cancel_followup_pending(chat_name, reason="quoted_bot_message")
+                quoted_bot_approved = True
+                logger.info("📎 Quoted-bot reply trigger approved for %s", chat_name)
             elif chat_type == "group" and self._schedule_followup_candidate(
                 event,
                 llm_content,
@@ -417,6 +554,7 @@ class AssistantHandler:
             should_use_group_judge = (
                 chat_type == "group"
                 and not followup_approved
+                and not quoted_bot_approved
                 and (not is_mention or not self.allow_mention_trigger)
             )
             if should_use_group_judge:
@@ -574,9 +712,9 @@ class AssistantHandler:
                 chat_name,
                 role_name,
                 messages,
-                _wxautox_attachment_capture=response_attachments,
-                _wxautox_input_files=input_files,
-                _wxautox_memory_trace=verified_memory_trace,
+                _mabobot_attachment_capture=response_attachments,
+                _mabobot_input_files=input_files,
+                _mabobot_memory_trace=verified_memory_trace,
             )
             if response_attachments:
                 response = self._strip_internal_action_markers(response)
@@ -813,6 +951,140 @@ class AssistantHandler:
             config["max_turns"],
         )
 
+    def _build_quoted_bot_judge_text(self, event: Event) -> str:
+        """Build a focused addressee/intent prompt for a quote of the bot."""
+        chat_name = str(event.data.get("chat_name") or "")
+        sender = str(event.data.get("sender") or "未知")
+        quote_nickname = str(event.data.get("quote_nickname") or self.bot_name)
+        quote_content = str(event.data.get("quote_content") or "")
+        content = str(event.data.get("message") or "")
+
+        def clipped(value: Any, token_budget: int) -> str:
+            return self.context_manager.truncate_text_to_budget(
+                str(value or ""),
+                token_budget,
+                notice="该消息过长，已截断",
+            )
+
+        lines = [
+            f"群聊：{chat_name}",
+            f"机器人名称：{self.bot_name}",
+            "",
+            "邻近群聊上下文（只用于判断当前消息在对谁说话）：",
+        ]
+        for message in self._get_judge_context_messages(chat_name, 8):
+            lines.append(
+                f"[{message.get('sender') or '未知'}] "
+                f"{clipped(message.get('content'), 100)}"
+            )
+        lines.extend(
+            [
+                "",
+                "已确认当前用户通过微信引用功能引用了机器人本人发出的文字：",
+                f"引用显示名：{quote_nickname}",
+                f"引用原文：{clipped(quote_content, 240)}",
+                "",
+                "当前引用回复：",
+                f"[{sender}] {clipped(content, 180)}",
+                "",
+                "引用机器人只说明用户选择了这段上下文，不自动等于要求机器人回答。",
+                "判断当前回复真正的交流对象和意图：",
+                "- followup_question：向机器人继续追问，包括“最新一代呢”“那现在呢”这类无问号的省略问句；",
+                "- request：要求机器人查询、解释、执行或给出内容；",
+                "- correction / clarification / challenge：纠正、澄清或质疑机器人，并期待机器人回应；",
+                "- answer / requested_update / elaboration：回答机器人、反馈机器人要求的结果，或向机器人补充实质条件以继续讨论；",
+                "- side_chat：只是借用机器人原话和其他群友交谈、@或点名其他人、替别人解释、群内泛评；",
+                "- acknowledgement / reaction：纯感谢、收到、附和、笑声、表情或情绪反应；",
+                "- quote_only：只有引用或复读，没有新增交流意图；",
+                "- new_topic / unclear：另起话题或确实无法判断。",
+                "relation 必须从以上分类中选择。只输出 JSON：",
+                '{"relation":"分类","reason":"简短说明当前消息在对谁说、是否期待机器人回答"}',
+            ]
+        )
+        return self.context_manager.truncate_text_to_budget(
+            "\n".join(lines),
+            2200,
+            notice="机器人引用判定上下文达到预算上限",
+        )
+
+    def _normalize_quoted_bot_judge_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        raw_relation = str(
+            result.get("relation")
+            or result.get("dialogue_act")
+            or result.get("message_relation")
+            or ""
+        ).strip().lower()
+        relation = _QUOTED_BOT_RELATION_ALIASES.get(raw_relation, raw_relation)
+        if relation in _QUOTED_BOT_POSITIVE_RELATIONS:
+            should_reply = True
+        elif relation in _QUOTED_BOT_NEGATIVE_RELATIONS:
+            should_reply = False
+        else:
+            relation = "unclear"
+            should_reply = False
+        return {
+            "should_reply": should_reply,
+            "relation": relation,
+            "reason": str(result.get("reason") or "No reason provided"),
+        }
+
+    def _consult_quoted_bot_reply(self, event: Event, role_name: str) -> bool:
+        """Decide whether a quote of the bot is actually asking the bot to reply."""
+        chat_name = str(event.data.get("chat_name") or "")
+        decision = {
+            "should_reply": False,
+            "relation": "unclear",
+            "reason": "invalid_json",
+        }
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是群聊引用回复意图分类器。系统已经确认被引用文字由机器人本人发送。"
+                        "引用动作不是要求机器人回答的充分条件；必须判断当前消息是在继续问机器人，"
+                        "还是只借用原话与其他群友交谈。只输出指定 JSON。"
+                    ),
+                },
+                {"role": "user", "content": self._build_quoted_bot_judge_text(event)},
+            ]
+            raw = self._call_auxiliary_model(
+                "followup_judge",
+                messages,
+                response_format={"type": "json_object"},
+                _mabobot_chat_name=chat_name,
+                _mabobot_role_name=role_name,
+            )
+            parsed = self._extract_first_json_object(raw)
+            if isinstance(parsed, dict):
+                decision = self._normalize_quoted_bot_judge_result(parsed)
+        except Exception as exc:
+            decision["reason"] = f"judge_error: {exc}"
+            logger.warning("📎 Quoted-bot Judge failed for %s: %s", chat_name, exc)
+
+        append_dashboard_event(
+            "judge_decision",
+            {
+                "should_reply": decision["should_reply"],
+                "reason": decision["reason"],
+                "relation": decision["relation"],
+                "atmosphere": "机器人引用判定",
+                "role_name": role_name,
+                "judge_name": "followup_judge",
+                "chat_name": chat_name,
+                "mode": "quoted_bot",
+                "quote_nickname": str(event.data.get("quote_nickname") or ""),
+            },
+        )
+        logger.info(
+            "📎 Quoted-bot Judge for %s: reply=%s relation=%s reason=%s",
+            chat_name,
+            decision["should_reply"],
+            decision["relation"],
+            decision["reason"],
+        )
+        return bool(decision["should_reply"])
+
     def _schedule_followup_candidate(self, event: Event, content: str) -> bool:
         """Own an unmentioned group message when a reply-follow-up window is active."""
         chat_name = str(event.data.get("chat_name") or "")
@@ -921,13 +1193,22 @@ class AssistantHandler:
         delay = max(0.05, due_at - now)
         generation = int(session.get("generation") or 0)
         anchor_id = str(session.get("anchor_id") or "")
-        timer = self.runtime_context.workers.start_timer(
-            f"followup-{chat_name}-{generation}-{time.time_ns()}",
+        # Assistant is application-owned now and is intentionally constructed
+        # without a PluginContext.  Own the short cancellable timer directly;
+        # ``close()`` and every session replacement cancel the stored handle.
+        timer = threading.Timer(
             delay,
             self._submit_followup_judge,
             args=(chat_name, anchor_id, generation),
         )
+        timer.name = f"Assistant-Followup-{generation}-{time.time_ns()}"
+        timer.daemon = True
         session["timer"] = timer
+        try:
+            timer.start()
+        except Exception:
+            session["timer"] = None
+            raise
 
     def _submit_followup_judge(
         self,
@@ -1030,8 +1311,8 @@ class AssistantHandler:
                 "followup_judge",
                 messages,
                 response_format={"type": "json_object"},
-                _wxautox_chat_name=chat_name,
-                _wxautox_role_name=str(snapshot.get("role_name") or ""),
+                _mabobot_chat_name=chat_name,
+                _mabobot_role_name=str(snapshot.get("role_name") or ""),
             )
             parsed = self._extract_first_json_object(raw)
             if isinstance(parsed, dict):
@@ -1486,7 +1767,7 @@ class AssistantHandler:
             wx_manager = event.context.get("wx")
 
             # A. 被动触发 (@ 或 私聊)
-            # 注意：wxautox4中私聊的chat_type可能是 "private", "friend", 或 "user"
+            # 兼容历史事件：私聊 chat_type 可能是 "private", "friend" 或 "user"。
             if chat_type in ["private", "friend", "user"] or (chat_type == "group" and is_mention and self.allow_mention_trigger):
                 should_reply = True
                 logger.info(f"🤖 Quote Trigger: Passive (Mention={is_mention}, Type={chat_type})")
@@ -1538,8 +1819,11 @@ class AssistantHandler:
                 # 4.1 下载/处理图片
                 image_base64 = self._process_quoted_image(event.data, wx_manager)
                 if not image_base64:
-                    if is_mention and wx_manager:
-                        wx_manager.send_message(chat_name, "⚠️ 无法获取引用图片，请稍后再试")
+                    logger.warning(
+                        "🤖 引用图片不可用，本次保持微信静默: chat=%s message_id=%s",
+                        chat_name,
+                        event.data.get("message_id", ""),
+                    )
                     return False
 
                 # 4.2 获取上下文，实际入模内容由 token 预算动态裁剪
@@ -1604,9 +1888,9 @@ class AssistantHandler:
                     chat_name,
                     role_name,
                     messages,
-                    _wxautox_attachment_capture=response_attachments,
-                    _wxautox_allow_image_input=chat_supports_vision,
-                    _wxautox_memory_trace=verified_memory_trace,
+                    _mabobot_attachment_capture=response_attachments,
+                    _mabobot_allow_image_input=chat_supports_vision,
+                    _mabobot_memory_trace=verified_memory_trace,
                 )
                 if response_attachments:
                     response = self._strip_internal_action_markers(response)
@@ -1858,7 +2142,7 @@ class AssistantHandler:
     def _build_quote_augmented_content(self, content: str, quote_content: str) -> str:
         """把文字引用内容显式放进本轮用户消息，避免 LLM 只看到“核实一下”。
 
-        wxauto 能拿到的 quote_content 有时是微信 UI 的预览片段（可能以 ... 结尾），
+        微信 UI 返回的 quote_content 有时只是预览片段（可能以 ... 结尾），
         但即使只是片段，也比完全丢失引用上下文更能让模型判断用户在问哪条消息。
         图片/视频等引用由专门流程处理，这里只增强文字引用。
         """
@@ -2158,9 +2442,8 @@ class AssistantHandler:
             {"role": "system", "content": role_prompt},
         ]
 
-        output_contract = self._build_human_like_output_contract(role_name)
-        if output_contract:
-            messages.append({"role": "system", "content": output_contract})
+        output_contract = self._build_reply_completion_contract(role_name)
+        messages.append({"role": "system", "content": output_contract})
 
         messages.append(
             {"role": "user", "content": f"[{now_str}] [{sender}]: {content}"}
@@ -2206,9 +2489,8 @@ class AssistantHandler:
         role_prompt = self.role_manager.get_role_prompt(role_name)
         messages = [{"role": "system", "content": role_prompt}]
 
-        output_contract = self._build_human_like_output_contract(role_name)
-        if output_contract:
-            messages.append({"role": "system", "content": output_contract})
+        output_contract = self._build_reply_completion_contract(role_name)
+        messages.append({"role": "system", "content": output_contract})
 
         dynamic_messages = self._get_anchored_dynamic_messages(
             chat_name=chat_name,
@@ -2314,7 +2596,7 @@ class AssistantHandler:
                 memory_config=memory_config,
             )
             dynamic_messages = list(state.get("messages") or [])
-            messages = messages[: 2 if output_contract else 1]
+            messages = messages[:2]
             checkpoint_text = str(state.get("memory_checkpoint") or "").strip()
             if checkpoint_text:
                 messages.append(
@@ -2839,9 +3121,15 @@ class AssistantHandler:
 
 JSON 格式示例：
 {{
+  "status": "answered",
   "messages": ["自然的一条微信回复"]
 }}
 
+status 只能是 answered、not_found、blocked：
+- answered：当前回复已经给出答案或交付结果
+- not_found：已合理尝试现有工具仍无法确认，并在消息中说明当前结论与尝试范围
+- blocked：缺少继续所必需的用户输入或授权，并在消息中明确需要什么
+不存在 continue 或 suppressed 状态，不得用空数组表示沉默。
 messages 是你要发送到微信的消息数组。请像真实微信用户一样回复：短、自然、即时，不要写成文章。
 能一句话说清就只返回 1 条。
 只有在信息确实较多、或自然聊天节奏需要停顿时，才拆成 2 到 {max_count} 条。
@@ -2849,6 +3137,20 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
 不要为了凑条数而拆分，不要使用标题、列表、总结腔或客服腔。
 {period_rule}
 """
+
+    def _build_reply_completion_contract(self, role_name: str) -> str:
+        terminal_contract = """【任务完成与终态规则】
+一条用户消息对应当前一个 Codex turn。所有安全且已获授权的搜索、读取和其他工具调用，都必须在这个 turn 内完成后再给最终回复。
+如果还有能实质推进原请求的安全工具动作，立即调用工具，不要先输出进度或结束本 turn。
+只有以下情况可以结束：已经给出答案或交付结果；合理尝试后仍无法确认；确实缺少继续所必需的用户输入或授权。
+最终回复是终态，不得说“我继续找”“正在搜索”“稍后回复”“查到再告诉你”等未来工作承诺。除非宿主明确提供了可持久化后台任务及任务 ID，否则不能声称会在本回复之后自行继续。
+不要把 JSON 协议或空响应包装成一条字符串消息。被动触发和已经通过主动回复判断的请求都必须给出非空终态结果。"""
+        output_contract = self._build_human_like_output_contract(role_name)
+        return (
+            f"{terminal_contract}\n\n{output_contract}"
+            if output_contract
+            else terminal_contract
+        )
 
     def _get_human_like_response_format(self, role_name: str) -> Optional[Dict[str, str]]:
         settings = self.role_manager.get_output_settings(role_name)
@@ -2866,19 +3168,11 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         response_format = self._get_human_like_response_format(role_name)
         search_enabled = self._is_search_enabled()
         output_schema = None
+        max_output_messages = 0
         if response_format:
-            output_schema = {
-                "type": "object",
-                "properties": {
-                    "messages": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                    }
-                },
-                "required": ["messages"],
-                "additionalProperties": False,
-            }
+            settings = self.role_manager.get_output_settings(role_name)
+            max_output_messages = max(1, int(settings.get("max_count", 3) or 3))
+            output_schema = terminal_reply_output_schema(max_output_messages)
 
         def call_codex(call_messages: List[Dict], *, retry: bool = False) -> str:
             from app.services.codex_profile_service import CodexProfileService
@@ -2902,53 +3196,116 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
                     max_turns=self.codex_max_turns_per_thread,
                     allow_exec_fallback=self.codex_exec_fallback_enabled,
                     output_schema=output_schema,
-                    input_files=kwargs.get("_wxautox_input_files") or (),
-                    allow_image_input=bool(kwargs.get("_wxautox_allow_image_input")),
+                    input_files=kwargs.get("_mabobot_input_files") or (),
+                    allow_image_input=bool(kwargs.get("_mabobot_allow_image_input")),
                     memory_trace=(
-                        kwargs.get("_wxautox_memory_trace")
-                        if isinstance(kwargs.get("_wxautox_memory_trace"), dict)
+                        kwargs.get("_mabobot_memory_trace")
+                        if isinstance(kwargs.get("_mabobot_memory_trace"), dict)
                         else None
                     ),
-                    history_mode=str(kwargs.get("_wxautox_history_mode") or "full"),
+                    history_mode=str(kwargs.get("_mabobot_history_mode") or "full"),
                     usage_capture=(
-                        kwargs.get("_wxautox_usage_capture")
-                        if isinstance(kwargs.get("_wxautox_usage_capture"), list)
+                        kwargs.get("_mabobot_usage_capture")
+                        if isinstance(kwargs.get("_mabobot_usage_capture"), list)
                         else None
                     ),
                 )
             )
-            attachment_capture = kwargs.get("_wxautox_attachment_capture")
+            attachment_capture = kwargs.get("_mabobot_attachment_capture")
             if isinstance(attachment_capture, list):
                 attachment_capture.clear()
                 attachment_capture.extend(result.attachments)
-            return self._strip_markdown(result.text)
+            # Never run Markdown cleanup across a JSON envelope: underscores in
+            # ``not_found`` or user-visible code/file names can otherwise be
+            # mistaken for emphasis delimiters and corrupt valid JSON.
+            return (
+                str(result.text or "").strip()
+                if response_format
+                else self._strip_markdown(result.text)
+            )
+
+        def validate_terminal(response_text: str):
+            if response_format:
+                return validate_structured_terminal_reply(
+                    response_text,
+                    max_messages=max_output_messages,
+                )
+            return validate_plain_terminal_reply(response_text)
+
+        def has_materialized_attachment() -> bool:
+            attachment_capture = kwargs.get("_mabobot_attachment_capture")
+            if not isinstance(attachment_capture, list):
+                return False
+            for attachment in attachment_capture:
+                if not isinstance(attachment, dict):
+                    continue
+                raw_path = str(attachment.get("path") or "").strip()
+                if raw_path:
+                    path = Path(raw_path)
+                    if path.exists() and path.is_file():
+                        return True
+            return False
 
         response = call_codex(messages)
-        if not response_format:
-            return response
-        attachment_capture = kwargs.get("_wxautox_attachment_capture")
-        if isinstance(attachment_capture, list) and attachment_capture:
-            logger.info("🤖 Human-like JSON retry skipped because model returned attachment(s)")
+        validation = validate_terminal(response)
+        if validation.valid:
             return response
 
-        if self._is_valid_human_like_response(response):
-            return response
+        if has_materialized_attachment():
+            # The artifact is already a concrete terminal result. Do not ask the
+            # model to regenerate it, and never leak malformed protocol/status
+            # text alongside the valid file.
+            logger.warning(
+                "🤖 Suppressing invalid terminal text because attachment(s) already exist: "
+                "chat=%s code=%s",
+                chat_name,
+                validation.code,
+            )
+            return ""
 
         retry_messages = messages + [
             {"role": "assistant", "content": response or ""},
             {
                 "role": "user",
                 "content": (
-                    "上一次回复不是合法 json，或没有包含非空 messages 数组。"
-                    "请重新只返回合法 json，格式为 {\"messages\": [\"一条自然微信回复\"]}。"
+                    f"上一次最终回复被宿主的确定性终态校验拒绝，错误码：{validation.code}。"
+                    "这不是让你汇报进度或换个说法结束。请继续完成原始用户请求；"
+                    "如果仍有能推进任务的安全工具动作，现在执行。只有真正得到终态后再回复。"
+                    + (
+                        "只返回合法 json，格式为 "
+                        "{\"status\":\"answered|not_found|blocked\","
+                        "\"messages\":[\"一条自然微信回复\"]}。"
+                        if response_format
+                        else "返回非空的最终答案，不要承诺稍后继续。"
+                    )
                 ),
             },
         ]
-        logger.warning("🤖 Human-like JSON response invalid or empty; retrying once")
-        return call_codex(retry_messages, retry=True)
+        logger.warning(
+            "🤖 Assistant terminal reply rejected; retrying once on the same Codex thread: "
+            "chat=%s code=%s",
+            chat_name,
+            validation.code,
+        )
+        retry_response = call_codex(retry_messages, retry=True)
+        retry_validation = validate_terminal(retry_response)
+        if retry_validation.valid:
+            return retry_response
+        if has_materialized_attachment():
+            logger.warning(
+                "🤖 Suppressing invalid retry text because attachment(s) already exist: "
+                "chat=%s code=%s",
+                chat_name,
+                retry_validation.code,
+            )
+            return ""
+        raise AssistantReplyError(
+            "Codex assistant failed deterministic terminal validation after one correction: "
+            f"{retry_validation.code}"
+        )
 
     def _is_valid_human_like_response(self, response: str) -> bool:
-        return self._extract_human_like_messages(response or "") is not None
+        return validate_structured_terminal_reply(response or "").valid
 
     def _strip_internal_action_markers(self, response: str) -> str:
         """移除模型误输出的内部动作占位文本，例如 [发送文件]。"""
@@ -3005,7 +3362,16 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             # This permits the current chat's isolated output directory while
             # still preventing one chat from sending another chat's files.
             access_context = codex_access_service.for_chat(chat_name, ensure=False)
-            allowed_root = Path(access_context.artifact_root).resolve()
+            configured_root = Path(access_context.artifact_root)
+            is_junction = getattr(configured_root, "is_junction", None)
+            if configured_root.is_symlink() or (
+                callable(is_junction) and is_junction()
+            ):
+                logger.error("🤖 聊天附件目录是链接，已拒绝发送: %s", configured_root)
+                return False
+            allowed_root = configured_root.resolve(strict=True)
+            if not allowed_root.is_dir():
+                return False
         except Exception:
             logger.exception("🤖 无法解析聊天附件的允许目录: %s", chat_name)
             return False
@@ -3020,14 +3386,18 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         }
         file_paths: List[str] = []
         seen = set()
+        rejected_count = 0
 
         for attachment in attachments:
             if not isinstance(attachment, dict):
+                rejected_count += 1
                 continue
             if attachment.get("type") not in (None, "image", "file"):
+                rejected_count += 1
                 continue
             raw_path = attachment.get("path")
             if not raw_path:
+                rejected_count += 1
                 continue
 
             path = Path(str(raw_path)).expanduser()
@@ -3036,13 +3406,16 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
                 resolved.relative_to(allowed_root)
             except Exception:
                 logger.warning(f"🤖 跳过不在允许目录内的附件: {raw_path}")
+                rejected_count += 1
                 continue
 
             if resolved.suffix.lower() not in allowed_suffixes:
                 logger.warning(f"🤖 跳过不支持的附件类型: {resolved}")
+                rejected_count += 1
                 continue
             if not resolved.exists() or not resolved.is_file():
                 logger.warning(f"🤖 跳过不存在的附件: {resolved}")
+                rejected_count += 1
                 continue
             if str(resolved) in seen:
                 continue
@@ -3050,8 +3423,14 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
             seen.add(str(resolved))
             file_paths.append(str(resolved))
 
-        if not file_paths:
-            return True
+        if rejected_count or not file_paths:
+            logger.error(
+                "🤖 拒绝发送不完整或无效的模型附件: chat=%s accepted=%s rejected=%s",
+                chat_name,
+                len(file_paths),
+                rejected_count,
+            )
+            return False
 
         logger.info(f"🤖 Sending {len(file_paths)} model attachment(s) to {chat_name}")
         return bool(wx_manager.send_files(chat_name, file_paths))
@@ -3109,9 +3488,17 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
         try:
             parsed = json.loads(text)
             if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if str(item).strip()]
+                return [
+                    str(item).strip()
+                    for item in parsed
+                    if str(item).strip() and not is_serialized_reply_protocol(item)
+                ]
             if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
-                return [str(item).strip() for item in parsed["messages"] if str(item).strip()]
+                return [
+                    str(item).strip()
+                    for item in parsed["messages"]
+                    if str(item).strip() and not is_serialized_reply_protocol(item)
+                ]
         except Exception:
             pass
 
@@ -3175,7 +3562,7 @@ messages 是你要发送到微信的消息数组。请像真实微信用户一�
                 else:
                     value = item
                 clean = str(value or "").strip()
-                if clean:
+                if clean and not is_serialized_reply_protocol(clean):
                     parts.append(clean)
 
             if parts:

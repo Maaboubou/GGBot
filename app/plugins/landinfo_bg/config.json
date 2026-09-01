@@ -1,0 +1,70 @@
+{
+    "name": "landinfo_bg",
+    "display_name": "地块查询",
+    "version": "1.0.0",
+    "description": "查询保加利亚地块信息并提供中文翻译",
+    "author": "System",
+    "category": "utility",
+    "requires": [
+        "selenium"
+    ],
+    "ui": {
+        "icon": "bi-geo-alt",
+        "llm_tasks": {
+            "translate": {
+                "label": "地块信息翻译",
+                "description": "将查询到的保加利亚语地块信息翻译为中文",
+                "category": "翻译",
+                "order": 10
+            }
+        }
+    },
+    "config_schema": {
+        "trigger_keywords": {
+            "type": "array",
+            "title": "地块关键词",
+            "description": "消息需包含任一关键词，并同时包含形如 123.45.67 的地块编号",
+            "group": "trigger",
+            "default": ["地块", "land", "імот", "имот"]
+        },
+        "chrome_debug_port": {
+            "type": "integer",
+            "description": "Chrome 远程调试端口",
+            "default": 19222
+        },
+        "chrome_path": {
+            "type": "string",
+            "description": "Chrome 可执行文件路径",
+            "default": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+        },
+        "chrome_user_data_dir": {
+            "type": "string",
+            "description": "Chrome 用户数据目录",
+            "default": "tmp/chrome_data"
+        },
+        "chrome_profile_dir": {
+            "type": "string",
+            "description": "Chrome 配置文件目录",
+            "default": "Default"
+        },
+        "page_load_timeout": {
+            "type": "integer",
+            "description": "页面加载超时时间(秒)",
+            "default": 20
+        },
+        "prompt_translate": {
+            "type": "string",
+            "description": "翻译提示词",
+            "default": "你是专业的保加利亚语翻译专家。请将下面的保加利亚语地块信息翻译成中文，保持原文格式和结构，使用专业术语。只输出翻译结果，不要添加任何解释。"
+        }
+    },
+    "config": {
+        "trigger_keywords": ["地块", "land", "імот", "имот"],
+        "chrome_debug_port": 19222,
+        "chrome_path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "chrome_user_data_dir": "tmp/chrome_data",
+        "chrome_profile_dir": "Default",
+        "page_load_timeout": 20,
+        "prompt_translate": "你是专业的保加利亚语翻译专家。请将下面的保加利亚语地块信息翻译成中文，保持原文格式和结构，使用专业术语。只输出翻译结果，不要添加任何解释。"
+    }
+}

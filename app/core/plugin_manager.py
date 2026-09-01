@@ -86,7 +86,7 @@ def purge_plugin_package_modules(package_name: str) -> List[str]:
 
 class PluginFileHandler(FileSystemEventHandler):
     """插件文件变化监听器"""
-    
+
     def __init__(self, plugin_manager: 'PluginManager'):
         self.plugin_manager = plugin_manager
         self.logger = logging.getLogger(__name__)
@@ -97,11 +97,11 @@ class PluginFileHandler(FileSystemEventHandler):
     def _queue_source_event(self, file_path: Path, event_type: str) -> None:
         if file_path.suffix.lower() != ".py":
             return
-        
+
         plugin_name = self.plugin_manager.plugin_for_source_path(file_path)
         if plugin_name is None:
             return
-        
+
         with self.plugin_manager._lock:
             plugin_info = self.plugin_manager.plugins.get(plugin_name)
             if plugin_info is None or not plugin_info.enabled or not plugin_info.loaded:
@@ -220,12 +220,12 @@ class PluginFileHandler(FileSystemEventHandler):
 
 class PluginManager:
     """插件管理器核心类"""
-    
+
     def __init__(self, plugins_dir: str = "app/plugins", event_bus: Optional[EventBus] = None):
         self.plugins_dir = Path(plugins_dir)
         self.event_bus = event_bus or get_event_bus()
         self.logger = logging.getLogger(__name__)
-        
+
         self.plugins: Dict[str, PluginInfo] = {}
         self._lock = threading.RLock()
         self._hot_reload_lock = threading.Lock()
@@ -234,14 +234,14 @@ class PluginManager:
         self._hot_reload_max_wait = 30 * 60.0
         self.routing_order = RoutingOrderStore(self.plugins_dir / "routing_order.json")
         self.runtime_registry = get_plugin_runtime_registry()
-        
+
         # 文件监控
         self._observer = Observer()
         self._file_handler = PluginFileHandler(self)
-        
+
         # 确保插件目录存在
         self.plugins_dir.mkdir(parents=True, exist_ok=True)
-    
+
     def start_monitoring(self):
         """启动文件监控"""
         try:
@@ -250,7 +250,7 @@ class PluginManager:
             self.logger.debug(f"Started monitoring plugin directory: {self.plugins_dir}")
         except Exception as e:
             self.logger.error(f"Failed to start file monitoring: {e}")
-    
+
     def stop_monitoring(self):
         """停止文件监控"""
         try:
@@ -259,7 +259,7 @@ class PluginManager:
             self.logger.info("Stopped plugin file monitoring")
         except Exception as e:
             self.logger.error(f"Error stopping file monitoring: {e}")
-    
+
     @staticmethod
     def _source_fingerprint(plugin_path: Path) -> Optional[str]:
         """Hash Python source paths and contents for stable hot-reload decisions."""
@@ -353,14 +353,14 @@ class PluginManager:
         """加载插件配置"""
         # First try to get plugin info to get the actual path
         plugin_info = self.plugins.get(plugin_name)
-        
+
         if plugin_info and plugin_info.path:
             # Use the actual plugin path
             config_file = Path(plugin_info.path) / "config.json"
         else:
             # Fallback to using plugin_name directly
             config_file = self.plugins_dir / plugin_name / "config.json"
-        
+
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
@@ -368,7 +368,7 @@ class PluginManager:
         except Exception as e:
             self.logger.error(f"Failed to load config for plugin '{plugin_name}': {e}")
             return None
-    
+
     def load_plugin(self, plugin_name: str) -> bool:
         """加载插件"""
         with self._lock:
@@ -382,7 +382,7 @@ class PluginManager:
             if plugin_name in self.plugins and self.plugins[plugin_name].loaded:
                 self.logger.warning(f"Plugin '{plugin_name}' is already loaded")
                 return True
-            
+
             # 支持多级目录：优先使用已发现的插件信息中的绝对路径
             if plugin_name in self.plugins:
                 plugin_path = Path(self.plugins[plugin_name].path)
@@ -391,12 +391,12 @@ class PluginManager:
             if not plugin_path.exists():
                 self.logger.error(f"Plugin directory not found: {plugin_path}")
                 return False
-            
+
             # 加载配置
             config = self.load_plugin_config(plugin_name)
             if not config:
                 return False
-            
+
             try:
                 # 动态导入插件模块
                 manifest = load_plugin_manifest(plugin_path, config)
@@ -413,18 +413,18 @@ class PluginManager:
                 if spec is None or spec.loader is None:
                     self.logger.error(f"Failed to create module spec for plugin '{plugin_name}'")
                     return False
-                
+
                 module = importlib.util.module_from_spec(spec)
                 import sys
                 sys.modules[module_name] = module
                 spec.loader.exec_module(module)
-                
+
                 # 检查插件是否有注册函数
                 if not hasattr(module, 'register'):
                     self.logger.error(f"Plugin '{plugin_name}' missing 'register' function")
                     return False
-                
-                
+
+
                 # 获取或创建插件信息
                 plugin_info = self.plugins.get(plugin_name)
                 if not plugin_info:
@@ -445,7 +445,7 @@ class PluginManager:
                     plugin_info.description = config.get("description", "")
                     plugin_info.author = config.get("author", "")
                     plugin_info.config = config  # 更新配置为最新加载的数据
-                
+
                 plugin_info.module = module
                 plugin_info.loaded = True
                 plugin_info.manifest = manifest
@@ -453,7 +453,7 @@ class PluginManager:
                     plugin_name, manifest, plugin_path
                 )
 
-                
+
                 # 注册插件
                 listener_ids = []
                 listener_key_counts: Dict[str, int] = {}
@@ -499,7 +499,7 @@ class PluginManager:
                     )
                     listener_ids.append(listener_id)
                     return listener_id
-                
+
                 # Every plugin is a Runtime API v2 plugin and must receive its
                 # owned PluginContext. There is deliberately no legacy branch.
                 register_signature = inspect.signature(module.register)
@@ -538,7 +538,7 @@ class PluginManager:
                         self.event_bus.disable_listener(listener_id)
 
                 # self.plugins[plugin_name] = plugin_info # 不再需要，因为我们是更新
-                
+
                 # 发布插件加载事件
                 self.event_bus.publish(Event(
                     type=EventType.PLUGIN_LOADED,
@@ -552,10 +552,10 @@ class PluginManager:
                         }
                     }
                 ))
-                
+
                 self.logger.debug(f"Successfully loaded plugin '{plugin_name}' v{plugin_info.version}")
                 return True
-                
+
             except Exception as e:
                 for listener_id in locals().get("listener_ids", []):
                     self.event_bus.unsubscribe(listener_id)
@@ -570,14 +570,14 @@ class PluginManager:
                 self.runtime_registry.unregister(plugin_name)
                 self.logger.error(f"Failed to load plugin '{plugin_name}': {e}")
                 return False
-    
+
     def unload_plugin(self, plugin_name: str) -> bool:
         """卸载插件"""
         with self._lock:
             if plugin_name not in self.plugins:
                 self.logger.warning(f"Plugin '{plugin_name}' not found")
                 return False
-            
+
             plugin_info = self.plugins[plugin_name]
             if plugin_info.kind != "plugin":
                 return False
@@ -586,7 +586,7 @@ class PluginManager:
                 # 取消所有事件订阅
                 for listener_id in plugin_info.listener_ids:
                     self.event_bus.unsubscribe(listener_id)
-                
+
                 # Runtime API v2 requires plugins to register cleanup through
                 # PluginContext. Closing the context is the single teardown
                 # path, so resources are not released twice.
@@ -599,7 +599,7 @@ class PluginManager:
                     )
                 plugin_info.runtime_context = None
                 plugin_info.last_unloaded_at = time.time()
-                
+
                 # 从sys.modules中移除整个插件包。只移除 main.py 会让
                 # getmagnet.py 等子模块在热重载后继续使用旧代码。
                 plugin_path = Path(plugin_info.path)
@@ -607,19 +607,19 @@ class PluginManager:
                 rel_module_path = str(rel_path).replace('\\', '.').replace('/', '.')
                 package_name = "app.plugins." + rel_module_path
                 purge_plugin_package_modules(package_name)
-                
+
                 # 发布插件卸载事件
                 self.event_bus.publish(Event(
                     type=EventType.PLUGIN_UNLOADED,
                     source="plugin_manager",
                     data={"plugin_name": plugin_name}
                 ))
-                
+
                 del self.plugins[plugin_name]
-                
+
                 self.logger.debug(f"Successfully unloaded plugin '{plugin_name}'")
                 return True
-                
+
             except Exception as e:
                 self.logger.error(f"Failed to unload plugin '{plugin_name}': {e}")
                 return False
@@ -636,7 +636,7 @@ class PluginManager:
         unloaded_count = sum(results.values())
         self.logger.info("Unloaded %s/%s plugins", unloaded_count, len(results))
         return results
-    
+
     def reload_plugin(self, plugin_name: str) -> bool:
         """重新加载插件"""
         with self._lock:
@@ -644,16 +644,16 @@ class PluginManager:
                 return self.load_plugin(plugin_name)
             if self.plugins[plugin_name].kind != "plugin":
                 return False
-            
+
             self.logger.debug(f"Reloading plugin '{plugin_name}'")
-            
+
             # 先卸载
             if not self.unload_plugin(plugin_name):
                 return False
-            
+
             # 再加载
             return self.load_plugin(plugin_name)
-    
+
     def _plugin_active_task_count(self, plugin_name: str) -> int:
         with self._lock:
             plugin_info = self.plugins.get(plugin_name)
@@ -746,7 +746,7 @@ class PluginManager:
         plugin_name = Path(plugin_path).name
         self.logger.debug(f"Loading new plugin: {plugin_name}")
         self.load_plugin(plugin_name)
-    
+
     def load_all_plugins(self) -> Dict[str, bool]:
         """加载所有插件"""
         self.discover_plugins() # 先发现所有插件
@@ -761,13 +761,13 @@ class PluginManager:
                 # Disabled plugins remain discoverable/configurable without
                 # importing their module or starting background work.
                 results[plugin_name] = True
-        
+
         loaded_count = sum(results.values())
         plugin_count = sum(1 for item in self.plugins.values() if item.kind == "plugin")
         self.logger.info(f"Loaded {loaded_count}/{plugin_count} plugins")
-        
+
         return results
-    
+
     def enable_plugin(self, plugin_name: str) -> bool:
         """启用插件"""
         with self._lock:
@@ -796,7 +796,7 @@ class PluginManager:
 
             self.logger.debug(f"Enabled plugin '{plugin_name}'")
             return True
-    
+
     def disable_plugin(self, plugin_name: str) -> bool:
         """禁用插件"""
         with self._lock:
@@ -848,11 +848,11 @@ class PluginManager:
             except OSError:
                 pass
             return False
-    
+
     def get_plugin_info(self, plugin_name: str) -> Optional[PluginInfo]:
         """获取插件信息"""
         return self.plugins.get(plugin_name)
-    
+
     def list_plugins(self) -> Dict[str, Dict[str, Any]]:
         """列出所有插件"""
         result = {}
@@ -861,14 +861,14 @@ class PluginManager:
                 continue
             # 获取运行中的监听器信息
             listeners = self.get_plugin_listeners(name)
-            
+
             # 推断特性
             features = plugin.config.get("features", [])
             if isinstance(features, list):
                 features = list(features) # copy
             else:
                 features = []
-            
+
             # 根据 README 规范推断 push 能力
             if "push" not in features:
                 if "DAILY_PUSH_TIME" in plugin.config or "ENABLE_DAILY_PUSH" in plugin.config:
@@ -903,7 +903,7 @@ class PluginManager:
                 "jobs": list(plugin.manifest.get("jobs", [])),
             }
         return result
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
         plugin_values = [item for item in self.plugins.values() if item.kind == "plugin"]
@@ -913,74 +913,74 @@ class PluginManager:
             "enabled_plugins": sum(1 for p in plugin_values if p.enabled),
             "total_listeners": sum(len(p.listener_ids) for p in plugin_values)
         }
-        
+
         # 聚合监听器信息: EventType -> [PluginName, ...]
         listeners_by_type: Dict[str, List[str]] = {}
-        
+
         for plugin in plugin_values:
             if not plugin.enabled or not plugin.loaded:
                 continue
-                
+
             for listener_id in plugin.listener_ids:
                 info = self.event_bus.get_listener_info(listener_id)
                 if info and info.get('enabled', True):
                     e_type = info['event_type'].value
                     if e_type not in listeners_by_type:
                         listeners_by_type[e_type] = []
-                    
+
                     if plugin.name not in listeners_by_type[e_type]:
                         listeners_by_type[e_type].append(plugin.name)
-        
+
         stats['listeners_by_type'] = listeners_by_type
-        
+
         # 添加 LLM 统计信息
         try:
             from app.services.llm_manager import get_llm_manager
             llm_manager = get_llm_manager()
             llm_stats = llm_manager.get_stats()
-            
+
             # 汇总所有插件的 LLM 调用统计
             total_calls = 0
             total_tokens = 0
             total_errors = 0
             all_response_times = []
-            
+
             # 使用 session stats（当前运行期间的统计）
             for key, data in llm_stats.get("session", {}).items():
                 total_calls += data.get("count", 0)
                 total_tokens += data.get("total_tokens", 0)
                 total_errors += data.get("error_count", 0)
                 all_response_times.extend(data.get("response_times", []))
-            
+
             # 计算平均响应时间
             avg_response_time = 0.0
             if all_response_times:
                 avg_response_time = sum(all_response_times) / len(all_response_times)
-            
+
             stats['total_calls'] = total_calls
             stats['total_tokens'] = total_tokens
             stats['error_count'] = total_errors
             stats['avg_response_time'] = avg_response_time
-            
+
         except Exception as e:
             logger.error(f"获取 LLM 统计失败: {e}")
             stats['total_calls'] = 0
             stats['total_tokens'] = 0
             stats['error_count'] = 0
             stats['avg_response_time'] = 0.0
-        
+
         return stats
 
     def get_all_plugin_names(self) -> List[str]:
         """获取所有已发现插件的名称列表"""
         return [name for name, item in self.plugins.items() if item.kind == "plugin"]
-    
+
     def get_plugin_listeners(self, plugin_name: str) -> List[Dict[str, Any]]:
         """获取插件的所有监听器信息"""
         plugin_info = self.plugins.get(plugin_name)
         if not plugin_info:
             return []
-        
+
         listeners = []
         for listener_id in plugin_info.listener_ids:
             listener_info = self.event_bus.get_listener_info(listener_id)

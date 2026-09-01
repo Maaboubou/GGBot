@@ -10,6 +10,7 @@ const LLMManager = {
     currentStats: {},
     catalogProviders: [],
     catalogModels: [],
+    catalogDiscovery: {},
     catalogVersion: '',
     catalogRequestId: 0,
     litellmUpdateStatus: {},
@@ -830,8 +831,13 @@ const LLMManager = {
         if (presetKey === 'other') {
             if (!this.catalogProviders.length) await this.loadModelCatalogProviders();
             const selectedProvider = document.getElementById('modelOtherProvider')?.value;
-            if (selectedProvider) await this.selectOtherProvider(selectedProvider, { preserveValues });
+            if (selectedProvider) await this.selectOtherProvider(selectedProvider, {
+                preserveValues,
+                skipCatalog: options.skipCatalog === true,
+            });
             else this.setCatalogState([], '请先从上方选择一个 LiteLLM 供应商。');
+        } else if (options.skipCatalog) {
+            this.setCatalogState([], '正在读取当前连接的模型目录…');
         } else if (preset.catalogProvider) {
             await this.loadModelCatalog(preset.catalogProvider);
         } else {
@@ -854,29 +860,76 @@ const LLMManager = {
             document.getElementById('modelApiKeyEnvValue').value = '';
             document.getElementById('modelName').value = '';
         }
-        await this.loadModelCatalog(providerKey);
+        if (!options.skipCatalog) await this.loadModelCatalog(providerKey);
         this.updateCredentialFields();
         this.updateModelFormReview();
     },
 
-    async loadModelCatalog(providerKey) {
+    getModelCatalogRequest(providerKey, options = {}) {
+        const isEdit = document.getElementById('modelEditMode')?.value === 'true';
+        const savedModelId = options.modelId
+            || (isEdit ? document.getElementById('modelId')?.dataset.oldId || '' : '');
+        return {
+            provider: providerKey,
+            q: '',
+            limit: 300,
+            model_id: savedModelId,
+            api_base: this.normalizePastedText(document.getElementById('modelApiBase')?.value || '').trim(),
+            credential_name: this.sanitizeCredentialName(document.getElementById('modelApiKeyEnv')?.value || ''),
+            api_key: options.includePendingCredential
+                ? document.getElementById('modelApiKeyEnvValue')?.value.trim() || ''
+                : '',
+            refresh: options.forceRefresh === true,
+        };
+    },
+
+    async loadModelCatalog(providerKey, options = {}) {
+        if (!providerKey) {
+            this.setCatalogState([], '填写 API 地址后可同步服务端模型。', {
+                status: 'not_configured', attempted: false,
+            });
+            return;
+        }
         const requestId = ++this.catalogRequestId;
         const hint = document.getElementById('modelCatalogHint');
-        if (hint) hint.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>正在读取本机 LiteLLM 模型目录…';
+        const refreshButton = document.getElementById('modelCatalogRefreshButton');
+        if (refreshButton) refreshButton.disabled = true;
+        if (hint) hint.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>正在合并服务端与 LiteLLM 模型目录…';
         try {
-            const response = await fetch(`/api/llm/models/catalog?provider=${encodeURIComponent(providerKey)}&limit=300`);
+            const payload = this.getModelCatalogRequest(providerKey, {
+                ...options,
+                includePendingCredential: options.forceRefresh === true,
+            });
+            // Connection addresses and credential references stay in the body
+            // so they never appear in browser history or access-log URLs.
+            const response = await fetch('/api/llm/models/catalog/discover', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
             const result = await response.json();
             if (requestId !== this.catalogRequestId) return;
             if (!response.ok || result.status !== 'success') {
                 throw new Error(result.detail || result.message || '模型目录加载失败');
             }
             this.catalogVersion = result.data?.version || this.catalogVersion;
-            this.setCatalogState(result.data?.models || []);
+            this.setCatalogState(result.data?.models || [], '', result.data?.discovery || {});
         } catch (error) {
             if (requestId !== this.catalogRequestId) return;
             console.warn(`Catalog unavailable for ${providerKey}:`, error);
-            this.setCatalogState([], '目录暂时不可用，仍可手动输入模型名称。');
+            this.setCatalogState([], '目录暂时不可用，仍可手动输入模型名称。', {
+                status: 'error', attempted: true,
+            });
+        } finally {
+            if (requestId === this.catalogRequestId && refreshButton) refreshButton.disabled = false;
         }
+    },
+
+    async refreshModelCatalog() {
+        const preset = this.getActiveProviderPreset();
+        const providerKey = preset.catalogProvider
+            || (preset.key === 'compatible' ? 'compatible' : preset.providerValue || '');
+        await this.loadModelCatalog(providerKey, { forceRefresh: true });
     },
 
     async loadCodexProfileOptions(selectedProfile = null) {
@@ -886,24 +939,43 @@ const LLMManager = {
         select.disabled = true;
         try {
             const data = await API.codexProfiles.list();
-            select.innerHTML = '<option value="">Codex 当前配置</option>' + (data.profiles || [])
+            const inheritedLabel = data.default_profile_id
+                ? `继承默认 Profile · ${this.escapeHtml(data.default_profile_id)}`
+                : '继承默认 Profile · 尚未配置';
+            select.innerHTML = `<option value="">${inheritedLabel}</option>` + (data.profiles || [])
                 .filter(profile => profile.available)
                 .map(profile => `<option value="${this.escapeHtml(profile.name)}">${this.escapeHtml(profile.name)} · ${this.escapeHtml(profile.model)}</option>`)
                 .join('');
             select.value = Array.from(select.options).some(option => option.value === selected) ? selected : '';
         } catch (error) {
-            select.innerHTML = '<option value="">无法加载 Profile，使用当前配置</option>';
+            select.innerHTML = '<option value="">无法加载 Codex Profile</option>';
         } finally {
             select.disabled = false;
         }
     },
 
-    setCatalogState(models, message = '') {
+    setCatalogState(models, message = '', discovery = null) {
         this.catalogModels = Array.isArray(models) ? models : [];
+        if (discovery && typeof discovery === 'object') this.catalogDiscovery = discovery;
         const hint = document.getElementById('modelCatalogHint');
         if (hint) {
             const version = this.catalogVersion ? ` · LiteLLM ${this.catalogVersion}` : '';
-            hint.textContent = message || `可选择 ${this.catalogModels.length} 个聊天模型${version}；目录外的新模型也可直接输入。`;
+            const available = this.catalogModels.filter(item => item.availability === 'available').length;
+            const status = this.catalogDiscovery?.status || '';
+            const fetchedDate = this.catalogDiscovery?.fetched_at
+                ? new Date(this.catalogDiscovery.fetched_at)
+                : null;
+            const fetchedAt = fetchedDate && !Number.isNaN(fetchedDate.getTime())
+                ? ` · 同步于 ${fetchedDate.toLocaleString('zh-CN', { hour12: false })}`
+                : '';
+            let statusText = '';
+            if (status === 'live') statusText = `服务端可用 ${available} 个模型${fetchedAt}`;
+            else if (status === 'cache') statusText = `服务端缓存 ${available} 个模型${fetchedAt}`;
+            else if (status === 'stale') statusText = `实时同步失败，使用上次缓存的 ${available} 个模型${fetchedAt}`;
+            else if (['not_configured', 'unsupported', 'error'].includes(status)) {
+                statusText = this.catalogDiscovery?.message || '当前使用 LiteLLM 本地目录';
+            } else statusText = `可选择 ${this.catalogModels.length} 个聊天模型`;
+            hint.textContent = message || `${statusText}${version}；目录外模型也可直接输入。`;
         }
         this.renderModelCatalogMenu(document.getElementById('modelName')?.value || '');
     },
@@ -951,16 +1023,21 @@ const LLMManager = {
         }
         menu.innerHTML = matches.map(item => {
             const capabilities = [];
+            if (item.availability === 'available') capabilities.push('服务端');
+            else if (item.availability === 'catalog_only') capabilities.push('目录');
             if (item.supports_vision) capabilities.push('图片');
             if (item.supports_reasoning) capabilities.push('推理');
             if (item.supports_web_search) capabilities.push('搜索');
             const context = item.max_input_tokens ? this.formatTokenCount(item.max_input_tokens) : '';
+            const availability = item.availability === 'available'
+                ? '服务端可用'
+                : item.availability === 'catalog_only' ? 'LiteLLM 目录' : (item.recommended ? '常用名称' : '版本/预览模型');
             return `
                 <button type="button" class="model-catalog-item" role="option"
                     data-model-catalog-id="${this.escapeHtml(item.id)}">
                     <span class="model-catalog-item-main">
                         <strong>${this.escapeHtml(item.id)}</strong>
-                        <small>${item.recommended ? '常用名称' : '版本/预览模型'}${context ? ` · 上下文 ${context}` : ''}</small>
+                        <small>${availability}${context ? ` · 上下文 ${context}` : ''}</small>
                     </span>
                     <span class="model-catalog-capabilities">${capabilities.map(value => `<em>${value}</em>`).join('')}</span>
                 </button>`;
@@ -2148,10 +2225,10 @@ const LLMManager = {
         if (presetKey === 'other') {
             document.getElementById('modelOtherProvider').value = meta.provider;
         }
-        await this.applyProviderPreset(presetKey, { preserveValues: true });
+        await this.applyProviderPreset(presetKey, { preserveValues: true, skipCatalog: true });
         if (presetKey === 'other') {
             document.getElementById('modelOtherProvider').value = meta.provider;
-            await this.selectOtherProvider(meta.provider, { preserveValues: true });
+            await this.selectOtherProvider(meta.provider, { preserveValues: true, skipCatalog: true });
         }
 
         document.getElementById('modelId').value = modelId;
@@ -2190,6 +2267,12 @@ const LLMManager = {
         }
         this.modelIdAutofill = !options.edit && !options.clone;
         this.updateCredentialFields();
+        const discoveryProvider = presetKey === 'other'
+            ? meta.provider
+            : (this.providerPresets[presetKey]?.catalogProvider || (presetKey === 'compatible' ? 'compatible' : ''));
+        if ((options.edit || options.clone) && discoveryProvider) {
+            await this.loadModelCatalog(discoveryProvider, { modelId });
+        }
         this.updateModelFormReview();
     },
 
@@ -2922,6 +3005,14 @@ const LLMManager = {
                 const hasReasoning = !!entry.has_reasoning;
                 const messageCount = entry.message_count || 0;
                 const responseSize = entry.response_size || 0;
+                const attachmentCount = Number(entry.attachment_count || 0);
+                const imageCount = Number(entry.image_count || 0);
+                const fileCount = Number(entry.file_count || 0);
+                const responseSummary = [
+                    `${responseSize} 个字符`,
+                    ...(imageCount ? [`${imageCount} 张图片`] : []),
+                    ...(fileCount ? [`${fileCount} 个文件`] : []),
+                ].join(' · ');
                 const reasoningSize = entry.reasoning_size || 0;
                 const tokenUsageHtml = this.renderTokenUsage(entry);
                 const memoryBadge = entry.has_memory_trace
@@ -2957,7 +3048,7 @@ const LLMManager = {
                                 </button>` : ''}
                                 <button class="btn btn-sm btn-outline-secondary py-0 px-2" style="font-size:0.75rem;"
                                     onclick="LLMManager.toggleCallHistoryBody(${idx}, 'resp')">
-                                    <i class="bi bi-box-arrow-up me-1"></i>响应
+                                    <i class="bi bi-box-arrow-up me-1"></i>响应${attachmentCount ? ` · ${attachmentCount} 附件` : ''}
                                 </button>
                                 ${entry.has_memory_trace ? `<button class="btn btn-sm btn-primary py-0 px-2" style="font-size:0.75rem;"
                                     onclick="LLMManager.toggleCallHistoryBody(${idx}, 'memory')">
@@ -2986,9 +3077,11 @@ const LLMManager = {
                     </div>` : ''}
                     <div class="history-resp-body d-none" data-history-index="${idx}" data-history-kind="resp">
                         <div class="px-3 pt-2">
-                            <small class="text-muted fw-semibold">📤 响应（${responseSize} 个字符）</small>
+                            <small class="text-muted fw-semibold">📤 响应（${responseSummary}）</small>
                         </div>
-                        <div class="m-2 p-2 bg-light rounded small" style="max-height:250px; font-size:0.8rem; overflow:auto; white-space:pre-wrap;"></div>
+                        <div class="history-response-text m-2 p-2 bg-light rounded small" style="max-height:250px; font-size:0.8rem; overflow:auto; white-space:pre-wrap;"></div>
+                        <div class="history-response-attachments d-none px-2 pb-2" aria-label="响应附件">
+                        </div>
                     </div>
                     ${entry.has_memory_trace ? `<div class="history-memory-body d-none border-top" data-history-index="${idx}" data-history-kind="memory">
                         <div class="px-3 pt-3 d-flex flex-wrap justify-content-between gap-2">
@@ -3063,9 +3156,10 @@ const LLMManager = {
         this.fetchCallHistoryEntry(entry)
             .then(fullEntry => {
                 if (kind === 'req') text = JSON.stringify(this.sanitizeCallHistoryPayload(fullEntry.messages || []), null, 2);
-                if (kind === 'resp') text = fullEntry.response_text || '';
                 if (kind === 'reasoning') text = fullEntry.reasoning_text || '';
-                if (kind === 'memory') {
+                if (kind === 'resp') {
+                    this.renderCallHistoryResponse(body, fullEntry, entry);
+                } else if (kind === 'memory') {
                     target.innerHTML = (
                         fullEntry.memory_trace
                             && typeof App !== 'undefined'
@@ -3082,6 +3176,117 @@ const LLMManager = {
                 console.error('Failed to load call history entry:', e);
                 target.textContent = '加载失败';
             });
+    },
+
+    buildCallHistoryAttachmentUrl(entry, attachmentIndex, download = false) {
+        const params = new URLSearchParams({
+            plugin_name: entry.plugin_name || this.currentHistoryPaging?.plugin || '',
+            call_type: entry.call_type || this.currentHistoryPaging?.callType || '',
+            index: String(entry.index ?? ''),
+            attachment_index: String(attachmentIndex),
+        });
+        if (download) params.set('download', 'true');
+        return `/api/llm/call-history/attachment?${params.toString()}`;
+    },
+
+    formatCallHistoryAttachmentSize(value) {
+        const bytes = Number(value || 0);
+        if (!Number.isFinite(bytes) || bytes <= 0) return '大小未知';
+        if (bytes < 1024) return `${Math.round(bytes)} B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+        if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    },
+
+    callHistoryFileIcon(attachment) {
+        const mime = String(attachment?.mime_type || '').toLowerCase();
+        const name = String(attachment?.name || '').toLowerCase();
+        if (mime.includes('pdf') || name.endsWith('.pdf')) return 'bi-file-earmark-pdf';
+        if (mime.includes('spreadsheet') || /\.(xlsx?|csv|tsv)$/.test(name)) return 'bi-file-earmark-spreadsheet';
+        if (mime.includes('presentation') || /\.(pptx?|odp)$/.test(name)) return 'bi-file-earmark-slides';
+        if (mime.includes('word') || /\.(docx?|odt|rtf)$/.test(name)) return 'bi-file-earmark-word';
+        if (mime.startsWith('audio/')) return 'bi-file-earmark-music';
+        if (mime.startsWith('video/')) return 'bi-file-earmark-play';
+        if (/\.(zip|7z|rar|tar|gz|tgz)$/.test(name)) return 'bi-file-earmark-zip';
+        if (mime.startsWith('text/') || /\.(txt|md|jsonl?|ya?ml|log)$/.test(name)) return 'bi-file-earmark-text';
+        return 'bi-file-earmark';
+    },
+
+    renderCallHistoryResponse(body, fullEntry, summaryEntry = {}) {
+        const textTarget = body.querySelector('.history-response-text');
+        const attachmentTarget = body.querySelector('.history-response-attachments');
+        if (!textTarget || !attachmentTarget) return;
+
+        const responseText = String(fullEntry.response_text || '');
+        const attachments = Array.isArray(fullEntry.response_attachments)
+            ? fullEntry.response_attachments.filter(item => item && typeof item === 'object')
+            : [];
+
+        textTarget.classList.remove('d-none', 'text-muted');
+        if (responseText) {
+            textTarget.textContent = responseText;
+        } else if (!attachments.length) {
+            textTarget.textContent = '（空响应）';
+            textTarget.classList.add('text-muted');
+        } else {
+            textTarget.textContent = '';
+            textTarget.classList.add('d-none');
+        }
+
+        if (!attachments.length) {
+            attachmentTarget.innerHTML = '';
+            attachmentTarget.classList.add('d-none');
+            return;
+        }
+
+        const entry = { ...summaryEntry, ...fullEntry };
+        attachmentTarget.innerHTML = attachments.map((attachment, arrayIndex) => {
+            const attachmentIndex = Number.isInteger(Number(attachment.index))
+                ? Number(attachment.index)
+                : arrayIndex;
+            const name = String(attachment.name || `附件 ${arrayIndex + 1}`);
+            const mime = String(attachment.mime_type || 'application/octet-stream');
+            const size = this.formatCallHistoryAttachmentSize(attachment.size);
+            const isImage = String(attachment.type || '').toLowerCase() === 'image'
+                || mime.toLowerCase().startsWith('image/');
+            const previewUrl = this.escapeHtml(this.buildCallHistoryAttachmentUrl(entry, attachmentIndex));
+            const downloadUrl = this.escapeHtml(this.buildCallHistoryAttachmentUrl(entry, attachmentIndex, true));
+            const safeName = this.escapeHtml(name);
+            const safeMeta = this.escapeHtml(`${size} · ${mime}`);
+
+            if (isImage) {
+                return `<article class="history-response-attachment history-response-image">
+                    <a class="history-response-image-preview" href="${previewUrl}" target="_blank" rel="noopener">
+                        <img src="${previewUrl}" alt="${safeName}" loading="lazy" data-history-attachment-image>
+                        <span class="history-response-image-fallback d-none"><i class="bi bi-image"></i>图片暂不可预览</span>
+                    </a>
+                    <div class="history-response-attachment-info">
+                        <span title="${safeName}">${safeName}</span>
+                        <a href="${downloadUrl}" title="下载 ${safeName}" aria-label="下载 ${safeName}"><i class="bi bi-download"></i></a>
+                    </div>
+                    <small>${safeMeta}</small>
+                </article>`;
+            }
+
+            const icon = this.callHistoryFileIcon(attachment);
+            return `<a class="history-response-attachment history-response-file" href="${downloadUrl}">
+                <i class="bi ${icon} history-response-file-icon"></i>
+                <span class="history-response-file-copy">
+                    <strong title="${safeName}">${safeName}</strong>
+                    <small>${safeMeta}</small>
+                </span>
+                <i class="bi bi-download history-response-file-download"></i>
+            </a>`;
+        }).join('');
+        attachmentTarget.classList.remove('d-none');
+        attachmentTarget.querySelectorAll('[data-history-attachment-image]').forEach(image => {
+            image.addEventListener('error', () => {
+                image.classList.add('d-none');
+                const frame = image.closest('.history-response-image-preview');
+                frame?.classList.add('is-unavailable');
+                frame?.querySelector('.history-response-image-fallback')?.classList.remove('d-none');
+            }, { once: true });
+        });
     },
 
     formatJobTime(value) {
@@ -3369,7 +3574,7 @@ const LLMManager = {
                             <div><small>线程生命周期</small><span>第 ${Number(session.thread_generation || 0).toLocaleString()} 代 · 当前 ${Number(session.turn_count || 0).toLocaleString()} 轮 · 总计 ${Number(session.lifetime_turn_count || 0).toLocaleString()} 轮</span></div>
                             <div><small>上下文压缩</small><span>当前 ${Number(session.compaction_count || 0)} 次 · 累计 ${Number(session.lifetime_compaction_count || 0)} 次</span></div>
                             <div><small>推理 / 搜索</small><span>${this.escapeHtml(this.reasoningEffortLabel(session.reasoning_effort))} · ${session.web_search_mode ? this.escapeHtml(session.web_search_mode) : '关闭'}</span></div>
-                            <div><small>运行后端</small><span>${this.escapeHtml(session.backend || '-')} · ${this.escapeHtml(session.runtime_profile || '当前 Codex')} · ${this.escapeHtml(session.access_mode || '-')}</span></div>
+                            <div><small>运行后端</small><span>${this.escapeHtml(session.backend || '-')} · ${this.escapeHtml(session.runtime_profile || '未标记 Profile')} · ${this.escapeHtml(session.access_mode || '-')}</span></div>
                             <div><small>统计来源</small><span>${this.escapeHtml(session.usage_source || '未提供')}${usage.label ? ` · ${this.escapeHtml(usage.label)}` : ''}</span></div>
                             <div><small>上下文窗口来源</small><span>${session.model_context_window_source === 'provider_usage' ? '提供方上报' : session.model_context_window_source === 'profile_metadata' ? 'Profile 元数据' : '未知'}</span></div>
                             <div><small>最近轮换</small><span>${this.escapeHtml(rotationLabel(session.last_rotation_reason))}</span></div>
@@ -3390,7 +3595,7 @@ const LLMManager = {
                         </td>
                         <td>
                             <div class="codex-cell-main">${this.escapeHtml(session.model || '-')}</div>
-                            <div class="codex-cell-sub">${this.escapeHtml(session.runtime_profile || '当前 Codex')} · ${Number(session.lifetime_turn_count || session.turn_count || 0).toLocaleString()} 轮</div>
+                            <div class="codex-cell-sub">${this.escapeHtml(session.runtime_profile || '未标记 Profile')} · ${Number(session.lifetime_turn_count || session.turn_count || 0).toLocaleString()} 轮</div>
                         </td>
                         <td>${contextHtml}</td>
                         <td>

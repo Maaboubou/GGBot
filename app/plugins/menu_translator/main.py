@@ -639,7 +639,7 @@ if __name__ == "__main__":
     # 本地测试模式
     import sys
     
-    # 确保能导入 app 包（将当前项目根目录加入 sys.path）
+    # 确保能导入 app 包（将 Mabobot 项目根目录加入 sys.path）。
     root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     if root_dir not in sys.path:
         sys.path.insert(0, root_dir)

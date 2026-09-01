@@ -7,11 +7,17 @@
       "boc_rate:text_message_received:handle_text",
       "Weekly:text_message_received:handle_text",
       "menu_translator:text_message_received:handle_text",
-      "builtin_translation:text_message_received:handle_text_message"
+      "landinfo_bg:text_message_received:handle_text",
+      "builtin_translation:text_message_received:handle_text_message",
+      "magnet_search:text_message_received:handle_text",
+      "image_editor:text_message_received:handle_text_message",
+      "wine_expert:text_message_received:handle_text_message"
     ],
     "image_message_received": [
       "builtin_chat_logger:image_message_received:handle_image_message",
-      "menu_translator:image_message_received:handle_image"
+      "menu_translator:image_message_received:handle_image",
+      "image_editor:image_message_received:handle_image_message",
+      "wine_expert:image_message_received:handle_image_message"
     ],
     "link_message_received": [
       "builtin_chat_logger:link_message_received:handle_link_message",
@@ -23,6 +29,11 @@
       "builtin_translation:quote_message_received:handle_text_message"
     ],
     "quote_text_message_received": [],
-    "quote_image_message_received": []
+    "quote_image_message_received": [
+      "image_editor:quote_image_message_received:handle_quote_image_message",
+      "wine_expert:quote_image_message_received:handle_quote_image_message"
+    ],
+    "other_message_received": [],
+    "tickle_message_received": []
   }
 }

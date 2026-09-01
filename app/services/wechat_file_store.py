@@ -1,6 +1,6 @@
 """Managed storage and lookup for inbound WeChat file messages.
 
-The wxautox message object is only reliable while its UI control is alive, so
+The mabowx message object is only reliable while its UI control is alive, so
 ``wx_bot`` downloads files immediately and records the durable result here.
 Quoted messages can then be resolved by filename without touching WeChat UI.
 """
@@ -15,13 +15,14 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DOWNLOAD_ROOT = PROJECT_ROOT / "tmp" / "wechat_files"
 DEFAULT_INDEX_PATH = PROJECT_ROOT / "data" / "wechat_file_index.sqlite3"
+PROJECT_PATH_PREFIX = "project:///"
 
 _INVALID_PATH_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 _FILE_SIZE_LINE = re.compile(
@@ -70,7 +71,7 @@ def normalize_file_name(value: str) -> str:
 
 
 def extract_file_name_from_message(content: Any) -> str:
-    """Extract the filename from wxautox4's multiline FileMessage content."""
+    """Extract the filename from mabowx's multiline FileMessage content."""
     lines = [str(line or "").strip() for line in str(content or "").splitlines()]
     candidates = []
     for line in lines:
@@ -83,7 +84,7 @@ def extract_file_name_from_message(content: Any) -> str:
 
     if not candidates:
         return ""
-    # wxautox4 currently emits: 文件 / filename / size / 未下载 / 微信电脑版.
+    # mabowx emits: 文件 / filename / size / 未下载 / 微信电脑版.
     # Prefer a value with an extension, while still supporting extensionless files.
     for candidate in candidates:
         if Path(candidate).suffix:
@@ -107,9 +108,31 @@ def looks_like_file_quote(quote_content: Any) -> bool:
     return bool(Path(name).suffix)
 
 
-def local_path_from_external(value: str | os.PathLike[str]) -> Path:
-    """Translate a Windows/WSL path into a path usable by this Python process."""
+def _safe_project_relative(value: str) -> PurePosixPath:
     text = str(value or "").strip()
+    relative = PurePosixPath(text)
+    if (
+        not text
+        or "\\" in text
+        or relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} or ":" in part for part in relative.parts)
+    ):
+        raise ValueError(f"invalid project-relative file path: {value}")
+    return relative
+
+
+def local_path_from_external(
+    value: str | os.PathLike[str],
+    *,
+    project_root: Path | None = None,
+) -> Path:
+    """Translate a portable, Windows or WSL path for the current project."""
+    text = str(value or "").strip()
+    root = Path(project_root or PROJECT_ROOT).resolve()
+    if text.startswith(PROJECT_PATH_PREFIX):
+        relative = _safe_project_relative(text[len(PROJECT_PATH_PREFIX) :])
+        return (root / Path(*relative.parts)).resolve()
     if os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", text):
         win_path = PureWindowsPath(text)
         drive = win_path.drive.rstrip(":").lower()
@@ -118,7 +141,74 @@ def local_path_from_external(value: str | os.PathLike[str]) -> Path:
         parts = Path(text).parts
         if len(parts) >= 4 and len(parts[2]) == 1:
             return Path(f"{parts[2].upper()}:\\", *parts[3:])
-    return Path(text)
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        return (root / candidate).resolve()
+    return candidate
+
+
+def portable_project_path(
+    value: str | os.PathLike[str],
+    *,
+    project_root: Path | None = None,
+) -> str:
+    """Encode a project-owned path without binding it to one installation root."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    root = Path(project_root or PROJECT_ROOT).resolve()
+    path = local_path_from_external(text, project_root=root).resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return str(path)
+    return PROJECT_PATH_PREFIX + relative.as_posix()
+
+
+def normalize_index_saved_paths(
+    index_path: Path,
+    *,
+    project_root: Path | None = None,
+    require_portable: bool = False,
+) -> int:
+    """Rewrite project-owned file rows to portable paths in one SQLite index."""
+    path = Path(index_path)
+    if not path.is_file():
+        return 0
+    updates = []
+    nonportable = 0
+    connection = sqlite3.connect(str(path), timeout=30)
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbound_files'"
+        ).fetchone()
+        if table is None:
+            return 0
+        rows = connection.execute(
+            "SELECT file_id, saved_path FROM inbound_files WHERE saved_path IS NOT NULL"
+        ).fetchall()
+        for file_id, saved_path in rows:
+            encoded = portable_project_path(
+                str(saved_path or ""),
+                project_root=project_root,
+            )
+            if encoded and not encoded.startswith(PROJECT_PATH_PREFIX):
+                nonportable += 1
+            if encoded and encoded != saved_path:
+                updates.append((encoded, str(file_id)))
+        if updates:
+            connection.executemany(
+                "UPDATE inbound_files SET saved_path = ? WHERE file_id = ?",
+                updates,
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    if require_portable and nonportable:
+        raise ValueError(
+            f"wechat file index contains {nonportable} path(s) outside the project"
+        )
+    return len(updates)
 
 
 def sha256_file(path: Path) -> str:
@@ -157,6 +247,7 @@ class WeChatFileStore:
         self.download_root.mkdir(parents=True, exist_ok=True)
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        normalize_index_saved_paths(self.index_path)
         self.cleanup_expired()
 
     def _connect(self) -> sqlite3.Connection:
@@ -231,6 +322,7 @@ class WeChatFileStore:
     ) -> Dict[str, Any]:
         now = datetime.now().timestamp()
         name = safe_file_name(original_filename, fallback=f"{file_id}.bin")
+        stored_path = portable_project_path(saved_path) if saved_path else None
         values = {
             "file_id": str(file_id),
             "source_message_id": str(source_message_id or ""),
@@ -238,7 +330,7 @@ class WeChatFileStore:
             "sender": str(sender or ""),
             "original_filename": name,
             "normalized_filename": normalize_file_name(name),
-            "saved_path": str(saved_path) if saved_path else None,
+            "saved_path": stored_path,
             "received_at": float(received_at),
             "file_size": int(file_size) if file_size is not None else None,
             "sha256": str(sha256 or "") or None,
@@ -277,7 +369,10 @@ class WeChatFileStore:
                 """,
                 values,
             )
-        return values
+        public_values = dict(values)
+        if stored_path:
+            public_values["saved_path"] = str(local_path_from_external(stored_path))
+        return public_values
 
     def resolve_quote(
         self,

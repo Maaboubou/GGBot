@@ -388,7 +388,7 @@ def browser_summarize(
             try:
                 call_kwargs = {}
                 if chat_name:
-                    call_kwargs["_wxautox_chat_name"] = chat_name
+                    call_kwargs["_mabobot_chat_name"] = chat_name
                 response = ctx.llm_manager.call(
                     plugin_name="summary_plus",
                     call_type="summary",

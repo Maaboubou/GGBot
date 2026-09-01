@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#faf9f5">
     <title>Mabobot 管理面板</title>
@@ -11,7 +11,7 @@
     <!-- Restore the chosen theme before styles load to prevent a light/dark flash. -->
     <script>
         (() => {
-            const storageKey = 'wxauto.colorTheme';
+            const storageKey = 'mabobot.colorTheme';
             let theme = 'light';
             try {
                 const savedTheme = localStorage.getItem(storageKey);
@@ -40,21 +40,32 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
 
     <!-- App CSS -->
-    <link href="/static/assets/css/style.css?v=3.6.27" rel="stylesheet">
+    <link href="/static/assets/css/style.css?v=3.6.41" rel="stylesheet">
     <link href="/static/assets/css/dashboard.css?v=3.5.3" rel="stylesheet">
 </head>
 
 <body>
 
     <!-- Mobile Overlay -->
-    <div class="mobile-overlay"></div>
+    <div class="mobile-overlay" aria-hidden="true"></div>
+    <button type="button" class="mobile-nav-trigger mobile-toggle" aria-controls="sidebarNavigation"
+        aria-expanded="false" aria-label="打开主导航" title="主导航">
+        <span class="mobile-nav-trigger-icons" aria-hidden="true">
+            <i class="bi bi-grid"></i>
+            <i class="bi bi-x-lg"></i>
+        </span>
+        <span class="visually-hidden" data-mobile-nav-label>打开主导航</span>
+    </button>
 
     <div class="wrapper">
         <!-- Sidebar -->
-        <nav class="sidebar d-flex flex-column" id="sidebarNavigation">
+        <nav class="sidebar d-flex flex-column" id="sidebarNavigation" aria-label="主导航">
             <div class="sidebar-brand">
                 <i class="bi bi-robot"></i>
-                <span>Mabobot 管理面板</span>
+                <span class="sidebar-brand-copy"><strong>Mabobot 管理面板</strong><small data-mobile-nav-current>主导航</small></span>
+                <button type="button" class="sidebar-mobile-close" id="sidebarMobileClose" aria-label="关闭主导航" title="关闭主导航">
+                    <i class="bi bi-x-lg" aria-hidden="true"></i>
+                </button>
             </div>
             <button type="button" class="sidebar-collapse-toggle" id="sidebarCollapseToggle"
                 aria-label="折叠侧边栏" aria-controls="sidebarNavigation" aria-expanded="true" title="折叠侧边栏">
@@ -78,19 +89,19 @@
                 <li class="nav-item">
                     <a href="/chats" class="nav-link" data-tab="users">
                         <i class="bi bi-chat-square-text"></i>
-                        <span>聊天</span>
+                        <span>聊天管理</span>
                     </a>
                 </li>
                 <li class="nav-item">
                     <a href="/assistant" class="nav-link" data-tab="roles">
                         <i class="bi bi-stars"></i>
-                        <span>AI 助手</span>
+                        <span>Bot 设定</span>
                     </a>
                 </li>
                 <li class="nav-item">
                     <a href="/plugins" class="nav-link" data-tab="plugins">
                         <i class="bi bi-puzzle"></i>
-                        <span>插件</span>
+                        <span>功能插件</span>
                     </a>
                 </li>
                 <li class="nav-item">
@@ -116,14 +127,15 @@
             </div>
 
             <div class="sidebar-footer p-3 border-top border-secondary border-opacity-25">
-                <small class="text-muted d-block mb-1">版本：2.2.2</small>
+                <small class="text-muted d-block mb-1">版本：3.0.0</small>
                 <div class="d-flex align-items-center text-muted gap-2">
                     <button id="themeToggle" type="button" class="sidebar-theme-toggle"
                         aria-label="切换到暗色模式" aria-pressed="false" title="切换到暗色模式">
                         <i class="bi bi-moon-stars" aria-hidden="true"></i>
                         <span class="visually-hidden" data-theme-label>暗色</span>
                     </button>
-                    <a href="#" class="text-decoration-none text-muted hover-white"><i class="bi bi-github"></i></a>
+                    <a href="https://github.com/Maaboubou/Mabobot" target="_blank" rel="noopener noreferrer"
+                        class="text-decoration-none text-muted hover-white" aria-label="Mabobot GitHub" title="Mabobot GitHub"><i class="bi bi-github"></i></a>
                     <a href="#" class="text-decoration-none text-muted hover-white"><i class="bi bi-book"></i></a>
                 </div>
             </div>
@@ -134,34 +146,44 @@
             <!-- Header -->
             <header class="page-header">
                 <div class="d-flex align-items-center gap-3">
-                    <button class="btn btn-outline-secondary d-md-none mobile-toggle">
-                        <i class="bi bi-list"></i>
-                    </button>
                     <div class="page-heading">
                         <h1 class="page-title" id="pageTitle">概览</h1>
                     </div>
                 </div>
                 <div class="page-global-actions">
-                    <button class="btn btn-surface page-icon-action" onclick="App.refreshCurrentTab()" title="刷新当前页面" aria-label="刷新当前页面">
-                        <i class="bi bi-arrow-clockwise text-primary"></i>
-                    </button>
-                    <div class="dropdown">
-                        <button class="btn btn-surface dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
-                            <i class="bi bi-power me-1"></i>重启
-                        </button>
-                        <ul class="dropdown-menu dropdown-menu-end">
-                            <li>
-                                <button id="restartWebButton" class="dropdown-item restart-action" onclick="App.restartWeb()" title="正在检查管理控制台是否支持 Web 单独重启">
-                                    <i class="bi bi-arrow-repeat me-2"></i>只重启 Web
-                                </button>
-                            </li>
-                            <li><hr class="dropdown-divider"></li>
-                            <li>
-                                <button class="dropdown-item restart-action text-danger" onclick="App.restartSystem()">
-                                    <i class="bi bi-power me-2"></i>重启全部服务
-                                </button>
-                            </li>
-                        </ul>
+                    <div class="service-command-bar" aria-label="Bot 服务控制">
+                        <div class="bot-service-control" id="botServiceControl" title="正在检查 Bot 服务状态">
+                            <span class="service-presence-dot" aria-hidden="true"></span>
+                            <span class="service-presence-copy">
+                                <strong>Bot 服务</strong>
+                                <small id="botServiceState">检测中</small>
+                            </span>
+                            <button class="service-power-switch" type="button" role="switch" id="botServiceToggle"
+                                aria-checked="false" aria-label="启用或停止 Bot 服务"
+                                onclick="App.toggleBotService(this.getAttribute('aria-checked') !== 'true')" disabled>
+                                <span aria-hidden="true"></span>
+                            </button>
+                        </div>
+                        <span class="service-command-divider" aria-hidden="true"></span>
+                        <div class="dropdown service-restart-menu">
+                            <button class="service-restart-trigger dropdown-toggle" type="button" data-bs-toggle="dropdown"
+                                aria-expanded="false" title="重启服务" aria-label="重启服务">
+                                <i class="bi bi-arrow-repeat" aria-hidden="true"></i><span>重启</span>
+                            </button>
+                            <ul class="dropdown-menu dropdown-menu-end">
+                                <li>
+                                    <button id="restartWebButton" class="dropdown-item restart-action" onclick="App.restartWeb()" title="正在检查管理控制台是否支持 Web 单独重启">
+                                        <i class="bi bi-arrow-repeat me-2"></i>只重启 Web
+                                    </button>
+                                </li>
+                                <li><hr class="dropdown-divider"></li>
+                                <li>
+                                    <button class="dropdown-item restart-action text-danger" onclick="App.restartSystem()">
+                                        <i class="bi bi-power me-2"></i>重启全部服务
+                                    </button>
+                                </li>
+                            </ul>
+                        </div>
                     </div>
                 </div>
             </header>
@@ -233,7 +255,7 @@
                 <div class="codex-home-shell">
                     <section class="codex-profile-section modern-card" aria-labelledby="codexProfilesTitle">
                         <div class="codex-home-section-head">
-                            <div><h2 id="codexProfilesTitle">Profiles</h2><p>为聊天选择独立账号或自定义模型；默认沿用当前 Codex 配置。</p></div>
+                            <div><h2 id="codexProfilesTitle">Profiles</h2><p>为官方 Codex 登录或兼容模型建立独立 Profile；所有任务均继承默认 Profile 或显式绑定。</p></div>
                         </div>
                         <div id="codexProfilesGrid" class="codex-profile-grid">
                             <div class="loading-wrapper small">正在读取 Profile…</div>
@@ -256,10 +278,18 @@
                                 <form id="codexProfileForm" class="row g-2 codex-profile-form" autocomplete="off">
                                     <div class="col-12">
                                         <div class="codex-profile-source-choice" role="radiogroup" aria-label="配置方式">
-                                            <label><input type="radio" name="profile_source" value="oauth" checked><span><i class="bi bi-qr-code"></i><strong>ChatGPT 官方登录</strong><small>扫码连接当前 ChatGPT 套餐</small></span></label>
+                                            <label><input type="radio" name="profile_source" value="oauth" checked><span><i class="bi bi-person-check"></i><strong>ChatGPT 官方登录</strong><small>导入本机登录或扫码连接</small></span></label>
                                             <label><input type="radio" name="profile_source" value="catalog"><span><i class="bi bi-grid"></i><strong>LiteLLM 目录</strong><small>选择供应商和模型后快速回填</small></span></label>
                                             <label><input type="radio" name="profile_source" value="manual"><span><i class="bi bi-pencil"></i><strong>手动填写</strong><small>直接配置 Responses 兼容接口</small></span></label>
                                         </div>
+                                    </div>
+                                    <div class="col-12 codex-profile-oauth-field">
+                                        <label class="form-label">官方登录方式</label>
+                                        <div class="codex-profile-source-choice codex-profile-auth-choice" role="radiogroup" aria-label="官方登录方式">
+                                            <label id="codexLocalAuthChoice"><input type="radio" name="auth_source" value="local_cache" checked><span><i class="bi bi-box-arrow-in-down"></i><strong>导入本机登录</strong><small id="codexLocalAuthHint">正在检查本机 Codex 登录…</small></span></label>
+                                            <label><input type="radio" name="auth_source" value="device_code"><span><i class="bi bi-qr-code"></i><strong>扫码登录</strong><small>通过 OpenAI 设备授权连接账号</small></span></label>
+                                        </div>
+                                        <div class="form-text">导入只会复制文件型登录缓存到此 Profile，不会移动或退出本机 Codex 账号。</div>
                                     </div>
                                     <div class="col-12 codex-profile-api-field codex-profile-catalog-field d-none">
                                         <section class="litellm-update-card codex-profile-litellm-update" id="codexProfileLiteLLMUpdateCard" data-litellm-update-surface aria-live="polite">
@@ -318,13 +348,98 @@
                                     <div class="col-md-5 codex-profile-api-field d-none"><label class="form-label" for="codexProfileProviderName">供应商名称</label><input class="form-control" id="codexProfileProviderName" name="provider_name" maxlength="100" placeholder="例如 DeepSeek"></div>
                                     <div class="col-md-7 codex-profile-api-field d-none"><label class="form-label" for="codexProfileBaseUrl">Responses API Base URL</label><input class="form-control" id="codexProfileBaseUrl" name="base_url" type="url" placeholder="https://api.example.com/v1" required><div class="form-text">目录只负责快速选型；接口本身必须兼容 OpenAI Responses API。</div></div>
                                     <div class="col-12 codex-profile-api-field d-none"><label class="form-label" for="codexProfileApiKey">API Key</label><div class="input-group"><input class="form-control" id="codexProfileApiKey" name="api_key" type="password" maxlength="4096" autocomplete="new-password" required><button class="btn btn-outline-secondary" type="button" onclick="UI.togglePassword('codexProfileApiKey')" aria-label="显示或隐藏 API Key"><i class="bi bi-eye"></i></button></div><div class="form-text" id="codexProfileApiKeyHint">密钥通过标准输入交给 WSL，并存入权限为 0600 的独立文件；不会写入 Profile 清单或返回网页。</div></div>
-                                    <div class="col-md-4"><label class="form-label">推理强度</label><select class="form-select" name="reasoning_effort"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></div>
-                                    <div class="col-md-4"><label class="form-label">输出详细度</label><select class="form-select" name="model_verbosity"><option selected>inherit</option><option>low</option><option>medium</option><option>high</option></select></div>
-                                    <div class="col-md-4"><label class="form-label">上下文窗口</label><input class="form-control" name="context_window" type="number" min="4096" max="10000000" value="128000"></div>
-                                    <div class="col-12"><label class="form-check form-switch"><input class="form-check-input" type="checkbox" name="make_default" checked><span class="form-check-label">设为 Assistant 默认 Profile</span></label></div>
+                                    <div class="col-md-4 codex-profile-final-config-field"><label class="form-label">推理强度</label><select class="form-select" name="reasoning_effort"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></div>
+                                    <div class="col-md-4 codex-profile-final-config-field"><label class="form-label">输出详细度</label><select class="form-select" name="model_verbosity"><option selected>inherit</option><option>low</option><option>medium</option><option>high</option></select></div>
+                                    <div class="col-md-4 codex-profile-final-config-field"><label class="form-label">上下文窗口</label><input class="form-control" name="context_window" type="number" min="4096" max="10000000" value="128000"></div>
+                                    <div class="col-12 codex-profile-final-config-field"><label class="form-check form-switch"><input class="form-check-input" type="checkbox" name="make_default" checked><span class="form-check-label">设为 Assistant 默认 Profile</span></label></div>
                                 </form>
                             </div>
                             <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button type="button" class="btn btn-primary" id="saveCodexProfileButton" onclick="CodexCenter.saveProfile()">创建 Profile</button></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="modal fade" id="codexSkillsModal" tabindex="-1" aria-labelledby="codexSkillsModalTitle" aria-hidden="true">
+                    <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+                        <div class="modal-content codex-skills-modal">
+                            <div class="modal-header">
+                                <div>
+                                    <h5 class="modal-title" id="codexSkillsModalTitle">Profile Skills</h5>
+                                    <p class="modal-subtitle mb-0">管理 <strong id="codexSkillsProfileName">—</strong> 的独立 Skill；系统 Skill 保持只读。</p>
+                                </div>
+                                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+                            </div>
+                            <div class="modal-body">
+                                <div class="alert alert-danger d-none" id="codexSkillsAlert" role="alert"></div>
+                                <div class="codex-skills-toolbar">
+                                    <div class="btn-group btn-group-sm" role="group" aria-label="Skill 视图">
+                                        <button type="button" class="btn btn-outline-secondary active" id="codexSkillsInstalledTab" onclick="CodexSkills.showInstalled()">已安装</button>
+                                        <button type="button" class="btn btn-outline-secondary" id="codexSkillsTrashTab" onclick="CodexSkills.showTrash()">回收站 <span id="codexSkillsTrashCount">0</span></button>
+                                    </div>
+                                    <label class="codex-skills-search" for="codexSkillsSearch"><i class="bi bi-search"></i><input id="codexSkillsSearch" type="search" placeholder="搜索 Skill" autocomplete="off"></label>
+                                    <button type="button" class="btn btn-outline-primary btn-sm" id="codexSkillGithubButton" onclick="CodexSkills.startGithubInstall()"><i class="bi bi-github me-1"></i>从 GitHub 安装</button>
+                                    <button type="button" class="btn btn-primary btn-sm" id="codexSkillNewButton" onclick="CodexSkills.startCreate()"><i class="bi bi-plus-lg me-1"></i>新建 Skill</button>
+                                </div>
+                                <div class="codex-skills-summary" id="codexSkillsSummary">正在读取 Skills…</div>
+                                <div class="codex-skills-layout">
+                                    <aside class="codex-skills-list custom-scrollbar" id="codexSkillsList" aria-label="Skill 列表">
+                                        <div class="loading-wrapper small">正在读取 Skills…</div>
+                                    </aside>
+                                    <section class="codex-skill-editor-panel">
+                                        <div class="codex-skill-empty" id="codexSkillEmpty">
+                                            <i class="bi bi-tools"></i>
+                                            <strong>选择一个 Skill 查看详情</strong>
+                                            <span>Profile Skill 可以编辑、停用和移入回收站。</span>
+                                        </div>
+                                        <form class="d-none" id="codexSkillEditor" autocomplete="off">
+                                            <div class="codex-skill-editor-head">
+                                                <div><h6 id="codexSkillEditorTitle">新建 Skill</h6><span id="codexSkillEditorMeta"></span></div>
+                                                <span class="codex-skill-scope-badge" id="codexSkillScopeBadge">Profile</span>
+                                            </div>
+                                            <div class="mb-3" id="codexSkillNameField">
+                                                <label class="form-label" for="codexSkillName">名称</label>
+                                                <input class="form-control font-monospace" id="codexSkillName" maxlength="64" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder="例如 weekly-report" required>
+                                                <div class="form-text">使用小写字母、数字和单个连字符；创建后不可改名。</div>
+                                            </div>
+                                            <div class="mb-3" id="codexSkillDescriptionField">
+                                                <label class="form-label" for="codexSkillDescription">触发描述</label>
+                                                <textarea class="form-control" id="codexSkillDescription" rows="3" maxlength="1024" placeholder="说明何时应使用这个 Skill，以及它能完成什么。" required></textarea>
+                                            </div>
+                                            <div class="d-none" id="codexSkillGithubFields">
+                                                <div class="mb-3">
+                                                    <label class="form-label" for="codexSkillGithubRepository">公开 GitHub 仓库</label>
+                                                    <input class="form-control font-monospace" id="codexSkillGithubRepository" type="url" maxlength="512" placeholder="https://github.com/hugohe3/ppt-master">
+                                                </div>
+                                                <div class="row g-3 mb-3">
+                                                    <div class="col-md-8">
+                                                        <label class="form-label" for="codexSkillGithubPath">仓库内 Skill 路径</label>
+                                                        <input class="form-control font-monospace" id="codexSkillGithubPath" maxlength="512" placeholder="skills/ppt-master">
+                                                    </div>
+                                                    <div class="col-md-4">
+                                                        <label class="form-label" for="codexSkillGithubRef">分支、标签或提交</label>
+                                                        <input class="form-control font-monospace" id="codexSkillGithubRef" maxlength="128" value="main">
+                                                    </div>
+                                                </div>
+                                                <div class="alert alert-warning small" role="note">
+                                                    第三方 Skill 可能包含可执行脚本。系统会先暂存并校验，但不会自动运行脚本或安装 requirements.txt、pyproject.toml、package.json 中的依赖。
+                                                </div>
+                                            </div>
+                                            <div class="mb-3" id="codexSkillContentField">
+                                                <label class="form-label" id="codexSkillContentLabel" for="codexSkillContent">指令正文</label>
+                                                <textarea class="form-control font-monospace codex-skill-content" id="codexSkillContent" maxlength="262144" spellcheck="false" placeholder="# 工作流程&#10;&#10;在这里写清楚执行步骤。" required></textarea>
+                                                <div class="form-text" id="codexSkillContentHint">创建时会自动生成合法的 SKILL.md frontmatter。</div>
+                                            </div>
+                                            <div class="codex-skill-editor-actions">
+                                                <button type="button" class="btn btn-outline-secondary btn-sm d-none" id="codexSkillToggleButton" onclick="CodexSkills.toggleSelected()"></button>
+                                                <button type="button" class="btn btn-outline-danger btn-sm d-none" id="codexSkillArchiveButton" onclick="CodexSkills.archiveSelected()"><i class="bi bi-archive me-1"></i>移入回收站</button>
+                                                <span></span>
+                                                <button type="button" class="btn btn-outline-secondary btn-sm" onclick="CodexSkills.cancelEdit()">取消</button>
+                                                <button type="submit" class="btn btn-primary btn-sm" id="codexSkillSaveButton">保存</button>
+                                            </div>
+                                        </form>
+                                    </section>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -350,9 +465,29 @@
                                 </div>
                                 <div class="codex-oauth-connected d-none" id="codexOAuthConnected">
                                     <div class="codex-oauth-success"><i class="bi bi-check-circle-fill"></i><span><strong>ChatGPT 已连接</strong><small id="codexOAuthAccount"></small></span></div>
-                                    <label class="form-label mt-3" for="codexOAuthModel">Profile 模型</label>
-                                    <select class="form-select" id="codexOAuthModel"></select>
-                                    <div class="form-text">模型来自当前账号的 Codex 目录。</div>
+                                    <div class="row g-3 mt-1">
+                                        <div class="col-12">
+                                            <label class="form-label" for="codexOAuthModel">模型</label>
+                                            <select class="form-select" id="codexOAuthModel" onchange="CodexCenter.syncOAuthModelConfig()"></select>
+                                            <div class="form-text" id="codexOAuthModelDescription">模型来自当前账号的 Codex 目录。</div>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <label class="form-label" for="codexOAuthReasoning">推理强度</label>
+                                            <select class="form-select" id="codexOAuthReasoning"></select>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <label class="form-label" for="codexOAuthVerbosity">输出详细度</label>
+                                            <select class="form-select" id="codexOAuthVerbosity"><option value="inherit" selected>跟随模型默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
+                                        </div>
+                                        <div class="col-12">
+                                            <label class="form-label" for="codexOAuthContextWindow">上下文窗口</label>
+                                            <input class="form-control" id="codexOAuthContextWindow" type="text" readonly>
+                                            <div class="form-text" id="codexOAuthCapabilities">能力信息来自登录后的账号模型目录。</div>
+                                        </div>
+                                        <div class="col-12">
+                                            <label class="form-check form-switch"><input class="form-check-input" id="codexOAuthMakeDefault" type="checkbox" checked><span class="form-check-label">设为 Assistant 默认 Profile</span></label>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                             <div class="modal-footer">
@@ -843,8 +978,8 @@
                                 </select>
                             </div>
                             <button class="btn btn-sm btn-outline-secondary" id="logFollowBtn"
-                                onclick="App.toggleLogFollow()" title="自动跟踪最新日志">
-                                <i class="bi bi-arrow-down-circle"></i> 跟随
+                                onclick="App.toggleLogFollow()" title="自动跟踪最新日志" aria-pressed="false">
+                                <i class="bi bi-arrow-down-circle"></i><span class="log-follow-label">跟随</span>
                             </button>
                             <button class="btn btn-sm btn-outline-secondary" onclick="App.loadLogs()" title="刷新">
                                 <i class="bi bi-arrow-clockwise"></i>
@@ -859,6 +994,11 @@
                             <span>加载日志中…</span>
                         </div>
                     </div>
+
+                    <button type="button" class="log-jump-latest d-none" id="logJumpLatest"
+                        onclick="App.resumeLogFollow()" aria-label="回到最新日志">
+                        <i class="bi bi-arrow-down" aria-hidden="true"></i><span>回到最新</span>
+                    </button>
 
                     <!-- Status Bar -->
                     <div class="logs-statusbar">
@@ -1234,7 +1374,13 @@
                                                 </button>
                                                 <div class="model-catalog-menu d-none" id="modelCatalogMenu" role="listbox"></div>
                                             </div>
-                                            <div class="form-text" id="modelCatalogHint">选择供应商后加载可用模型。</div>
+                                            <div class="form-text d-flex align-items-center justify-content-between gap-2">
+                                                <span id="modelCatalogHint">选择供应商后加载可用模型。</span>
+                                                <button type="button" class="btn btn-link btn-sm p-0 flex-shrink-0"
+                                                    id="modelCatalogRefreshButton" onclick="LLMManager.refreshModelCatalog()">
+                                                    <i class="bi bi-arrow-repeat me-1"></i>同步服务端
+                                                </button>
+                                            </div>
                                         </div>
                                         <div class="col-12" id="modelApiBaseGroup">
                                             <label class="form-label" for="modelApiBase">API 地址 <span class="model-required-mark d-none" id="modelApiBaseRequired">*</span></label>
@@ -1322,7 +1468,7 @@
                                             <div class="col-sm-6 col-lg-4 d-none" id="modelCodexProfileGroup">
                                                 <label class="form-label" for="modelCodexProfile">Codex Profile</label>
                                                 <select class="form-select" id="modelCodexProfile">
-                                                    <option value="">Codex 当前配置</option>
+                                                    <option value="">继承默认 Profile</option>
                                                 </select>
                                                 <div class="form-text">辅助任务也可绑定隔离 Profile，不会切换全局 Codex。</div>
                                             </div>
@@ -1468,12 +1614,14 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
     <!-- App Scripts -->
-    <script src="/static/assets/js/api.js?v=3.5.10"></script>
-    <script src="/static/assets/js/ui.js?v=3.4.12"></script>
-    <script src="/static/assets/js/system_operations.js?v=1.3.1"></script>
-    <script src="/static/assets/js/llm_manager.js?v=3.4.8"></script>
-    <script src="/static/assets/js/codex_center.js?v=1.0.8"></script>
-    <script src="/static/assets/js/main.js?v=3.6.10"></script>
+    <script src="/static/assets/js/api.js?v=3.5.16"></script>
+    <script src="/static/assets/js/ui.js?v=3.4.19"></script>
+    <script src="/static/assets/js/system_operations.js?v=1.3.2"></script>
+    <script src="/static/assets/js/system_tools.js?v=1.0.0"></script>
+    <script src="/static/assets/js/llm_manager.js?v=3.4.11"></script>
+    <script src="/static/assets/js/codex_center.js?v=1.0.13"></script>
+    <script src="/static/assets/js/codex_skills.js?v=1.1.0"></script>
+    <script src="/static/assets/js/main.js?v=3.6.14"></script>
     <script src="/static/assets/js/memory_console.js?v=1.0.3"></script>
 
     <!-- ==================== Judge History Modal ==================== -->

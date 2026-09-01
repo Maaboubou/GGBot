@@ -25,17 +25,19 @@ logger = logging.getLogger(__name__)
 
 class EmailService:
     """邮件服务类"""
-    
-    def __init__(self):
-        # 邮箱地址与授权码都由用户在本机配置，不提供默认账号。
-        qq_email: Optional[str] = None
+
+    def _get_email_address(self) -> Optional[str]:
+        """获取发件地址（优先数据库，回退到环境变量）。"""
+        email_address: Optional[str] = None
         if _get_setting_from_db is not None:
             try:
-                qq_email = _get_setting_from_db("QQEMAIL_ADDR")
+                email_address = _get_setting_from_db("QQEMAIL_ADDR")
             except Exception:
                 pass
-        self.qq_email = str(qq_email or os.getenv("QQEMAIL_ADDR") or "").strip()
-        
+        if not email_address:
+            email_address = os.getenv("QQEMAIL_ADDR")
+        return str(email_address or "").strip() or None
+
     def _get_auth_code(self) -> Optional[str]:
         """获取邮箱授权码（优先数据库，回退到环境变量）"""
         auth_code: Optional[str] = None
@@ -52,47 +54,52 @@ class EmailService:
             auth_code = os.getenv("QQEMAIL_CODE")
 
         return auth_code
-    
+
     def send_email(self, body_text: str, subject: str = "微信助手通知") -> bool:
         """
         发送邮件
-        
+
         Args:
             body_text: 正文内容
             subject: 邮件标题，默认为 "微信助手通知"
-            
+
         Returns:
             bool: 发送成功返回True，失败返回False
         """
-        auth_code = self._get_auth_code()
-        if not self.qq_email or not auth_code:
-            logger.error("❌ 邮箱或授权码未配置，请设置 QQEMAIL_ADDR 和 QQEMAIL_CODE")
+        qq_email = self._get_email_address()
+        if not qq_email:
+            logger.error("❌ 邮箱地址未配置，请设置 QQEMAIL_ADDR")
             return False
-            
+
+        auth_code = self._get_auth_code()
+        if not auth_code:
+            logger.error("❌ 邮件授权码未配置，请设置环境变量 QQEMAIL_CODE")
+            return False
+
         try:
             msg = MIMEMultipart()
-            msg['From'] = self.qq_email
-            msg['To'] = self.qq_email  # 发给自己
+            msg['From'] = qq_email
+            msg['To'] = qq_email  # 发给自己
             msg['Subject'] = subject
 
             msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
 
             server = smtplib.SMTP_SSL('smtp.qq.com', 465)
-            server.login(self.qq_email, auth_code)
+            server.login(qq_email, auth_code)
             server.send_message(msg)
             server.quit()
-            
+
             logger.info(f"✅ 邮件发送成功: {subject}")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ 邮件发送失败: {e}")
             return False
-    
+
     def send_offline_notification(self, bot_name: str = "微信助手") -> bool:
         """发送掉线通知邮件"""
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
+
         email_body = f"""
 {bot_name} 掉线通知
 
@@ -104,13 +111,13 @@ class EmailService:
 
 此消息由微信掉线监控系统自动发送。
         """.strip()
-        
+
         return self.send_email(email_body, f"🚨 {bot_name} 掉线通知")
-    
+
     def send_recovery_notification(self, bot_name: str = "微信助手") -> bool:
         """发送恢复通知邮件"""
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
+
         email_body = f"""
 {bot_name} 状态已恢复正常！
 
@@ -122,7 +129,7 @@ class EmailService:
 
 此消息由微信掉线监控系统自动发送。
         """.strip()
-        
+
         return self.send_email(email_body, f"✅ {bot_name} 恢复在线")
 
 
@@ -150,7 +157,7 @@ def send_email(body_text: str, subject: str = "微信助手通知") -> bool:
 def send_alert_email(subject: str, body: str) -> bool:
     """
     独立运行专用便捷函数（供 Ping_notify.py 等脚本调用）。
-    直接从环境变量 QQEMAIL_CODE 读取授权码，无需数据库。
+    直接从环境变量 QQEMAIL_ADDR / QQEMAIL_CODE 读取配置，无需数据库。
 
     Args:
         subject: 邮件主题
@@ -159,12 +166,17 @@ def send_alert_email(subject: str, body: str) -> bool:
     Returns:
         bool: 发送成功返回 True，失败返回 False
     """
-    qq_email = os.getenv("QQEMAIL_ADDR", "").strip()
+    qq_email = str(os.getenv("QQEMAIL_ADDR") or "").strip()
     auth_code = os.getenv("QQEMAIL_CODE")
 
-    if not qq_email or not auth_code:
-        logger.error("❌ 邮箱或授权码未配置，请设置 QQEMAIL_ADDR 和 QQEMAIL_CODE")
-        print("❌ 邮箱或授权码未配置，请设置 QQEMAIL_ADDR 和 QQEMAIL_CODE")
+    if not qq_email:
+        logger.error("❌ 邮箱地址未配置，请设置环境变量 QQEMAIL_ADDR")
+        print("❌ 邮箱地址未配置，请设置环境变量 QQEMAIL_ADDR")
+        return False
+
+    if not auth_code:
+        logger.error("❌ 邮件授权码未配置，请设置环境变量 QQEMAIL_CODE")
+        print("❌ 邮件授权码未配置，请设置环境变量 QQEMAIL_CODE")
         return False
 
     try:
@@ -192,7 +204,7 @@ def send_alert_email(subject: str, body: str) -> bool:
 if __name__ == "__main__":
     # 测试邮件发送
     service = get_email_service()
-    
+
     test_body = f"""
 这是一封测试邮件。
 
@@ -201,7 +213,7 @@ if __name__ == "__main__":
 
 如果您收到这封邮件，说明邮件配置正确。
     """.strip()
-    
+
     if service.send_email(test_body, "📧 新架构邮件功能测试"):
         print("测试邮件发送成功")
     else:

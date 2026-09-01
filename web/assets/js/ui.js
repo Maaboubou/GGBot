@@ -4,8 +4,8 @@
  */
 
 const UI = {
-    sidebarStorageKey: 'wxauto.sidebarCollapsed',
-    themeStorageKey: 'wxauto.colorTheme',
+    sidebarStorageKey: 'mabobot.sidebarCollapsed',
+    themeStorageKey: 'mabobot.colorTheme',
     routes: {
         dashboard: '/',
         codex: '/codex',
@@ -31,6 +31,7 @@ const UI = {
         '/system/runtime': 'settings',
         '/system/developer': 'settings',
         '/system/operations': 'settings',
+        '/system/tools': 'settings',
         '/system/backups': 'settings',
         '/assistant/roles': 'roles',
         '/assistant/chats': 'roles',
@@ -63,13 +64,35 @@ const UI = {
         // Mobile Sidebar
         const toggleBtn = document.querySelector('.mobile-toggle');
         const overlay = document.querySelector('.mobile-overlay');
+        const sidebar = document.getElementById('sidebarNavigation');
+        const mobileCloseBtn = document.getElementById('sidebarMobileClose');
         const collapseBtn = document.getElementById('sidebarCollapseToggle');
         if (toggleBtn) {
-            toggleBtn.addEventListener('click', () => UI.toggleSidebar(true));
+            toggleBtn.addEventListener('click', () => {
+                UI.toggleSidebar(!sidebar?.classList.contains('show'));
+            });
         }
         if (overlay) {
             overlay.addEventListener('click', () => UI.toggleSidebar(false));
         }
+        mobileCloseBtn?.addEventListener('click', () => UI.toggleSidebar(false));
+        sidebar?.addEventListener('keydown', event => UI.handleMobileSidebarKeydown(event));
+        const mobileSheetHandle = sidebar?.querySelector('.sidebar-brand');
+        mobileSheetHandle?.addEventListener('touchstart', event => {
+            const touch = event.changedTouches[0];
+            UI.mobileNavTouchStart = touch ? { x: touch.clientX, y: touch.clientY } : null;
+        }, { passive: true });
+        mobileSheetHandle?.addEventListener('touchend', event => {
+            const start = UI.mobileNavTouchStart;
+            const touch = event.changedTouches[0];
+            UI.mobileNavTouchStart = null;
+            if (!start || !touch) return;
+            const deltaX = touch.clientX - start.x;
+            const deltaY = touch.clientY - start.y;
+            if (deltaY > 64 && deltaY > Math.abs(deltaX) * 1.2) UI.toggleSidebar(false);
+        }, { passive: true });
+        this.syncMobileNavigationMode();
+        window.addEventListener('resize', this.debounce(() => this.syncMobileNavigationMode(), 120));
         if (collapseBtn) {
             collapseBtn.addEventListener('click', () => UI.toggleDesktopSidebar());
 
@@ -171,15 +194,96 @@ const UI = {
         };
     },
 
-    toggleSidebar(show) {
-        const sidebar = document.querySelector('.sidebar');
+    toggleSidebar(show, options = {}) {
+        const sidebar = document.getElementById('sidebarNavigation');
         const overlay = document.querySelector('.mobile-overlay');
-        if (show) {
-            sidebar.classList.add('show');
-            overlay.classList.add('show');
-        } else {
+        const toggleBtn = document.querySelector('.mobile-toggle');
+        if (!sidebar || !overlay) return;
+        const isMobile = window.innerWidth <= 768;
+        const wasOpen = sidebar.classList.contains('show');
+        const shouldShow = Boolean(show) && isMobile;
+        if (shouldShow && !wasOpen) {
+            this.mobileNavReturnFocus = document.activeElement instanceof HTMLElement
+                ? document.activeElement
+                : toggleBtn;
+        }
+        sidebar.classList.toggle('show', shouldShow);
+        overlay.classList.toggle('show', shouldShow);
+        document.body.classList.toggle('mobile-nav-open', shouldShow);
+        sidebar.inert = isMobile && !shouldShow;
+        if (isMobile) sidebar.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+        else sidebar.removeAttribute('aria-hidden');
+        if (toggleBtn) {
+            const actionLabel = shouldShow ? '关闭主导航' : '打开主导航';
+            toggleBtn.setAttribute('aria-expanded', String(shouldShow));
+            toggleBtn.setAttribute('aria-label', actionLabel);
+            toggleBtn.title = actionLabel;
+            toggleBtn.querySelector('[data-mobile-nav-label]')?.replaceChildren(document.createTextNode(actionLabel));
+        }
+        if (shouldShow) {
+            window.requestAnimationFrame(() => {
+                const activeLink = sidebar.querySelector('.nav-link.active');
+                (activeLink || document.getElementById('sidebarMobileClose'))?.focus({ preventScroll: true });
+            });
+        } else if (wasOpen && options.restoreFocus !== false) {
+            const returnFocus = this.mobileNavReturnFocus?.isConnected
+                ? this.mobileNavReturnFocus
+                : toggleBtn;
+            window.requestAnimationFrame(() => returnFocus?.focus({ preventScroll: true }));
+        }
+    },
+
+    syncMobileNavigationMode() {
+        const sidebar = document.getElementById('sidebarNavigation');
+        const overlay = document.querySelector('.mobile-overlay');
+        const toggleBtn = document.querySelector('.mobile-toggle');
+        if (!sidebar || !overlay) return;
+        const updateTrigger = expanded => {
+            if (!toggleBtn) return;
+            const actionLabel = expanded ? '关闭主导航' : '打开主导航';
+            toggleBtn.setAttribute('aria-expanded', String(expanded));
+            toggleBtn.setAttribute('aria-label', actionLabel);
+            toggleBtn.title = actionLabel;
+            toggleBtn.querySelector('[data-mobile-nav-label]')?.replaceChildren(document.createTextNode(actionLabel));
+        };
+        const isMobile = window.innerWidth <= 768;
+        if (!isMobile) {
             sidebar.classList.remove('show');
             overlay.classList.remove('show');
+            document.body.classList.remove('mobile-nav-open');
+            sidebar.inert = false;
+            sidebar.removeAttribute('aria-hidden');
+            updateTrigger(false);
+            return;
+        }
+        const open = sidebar.classList.contains('show');
+        sidebar.inert = !open;
+        sidebar.setAttribute('aria-hidden', open ? 'false' : 'true');
+        overlay.classList.toggle('show', open);
+        document.body.classList.toggle('mobile-nav-open', open);
+        updateTrigger(open);
+    },
+
+    handleMobileSidebarKeydown(event) {
+        const sidebar = document.getElementById('sidebarNavigation');
+        if (!sidebar?.classList.contains('show') || window.innerWidth > 768) return;
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            this.toggleSidebar(false);
+            return;
+        }
+        if (event.key !== 'Tab') return;
+        const focusable = [...sidebar.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+            .filter(element => !element.hidden && element.getClientRects().length);
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
         }
     },
 
@@ -233,10 +337,23 @@ const UI = {
 
     switchTab(tabId, options = {}) {
         if (!this.routes[tabId]) tabId = 'dashboard';
+        const logsPageActive = tabId === 'logs';
+        document.body.classList.toggle('logs-page-active', logsPageActive);
+        if (logsPageActive && window.innerWidth <= 768) {
+            window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+            const mainContent = document.querySelector('.main-content');
+            if (mainContent) mainContent.scrollTop = 0;
+        }
         // Update Sidebar
-        document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active'));
+        document.querySelectorAll('.nav-link').forEach(el => {
+            el.classList.remove('active');
+            el.removeAttribute('aria-current');
+        });
         const activeLink = document.querySelector(`.nav-link[data-tab="${tabId}"]`);
-        if (activeLink) activeLink.classList.add('active');
+        if (activeLink) {
+            activeLink.classList.add('active');
+            activeLink.setAttribute('aria-current', 'page');
+        }
 
         // Update Content
         // specific selector to avoid hiding nested tab-content (like in LLM manager)
@@ -256,21 +373,24 @@ const UI = {
         }
 
         // Close sidebar on mobile
-        if (window.innerWidth < 768) UI.toggleSidebar(false);
+        if (window.innerWidth <= 768) UI.toggleSidebar(false);
 
         // Update Title
         const titleMap = {
             'dashboard': '概览',
             'codex': 'Codex 运行中心',
-            'plugins': '插件',
-            'users': '聊天',
-            'roles': 'AI 助手',
+            'plugins': '功能插件',
+            'users': '聊天管理',
+            'roles': 'Bot 设定',
             'settings': '系统',
             'wechat': 'WeChat 状态',
             'logs': '运行与日志',
             'llm': '模型配置'
         };
-        document.getElementById('pageTitle').textContent = titleMap[tabId] || '概览';
+        const currentTitle = titleMap[tabId] || '概览';
+        document.getElementById('pageTitle').textContent = currentTitle;
+        const mobileNavCurrent = document.querySelector('[data-mobile-nav-current]');
+        if (mobileNavCurrent) mobileNavCurrent.textContent = `当前页面 · ${currentTitle}`;
     },
 
     showLoading(elementId) {
@@ -1336,6 +1456,7 @@ const UI = {
             '/system/runtime': 'runtime',
             '/system/developer': 'developer',
             '/system/operations': 'operations',
+            '/system/tools': 'tools',
             '/system/backups': 'backups'
         }[path] || 'identity';
     },
@@ -1353,6 +1474,10 @@ const UI = {
                 description: '统一任务、插件状态和组件健康'
             },
             {
+                id: 'tools', title: '工具与更新', icon: 'bi-box-arrow-up',
+                description: '升级必要组件并修复媒体与浏览器运行时'
+            },
+            {
                 id: 'backups', title: '备份与迁移', icon: 'bi-shield-check',
                 description: '状态备份、完整迁移和安全恢复'
             },
@@ -1362,11 +1487,39 @@ const UI = {
         const requested = this.getSystemSettingsGroupFromPath();
         const activeId = platformGroups.some(group => group.id === requested) ? requested : groups[0]?.id;
         const navigation = platformGroups.map(group => `
-            <button type="button" class="system-settings-nav-item ${group.id === activeId ? 'active' : ''}" data-system-group="${this.escapeHtml(group.id)}">
+            <button type="button" class="system-settings-nav-item ${group.id === activeId ? 'active' : ''}" data-system-group="${this.escapeHtml(group.id)}" data-system-icon="${this.escapeHtml(group.icon)}">
                 <i class="bi ${this.escapeHtml(group.icon)}"></i>
                 <span><strong>${this.escapeHtml(group.title)}</strong></span>
             </button>
         `).join('');
+        const activeGroup = platformGroups.find(group => group.id === activeId) || platformGroups[0] || {};
+        const mobileNavigation = `
+            <details class="system-settings-mobile-picker" id="systemSettingsMobilePicker">
+                <summary class="system-settings-mobile-toggle" aria-label="选择系统分区">
+                    <span class="system-settings-mobile-icon" data-system-mobile-icon><i class="bi ${this.escapeHtml(activeGroup.icon || 'bi-sliders')}"></i></span>
+                    <span class="system-settings-mobile-current">
+                        <strong data-system-mobile-title>${this.escapeHtml(activeGroup.title || '系统')}</strong>
+                        <small data-system-mobile-description>${this.escapeHtml(activeGroup.description || '选择需要管理的系统分区')}</small>
+                    </span>
+                    <i class="bi bi-chevron-down system-settings-mobile-chevron" aria-hidden="true"></i>
+                </summary>
+                <div class="system-settings-mobile-popover">
+                    <div class="system-settings-mobile-popover-head">
+                        <strong>系统分区</strong><span>${platformGroups.length}</span>
+                    </div>
+                    <div class="system-settings-mobile-list" role="listbox" aria-label="系统设置分区">
+                        ${platformGroups.map(group => `
+                            <button type="button" class="system-settings-mobile-item ${group.id === activeId ? 'active' : ''}"
+                                data-system-mobile-group="${this.escapeHtml(group.id)}" data-system-icon="${this.escapeHtml(group.icon)}"
+                                data-system-title="${this.escapeHtml(group.title)}" data-system-description="${this.escapeHtml(group.description || '')}"
+                                role="option" aria-selected="${group.id === activeId ? 'true' : 'false'}">
+                                <span class="system-settings-mobile-item-icon"><i class="bi ${this.escapeHtml(group.icon)}"></i></span>
+                                <span class="system-settings-mobile-item-copy"><strong>${this.escapeHtml(group.title)}</strong><small>${this.escapeHtml(group.description || '')}</small></span>
+                                <i class="bi bi-check-lg system-settings-mobile-check" aria-hidden="true"></i>
+                            </button>`).join('')}
+                    </div>
+                </div>
+            </details>`;
         const renderField = (field, group) => {
                 const inputId = `system-setting-${field.key}`;
                 const restart = field.requires_restart ? '<span class="system-restart-pill">需重启</span>' : '';
@@ -1442,12 +1595,16 @@ const UI = {
             <section class="system-settings-section ${activeId === 'operations' ? '' : 'd-none'}" data-system-section="operations">
                 <div id="systemOperationsConsole" class="system-platform-console"><div class="loading-wrapper">正在读取运行状态…</div></div>
             </section>
+            <section class="system-settings-section ${activeId === 'tools' ? '' : 'd-none'}" data-system-section="tools">
+                <div id="systemToolsConsole" class="system-platform-console"><div class="loading-wrapper">正在读取工具状态…</div></div>
+            </section>
             <section class="system-settings-section ${activeId === 'backups' ? '' : 'd-none'}" data-system-section="backups">
                 <div id="systemBackupsConsole" class="system-platform-console"><div class="loading-wrapper">正在读取备份…</div></div>
             </section>`;
 
         container.innerHTML = `
             <div class="system-settings-shell">
+                ${mobileNavigation}
                 <aside class="system-settings-nav">${navigation}</aside>
                 <main class="system-settings-main">${sections}${platformSections}</main>
             </div>`;
@@ -1455,6 +1612,24 @@ const UI = {
         container.querySelectorAll('[data-system-group]').forEach(button => button.addEventListener('click', () => {
             this.switchSystemSettingsGroup(button.dataset.systemGroup);
         }));
+        container.querySelectorAll('[data-system-mobile-group]').forEach(button => {
+            button.addEventListener('click', () => {
+                this.switchSystemSettingsGroup(button.dataset.systemMobileGroup, { mobile: true });
+            });
+        });
+        const mobilePicker = container.querySelector('#systemSettingsMobilePicker');
+        mobilePicker?.addEventListener('keydown', event => {
+            if (event.key !== 'Escape') return;
+            mobilePicker.open = false;
+            mobilePicker.querySelector('summary')?.focus();
+        });
+        if (!this.systemSettingsPickerOutsideBound) {
+            this.systemSettingsPickerOutsideBound = true;
+            document.addEventListener('click', event => {
+                const picker = document.getElementById('systemSettingsMobilePicker');
+                if (picker?.open && !picker.contains(event.target)) picker.open = false;
+            });
+        }
         container.querySelectorAll('[data-reveal-setting]').forEach(button => button.addEventListener('click', () => {
             const input = document.getElementById(button.dataset.revealSetting);
             if (!input) return;
@@ -1474,11 +1649,31 @@ const UI = {
         container.querySelectorAll('[data-system-section]').forEach(section => {
             section.classList.toggle('d-none', section.dataset.systemSection !== groupId);
         });
+        const mobilePicker = container.querySelector('#systemSettingsMobilePicker');
+        const mobileItem = container.querySelector(`[data-system-mobile-group="${CSS.escape(groupId)}"]`);
+        container.querySelectorAll('[data-system-mobile-group]').forEach(button => {
+            const active = button.dataset.systemMobileGroup === groupId;
+            button.classList.toggle('active', active);
+            button.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        if (mobileItem) {
+            const mobileIcon = container.querySelector('[data-system-mobile-icon]');
+            const mobileTitle = container.querySelector('[data-system-mobile-title]');
+            const mobileDescription = container.querySelector('[data-system-mobile-description]');
+            if (mobileIcon) {
+                const icon = document.createElement('i');
+                icon.className = `bi ${mobileItem.dataset.systemIcon || 'bi-sliders'}`;
+                mobileIcon.replaceChildren(icon);
+            }
+            if (mobileTitle) mobileTitle.textContent = mobileItem.dataset.systemTitle || '系统';
+            if (mobileDescription) mobileDescription.textContent = mobileItem.dataset.systemDescription || '';
+        }
+        if (mobilePicker) mobilePicker.open = false;
         if (options.history !== false) {
             const paths = {
                 identity: '/system', integrations: '/system/integrations',
                 runtime: '/system/runtime', developer: '/system/developer',
-                operations: '/system/operations', backups: '/system/backups'
+                operations: '/system/operations', tools: '/system/tools', backups: '/system/backups'
             };
             const path = paths[groupId] || '/system';
             if (this.normalizePath(window.location.pathname) !== path) {
@@ -1486,7 +1681,15 @@ const UI = {
             }
         }
         if (groupId === 'operations') window.SystemOperations?.loadRuntime();
+        if (groupId === 'tools') window.SystemTools?.load();
         if (groupId === 'backups') window.SystemOperations?.loadBackups();
+        if (options.mobile && window.innerWidth <= 767.98) {
+            const main = container.querySelector('.system-settings-main');
+            window.requestAnimationFrame(() => main?.scrollIntoView({
+                behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+                block: 'start'
+            }));
+        }
     },
 
     togglePassword(id) {
@@ -1536,6 +1739,7 @@ const UI = {
                 const checked = Boolean(grant);
                 const available = Boolean(capability.enabled && capability.loaded);
                 const supportsPush = (capability.features || []).includes('push');
+                const configurable = Boolean(capability.configurable);
                 const searchValue = `${capability.display_name || ''} ${capability.id} ${capability.description || ''}`.toLowerCase();
                 return `
                     <article class="chat-policy-plugin ${checked ? 'selected' : ''} ${available ? '' : 'unavailable'}"
@@ -1543,6 +1747,10 @@ const UI = {
                         <div class="chat-policy-plugin-main">
                             <span><i class="bi ${this.escapeHtml(capability.icon || 'bi-puzzle')}"></i></span>
                             <div><strong>${this.escapeHtml(capability.display_name || capability.id)}</strong><small>${this.escapeHtml(capability.description || capability.category_label || '')}</small></div>
+                            <button type="button" class="chat-policy-plugin-config" data-plugin-config="${this.escapeHtml(capability.id)}"
+                                ${configurable ? '' : 'disabled'} title="${configurable ? '配置此功能插件' : '此功能插件没有可配置项'}" aria-label="配置 ${this.escapeHtml(capability.display_name || capability.id)}">
+                                <i class="bi bi-sliders"></i><span>配置</span>
+                            </button>
                             <input class="form-check-input chat-policy-plugin-toggle" type="checkbox" value="${this.escapeHtml(capability.id)}" ${checked ? 'checked' : ''} ${available ? '' : 'disabled'} aria-label="启用 ${this.escapeHtml(capability.display_name || capability.id)}">
                         </div>
                         <div class="chat-policy-plugin-options">
@@ -1575,7 +1783,7 @@ const UI = {
 
                 <nav class="chat-policy-tabs" role="tablist" aria-label="聊天配置分区">
                     <button type="button" class="${activePane === 'assistant' ? 'active' : ''}" data-chat-policy-tab="assistant" aria-selected="${activePane === 'assistant'}"><i class="bi bi-stars"></i>助手</button>
-                    <button type="button" class="${activePane === 'plugins' ? 'active' : ''}" data-chat-policy-tab="plugins" aria-selected="${activePane === 'plugins'}"><i class="bi bi-puzzle"></i>插件 <span data-plugin-tab-count>${selectedPluginCount}</span></button>
+                    <button type="button" class="${activePane === 'plugins' ? 'active' : ''}" data-chat-policy-tab="plugins" aria-selected="${activePane === 'plugins'}"><i class="bi bi-puzzle"></i>功能插件 <span data-plugin-tab-count>${selectedPluginCount}</span></button>
                     <button type="button" class="${activePane === 'advanced' ? 'active' : ''}" data-chat-policy-tab="advanced" aria-selected="${activePane === 'advanced'}"><i class="bi bi-sliders"></i>高级</button>
                 </nav>
 
@@ -1633,7 +1841,7 @@ const UI = {
 
                 <div class="chat-policy-pane ${activePane === 'plugins' ? 'active' : ''}" data-chat-policy-pane="plugins">
                     <section class="chat-policy-block">
-                        <div class="chat-policy-block-head"><h4>独立插件</h4><div class="chat-policy-block-actions"><a class="chat-policy-head-action" href="/plugins" onclick="event.preventDefault(); UI.switchTab('plugins')"><i class="bi bi-box-arrow-up-right"></i>管理插件</a></div></div>
+                        <div class="chat-policy-block-head"><h4>功能插件</h4><div class="chat-policy-block-actions"><a class="chat-policy-head-action" href="/plugins" onclick="event.preventDefault(); UI.switchTab('plugins')"><i class="bi bi-box-arrow-up-right"></i>管理功能插件</a></div></div>
                         <div class="chat-plugin-toolbar">
                             <label><i class="bi bi-search"></i><input type="search" data-plugin-search-input placeholder="搜索插件" autocomplete="off"></label>
                             <div><button type="button" class="active" data-plugin-filter="enabled">已启用</button><button type="button" data-plugin-filter="all">全部</button></div>
@@ -1669,11 +1877,10 @@ const UI = {
         const selected = String(selectedProfile || '');
         const defaultLabel = profilesData.default_profile_id
             ? `继承默认 · ${profilesData.default_profile_id}`
-            : '继承默认 · 当前本机 Codex';
+            : '继承默认 · 尚未配置默认 Profile';
         const visibleProfiles = profiles.filter(item => item.available || item.name === selected);
         return [
             `<option value="" ${selected ? '' : 'selected'}>${this.escapeHtml(defaultLabel)}</option>`,
-            `<option value="__current__" ${selected === '__current__' ? 'selected' : ''}>当前本机 Codex</option>`,
             ...visibleProfiles.map(item => `<option value="${this.escapeHtml(item.name)}" ${selected === item.name ? 'selected' : ''}>${this.escapeHtml(item.name)} · ${this.escapeHtml(item.model)}${item.available ? '' : ' · 尚不可用'}</option>`)
         ].join('');
     },
@@ -1703,6 +1910,13 @@ const UI = {
         form.querySelectorAll('.chat-policy-plugin-toggle').forEach(toggle => {
             toggle.addEventListener('change', () => syncPlugin(toggle));
             syncPlugin(toggle);
+        });
+        form.querySelectorAll('[data-plugin-config]').forEach(button => {
+            button.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                App.showPluginSettings(button.dataset.pluginConfig);
+            });
         });
         const chatLogPluginToggle = form.querySelector('[data-chat-log-plugin-toggle]');
         chatLogPluginToggle?.addEventListener('change', async event => {

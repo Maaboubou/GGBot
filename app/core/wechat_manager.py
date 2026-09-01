@@ -1,7 +1,4 @@
-"""
-微信管理器 - 封装与wxautox的交互
-基于wxautox官方文档实现
-"""
+"""微信管理器：通过 HTTP 与使用 mabowx 的 wx_bot 桥接进程交互。"""
 
 import logging
 import os
@@ -45,7 +42,7 @@ class WeChatManager:
     - 通过HTTP API与独立的wx_bot.py进程通信
     """
     _outbound_send_lock = threading.RLock()
-    
+
     def __init__(self, event_bus: Optional[EventBus] = None):
         self.event_bus = event_bus or get_event_bus()
         self.logger = logging.getLogger(__name__)
@@ -78,8 +75,8 @@ class WeChatManager:
 
     def _post_outbound(self, endpoint: str, payload: Dict[str, Any], timeout: int) -> requests.Response:
         """
-        wxautox 依赖单一微信窗口/焦点，所有真实发送动作必须串行化。
-        这里不锁下载、监听等只读操作，只锁会操作微信窗口的出站发送 API。
+        应用层串行多段回复，保证同一业务回复不被其他会话插入。
+        单次 UI 事务、目标校验和重试均由 mabowx 内部负责。
         """
         with self._outbound_send_lock:
             self.logger.debug(
@@ -98,7 +95,7 @@ class WeChatManager:
         """把多段回复视为一次连续出站发送，避免中途被其他群切走窗口。"""
         with self._outbound_send_lock:
             yield
-        
+
     def start(self) -> bool:
         """启动微信管理器并检查与wx_bot的连接"""
         self.logger.info("Starting WeChat manager (API client mode)...")
@@ -371,7 +368,7 @@ class WeChatManager:
             # 本地视图立即服从用户的停止意图；桥接残留会在重连同步时再次清理。
             self._listened_chats.pop(chat_name, None)
             self._stats['listened_chats_count'] = len(self._listened_chats)
-    
+
     def send_message(self, chat_name: str, message: str, at_users: List[str] = None) -> bool:
         """发送消息 - 通过API"""
         normalized_at_users = [
@@ -489,15 +486,57 @@ class WeChatManager:
             )
             return False
 
-    # === 新增：原WXAUTOTEST.py中使用的方法 ===
-    
+    def tickle(self, chat_name: str, sender: str) -> bool:
+        """拍一拍指定聊天中发起互动的成员。"""
+        chat_name = str(chat_name or "").strip()
+        sender = str(sender or "").strip()
+        if not chat_name or not sender:
+            return False
+
+        try:
+            response = self._post_outbound(
+                "/api/tickle_message",
+                {"chat_name": chat_name, "sender": sender},
+                timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get("status") == "success":
+                self.logger.info("👋 Successfully tickled %s in %s", sender, chat_name)
+                self._stats['messages_processed'] += 1
+                return True
+
+            self.logger.warning(
+                "Failed to tickle %s in %s: %s",
+                sender,
+                chat_name,
+                data.get("message"),
+            )
+            return False
+        except requests.RequestException as e:
+            response_body = ""
+            if getattr(e, "response", None) is not None:
+                response_body = (e.response.text or "").strip()
+                if len(response_body) > 1000:
+                    response_body = response_body[:1000] + "...<truncated>"
+            self.logger.warning(
+                "Failed to call tickle_message API: chat=%s sender=%s error=%s | response_body=%s",
+                chat_name,
+                sender,
+                e,
+                response_body or "<empty>",
+            )
+            return False
+
+    # === 历史桥接脚本使用的方法 ===
+
     def send_files(self, chat_name: str, file_paths: List[str]) -> bool:
         """发送文件 - 通过API"""
         try:
             # 支持单个文件路径的兼容性
             if isinstance(file_paths, str):
                 file_paths = [file_paths]
-                
+
             response = self._post_outbound(
                 "/api/send_files",
                 {"who": chat_name, "file_paths": file_paths},
@@ -619,7 +658,7 @@ class WeChatManager:
                 self.logger.warning(f"⏰ 第{attempt}次尝试超时 ({timeout}秒): {e}")
                 last_exception = e
                 # 超时后立即重试，因为可能是网络波动
-                
+
             except requests.exceptions.ConnectionError as e:
                 self.logger.warning(f"🔗 第{attempt}次尝试连接失败: {e}")
                 last_exception = e
@@ -778,7 +817,7 @@ class WeChatManager:
             return False
 
     # === 原有方法保持不变 ===
-    
+
     def get_all_friends(self, keywords: str = None) -> List[Dict[str, Any]]:
         """获取所有好友 - 通过API"""
         try:
@@ -795,7 +834,7 @@ class WeChatManager:
         except requests.RequestException as e:
             self.logger.error(f"Failed to call get_friends API: {e}")
             return []
-    
+
     def get_recent_groups(self) -> List[Dict[str, Any]]:
         """获取最近群聊列表 - 通过API"""
         try:
@@ -811,7 +850,7 @@ class WeChatManager:
         except requests.RequestException as e:
             self.logger.error(f"Failed to call get_groups API: {e}")
             return []
-    
+
     def get_current_chat_info(self) -> Dict[str, Any]:
         """获取当前聊天信息 - 通过API"""
         try:
@@ -843,7 +882,7 @@ class WeChatManager:
         except requests.RequestException as e:
             self.logger.error(f"Failed to call get_my_info API: {e}")
             return {}
-    
+
     def get_listened_chats(self) -> Dict[str, Dict[str, Any]]:
         """获取正在监听的聊天列表"""
         self.get_listener_status()
@@ -867,7 +906,7 @@ class WeChatManager:
                 "actual": [],
                 "missing": []
             }
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息；状态页使用监控线程缓存，不额外请求 wx_bot。"""
         cached_health = self.get_cached_health()
@@ -883,7 +922,7 @@ class WeChatManager:
             'listened_chats': list(self._listened_chats.keys()),
             'listener_status': listener_status
         }
-    
+
     def is_connected(self) -> bool:
         """检查是否连接"""
         return self._check_wechat_connection()
@@ -895,7 +934,7 @@ class WeChatManager:
     def is_connected_cached(self) -> bool:
         """供健康检查等只读路径使用，避免探针反过来阻塞服务。"""
         return bool(self._last_health.get('wechat_connected'))
-    
+
     def is_online(self) -> bool:
         """检查微信是否在线 - 通过API（模拟wx.IsOnline()）"""
         try:
@@ -917,8 +956,8 @@ class WeChatManager:
             self.logger.warning(f"Failed to call is_online API: {e}")
             return False
 
-    # === 兼容性方法 - 提供与原WXAUTOTEST.py相同的接口 ===
-    
+    # === 兼容性方法 - 保持现有桥接接口 ===
+
     def SendFiles(self, filepath: str, who: str) -> bool:
         """兼容性方法 - 发送文件（保持原有接口风格）"""
         return self.send_files(who, [filepath])

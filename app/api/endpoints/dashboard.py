@@ -74,7 +74,7 @@ def _count_today_ai_replies() -> int:
         
         today = datetime.now().date()
         total = 0
-        bot_name = get_setting("WECHAT_BOT_NAME", "微信助手")
+        bot_name = get_setting("WECHAT_BOT_NAME", "刘局")
         
         for log_file in logs_dir.glob("*.jsonl"):
             try:
@@ -108,7 +108,7 @@ def _count_active_users_today() -> int:
         
         today = datetime.now().date()
         active_users = set()
-        bot_name = get_setting("WECHAT_BOT_NAME", "微信助手")
+        bot_name = get_setting("WECHAT_BOT_NAME", "刘局")
         
         for log_file in logs_dir.glob("*.jsonl"):
             try:
@@ -144,7 +144,7 @@ def _get_recent_activities(limit: int = 20) -> List[Dict[str, Any]]:
             return []
         
         activities = []
-        bot_name = get_setting("WECHAT_BOT_NAME", "微信助手")
+        bot_name = get_setting("WECHAT_BOT_NAME", "刘局")
         
         # 收集所有日志文件的最新条目
         for log_file in logs_dir.glob("*.jsonl"):
@@ -197,7 +197,7 @@ def _get_top_users_today(limit: int = 5) -> List[Dict[str, Any]]:
         
         today = datetime.now().date()
         user_counts = {}
-        bot_name = get_setting("WECHAT_BOT_NAME", "微信助手")
+        bot_name = get_setting("WECHAT_BOT_NAME", "刘局")
         
         for log_file in logs_dir.glob("*.jsonl"):
             try:

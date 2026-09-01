@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect magnet links and render wxautox-friendly resource reports."""
+"""Inspect magnet links and render Mabobot-friendly resource reports."""
 
 from __future__ import annotations
 
@@ -1334,7 +1334,7 @@ def write_html(output: Path, content: str) -> Path:
 
 
 class MagnetCheckPlugin:
-    """wxautox plugin adapter for automatic magnet-link inspection."""
+    """Mabobot plugin adapter for automatic magnet-link inspection."""
 
     def __init__(self) -> None:
         self.trigger_word = str(
@@ -1372,7 +1372,7 @@ class MagnetCheckPlugin:
                 default=False,
             )
         )
-        self.bot_name = str(get_setting("WECHAT_BOT_NAME", "微信助手") or "").strip()
+        self.bot_name = str(get_setting("WECHAT_BOT_NAME", "刘局") or "").strip()
         self.detection_threshold = min(
             0.5,
             max(
@@ -1554,7 +1554,7 @@ def handle_text(event: Event) -> bool:
 
 
 def register(event_bus: Any, subscribe: Any, context: Any) -> None:
-    """Register the plugin with wxautox's event bus."""
+    """Register the plugin with Mabobot's event bus."""
 
     del event_bus  # Reserved for future shared services.
     global plugin

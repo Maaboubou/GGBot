@@ -32,6 +32,11 @@ _RESTART_SERVICE_ALIASES = {
     "start.py": "web",
 }
 
+_BOT_CONTROL_ACTIONS = {
+    "start": "start-bot",
+    "stop": "stop-bot",
+}
+
 
 def normalize_restart_service(service: str) -> str:
     """把 API 服务名转换成 launcher 可识别的重启动作。"""
@@ -54,34 +59,74 @@ def write_restart_signal(signal_file: Path, action: str) -> None:
             temp_file.unlink()
 
 
-def launcher_supports_precise_restart(project_root: Path) -> bool:
-    """确认当前活跃 launcher 支持区分 all/web 的第二版信号协议。"""
+def get_launcher_signal_protocol(project_root: Path) -> int:
+    """返回当前活跃 launcher 的服务控制协议版本。"""
     state_file = project_root / "data" / "launcher_state.json"
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))
-        if int(state.get("signal_protocol", 0)) < 2:
-            return False
+        protocol = int(state.get("signal_protocol", 0))
         process = psutil.Process(int(state["pid"]))
         command_line = " ".join(process.cmdline()).casefold()
-        return process.is_running() and "launcher.py" in command_line
+        launcher_id = str(state.get("launcher_id") or "").strip().casefold()
+        is_desktop_launcher = (
+            launcher_id == "mabobot.desktop.launcher"
+            and "mabobot_launcher" in command_line
+        )
+        return protocol if process.is_running() and is_desktop_launcher else 0
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, psutil.Error):
-        return False
+        return 0
+
+
+def launcher_supports_precise_restart(project_root: Path) -> bool:
+    """确认当前活跃 launcher 支持区分 all/web 的第二版信号协议。"""
+    return get_launcher_signal_protocol(project_root) >= 2
 
 
 @router.get("/restart-capabilities")
 async def get_restart_capabilities() -> Dict[str, Any]:
     """供前端确认当前后端支持精确的 Web 单独重启协议。"""
     project_root = Path(__file__).resolve().parent.parent.parent.parent
-    precise_restart = launcher_supports_precise_restart(project_root)
+    signal_protocol = get_launcher_signal_protocol(project_root)
+    precise_restart = signal_protocol >= 2
+    bot_control = signal_protocol >= 3
     return {
         "services": ["all", "web"] if precise_restart else ["all"],
-        "signal_protocol": 2 if precise_restart else 1,
+        "controls": ["start-bot", "stop-bot"] if bot_control else [],
+        "signal_protocol": signal_protocol or 1,
         "reason": (
             None
             if precise_restart
             else "当前管理面板进程不支持单独重启 Web 服务。请完整关闭并重新打开 Mabobot 管理面板。"
         ),
     }
+
+
+@router.post("/control/bot/{action}")
+async def control_bot_service(action: str) -> Dict[str, Any]:
+    """通过 launcher 启动或停止 Bot 服务，并保持 Web 控制台在线。"""
+    normalized_action = _BOT_CONTROL_ACTIONS.get(str(action or "").strip().casefold())
+    if not normalized_action:
+        raise HTTPException(status_code=400, detail=f"Unsupported Bot service action: {action}")
+
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+    if get_launcher_signal_protocol(project_root) < 3:
+        raise HTTPException(
+            status_code=409,
+            detail="当前 launcher 尚未加载 Bot 启停协议，请完整重启一次管理控制台",
+        )
+
+    try:
+        signal_file = project_root / ".restart_signal"
+        write_restart_signal(signal_file, normalized_action)
+        action_label = "启动" if normalized_action == "start-bot" else "停止"
+        return {
+            "status": "success",
+            "message": f"Bot 服务{action_label}请求已提交",
+            "service": "bot",
+            "action": action,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to control Bot service: {str(e)}")
 
 
 @router.get("/status")
@@ -91,21 +136,21 @@ async def get_system_status() -> Dict[str, Any]:
         # CPU信息
         cpu_percent = psutil.cpu_percent(interval=1)
         cpu_count = psutil.cpu_count()
-        
+
         # 内存信息
         memory = psutil.virtual_memory()
-        
+
         # 磁盘信息
         disk = psutil.disk_usage('/')
-        
+
         # 系统启动时间
         boot_time = psutil.boot_time()
         system_uptime_seconds = time.time() - boot_time
-        
+
         # 应用启动时间
         process = psutil.Process()
         app_uptime_seconds = time.time() - process.create_time()
-        
+
         # 格式化运行时长
         def format_uptime(seconds):
             days = int(seconds // 86400)
@@ -117,7 +162,7 @@ async def get_system_status() -> Dict[str, Any]:
                 return f"{hours}小时 {minutes}分钟"
             else:
                 return f"{minutes}分钟"
-        
+
         # 获取监控服务状态
         monitor_status = {}
         try:
@@ -278,17 +323,17 @@ async def restart_wechat(request: Request) -> Dict[str, Any]:
         # 获取微信管理器
         components = get_app_components(request)
         wechat_manager = components.get("wechat_manager")
-        
+
         if not wechat_manager:
             return {
                 "status": "error",
                 "message": "微信管理器不可用",
                 "timestamp": time.time()
             }
-        
+
         # 调用重启方法
         success = wechat_manager.restart_wechat()
-        
+
         if success:
             return {
                 "status": "success",
@@ -297,11 +342,11 @@ async def restart_wechat(request: Request) -> Dict[str, Any]:
             }
         else:
             return {
-                "status": "error", 
+                "status": "error",
                 "message": "微信重启请求失败",
                 "timestamp": time.time()
             }
-            
+
     except Exception as e:
         return {
             "status": "error",
@@ -316,11 +361,11 @@ async def get_system_info() -> Dict[str, Any]:
     try:
         # 进程信息
         process = psutil.Process()
-        
+
         # 获取机器人名称
         from app.services.config_service import get_setting
         bot_name = get_setting("WECHAT_BOT_NAME")
-        
+
         return {
             "application": {
                 "name": "Mabobot",
@@ -360,7 +405,7 @@ async def get_components_status(request: Request) -> Dict[str, Any]:
     try:
         components_data = get_app_components(request)
         components = {}
-        
+
         # 事件总线状态
         event_bus = components_data.get("event_bus")
         if event_bus:
@@ -370,7 +415,7 @@ async def get_components_status(request: Request) -> Dict[str, Any]:
             }
         else:
             components["event_bus"] = {"status": "not_available"}
-        
+
         # 插件管理器状态
         plugin_manager = components_data.get("plugin_manager")
         if plugin_manager:
@@ -380,7 +425,7 @@ async def get_components_status(request: Request) -> Dict[str, Any]:
             }
         else:
             components["plugin_manager"] = {"status": "not_available"}
-        
+
         # 微信管理器状态
         wechat_manager = components_data.get("wechat_manager")
         if wechat_manager:
@@ -390,25 +435,25 @@ async def get_components_status(request: Request) -> Dict[str, Any]:
             except Exception:
                 is_connected = False
                 stats = {}
-            
+
             components["wechat_manager"] = {
                 "status": "connected" if is_connected else "disconnected",
                 "stats": stats
             }
         else:
             components["wechat_manager"] = {"status": "not_available"}
-        
+
         return components
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get components status: {str(e)}")
 
 
 @router.get("/logs/{log_type}")
 async def get_logs(
-    log_type: str, 
-    lines: int = 100, 
-    plugin_name: str = None, 
+    log_type: str,
+    lines: int = 100,
+    plugin_name: str = None,
     search: str = None
 ) -> Dict[str, Any]:
     """获取日志内容"""
@@ -418,12 +463,12 @@ async def get_logs(
             "app": "logs/app.log",
             "wx_bot": "logs/wx_bot.log"
         }
-        
+
         if log_type not in log_files:
             raise HTTPException(status_code=400, detail=f"Invalid log type: {log_type}")
-        
+
         log_path = Path(log_files[log_type])
-        
+
         if not log_path.exists():
             return {
                 "log_type": log_type,
@@ -432,7 +477,7 @@ async def get_logs(
                 "file_exists": False,
                 "message": f"日志文件不存在: {log_path}"
             }
-        
+
         # 普通查看仅反向读取文件尾部；筛选时逐行扫描并使用固定长度队列。
         # 放入线程池，避免日志 I/O 阻塞 FastAPI 事件循环。
         line_limit = max(1, min(int(lines or 100), 5000))
@@ -493,8 +538,8 @@ async def restart_service(service: str) -> Dict[str, Any]:
         )
 
     try:
-        # 写入重启信号文件，由 launcher.py 按 action 精确执行。
-        # 使用绝对路径确保 launcher.py 能看到
+        # 写入重启信号文件，由桌面启动器按 action 精确执行。
+        # 使用绝对路径确保独立启动器进程能看到。
         signal_file = project_root / ".restart_signal"
         write_restart_signal(signal_file, action)
 
@@ -509,7 +554,7 @@ async def restart_service(service: str) -> Dict[str, Any]:
             "restart_self": True, # 前端根据此字段判断是否需要倒计时刷新
             "note": f"系统主控进程将重启{service_label}，请稍候刷新页面"
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to trigger restart: {str(e)}")
 
@@ -522,7 +567,7 @@ async def get_processes_status() -> Dict[str, Any]:
             "wx_bot": {"running": False, "pid": None},
             "app": {"running": True, "pid": os.getpid()}
         }
-        
+
         # 检查 wx_bot.py 进程
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
@@ -534,11 +579,11 @@ async def get_processes_status() -> Dict[str, Any]:
                     break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        
+
         return {
             "processes": processes,
             "timestamp": time.time()
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get processes status: {str(e)}")

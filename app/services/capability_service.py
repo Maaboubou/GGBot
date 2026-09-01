@@ -184,6 +184,9 @@ SUMMARY_GROUP_FIELDS = {
         "local_asr_model_path",
         "local_asr_vad_path",
     },
+    "douyin": {
+        "douyin_max_download_duration",
+    },
     "bilibili": {
         "prompt_bilibili_mindmap",
         "danmaku_font_size",

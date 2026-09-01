@@ -3,25 +3,25 @@ fastapi>=0.140,<1
 uvicorn[standard]
 python-multipart>=0.0.32,<1
 Flask
-SQLAlchemy
+sqlalchemy
+alembic
 pydantic
 
-# HTTP and browser automation
+# HTTP, scraping, and browser automation
 requests
 urllib3
 certifi
 httpx
+cloudscraper
+curl-cffi
 beautifulsoup4
+lxml
 selenium
 websocket-client>=1.8,<2
 playwright>=1.58,<2
 ddgs>=9.15,<10
-yt-dlp>=2026.7.4
-yt-dlp-danmaku>=0.3,<1
-youtube-transcript-api>=1.2,<2
-json-repair>=0.59,<1
 
-# AI providers and local retrieval
+# LLM providers and local retrieval
 litellm
 packaging>=23,<27
 openai
@@ -30,26 +30,36 @@ tiktoken>=0.12,<1
 fastembed>=0.7,<1
 numpy>=1.26,<3
 
-# Images, OCR and reports
-Pillow>=10
+# Media, OCR, and image processing
+Pillow
 ddddocr
 NudeNet>=3.4,<4
 opencv-python-headless>=4.11,<5
 matplotlib
-lxml
-pandas
 static-ffmpeg==3.0
+yt-dlp>=2026.7.4
+yt-dlp-danmaku>=0.3,<1
+youtube-transcript-api>=1.2,<2
+json-repair>=0.59,<1
 
-# Windows integration and utilities
+# Platform integration and utilities
 psutil
 watchdog
 python-dotenv
+loguru
 comtypes
+pywebview>=6.2,<7
+pystray>=0.19,<1
 pytz
 pyperclip
 pyautogui
 PyGetWindow
 pypinyin
+boto3
+pandas
 
-# Verified with the current WeChat 4.x integration.
-wxautox4==41.1.1.post1
+# static-ffmpeg installs FFmpeg/FFprobe into the active Python environment.
+# A system FFmpeg with librsvg can still be used for Bilibili webmask occlusion.
+# Playwright also needs a Chromium runtime (`playwright install chromium`) once.
+# Optional system tools for Codex file workflows: LibreOffice/Pandoc/Poppler/p7zip.
+# WeChat automation is provided by the bundled mabowx package.

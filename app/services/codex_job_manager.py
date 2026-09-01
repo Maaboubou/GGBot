@@ -13,6 +13,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.utils.subprocess_utils import hidden_process_kwargs
+
 logger = logging.getLogger(__name__)
 
 _INTERNAL_KEYS = {
@@ -351,6 +353,7 @@ class CodexJobManager:
                         stderr=subprocess.DEVNULL,
                         timeout=10,
                         check=False,
+                        **hidden_process_kwargs(),
                     )
                 except Exception:
                     logger.exception("Codex job %s: taskkill failed", request_id)
@@ -368,6 +371,7 @@ class CodexJobManager:
                         stderr=subprocess.DEVNULL,
                         timeout=10,
                         check=False,
+                        **hidden_process_kwargs(),
                     )
                 except Exception:
                     logger.exception("Codex job %s: WSL child cleanup failed", request_id)

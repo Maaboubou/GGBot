@@ -48,10 +48,10 @@ def understand_image(image_base64: str) -> Optional[str]:
             plugin_name="builtin_chat_logger",
             call_type="image_understanding",
             messages=messages,
-            _wxautox_allow_image_input=True,
-            _wxautox_require_image_input=True,
-            _wxautox_disable_model_web_search=True,
-            _wxautox_history_mode="image_enrichment",
+            _mabobot_allow_image_input=True,
+            _mabobot_require_image_input=True,
+            _mabobot_disable_model_web_search=True,
+            _mabobot_history_mode="image_enrichment",
         )
         text = str(result or "").strip()
         if text:

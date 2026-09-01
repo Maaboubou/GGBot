@@ -16,6 +16,8 @@ from typing import Any, Dict, Optional
 import requests
 from packaging.version import InvalidVersion, Version
 
+from app.utils.subprocess_utils import hidden_process_kwargs
+
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,7 @@ class LiteLLMUpdateService:
             timeout=timeout,
             check=False,
             shell=False,
+            **hidden_process_kwargs(),
         )
 
     def _install_exact(self, target_version: str) -> None:

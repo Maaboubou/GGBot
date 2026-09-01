@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mabobot_user_home="${HOME:?HOME must be set}"
+mabobot_local_share="${mabobot_user_home}/.local/share"
+runtime_env="${mabobot_local_share}/mabobot/runtime/file-tools.env"
+if [[ -f "${runtime_env}" && -O "${runtime_env}" ]] \
+    && [[ -z "$(find "${runtime_env}" -maxdepth 0 -perm /022 -print -quit 2>/dev/null)" ]]; then
+    source "${runtime_env}"
+fi
+clam_root="${MABOBOT_CLAMAV_ROOT:-${MABOBOT_REGISTERED_CLAMAV_ROOT:-${mabobot_local_share}/mabobot-clamav/usr/local}}"
+clam_database="${MABOBOT_CLAMAV_DATABASE:-${MABOBOT_REGISTERED_CLAMAV_DATABASE:-${mabobot_local_share}/mabobot-clamav-db}}"
+clam_config="${MABOBOT_FRESHCLAM_CONFIG:-${clam_root}/etc/freshclam.conf}"
+clam_temp="${MABOBOT_CLAMAV_TEMP:-/tmp/mabobot-clamav-tmp}"
+tool_name="${0##*/}"
+
+export LD_LIBRARY_PATH="${clam_root}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export CVD_CERTS_DIR="${CVD_CERTS_DIR:-${clam_root}/etc/certs}"
+
+case "${tool_name}" in
+    clamscan)
+        exec "${clam_root}/bin/clamscan" \
+            --database="${clam_database}" \
+            --tempdir="${clam_temp}" \
+            "$@"
+        ;;
+    freshclam)
+        exec "${clam_root}/bin/freshclam" \
+            --config-file="${clam_config}" \
+            --datadir="${clam_database}" \
+            --cvdcertsdir="${clam_root}/etc/certs" \
+            "$@"
+        ;;
+    mabobot-clamav)
+        if [[ "$#" -lt 1 ]]; then
+            echo "usage: mabobot-clamav <clamscan|freshclam> [args...]" >&2
+            exit 2
+        fi
+        subcommand="$1"
+        shift
+        case "${subcommand}" in
+            clamscan)
+                exec "${clam_root}/bin/clamscan" \
+                    --database="${clam_database}" \
+                    --tempdir="${clam_temp}" \
+                    "$@"
+                ;;
+            freshclam)
+                exec "${clam_root}/bin/freshclam" \
+                    --config-file="${clam_config}" \
+                    --datadir="${clam_database}" \
+                    --cvdcertsdir="${clam_root}/etc/certs" \
+                    "$@"
+                ;;
+        esac
+        ;;
+esac
+
+echo "unsupported ClamAV command: ${tool_name}" >&2
+exit 2

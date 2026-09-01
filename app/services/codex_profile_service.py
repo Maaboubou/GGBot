@@ -3,28 +3,57 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import threading
 import time
 from copy import deepcopy
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from app.services.file_tools_runtime import _as_wsl_path, _default_use_wsl, get_file_tools_runtime
+from app.services.wsl_probe_guard import (
+    WslCircuitOpenError,
+    WslTransportError,
+    run_guarded_wsl_command,
+)
+from app.utils.subprocess_utils import apply_hidden_process_defaults
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROFILE_SCRIPT = PROJECT_ROOT / "scripts" / "file_tools" / "manage_codex_profiles.py"
 DEFAULT_ASSISTANT_PROFILE_KEY = "ASSISTANT_CODEX_PROFILE_ID"
-# Stored on a chat policy when it must bypass the administrator-selected
-# default and explicitly use the local Codex installation. Profile names must
-# start with an alphanumeric character, so this value cannot collide with one.
-CURRENT_CODEX_PROFILE_ID = "__current__"
+LEGACY_CURRENT_CODEX_PROFILE_ID = "__current__"
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
 
 
 class CodexProfileError(RuntimeError):
     pass
+
+
+def _managed_profile_permission_roots(profile: dict[str, Any]) -> tuple[str, ...]:
+    """Expose only non-secret skill assets from a validated managed CODEX_HOME."""
+    name = str(profile.get("name") or "").strip()
+    raw_home = str(profile.get("codex_home") or "").strip()
+    if (
+        not _PROFILE_NAME_RE.fullmatch(name)
+        or not raw_home.startswith("/")
+        or "\\" in raw_home
+        or "\x00" in raw_home
+    ):
+        return ()
+    codex_home = PurePosixPath(raw_home)
+    if ".." in codex_home.parts or codex_home.parts[-3:] != (
+        ".codex",
+        "mabobot-profiles",
+        name,
+    ):
+        return ()
+    return (
+        str(codex_home / "skills"),
+        str(codex_home / "plugins" / "cache"),
+    )
 
 
 def public_profile(value: Any) -> Optional[dict[str, Any]]:
@@ -33,6 +62,8 @@ def public_profile(value: Any) -> Optional[dict[str, Any]]:
     allowed = {
         "name",
         "auth_type",
+        "auth_source",
+        "setup_status",
         "model",
         "provider_name",
         "base_url",
@@ -51,9 +82,19 @@ def public_profile(value: Any) -> Optional[dict[str, Any]]:
         "plan_type",
         "key_configured",
         "auth_configured",
+        "auth_sync_status",
+        "auth_sync_reason",
         "available",
     }
     profile = {key: deepcopy(value[key]) for key in allowed if key in value}
+    if profile.get("auth_type") == "chatgpt":
+        # Profiles created before auth-source tracking used device-code login.
+        if profile.get("auth_source") not in {"device_code", "local_cache"}:
+            profile["auth_source"] = "device_code"
+    else:
+        profile["auth_source"] = "api_key"
+    if profile.get("setup_status") not in {"pending", "ready"}:
+        profile["setup_status"] = "ready"
     required = ("name", "model", "wrapper_path")
     return profile if all(str(profile.get(key) or "").strip() for key in required) else None
 
@@ -66,6 +107,7 @@ class CodexProfileService:
         self._cache_lock = threading.RLock()
         self._cache_until = 0.0
         self._cached_listing: Optional[dict[str, Any]] = None
+        self._auth_sync_lock = threading.RLock()
 
     def _command(self, action: str) -> list[str]:
         script = _as_wsl_path(PROFILE_SCRIPT) if self.use_wsl else str(PROFILE_SCRIPT)
@@ -74,14 +116,19 @@ class CodexProfileService:
 
     def _run(self, action: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         try:
-            result = subprocess.run(
-                self._command(action),
-                input=json.dumps(payload, ensure_ascii=False) if payload is not None else None,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
+            command = self._command(action)
+            run_kwargs = {
+                "input": json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+                "capture_output": True,
+                "text": True,
+                "timeout": 30,
+                "check": False,
+            }
+            run_kwargs = apply_hidden_process_defaults(run_kwargs)
+            if self.use_wsl:
+                result = run_guarded_wsl_command(command, runner=subprocess.run, **run_kwargs)
+            else:
+                result = subprocess.run(command, **run_kwargs)
         except (OSError, subprocess.SubprocessError) as exc:
             raise CodexProfileError(f"无法访问本地 Codex Profile：{exc}") from exc
         lines = (result.stdout or "").strip().splitlines()
@@ -101,24 +148,62 @@ class CodexProfileService:
 
     def list_profiles(self) -> dict[str, Any]:
         with self._cache_lock:
+            stale = deepcopy(self._cached_listing) if self._cached_listing is not None else None
             cached = (
                 deepcopy(self._cached_listing)
                 if self._cached_listing is not None and time.monotonic() < self._cache_until
                 else None
             )
-        data = cached or self._run("list")
+        stale_reason = ""
+        try:
+            data = cached or self._run("list")
+            stale_reason = str(data.get("_mabobot_stale_reason") or "")
+        except CodexProfileError as exc:
+            cause: Optional[BaseException] = exc
+            wsl_unavailable = False
+            while cause is not None:
+                if isinstance(
+                    cause,
+                    (OSError, subprocess.TimeoutExpired, WslCircuitOpenError, WslTransportError),
+                ):
+                    wsl_unavailable = True
+                    break
+                cause = cause.__cause__
+            if not self.use_wsl or not wsl_unavailable or stale is None:
+                raise
+            data = stale
+            stale_reason = str(exc)
+            data["_mabobot_stale_reason"] = stale_reason
         if cached is None:
             with self._cache_lock:
                 self._cached_listing = deepcopy(data)
                 self._cache_until = time.monotonic() + 3.0
         profiles = [profile for item in data.get("profiles") or [] if (profile := public_profile(item))]
         default_id = self.default_profile_id()
+        available_names = [
+            str(profile.get("name") or "") for profile in profiles if profile.get("available")
+        ]
+        if default_id not in available_names:
+            migrated_default = available_names[0] if available_names else ""
+            if default_id or migrated_default:
+                self._write_default_profile(migrated_default)
+            default_id = migrated_default
         for profile in profiles:
             profile["is_default"] = profile.get("name") == default_id
+        local_auth = data.get("local_auth")
+        if not isinstance(local_auth, dict):
+            local_auth = {}
         return {
             "codex_home": str(data.get("codex_home") or ""),
+            "local_auth": {
+                "available": bool(local_auth.get("available")),
+                "storage": str(local_auth.get("storage") or "unavailable"),
+                "reason": str(local_auth.get("reason") or "本机登录不可导入"),
+            },
             "default_profile_id": default_id,
             "profiles": profiles,
+            "stale": bool(stale_reason),
+            "stale_reason": stale_reason,
         }
 
     def create_profile(self, payload: dict[str, Any], *, codex_bin: str) -> dict[str, Any]:
@@ -129,11 +214,50 @@ class CodexProfileService:
             raise CodexProfileError("新建 Profile 返回内容不完整")
         self.invalidate_cache()
         get_file_tools_runtime(use_wsl=self.use_wsl, force=True)
-        # A ChatGPT profile is not usable until device authorization finishes.
-        # The UI selects it only after the account and model have been verified.
-        if bool(payload.get("make_default", True)) and profile.get("auth_type") != "chatgpt":
+        # A ChatGPT profile becomes eligible only after its copied or newly
+        # authorized account has been verified through its isolated runtime.
+        if (
+            profile.get("auth_type") != "chatgpt"
+            and (bool(payload.get("make_default", True)) or not self.default_profile_id())
+        ):
             self.set_default_profile(str(profile["name"]))
         return profile
+
+    def import_local_auth(self, name: str) -> dict[str, Any]:
+        return self.sync_local_auth_if_needed(name, force=True)
+
+    def sync_local_auth_if_needed(self, name: str, *, force: bool = False) -> dict[str, Any]:
+        """Refresh one file-backed login and retire any process holding its old token."""
+        normalized = str(name or "").strip()
+        with self._auth_sync_lock:
+            profile = self.get_profile(normalized)
+            if not profile:
+                raise CodexProfileError("Codex Profile 不存在")
+            if profile.get("auth_type") != "chatgpt" or profile.get("auth_source") != "local_cache":
+                raise CodexProfileError("该 Profile 未选择导入本机 Codex 登录")
+            if not force and profile.get("auth_sync_status") == "synced":
+                return {
+                    "name": normalized,
+                    "imported": False,
+                    "changed": False,
+                    "auth_configured": bool(profile.get("auth_configured")),
+                    "auth_sync_status": "synced",
+                    "profile": profile,
+                }
+            result = self._run("import-local-auth", {"name": normalized})
+            self.invalidate_cache()
+            refreshed = self.get_profile(normalized)
+        get_codex_runtime_registry().invalidate(normalized)
+        return {
+            **result,
+            "profile": refreshed,
+        }
+
+    def clear_profile_auth(self, name: str) -> dict[str, Any]:
+        result = self._run("clear-auth", {"name": str(name or "").strip()})
+        self.invalidate_cache()
+        get_codex_runtime_registry().invalidate(name)
+        return result
 
     def update_profile(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         profile = public_profile(self._run("update", {**dict(payload), "name": name}))
@@ -151,18 +275,29 @@ class CodexProfileService:
             raise CodexProfileError("Codex Profile 不存在")
 
         default_cleared = self.default_profile_id() == normalized
+        replacement_default = ""
         if default_cleared:
-            self.set_default_profile("")
+            replacement_default = next(
+                (
+                    str(item.get("name") or "")
+                    for item in self.list_profiles().get("profiles") or []
+                    if item.get("name") != normalized and item.get("available")
+                ),
+                "",
+            )
         chat_bindings_cleared = self._clear_chat_profile_bindings(normalized)
         model_bindings_cleared = self._clear_model_profile_bindings(normalized)
 
         get_codex_runtime_registry().invalidate(normalized)
         result = self._run("delete", {"name": normalized})
         self.invalidate_cache()
+        if default_cleared:
+            self._write_default_profile(replacement_default)
         return {
             "name": normalized,
             "deleted": bool(result.get("deleted", True)),
             "default_cleared": default_cleared,
+            "replacement_default_profile_id": replacement_default,
             "chat_bindings_cleared": chat_bindings_cleared,
             "model_bindings_cleared": model_bindings_cleared,
         }
@@ -215,28 +350,48 @@ class CodexProfileService:
     @staticmethod
     def default_profile_id() -> str:
         try:
-            from app.services.config_service import get_setting
+            from app.services.config_service import get_setting, update_setting
 
-            return str(get_setting(DEFAULT_ASSISTANT_PROFILE_KEY, "") or "").strip()
+            value = str(get_setting(DEFAULT_ASSISTANT_PROFILE_KEY, "") or "").strip()
+            if value == LEGACY_CURRENT_CODEX_PROFILE_ID:
+                update_setting(DEFAULT_ASSISTANT_PROFILE_KEY, "")
+                return ""
+            return value
         except Exception:
             return ""
 
     @classmethod
     def resolve_assistant_profile_id(cls, configured_profile_id: Any) -> str:
-        """Resolve inherit/current/specific chat choices to a runtime profile id."""
+        """Resolve an inherited or explicit chat choice to a managed Profile."""
         normalized = str(configured_profile_id or "").strip()
-        if normalized == CURRENT_CODEX_PROFILE_ID:
-            return ""
-        return normalized or cls.default_profile_id()
+        if normalized == LEGACY_CURRENT_CODEX_PROFILE_ID:
+            normalized = ""
+        resolved = normalized or cls.default_profile_id()
+        if not resolved:
+            raise CodexProfileError("尚未配置默认 Codex Profile，请先新建并完成登录")
+        return resolved
 
     def set_default_profile(self, name: str) -> None:
         normalized = str(name or "").strip()
-        if normalized and self.get_profile(normalized) is None:
+        if not normalized:
+            raise CodexProfileError("默认 Codex Profile 不能为空")
+        profile = self.get_profile(normalized)
+        if profile is None:
             raise CodexProfileError("Codex Profile 不存在")
+        if not profile.get("available"):
+            raise CodexProfileError("Codex Profile 尚未完成登录或密钥配置")
+        self._write_default_profile(normalized)
+
+    @staticmethod
+    def _write_default_profile(name: str) -> None:
         from app.services.config_service import update_setting
 
-        if not update_setting(DEFAULT_ASSISTANT_PROFILE_KEY, normalized):
+        if not update_setting(DEFAULT_ASSISTANT_PROFILE_KEY, str(name or "").strip()):
             raise CodexProfileError("保存默认 Codex Profile 失败")
+
+    def ensure_default_profile(self, name: str) -> None:
+        if not self.default_profile_id():
+            self.set_default_profile(name)
 
     def invalidate_cache(self) -> None:
         with self._cache_lock:
@@ -252,14 +407,21 @@ class CodexProfileRuntimeRegistry:
         self._runtimes: dict[str, tuple[str, Any]] = {}
 
     def resolve(self, profile_id: str = "") -> tuple[Any, Optional[dict[str, Any]]]:
-        from app.services.agent_runtime import CodexAgentRuntime, get_agent_runtime
+        from app.services.agent_runtime import CodexAgentRuntime
 
-        normalized = str(profile_id or "").strip()
-        if not normalized:
-            return get_agent_runtime(), None
-        profile = get_codex_profile_service().get_profile(normalized)
+        service = get_codex_profile_service()
+        normalized = service.resolve_assistant_profile_id(profile_id)
+        profile = service.get_profile(normalized)
         if not profile:
             raise CodexProfileError(f"Codex Profile 不存在：{normalized}")
+        if (
+            profile.get("auth_source") == "local_cache"
+            and profile.get("auth_sync_status") in {"missing", "outdated", "invalid"}
+        ):
+            synced = service.sync_local_auth_if_needed(normalized)
+            profile = synced.get("profile") or service.get_profile(normalized)
+            if not profile:
+                raise CodexProfileError(f"Codex Profile 不存在：{normalized}")
         if not profile.get("available"):
             raise CodexProfileError(f"Codex Profile 尚未完成登录或密钥配置：{normalized}")
         signature = "|".join(
@@ -271,7 +433,10 @@ class CodexProfileRuntimeRegistry:
             if cached and cached[0] == signature:
                 return cached[1], profile
             previous = cached[1] if cached else None
-            runtime = CodexAgentRuntime(codex_bin=str(profile["wrapper_path"]))
+            runtime = CodexAgentRuntime(
+                codex_bin=str(profile["wrapper_path"]),
+                permission_read_roots=_managed_profile_permission_roots(profile),
+            )
             try:
                 runtime.start()
             except Exception:

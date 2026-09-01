@@ -1,5 +1,6 @@
 ﻿param(
-    [switch]$Force
+    [switch]$Force,
+    [string]$StatusFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,12 +12,34 @@ $HashMarker = Join-Path $VenvDir ".requirements.sha256"
 $PlaywrightReady = $false
 
 function Write-Step([string]$Message) {
+    if ($StatusFile) {
+        Set-Content -LiteralPath $StatusFile -Value $Message -Encoding UTF8
+    }
     Write-Host "[INFO] $Message" -ForegroundColor Cyan
 }
 
 function Stop-Install([string]$Message) {
+    if ($StatusFile) {
+        Set-Content -LiteralPath $StatusFile -Value $Message -Encoding UTF8
+    }
     Write-Host "[ERROR] $Message" -ForegroundColor Red
     exit 1
+}
+
+function Remove-StaleLiteLLMMetadata {
+    $SitePackages = Join-Path $VenvDir "Lib\site-packages"
+    if (-not (Test-Path $SitePackages)) {
+        return
+    }
+
+    $StaleEntries = @(
+        Get-ChildItem -LiteralPath $SitePackages -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "~itellm*" }
+    )
+    foreach ($Entry in $StaleEntries) {
+        Remove-Item -LiteralPath $Entry.FullName -Recurse -Force
+        Write-Step "已清理损坏的 LiteLLM 安装残留：$($Entry.Name)"
+    }
 }
 
 Set-Location $ProjectRoot
@@ -25,12 +48,14 @@ if (-not (Test-Path $Requirements)) {
     Stop-Install "requirements.txt 不存在。"
 }
 
+Remove-StaleLiteLLMMetadata
+
 $RequirementHash = (Get-FileHash $Requirements -Algorithm SHA256).Hash
 $EnvironmentReady = $false
 if (-not $Force -and (Test-Path $VenvPython) -and (Test-Path $HashMarker)) {
     $SavedHash = (Get-Content $HashMarker -Raw).Trim()
     if ($SavedHash -eq $RequirementHash) {
-        & $VenvPython -c "import fastapi, flask, wxautox4, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair" 2>$null
+        & $VenvPython -c "import fastapi, flask, mabowx, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair, webview, pystray" 2>$null
         $EnvironmentReady = ($LASTEXITCODE -eq 0)
         if ($EnvironmentReady) {
             & $VenvPython -c "from pathlib import Path; from playwright.sync_api import sync_playwright; p = sync_playwright().start(); path = p.chromium.executable_path; p.stop(); raise SystemExit(0 if Path(path).is_file() else 1)" 2>$null
@@ -86,7 +111,7 @@ if (-not $EnvironmentReady) {
         Stop-Install "依赖安装失败，请检查网络、Python 版本和上方 pip 错误。"
     }
 
-    & $VenvPython -c "import fastapi, flask, wxautox4, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair"
+    & $VenvPython -c "import fastapi, flask, mabowx, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair, webview, pystray"
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "依赖安装完成，但关键模块导入检查失败。"
     }
@@ -127,5 +152,8 @@ foreach ($Directory in @("data", "logs", "tmp")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot $Directory) | Out-Null
 }
 
+if ($StatusFile) {
+    Set-Content -LiteralPath $StatusFile -Value "运行环境准备完成" -Encoding UTF8
+}
 Write-Host "[OK] Python 环境准备完成：$VenvPython" -ForegroundColor Green
 exit 0

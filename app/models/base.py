@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///data/database.db")
 
 engine = create_engine(
-    DATABASE_URL, 
+    DATABASE_URL,
     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
 )
 
@@ -106,6 +106,33 @@ def ensure_assistant_policy_columns(bind=None):
     return ["codex_profile_id"]
 
 
+def migrate_legacy_current_codex_bindings(bind=None):
+    """Map the retired ``__current__`` choice to inherited managed Profile use."""
+    active_engine = bind or engine
+    inspector = inspect(active_engine)
+    if not inspector.has_table("assistant_chat_policies"):
+        return 0
+    existing = {
+        column["name"] for column in inspector.get_columns("assistant_chat_policies")
+    }
+    if "codex_profile_id" not in existing:
+        return 0
+    quote = active_engine.dialect.identifier_preparer.quote
+    with active_engine.begin() as connection:
+        result = connection.execute(
+            text(
+                f"UPDATE {quote('assistant_chat_policies')} "
+                f"SET {quote('codex_profile_id')} = NULL "
+                f"WHERE {quote('codex_profile_id')} = :legacy_value"
+            ),
+            {"legacy_value": "__current__"},
+        )
+    migrated = int(result.rowcount or 0)
+    if migrated:
+        logger.info("已迁移 %s 条旧版当前 Codex 绑定为默认 Profile", migrated)
+    return migrated
+
+
 def get_db():
     """获取数据库会话"""
     db = SessionLocal()
@@ -123,9 +150,10 @@ def create_tables():
     from . import chatbot_role    # 后导入引用WeChatUser的模型
     from . import chatbot_judge   # Judge 配置与用户绑定
     from . import assistant_policy
-    
+
     Base.metadata.create_all(bind=engine)
     drop_legacy_knowledge_base_columns(engine)
     ensure_wechat_user_access_columns(engine)
     ensure_assistant_policy_columns(engine)
+    migrate_legacy_current_codex_bindings(engine)
     assistant_policy.migrate_legacy_assistant_permissions(engine)

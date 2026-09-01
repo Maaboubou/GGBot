@@ -104,10 +104,6 @@ def _cfg_bool(key: str, default: bool) -> bool:
     return default
 
 
-def _editor_name() -> str:
-    return _cfg_str("WEEKLY_EDITOR_NAME", "微信助手") or "微信助手"
-
-
 def _parse_hhmm(value: str) -> tuple[int, int]:
     try:
         parts = (value or "09:00").strip().split(":")
@@ -493,30 +489,53 @@ def _build_plan_prompt(
     logs_text: str,
 ) -> str:
     issue_label = f"第{issue}期"
-    editor_label = f"编辑：{_editor_name()}"
     now_bj = datetime.now(pytz.timezone("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S %Z")
     return f"""
-你是一名周报总编，现在要为群聊「{chat_name}」设计生成周报 PDF。
+你是刘局，也是一本群聊杂志的主编。现在要为群聊「{chat_name}」主编一期只属于这 7 天的群聊杂志。
 
-你将阅读过去 7 天群聊记录，并设计一套多页周报图片方案。
+它不是工作周报、会议纪要、数据简报，也不是把聊天记录换一种顺序复述。你要从真实聊天里找到本周独有的编辑主题、戏剧线索、人物关系、意外转折和余味，把零散聊天编成一期让群友愿意翻完、看完会笑、还能想起当时情景的杂志。
 最终会生成固定 {page_count} 张横版 4:3 图片，然后每张作为 PDF 的一页。
 当前北京时间：{now_bj}。如果页面中出现年份、日期、统计周期或“本周/今年”的判断，必须以这个当前时间和下面的统计周期为准；不要沿用旧年份、旧截图或历史 run 的日期。
 
-你不是在直接生成图片，而是在担任总编、设计师和分镜导演。
-请你完全根据本周群聊内容自行决定每一页展示什么、每页标题、每页文案、排版方式、视觉风格，以及每页之间是否统一或变化。
+你不是在直接生成图片，而是在担任总编、特稿编辑、设计师和分镜导演。
+
+先在内部完成选题判断，不要输出分析过程：
+1. 通读整周，而不是只抓消息最多的一天；找出一个能够解释“这周为什么值得做成一期”的编辑主题。
+2. 判断本周的群聊气质和故事走向：它可能热闹、荒诞、松弛、温暖、嘴硬心软、持续跑题，也可能围绕一个小事件不断长出支线。
+3. 找出跨天呼应、话题变形、突然反转、被忽略的好问题、无人接住的妙语，以及后来被重新提起的伏笔。
+4. 根据素材浓度决定取舍：活跃周要大胆编辑，不做流水账；安静周要放大少数真正有意思的细节，不注水、不假装热闹。
+5. 先定本期独有的杂志概念，再决定每页的内容形式、叙事顺序和视觉语言。每一页都要推进这一期，而不是重复首页或换标题复述同一批热门话题。
+
+标题原则：
+1. 总标题必须从本周具体内容、反差、悬念、共同情绪或一句有代表性的表达中长出来，每期重新创作。
+2. 标题要像真正的杂志封面标题：具体、有画面、有一点好奇心或幽默感；可以机灵，但不要硬凑网络梗和廉价标题党。
+3. 禁止把“群聊周报”“本周回顾”“一周总结”“群聊那些事”“本周热点”这类通用词直接当总标题或页面标题。
+4. 不要把群名、用户名、昵称机械拼进标题，也不要仅仅因为某个人发言多就把整期做成人物专刊。
+
+内容组织原则：
+1. 只有首页承担封面功能；其余页面没有固定栏目。不要默认套用“热点榜、群友金句、活跃人物、数据统计、未完待续”等栏目，只有本周素材真的需要时才使用。
+2. 可以采用但不限于：一条话题的漂流史、群聊小剧场、梗的考古、跨天暗线、观点碰撞、人物群像、冷门细节特写、一个问题的多种答案、剧情反转、平行宇宙式编辑想象、下周悬念。它们只是灵感，不是栏目清单，更不能每期照搬。
+3. 页面形式可以混合变化，例如封面故事、短特稿、对话切片、视觉时间线、关系图、编辑手记、迷你漫画感场景、趣味预测；具体用什么完全由本周内容决定。
+4. 事实信息、群体气氛和趣味表达要自然混合。优先做“共同记忆”，不要做排行榜，不公开比较谁最水、谁最能聊，也不要给群友贴永久标签。
+5. 所有页合起来要有开场、展开、变化和收束，但不强迫套用传统起承转合；最后一页也不必固定预测下周，可以用最适合本期主题的方式留下余味。
+
+语言与气质：
+1. 整体轻松、鲜活、有熟人感，不要严肃风，不要政务宣传口吻，不要企业汇报腔，不要“凝心聚力、成果丰硕、展望未来”式套话。
+2. 可以幽默、毒舌、调侃和轻微荒诞，但笑点必须来自真实语境；不要强行造梗，不恶意评价个人，不替群友虚构动机或心理活动。
+3. 编辑文案要短、准、有节奏，像一个了解这个群的朋友在主编杂志，而不是 AI 在做摘要。
 
 硬性规则：
 1. 必须生成 exactly {page_count} 页，不多不少。
-2. 不要使用固定模板，不要预设固定栏目，不要预设固定视觉风格；但每一页必须有明确主题、自然构图和高质量视觉完成度。
+2. 不要使用固定模板，不要预设固定栏目，不要预设固定视觉风格；本期各页可以因内容而变化，但整期需要有可感知的编辑概念和呼应关系。
 3. 不要把用户名、昵称、头像、群名里的词自动当成本周主题。
 4. OCR、链接摘要、机器人辅助消息、系统工具消息不是实际聊天内容，除非真人围绕它们展开讨论，否则忽略。
-5. 可以幽默、毒舌、调侃，但要像熟人群内玩笑。
+5. 不得编造聊天中没有发生的事件、结论、关系或人物态度；创意表达只能建立在真实素材之上。
 6. 如果使用“用户名：聊天内容”的直接引用，聊天内容必须逐字来自原始记录。
 7. 如果不是逐字原话，就必须写成编辑口吻，不要伪装成聊天截图。
 8. 每页都要适合单独生成一张 4:3 横版图片。
 9. 周报期数「{issue_label}」只允许出现在首页。
-10. 「{editor_label}」只允许出现在首页。
-11. 第 2 页到第 {page_count} 页不要出现期数、不要出现“{editor_label}”。
+10. 「编辑：刘局」只允许出现在首页。
+11. 第 2 页到第 {page_count} 页不要出现期数、不要出现“编辑：刘局”。
 12. 图片模型中文能力有限，所以每页 visible_text 要短而准：每页核心可见中文尽量控制在 60-140 字，不要塞满小字。
 13. 不要让 image_prompt 像“本地画图脚本说明”或网页排版模板；它应该是面向真实图像模型的开放式创意 brief，允许模型自由选择画面语言。
 14. image_prompt 里不要要求把“Prompt:”“Title:”“Guard:”“可见文字:”等任务标签画到图上；这些标签只是给模型理解任务，不是画面内容。
@@ -530,20 +549,31 @@ def _build_plan_prompt(
 
 输出严格 JSON，不要 Markdown，不要解释。格式如下：
 {{
-  "title": "周报标题",
+  "title": "从本周具体内容中生长出来的杂志总标题，禁止通用周报标题",
   "issue": {issue},
   "issue_label": "{issue_label}",
   "period": "统计周期",
   "page_count": {page_count},
-  "overall_design_intent": "你根据本周内容判断出的整体设计意图，可以自由发挥",
+  "editorial_concept": {{
+    "theme": "本期唯一的编辑主题",
+    "cover_hook": "让群友想翻开的封面钩子",
+    "tone_keywords": ["根据本周内容确定的气质词"],
+    "story_arc": "本期内容如何从开场走向收束",
+    "selection_reason": "为什么这一主题只属于本周"
+  }},
+  "overall_design_intent": "与本期编辑主题一致、但不做正式汇报的整体视觉设计意图",
   "pages": [
     {{
       "page_no": 1,
-      "page_role": "这一页在整份周报里的作用",
+      "page_role": "这一页在整期杂志里的作用",
+      "content_form": "根据本周内容选择的页面形式，不得按固定栏目填写",
+      "editorial_angle": "本页相对其他页面独有的观察角度",
       "title": "本页标题",
+      "subtitle": "可选的短副标题，没有必要就留空",
       "visible_text": ["本页可见文案"],
+      "source_basis": ["支撑本页内容的真实聊天事实或逐字短引，不会直接画到图片上"],
       "layout_intent": "本页排版设计思路",
-      "image_prompt": "用于生成这一页图片的完整提示词。必须包含本页所有可见文字、视觉意图、构图方向、4:3 横版要求。保持开放式，不要固化成模板；首页必须包含 {issue_label} 和 {editor_label}；其他页不得包含期数和编辑署名；不要把提示词标签/任务说明画进图片。"
+      "image_prompt": "用于生成这一页图片的完整提示词。必须包含 title、非空 subtitle、visible_text 中全部需要画出的文字，以及本页视觉意图、构图方向和 4:3 横版要求。source_basis 只用于事实校验，不得画出。保持开放式、轻松、有杂志感，不要固化成模板或正式汇报；首页必须包含 {issue_label} 和 编辑：刘局；其他页不得包含期数和编辑署名；不要把提示词标签/任务说明画进图片。"
     }}
   ]
 }}
@@ -647,7 +677,6 @@ def _create_weekly_plan(
 
 def _normalize_plan_pages(plan: dict[str, Any], page_count: int) -> None:
     issue_label = str(plan.get("issue_label") or "")
-    editor_label = f"编辑：{_editor_name()}"
     for idx, page in enumerate(plan.get("pages") or [], start=1):
         page["page_no"] = idx
         title = str(page.get("title") or f"第{idx}页")
@@ -660,24 +689,24 @@ def _normalize_plan_pages(plan: dict[str, Any], page_count: int) -> None:
             text = str(item or "").strip()
             if not text:
                 continue
-            if idx != 1 and (editor_label in text or issue_label in text):
+            if idx != 1 and ("编辑：刘局" in text or "编辑:刘局" in text or issue_label in text):
                 continue
             clean_visible.append(text)
         if idx == 1:
             if issue_label and not any(issue_label in item for item in clean_visible):
                 clean_visible.insert(0, issue_label)
-            if not any(editor_label in item for item in clean_visible):
-                clean_visible.append(editor_label)
+            if not any("编辑：刘局" in item or "编辑:刘局" in item for item in clean_visible):
+                clean_visible.append("编辑：刘局")
         page["visible_text"] = clean_visible
 
         prompt = str(page.get("image_prompt") or "")
         if idx != 1:
-            prompt = prompt.replace(editor_label, "")
+            prompt = prompt.replace("编辑：刘局", "").replace("编辑:刘局", "")
             if issue_label:
                 prompt = prompt.replace(issue_label, "")
-            prompt += f"\n本页不是首页，不要显示周报期数，不要显示“{editor_label}”。"
+            prompt += "\n本页不是首页，不要显示周报期数，不要显示“编辑：刘局”。"
         else:
-            prompt += f"\n首页必须清晰显示：{issue_label}；{editor_label}。"
+            prompt += f"\n首页必须清晰显示：{issue_label}；编辑：刘局。"
         page["image_prompt"] = prompt.strip()
 
 
@@ -704,8 +733,7 @@ def _build_batch_image_prompt(plan: dict[str, Any]) -> str:
     page_blocks = []
     for page in pages:
         page_no = int(page.get("page_no") or 0)
-        editor_label = f"编辑：{_editor_name()}"
-        guard = f"首页必须显示周报期数和“{editor_label}”。" if page_no == 1 else f"本页不是首页，不要显示周报期数，不要显示“{editor_label}”。"
+        guard = "首页必须显示周报期数和“编辑：刘局”。" if page_no == 1 else "本页不是首页，不要显示周报期数，不要显示“编辑：刘局”。"
         page_blocks.append(
             f"""
 PAGE {page_no:02d}
@@ -717,7 +745,7 @@ Prompt:
 """.strip()
         )
     return f"""
-你是一名周报视觉总监，现在要把一份多页微信群周报设计方案生成成图片。
+你是刘局，现在要把一期根据本周聊天动态选题的群聊杂志生成成图片。
 
 当前北京时间：{now_bj}。涉及年份、日期或“本周”的画面文字必须以当前时间和计划中的统计周期为准，不要生成 2025 或其他旧年份。
 
@@ -727,7 +755,7 @@ Prompt:
 1. 请显式使用 Codex 子代理/并行代理工作流：按页拆分任务，尽量 one subagent per page；如果当前环境的子代理线程上限不足，就按线程上限分批处理。
 2. 每个子代理只负责一页图片，最终由主 Codex 等待所有页面完成后统一收齐。
 3. 每张图必须是真实图像模型生成的高质量 raster image 文件；不要用 PIL/Canvas/SVG/HTML 截图等本地工具临时拼字排版来冒充成品。如果当前 Codex 环境没有可用的真实图片生成能力，必须明确失败，不要交付占位图或脚本生成图。
-4. 严禁复制、重命名、复用项目目录/历史 run/tmp/wxautox 文件下载中的任何既有图片、微信截图、聊天截图或上次失败产物。
+4. 严禁复制、重命名、复用项目目录、历史 run、tmp 或 mabowx文件下载中的任何既有图片、微信截图、聊天截图或上次失败产物。
 5. 最终附件必须保存为这些精确文件名：{", ".join(f"page_{int(page.get('page_no') or 0):02d}.png" for page in pages)}。
 6. 不要额外生成封面、索引、说明图、草稿图或中间图。
 7. 如果某一页生成失败，请在本次调用内重试该页；最终回复前必须确认所有 page_XX.png 都存在。
@@ -737,8 +765,12 @@ Prompt:
 11. 保持开放式创作：不要把所有页面做成同一套固定模板；可以根据每页主题自由选择构图、质感、镜头、色彩和视觉语言。
 12. 画面里只应出现每页需要读者看到的标题/短句，不要把任务标签或提示词文本画进去，例如不要出现“Prompt:”“Title:”“Guard:”“visible_text”“生成 4:3 横版图片”等字样。
 13. 每个 page_XX.png 必须是独立生成的不同页面；不要复用同一张图改名，不要让两页内容或构图重复。
+14. 整期应像一本轻松、有个性、会讲故事的独立杂志或 zine，不要做成政务宣传册、企业工作汇报、会议纪要、数据大屏或整齐刻板的信息图模板。
+15. 允许各页视觉语言随内容变化；用少量色彩、字体气质或视觉小元素形成整期呼应即可，不要牺牲每页的独特性去追求完全统一。
+16. 幽默感应来自页面 prompt 中的真实内容和反差，不要擅自添加网络热梗、鸡汤口号、宏大结论或不存在的人物评价。
 
-整份周报标题：{plan.get("title") or "群聊周报"}
+本期杂志标题：{plan.get("title") or "本期群聊杂志"}
+本期编辑概念：{json.dumps(plan.get("editorial_concept") or {}, ensure_ascii=False)}
 整体设计意图：{plan.get("overall_design_intent") or ""}
 
 页面任务：
@@ -995,16 +1027,13 @@ def _failure_stage_label(stage: str) -> str:
 
 
 def _admin_chat_name() -> str:
-    return _cfg_str("WEEKLY_ADMIN_CHAT", "")
+    return _cfg_str("WEEKLY_ADMIN_CHAT", "Gerry") or "Gerry"
 
 
 def _notify_failure(wx: Any, chat_name: str, issue: int, failure: dict[str, Any]) -> None:
-    if not _cfg_bool("WEEKLY_NOTIFY_FAILURE", False):
+    if not _cfg_bool("WEEKLY_NOTIFY_FAILURE", True):
         return
     admin_chat = _admin_chat_name()
-    if not admin_chat:
-        logger.warning("🗞️ Weekly: 未配置管理员，跳过失败私聊通知")
-        return
     message = (
         "Weekly 周报生成失败\n\n"
         f"群聊：{chat_name}\n"

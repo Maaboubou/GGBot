@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 import requests
 from selenium import webdriver
 
+from app.utils.subprocess_utils import hidden_process_kwargs
+
 
 class BrowserRuntimeMixin:
     """Own the single automation browser and its recovery lifecycle."""
@@ -47,7 +49,13 @@ class BrowserRuntimeMixin:
                 cmd = ["taskkill", "/F", "/PID", str(pid)]
             else:
                 cmd = ["kill", "-9", str(pid)]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                **hidden_process_kwargs(),
+            )
             if result.returncode == 0:
                 self.logger.info(f"✅ 已终止 {label}: PID={pid}")
             else:
@@ -209,7 +217,9 @@ class BrowserRuntimeMixin:
             try:
                 # 尝试将 WSL 路径转换为 Windows 路径以供 chrome.exe 使用
                 cmd = ["wslpath", "-w", user_data_dir]
-                win_user_data_dir = subprocess.check_output(cmd, text=True).strip()
+                win_user_data_dir = subprocess.check_output(
+                    cmd, text=True, **hidden_process_kwargs()
+                ).strip()
                 self.logger.info(f"📂 WSL 路径转换: {user_data_dir} -> {win_user_data_dir}")
                 user_data_dir = win_user_data_dir
             except Exception as e:
@@ -234,7 +244,12 @@ class BrowserRuntimeMixin:
 
             self.logger.info(f"🚀 正在启动 Chrome: {' '.join(args)}")
             # 在 WSL 中使用 subprocess.Popen 启动 Windows 程序是异步的且不会阻塞
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                **hidden_process_kwargs(),
+            )
 
             self.logger.info("⏳ 等待 Chrome 调试端口就绪...")
             for i in range(40):
@@ -283,7 +298,11 @@ class BrowserRuntimeMixin:
 
         if self.is_wsl:
             try:
-                user_data_dir = subprocess.check_output(["wslpath", "-w", user_data_dir], text=True).strip()
+                user_data_dir = subprocess.check_output(
+                    ["wslpath", "-w", user_data_dir],
+                    text=True,
+                    **hidden_process_kwargs(),
+                ).strip()
             except Exception:
                 pass
 
@@ -317,6 +336,7 @@ class BrowserRuntimeMixin:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                **hidden_process_kwargs(),
             )
             if result.returncode == 0:
                 self.logger.info("✅ 已按自动化 Chrome 命令行特征清理残留进程")
@@ -338,6 +358,7 @@ class BrowserRuntimeMixin:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                **hidden_process_kwargs(),
             )
             return result.stdout.strip().lower() == "chrome.exe"
         except Exception as e:
@@ -353,7 +374,13 @@ class BrowserRuntimeMixin:
                 try:
                     # 使用 netstat.exe 查找 PID
                     cmd_netstat = f"netstat.exe -ano | grep LISTENING | grep :{self.chrome_debug_port}"
-                    result = subprocess.run(cmd_netstat, capture_output=True, text=True, shell=True)
+                    result = subprocess.run(
+                        cmd_netstat,
+                        capture_output=True,
+                        text=True,
+                        shell=True,
+                        **hidden_process_kwargs(),
+                    )
                     if result.returncode == 0 and result.stdout.strip():
                         # netstat.exe 输出最后一位是 PID
                         lines = result.stdout.strip().split('\n')
@@ -368,7 +395,12 @@ class BrowserRuntimeMixin:
                                 self.logger.warning(f"⚠️ PID {pid} 不是 chrome.exe，跳过端口清理")
                                 continue
                             self.logger.info(f"🔫 (WSL-Win) 找到 PID: {pid}，准备使用 taskkill.exe 终止...")
-                            result = subprocess.run(["taskkill.exe", "/F", "/PID", pid], capture_output=True, text=True)
+                            result = subprocess.run(
+                                ["taskkill.exe", "/F", "/PID", pid],
+                                capture_output=True,
+                                text=True,
+                                **hidden_process_kwargs(),
+                            )
                             if result.returncode == 0:
                                 self.logger.info(f"✅ (WSL-Win) 进程 {pid} 已终止")
                             else:
@@ -379,13 +411,30 @@ class BrowserRuntimeMixin:
                         self.logger.info(f"🤷 (WSL) 未通过 netstat.exe 找到监听端口 {self.chrome_debug_port} 的进程")
                         # 兜底：直接按名字杀
                         self.logger.info("🛡️ (WSL) 尝试按映像名称清理 chrome.exe...")
-                        subprocess.run(["taskkill.exe", "/F", "/IM", "chrome.exe", "/FI", f"WINDOWTITLE eq *{self.chrome_debug_port}*"], capture_output=True)
+                        subprocess.run(
+                            [
+                                "taskkill.exe",
+                                "/F",
+                                "/IM",
+                                "chrome.exe",
+                                "/FI",
+                                f"WINDOWTITLE eq *{self.chrome_debug_port}*",
+                            ],
+                            capture_output=True,
+                            **hidden_process_kwargs(),
+                        )
                 except Exception as e:
                     self.logger.warning(f"⚠️ WSL 互操作关闭 Chrome 失败: {e}")
 
             elif os.name == "nt":
                 command = f'netstat -aon | findstr LISTENING | findstr ":{self.chrome_debug_port}"'
-                result = subprocess.run(command, capture_output=True, text=True, shell=True)
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                    **hidden_process_kwargs(),
+                )
                 if result.returncode == 0 and result.stdout.strip():
                     pids = set()
                     for line in result.stdout.strip().splitlines():
@@ -397,7 +446,12 @@ class BrowserRuntimeMixin:
                             self.logger.warning(f"⚠️ PID {pid} 不是 chrome.exe，跳过端口清理")
                             continue
                         self.logger.info(f"🔫 (Windows) 找到监听端口 {self.chrome_debug_port} 的 PID: {pid}，准备终止...")
-                        kill_result = subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, text=True)
+                        kill_result = subprocess.run(
+                            ["taskkill", "/F", "/PID", pid],
+                            capture_output=True,
+                            text=True,
+                            **hidden_process_kwargs(),
+                        )
                         if kill_result.returncode == 0:
                             self.logger.info(f"✅ 进程 {pid} 已终止")
                         else:
@@ -408,13 +462,25 @@ class BrowserRuntimeMixin:
                     self.logger.info(f"🤷 (Windows) 未找到监听端口 {self.chrome_debug_port} 的进程")
             else:
                 command = f"lsof -ti :{self.chrome_debug_port}"
-                result = subprocess.run(command, capture_output=True, text=True, shell=True)
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                    **hidden_process_kwargs(),
+                )
                 if result.stdout.strip():
                     pids = result.stdout.strip().split("\n")
                     for pid in pids:
                         if pid.strip():
                             self.logger.info(f"🔫 (Unix) 找到 PID: {pid}，准备终止...")
-                            subprocess.run(f"kill -9 {pid}", check=True, shell=True, capture_output=True)
+                            subprocess.run(
+                                f"kill -9 {pid}",
+                                check=True,
+                                shell=True,
+                                capture_output=True,
+                                **hidden_process_kwargs(),
+                            )
                             self.logger.info(f"✅ 进程 {pid} 已终止")
                     time.sleep(1)
                 else:

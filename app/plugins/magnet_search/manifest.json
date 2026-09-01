@@ -1,0 +1,11 @@
+{
+  "schema_version": 2,
+  "plugin_api_version": 2,
+  "storage": {"cache_retention_days": 7, "cache_limit_mb": 1024},
+  "backup": {"schema_version": 1, "include_persistent_storage": false, "include_generated_files": true, "supports_restore_migration": false, "sensitive": false},
+  "health": {"critical": false, "timeout_seconds": 8},
+  "listeners": [
+    {"event": "text_message_received", "handler": "handle_text", "title": "磁力搜索", "trigger": {"kind": "keyword", "summary": "消息包含搜索触发词，移除触发词与 @ 后仍有搜索内容", "config_keys": ["trigger_keyword"], "conditions": ["空查询不会触发"]}, "scope": {"level": "global", "chat_types": ["group", "user"]}, "propagation": "stop_on_consumed"}
+  ],
+  "jobs": []
+}

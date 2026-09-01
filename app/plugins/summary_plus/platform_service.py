@@ -20,7 +20,7 @@ __all__ = [
 class PlatformRoute:
     name: str
     extract_share_url: Callable[[Any, str, str], Optional[str]]
-    async_handler: Callable[[Any, Any, str, str, logging.Logger], None]
+    async_handler: Callable[..., Optional[bool]]
 
 
 def _send_files(
@@ -96,11 +96,69 @@ def _resolve_pending_link_url(event: Event, wx: Any, chat_name: str, logger: log
     return None
 
 
-def _handle_douyin_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+def _handle_douyin_async(
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    share_url: str,
+    logger: logging.Logger,
+    message_id: Optional[str] = None,
+) -> None:
     try:
         if not wx:
             logger.info("ℹ️ 未找到 wx 上下文，跳过抖音视频下载")
             return
+
+        duration = svc._check_douyin_duration(share_url)
+        max_download_duration = max(
+            1,
+            int(getattr(svc, "douyin_max_download_duration", 300)),
+        )
+        if duration is not None and duration > max_download_duration:
+            logger.info(
+                "ℹ️ 抖音视频 %s 时长 %ss > %ss，进入本地 ASR 脑图制作逻辑。",
+                share_url,
+                duration,
+                max_download_duration,
+            )
+            if not getattr(svc, "local_asr_enabled", True):
+                logger.info("ℹ️ 抖音长视频本地 ASR 已关闭，跳过脑图制作。")
+                return
+
+            max_asr_minutes = max(
+                1,
+                int(getattr(svc, "local_asr_max_duration_minutes", 35)),
+            )
+            if duration > max_asr_minutes * 60:
+                logger.info(
+                    "ℹ️ 抖音视频 %s 时长 %ss，超过本地 ASR 上限 %s 分钟，直接忽略。",
+                    share_url,
+                    duration,
+                    max_asr_minutes,
+                )
+                return
+
+            article_text = svc._douyin_transcribe_local(share_url)
+            if article_text:
+                asyncio.run(
+                    svc._generate_douyin_mindmap_async(
+                        share_url,
+                        wx,
+                        chat_name,
+                        article_text=article_text,
+                    )
+                )
+            return
+
+        if duration is None:
+            logger.info("ℹ️ 抖音视频时长获取失败，兼容回退为直接下载。")
+        else:
+            logger.info(
+                "ℹ️ 抖音视频 %s 时长 %ss <= %ss，继续下载视频。",
+                share_url,
+                duration,
+                max_download_duration,
+            )
 
         video_path = svc._download_douyin_with_ytdlp(share_url, timeout_sec=180)
         if video_path:
@@ -120,7 +178,14 @@ def _handle_douyin_async(svc: Any, wx: Any, chat_name: str, share_url: str, logg
         raise
 
 
-def _handle_tiktok_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+def _handle_tiktok_async(
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    share_url: str,
+    logger: logging.Logger,
+    message_id: Optional[str] = None,
+) -> None:
     try:
         video_url_list = svc.parse_tiktok_video(share_url)
         if video_url_list and wx:
@@ -134,7 +199,14 @@ def _handle_tiktok_async(svc: Any, wx: Any, chat_name: str, share_url: str, logg
         raise
 
 
-def _handle_weibo_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+def _handle_weibo_async(
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    share_url: str,
+    logger: logging.Logger,
+    message_id: Optional[str] = None,
+) -> None:
     try:
         logger.info(f"📺 检测到微博链接，开始使用 yt-dlp 下载: {share_url}")
         if not wx:
@@ -152,7 +224,14 @@ def _handle_weibo_async(svc: Any, wx: Any, chat_name: str, share_url: str, logge
         raise
 
 
-def _handle_bilibili_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+def _handle_bilibili_async(
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    share_url: str,
+    logger: logging.Logger,
+    message_id: Optional[str] = None,
+) -> None:
     try:
         if not svc._ensure_bili_cookie_login_ready(wx=wx, chat_name=chat_name):
             logger.warning("⚠️ B站 Cookie 未就绪，将继续尝试后续字幕/API/ASR流程。")
@@ -176,7 +255,7 @@ def _handle_bilibili_async(svc: Any, wx: Any, chat_name: str, share_url: str, lo
                     logger.error(f"❌ Bilibili 视频下载失败: {share_url}")
             return
 
-        max_download_duration = getattr(svc, "bilibili_max_download_duration", 120)
+        max_download_duration = getattr(svc, "bilibili_max_download_duration", 300)
         if duration <= max_download_duration:
             logger.info(f"ℹ️ Bilibili 视频 {share_url} 时长 {duration}s <= {max_download_duration}s，下载 720p。")
             if wx:
@@ -238,19 +317,45 @@ def _handle_bilibili_async(svc: Any, wx: Any, chat_name: str, share_url: str, lo
         raise
 
 
-def _handle_xhs_async(svc: Any, wx: Any, chat_name: str, share_url: str, logger: logging.Logger) -> None:
+def _handle_xhs_async(
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    share_url: str,
+    logger: logging.Logger,
+    message_id: Optional[str] = None,
+) -> bool:
     try:
-        file_path = svc.process_xhs_note(share_url)
+        resolved_url = svc._xhs_resolve_share_url(share_url)
+        file_path = svc.process_xhs_note(resolved_url)
         if file_path and wx:
             _send_files(wx, chat_name, file_path, logger, svc)
-        elif not file_path:
-            logger.info(f"ℹ️ 小红书笔记 {share_url} 处理完成，但未生成待发送文件（可能时长超限或非单图）")
+            return True
+
+        summary = svc.summarize_xhs_note(resolved_url, chat_name=chat_name)
+        if summary and wx:
+            sent = _send_summary_reply(wx, chat_name, message_id, summary, logger)
+            if sent and chat_name in getattr(svc, "special_translation_groups", set()):
+                translated = svc.translate_text_for_special_group(summary)
+                if translated:
+                    wx.send_message(chat_name, translated)
+            return sent
+
+        logger.info("ℹ️ 小红书笔记处理完成，但没有可发送的媒体或摘要: %s", resolved_url)
+        return False
     except Exception as e:
         logger.error(f"❌ 异步处理小红书视频/图片失败: {e}", exc_info=True)
         raise
 
 
-def _handle_youtube_async(svc: Any, wx: Any, chat_name: str, youtube_url: str, logger: logging.Logger) -> None:
+def _handle_youtube_async(
+    svc: Any,
+    wx: Any,
+    chat_name: str,
+    youtube_url: str,
+    logger: logging.Logger,
+    message_id: Optional[str] = None,
+) -> None:
     loop = None
     try:
         logger.info(f"🎥 检测到 YouTube 链接，启动脑图制作流程: {youtube_url}")
@@ -306,18 +411,28 @@ def _dispatch_platform_route(
     chat_name: str,
     share_url: str,
     logger: logging.Logger,
+    message_id: Optional[str] = None,
 ) -> DispatchDecision:
     """Submit a platform route to Runtime API v2's bounded dispatcher."""
 
     def worker(operation: OperationContext) -> ProcessingResult:
         operation.progress(10, f"正在处理 {route.name}")
-        route.async_handler(svc, wx, chat_name, share_url, logger)
+        handled = route.async_handler(
+            svc,
+            wx,
+            chat_name,
+            share_url,
+            logger,
+            message_id,
+        )
+        if handled is False:
+            return ProcessingResult.skipped(f"{route.name} 没有可发送内容")
         return ProcessingResult.completed(f"{route.name} 处理完成")
 
     dispatch = getattr(svc, "dispatch_operation", None)
     if not callable(dispatch):
         # Compatibility path for isolated unit tests and Runtime API v1.
-        route.async_handler(svc, wx, chat_name, share_url, logger)
+        route.async_handler(svc, wx, chat_name, share_url, logger, message_id)
         return DispatchDecision(True, "compatibility")
     decision = dispatch(
         route.name,
@@ -447,7 +562,15 @@ def handle_link_message(event: Event, svc: Any, logger: logging.Logger) -> bool:
             share_url = route.extract_share_url(svc, url or "", message)
             if not share_url:
                 continue
-            _dispatch_platform_route(route, svc, wx, chat_name, share_url, logger)
+            _dispatch_platform_route(
+                route,
+                svc,
+                wx,
+                chat_name,
+                share_url,
+                logger,
+                event.data.get("message_id"),
+            )
             return True
 
         if not url:

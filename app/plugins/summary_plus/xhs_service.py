@@ -10,11 +10,15 @@ import tempfile
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from PIL import Image
 
+from app.utils.subprocess_utils import hidden_process_kwargs
+
+from .browser_service import strip_summary_tag_section
+from .content_cleaner import strip_markdown
 from .runtime_support import ArtifactLimitError
 from .ytdlp_cookie_service import ytdlp_browser_cookie_args
 
@@ -25,6 +29,284 @@ TIKHUB_ENDPOINT_XHS_VIDEO_NOTE = "https://api.tikhub.io/api/v1/xiaohongshu/app_v
 
 class XiaohongshuMixin:
     """Platform-specific Xiaohongshu workflow mixed into SummaryService."""
+
+    def _xhs_h5_headers(self) -> Dict[str, str]:
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Mobile Safari/537.36"
+            ),
+            "Referer": "https://www.xiaohongshu.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+    def _xhs_note_id(self, note: Any) -> Optional[str]:
+        if not isinstance(note, dict):
+            return None
+        value = note.get("note_id") or note.get("noteId") or note.get("id")
+        value = str(value or "").strip()
+        return value or None
+
+    def _xhs_resolve_share_url(self, share_url: str) -> str:
+        """Resolve WeChat's ``/explore?share_id=...`` landing URL to a note URL.
+
+        WeChat cards can expose an ID-less Xiaohongshu landing URL. Xiaohongshu
+        redirects that request to the home page, but preserves the canonical note
+        URL in ``window.__INITIAL_STATE__.global.shareContext``.
+        """
+        normalized_share_url = self._normalize_xhs_share_url(share_url)
+        if self._extract_xhs_note_id(normalized_share_url):
+            return normalized_share_url
+
+        try:
+            response = requests.get(
+                normalized_share_url,
+                headers=self._xhs_h5_headers(),
+                timeout=30,
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+
+            final_url = self._normalize_xhs_share_url(str(getattr(response, "url", "") or ""))
+            if self._extract_xhs_note_id(final_url):
+                self.logger.info(
+                    "✅ 小红书分享链接经 HTTP 跳转恢复笔记 ID: %s",
+                    self._extract_xhs_note_id(final_url),
+                )
+                return final_url
+
+            state = self._xhs_extract_initial_state_json(response.text)
+            global_state = state.get("global") if isinstance(state, dict) else None
+            share_context = (
+                global_state.get("shareContext")
+                if isinstance(global_state, dict)
+                else None
+            )
+            if not isinstance(share_context, dict):
+                return normalized_share_url
+
+            requested_share_id = (
+                parse_qs(urlparse(normalized_share_url).query).get("share_id") or [""]
+            )[0]
+            context_share_id = str(share_context.get("shareId") or "").strip()
+            if requested_share_id and context_share_id and requested_share_id != context_share_id:
+                self.logger.warning(
+                    "⚠️ 小红书分享上下文与请求 share_id 不一致，拒绝使用页面候选链接"
+                )
+                return normalized_share_url
+
+            candidate = str(share_context.get("shareLink") or "").strip()
+            content_id = str(share_context.get("shareContentId") or "").strip()
+            if not candidate and re.fullmatch(r"[0-9a-fA-F]{16,32}", content_id):
+                candidate = f"https://www.xiaohongshu.com/discovery/item/{content_id}"
+            if not candidate:
+                return normalized_share_url
+
+            candidate = self._normalize_xhs_share_url(
+                urljoin(final_url or normalized_share_url, candidate)
+            )
+            parsed_candidate = urlparse(candidate)
+            hostname = (parsed_candidate.hostname or "").lower()
+            note_id = self._extract_xhs_note_id(candidate)
+            if (
+                parsed_candidate.scheme not in {"http", "https"}
+                or not (hostname == "xiaohongshu.com" or hostname.endswith(".xiaohongshu.com"))
+                or not note_id
+            ):
+                self.logger.warning("⚠️ 小红书分享上下文未提供有效的站内笔记链接")
+                return normalized_share_url
+            if content_id and content_id.casefold() != note_id.casefold():
+                self.logger.warning("⚠️ 小红书分享上下文中的笔记 ID 不一致，拒绝候选链接")
+                return normalized_share_url
+
+            self.logger.info("✅ 小红书长链接已恢复真实笔记 ID: %s", note_id)
+            return candidate
+        except Exception as exc:
+            self.logger.warning("⚠️ 小红书长链接解析失败，保留原链接: %s", exc)
+            return normalized_share_url
+
+    def _xhs_extract_note_from_state(
+        self,
+        state: Any,
+        target_note_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        if not isinstance(state, dict):
+            return None
+        note_data = state.get("noteData")
+        data = note_data.get("data") if isinstance(note_data, dict) else None
+        note = data.get("noteData") if isinstance(data, dict) else None
+        if not isinstance(note, dict) or not note:
+            return None
+        note_id = self._xhs_note_id(note)
+        if target_note_id and note_id != target_note_id:
+            self.logger.warning(
+                "⚠️ 小红书 H5 页面笔记不匹配: target=%s, actual=%s",
+                target_note_id,
+                note_id or "<unknown>",
+            )
+            return None
+        return note
+
+    def _xhs_fetch_note_from_h5(self, share_url: str) -> Optional[dict]:
+        """Fetch complete note metadata directly from Xiaohongshu's H5 state."""
+        resolved_share_url = self._xhs_resolve_share_url(share_url)
+        target_note_id = self._extract_xhs_note_id(resolved_share_url)
+        if not target_note_id:
+            self.logger.warning("⚠️ 小红书 H5 请求前仍未恢复笔记 ID")
+            return None
+        try:
+            self.logger.info("正在直连小红书 H5 页面提取笔记: note_id=%s", target_note_id)
+            response = requests.get(
+                resolved_share_url,
+                headers=self._xhs_h5_headers(),
+                timeout=30,
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            state = self._xhs_extract_initial_state_json(response.text)
+            note = self._xhs_extract_note_from_state(state, target_note_id)
+            if not note:
+                self.logger.warning("⚠️ 小红书 H5 页面中未找到目标笔记数据")
+                return None
+            self.logger.info(
+                "✅ 小红书 H5 笔记提取成功: note_id=%s, type=%s",
+                target_note_id,
+                note.get("type") or note.get("note_type") or "unknown",
+            )
+            return note
+        except Exception as exc:
+            self.logger.warning("⚠️ 直连小红书 H5 笔记提取失败: %s", exc)
+            return None
+
+    def _xhs_extract_subtitle_urls(self, note: Any) -> List[str]:
+        """Extract subtitle URLs, preferring source-language and Chinese tracks."""
+        tracks: Dict[str, List[str]] = {}
+        seen_nodes = set()
+
+        def add_track(language: str, value: Any) -> None:
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                url = self._xhs_pick_url(item)
+                if not url:
+                    continue
+                bucket = tracks.setdefault(language.casefold(), [])
+                if url not in bucket:
+                    bucket.append(url)
+
+        def visit(value: Any) -> None:
+            if isinstance(value, str):
+                candidate = value.strip()
+                if candidate.startswith(("{", "[")):
+                    try:
+                        visit(json.loads(candidate))
+                    except (TypeError, ValueError):
+                        pass
+                return
+            if not isinstance(value, (dict, list)):
+                return
+            node_id = id(value)
+            if node_id in seen_nodes:
+                return
+            seen_nodes.add(node_id)
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            for key, child in value.items():
+                if str(key).casefold() == "subtitles" and isinstance(child, dict):
+                    for language, track in child.items():
+                        add_track(str(language), track)
+                visit(child)
+
+        visit(note)
+        ordered_languages = ["source", "zh-cn", "zh_cn", "zh", "zh-hans"]
+        result: List[str] = []
+        for language in ordered_languages:
+            result.extend(url for url in tracks.pop(language, []) if url not in result)
+        for urls in tracks.values():
+            result.extend(url for url in urls if url not in result)
+        return result
+
+    def _xhs_subtitle_to_text(self, subtitle_text: str) -> str:
+        lines: List[str] = []
+        for raw_line in (subtitle_text or "").lstrip("\ufeff").splitlines():
+            line = raw_line.strip()
+            if not line or line.upper() == "WEBVTT" or re.fullmatch(r"\d+", line):
+                continue
+            if "-->" in line:
+                continue
+            line = re.sub(r"<[^>]+>", "", line).strip()
+            if line and (not lines or line != lines[-1]):
+                lines.append(line)
+        return "\n".join(lines)
+
+    def _xhs_fetch_subtitle_text(self, note: Any) -> Optional[str]:
+        for subtitle_url in self._xhs_extract_subtitle_urls(note):
+            try:
+                response = requests.get(
+                    subtitle_url,
+                    headers=self._xhs_h5_headers(),
+                    timeout=20,
+                )
+                response.raise_for_status()
+                text = self._xhs_subtitle_to_text(response.text)
+                if text:
+                    self.logger.info("✅ 小红书字幕提取成功: %s 字", len(text))
+                    return text
+            except Exception as exc:
+                self.logger.warning("⚠️ 小红书字幕轨道读取失败，尝试下一轨: %s", exc)
+        return None
+
+    def summarize_xhs_note(self, share_url: str, chat_name: str = "") -> Optional[str]:
+        """Summarize H5 note text/subtitles without downloading an oversized video."""
+        resolved_share_url = self._xhs_resolve_share_url(share_url)
+        note = self._xhs_fetch_note_from_h5(resolved_share_url)
+        if not note:
+            return None
+
+        title = str(note.get("title") or "").strip()
+        description = str(note.get("desc") or note.get("description") or "").strip()
+        user = note.get("user") if isinstance(note.get("user"), dict) else {}
+        author = str(user.get("nickName") or user.get("nickname") or "").strip()
+        subtitle_text = self._xhs_fetch_subtitle_text(note)
+
+        sections = []
+        if title:
+            sections.append(f"标题：{title}")
+        if author:
+            sections.append(f"作者：{author}")
+        if description:
+            sections.append(f"笔记正文：{description}")
+        if subtitle_text:
+            sections.append(f"视频字幕：\n{subtitle_text}")
+        source_text = "\n\n".join(sections).strip()
+        if not source_text:
+            return None
+
+        max_content_length = max(1, int(getattr(self, "MAX_CONTENT_LENGTH", 20000)))
+        messages = [
+            {
+                "role": "system",
+                "content": str(
+                    getattr(self, "prompt_summary", "请忠实、简洁地总结用户提供的内容。")
+                ),
+            },
+            {"role": "user", "content": source_text[:max_content_length]},
+        ]
+        call_kwargs = {"_mabobot_chat_name": chat_name} if chat_name else {}
+        try:
+            response = self.llm_manager.call(
+                plugin_name="summary_plus",
+                call_type="summary",
+                messages=messages,
+                **call_kwargs,
+            )
+        except Exception as exc:
+            self.logger.error("❌ 小红书摘要模型调用失败: %s", exc, exc_info=True)
+            return None
+        summary = strip_summary_tag_section(strip_markdown(str(response or "").strip()))
+        return summary or None
 
     def _xhs_ytdlp_info(
         self,
@@ -96,7 +378,7 @@ class XiaohongshuMixin:
                 self._remove_path_quietly(raw_path)
 
         self.logger.info(
-            "检测到 yt-dlp 小红书多图（%s 张），准备合并为长图",
+            "检测到小红书多图（%s 张），准备合并为长图",
             len(image_urls),
         )
         temp_files: List[str] = []
@@ -116,7 +398,7 @@ class XiaohongshuMixin:
             self._merge_images_vertically(converted_images, output_path)
             return output_path
         except Exception as exc:
-            self.logger.warning("⚠️ yt-dlp 小红书图片处理失败，将回退 TikHub: %s", exc)
+            self.logger.warning("⚠️ 小红书图片处理失败: %s", exc)
             return None
         finally:
             for temp_path in temp_files:
@@ -309,6 +591,7 @@ class XiaohongshuMixin:
                 capture_output=True,
                 text=True,
                 timeout=210,
+                **hidden_process_kwargs(),
             )
             if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
                 if os.path.getsize(save_path) > max_bytes:
@@ -364,7 +647,12 @@ class XiaohongshuMixin:
         self.logger.info(f"正在进行格式转换: {input_path} -> {output_path}")
         try:
             # -y 表示覆盖输出文件
-            subprocess.run([self.ffmpeg_bin, "-y", "-i", input_path, output_path], check=True, capture_output=True)
+            subprocess.run(
+                [self.ffmpeg_bin, "-y", "-i", input_path, output_path],
+                check=True,
+                capture_output=True,
+                **hidden_process_kwargs(),
+            )
             self.logger.info("转换完成")
         except subprocess.CalledProcessError as e:
             self.logger.error(f"转换失败: {e.stderr.decode()}")
@@ -430,9 +718,11 @@ class XiaohongshuMixin:
         def looks_like_note(item: dict) -> bool:
             note_keys = {
                 "note_id",
+                "noteId",
                 "id",
                 "type",
                 "image_list",
+                "imageList",
                 "images_list",
                 "video_info",
                 "video_info_v2",
@@ -449,7 +739,12 @@ class XiaohongshuMixin:
                 return
 
             if looks_like_note(value):
-                marker = value.get("note_id") or value.get("id") or id(value)
+                marker = (
+                    value.get("note_id")
+                    or value.get("noteId")
+                    or value.get("id")
+                    or id(value)
+                )
                 if marker not in seen:
                     seen.add(marker)
                     notes.append(value)
@@ -471,7 +766,13 @@ class XiaohongshuMixin:
         return notes
 
     def _xhs_has_usable_media(self, note: dict) -> bool:
-        images = note.get("image_list") or note.get("images_list") or note.get("images") or []
+        images = (
+            note.get("image_list")
+            or note.get("imageList")
+            or note.get("images_list")
+            or note.get("images")
+            or []
+        )
         if isinstance(images, dict):
             images = [images]
         video_info = self._xhs_get_video_info(note)
@@ -497,12 +798,12 @@ class XiaohongshuMixin:
         target_notes = [
             note
             for note in valid_notes
-            if str(note.get("note_id") or note.get("id") or "") == target_note_id
+            if self._xhs_note_id(note) == target_note_id
         ]
         ignored_ids = [
-            str(note.get("note_id") or note.get("id") or "<unknown>")
+            str(self._xhs_note_id(note) or "<unknown>")
             for note in valid_notes
-            if str(note.get("note_id") or note.get("id") or "") != target_note_id
+            if self._xhs_note_id(note) != target_note_id
         ]
         if ignored_ids:
             self.logger.info(
@@ -541,9 +842,10 @@ class XiaohongshuMixin:
         """单张 live 图优先返回动态视频；多图场景不调用。"""
         if not isinstance(image_info, dict):
             return None
-        live_photo = image_info.get("live_photo")
+        live_photo = image_info.get("live_photo") or image_info.get("livePhoto")
         if not isinstance(live_photo, dict):
-            return None
+            stream = image_info.get("stream")
+            return self._xhs_extract_video_url(stream) if isinstance(stream, dict) else None
         return self._xhs_extract_video_url(live_photo)
 
     def _xhs_request_note_endpoint(
@@ -637,7 +939,7 @@ class XiaohongshuMixin:
             self.logger.warning("⚠️ TikHub 小红书App V2 图文接口未返回可用媒体字段")
             return None
 
-        video_note_id = str(primary_note.get("note_id") or primary_note.get("id") or note_id or "").strip()
+        video_note_id = str(self._xhs_note_id(primary_note) or note_id or "").strip()
         video_params = {"note_id": video_note_id} if video_note_id else params
         video_response = self._xhs_request_note_endpoint(
             token,
@@ -804,26 +1106,18 @@ class XiaohongshuMixin:
 
     def _xhs_fetch_video_note_from_h5(self, share_url: str) -> Optional[dict]:
         """直连小红书 H5 页面，绕过第三方 API 提取视频流；仅用于视频兜底。"""
-        normalized_share_url = self._normalize_xhs_share_url(share_url)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
-            "Referer": "https://www.xiaohongshu.com/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-        try:
-            self.logger.info(f"正在直连小红书 H5 页面提取视频: {normalized_share_url}")
-            response = requests.get(normalized_share_url, headers=headers, timeout=30, allow_redirects=True)
-            response.raise_for_status()
-            state = self._xhs_extract_initial_state_json(response.text)
-            video_info = self._xhs_find_video_info_in_state(state) if state else None
-            if not video_info or not self._xhs_extract_video_url(video_info):
-                self.logger.warning("⚠️ 小红书 H5 页面中未找到可用视频流")
-                return None
-            uid = self._extract_xhs_note_id(response.url) or self._extract_xhs_note_id(normalized_share_url) or uuid.uuid4().hex[:8]
-            return {"type": "video", "note_id": uid, "video_info": video_info}
-        except Exception as e:
-            self.logger.warning(f"⚠️ 直连小红书 H5 视频提取失败: {e}")
+        note = self._xhs_fetch_note_from_h5(share_url)
+        if not note:
             return None
+        video_info = self._xhs_get_video_info(note)
+        if not video_info or not self._xhs_extract_video_url(video_info):
+            self.logger.warning("⚠️ 小红书 H5 页面中未找到可用视频流")
+            return None
+        return {
+            "type": "video",
+            "note_id": self._xhs_note_id(note) or uuid.uuid4().hex[:8],
+            "video_info": video_info,
+        }
 
     def _xhs_url_looks_video(self, share_url: str) -> bool:
         try:
@@ -833,192 +1127,123 @@ class XiaohongshuMixin:
         except Exception:
             return "type=video" in (share_url or "").lower()
 
-    def process_xhs_note(self, share_url: str) -> Optional[str]:
-        """获取小红书笔记并根据规则处理，返回文件路径。
-
-        优先使用 yt-dlp；失败后回退 TikHub，并保留原有 H5 视频兜底。
-        """
-        handled, ytdlp_path = self._process_xhs_note_with_ytdlp(share_url)
-        if handled:
-            return ytdlp_path
-        self.logger.info("🔄 小红书 yt-dlp 处理失败，回退 TikHub/H5")
-
-        token = (os.getenv("TIKHUB_API_TOKEN") or "").strip()
-        target_note_id = self._xhs_target_note_id(share_url)
-
-        # ---- 视频 H5 直解析兜底（无论有无 TikHub token 都可尝试） ----
-        h5_video_note: Optional[dict] = None
-
-        def _try_h5_video_fallback() -> Optional[dict]:
-            nonlocal h5_video_note
-            if h5_video_note is not None:
-                return h5_video_note
-            if not self._xhs_url_looks_video(share_url):
-                h5_video_note = False  # type: ignore
-                return None
-            note_data = self._xhs_fetch_video_note_from_h5(share_url)
-            h5_video_note = note_data or False  # type: ignore
-            return note_data
-
-        # ---- 先走 TikHub API ----
-        notes: list = []
-        video_from_tikhub_failed = False
-        if token:
-            res_json = self._xhs_fetch_note_response(token, share_url)
-            notes = self._xhs_extract_notes_from_response(res_json) if res_json else []
-            notes = self._xhs_select_target_notes(notes, target_note_id)
-            if notes:
-                # 检查 TikHub 视频笔记是否能提取到有效 URL
-                for note in notes:
-                    note_type = str(note.get("type") or note.get("note_type") or "").lower()
-                    video_info = self._xhs_get_video_info(note)
-                    if note_type == "video" or video_info:
-                        selected_url = self._xhs_extract_video_url(video_info)
-                        if not selected_url:
-                            video_from_tikhub_failed = True
-                            self.logger.info("TikHub 返回视频笔记但无法提取有效 MP4 URL，将尝试 H5 兜底")
-                        break
-
-        # ---- 视频兜底：TikHub 无结果或无有效视频 URL 时走 H5 ----
-        h5_note = (
-            _try_h5_video_fallback()
-            if video_from_tikhub_failed or not notes
-            else None
+    def _xhs_process_note_payload(
+        self,
+        note: Any,
+        *,
+        source: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Convert one H5/TikHub note payload into a WeChat-sendable artifact."""
+        if not isinstance(note, dict):
+            return False, None
+        note_type = str(note.get("type") or note.get("note_type") or "").lower()
+        images_list = (
+            note.get("image_list")
+            or note.get("imageList")
+            or note.get("images_list")
+            or note.get("images")
+            or []
         )
-        if h5_note:
-            video_info = h5_note.get("video_info", {})
-            duration = self._xhs_video_duration_seconds(video_info)
-            if duration > self.xhs_max_download_duration:
-                self.logger.info(
-                    f"跳过处理(H5): 视频时长为 {duration}s，"
-                    f"超过 {self.xhs_max_download_duration}s"
-                )
-                return None
-            selected_url = self._xhs_extract_video_url(video_info)
-            if selected_url:
-                uid = h5_note.get("note_id", uuid.uuid4().hex[:8])
+        if isinstance(images_list, dict):
+            images_list = [images_list]
+        video_info = self._xhs_get_video_info(note)
+        uid = self._xhs_note_id(note) or uuid.uuid4().hex[:8]
+
+        try:
+            if video_info or note_type == "video":
+                duration = self._xhs_video_duration_seconds(video_info)
+                if duration > self.xhs_max_download_duration:
+                    self.logger.info(
+                        "跳过视频下载(%s): 目标视频 %s 时长为 %ss，超过 %ss；将尝试字幕摘要",
+                        source,
+                        uid,
+                        duration,
+                        self.xhs_max_download_duration,
+                    )
+                    return True, None
+                selected_url = self._xhs_extract_video_url(video_info)
+                if not selected_url:
+                    self.logger.warning("⚠️ %s 小红书笔记未找到有效视频 URL", source)
+                    return False, None
                 tmp_dir = self._temp_dir("videos")
                 filepath = os.path.join(tmp_dir, f"xhs_video_{uid}.mp4")
                 self._xhs_download_file(selected_url, filepath)
-                self.logger.info(f"✅ H5 兜底下载小红书视频成功: {filepath}")
-                return filepath
-            self.logger.warning("H5 兜底也未找到有效视频 URL")
-            return None
+                self.logger.info("✅ %s 小红书视频下载成功: %s", source, filepath)
+                return True, filepath
 
-        # ---- 图片处理：仅走 TikHub API ----
-        if not notes:
-            if not token:
-                self.logger.warning("⚠️ 缺少 TikHub Token：请在 .env 设置 TIKHUB_API_TOKEN（图片提取需要）")
-            else:
-                self.logger.warning("未获取到有效小红书数据")
-            return None
-
-        try:
-            for note in notes:
-                note_type = str(note.get("type") or note.get("note_type") or "").lower()
-                images_list = note.get("image_list") or note.get("images_list") or note.get("images") or []
-                if isinstance(images_list, dict):
-                    images_list = [images_list]
-                video_info = self._xhs_get_video_info(note)
-                uid = note.get("note_id") or note.get("id") or uuid.uuid4().hex[:8]
-
-                # 规则 1: 视频处理（TikHub 成功路径）
-                if video_info or note_type == "video":
-                    duration = self._xhs_video_duration_seconds(video_info)
-                    if duration > self.xhs_max_download_duration:
-                        self.logger.info(
-                            f"跳过处理: 目标视频 {uid} 时长为 {duration}s，"
-                            f"超过 {self.xhs_max_download_duration}s"
-                        )
-                        return None
-
-                    selected_url = self._xhs_extract_video_url(video_info)
-                    if selected_url:
+            if images_list or note_type in ("normal", "image", "images"):
+                if len(images_list) == 1:
+                    live_video_url = self._xhs_extract_live_photo_video_url(images_list[0])
+                    if live_video_url:
                         tmp_dir = self._temp_dir("videos")
-                        filename = f"xhs_video_{uid}.mp4"
-                        filepath = os.path.join(tmp_dir, filename)
-                        self._xhs_download_file(selected_url, filepath)
-                        return filepath
-                    else:
-                        self.logger.warning("未找到有效视频 URL")
+                        filepath = os.path.join(tmp_dir, f"xhs_live_{uid}.mp4")
+                        self._xhs_download_file(live_video_url, filepath)
+                        self.logger.info("✅ %s 小红书 Live Photo 下载成功: %s", source, filepath)
+                        return True, filepath
 
-                # 规则 2: 单图或多图处理
-                elif images_list or note_type in ("normal", "image", "images"):
-                    img_count = len(images_list)
-                    if img_count == 1:
-                        live_video_url = self._xhs_extract_live_photo_video_url(images_list[0])
-                        if live_video_url:
-                            tmp_dir = self._temp_dir("videos")
-                            filepath = os.path.join(tmp_dir, f"xhs_live_{uid}.mp4")
-                            self._xhs_download_file(live_video_url, filepath)
-                            return filepath
+                image_urls = [
+                    image_url
+                    for image_url in (
+                        self._xhs_static_image_url(image_info)
+                        for image_info in images_list
+                    )
+                    if image_url
+                ]
+                if not image_urls:
+                    self.logger.warning("⚠️ %s 小红书笔记未找到图片原图 URL", source)
+                    return False, None
+                image_path = self._process_xhs_image_urls(image_urls, uid)
+                return (True, image_path) if image_path else (False, None)
 
-                        # 单张静态图逻辑
-                        img_url = self._xhs_static_image_url(images_list[0])
-                        if img_url:
-                            tmp_dir = self._temp_dir("images")
-                            temp_img = os.path.join(tmp_dir, f"temp_{uid}_raw")
-                            output_jpg = os.path.join(tmp_dir, f"xhs_img_{uid}.jpg")
+            self.logger.info(
+                "跳过处理(%s): 类型为 %s, 图片数量为 %s",
+                source,
+                note_type or "unknown",
+                len(images_list),
+            )
+            return False, None
+        except Exception as exc:
+            self.logger.warning("⚠️ %s 小红书媒体处理失败: %s", source, exc, exc_info=True)
+            return False, None
 
-                            self._xhs_download_file(img_url, temp_img)
-                            try:
-                                self._xhs_convert_to_jpg(temp_img, output_jpg)
-                                if os.path.exists(temp_img):
-                                    os.remove(temp_img)
-                                return output_jpg
-                            except Exception as e:
-                                self.logger.error(f"图片处理异常: {e}")
-                                if os.path.exists(temp_img):
-                                    os.remove(temp_img)
-                        else:
-                            self.logger.warning("未找到图片原图 URL")
+    def _xhs_process_note_payloads(
+        self,
+        notes: List[dict],
+        *,
+        source: str,
+    ) -> Tuple[bool, Optional[str]]:
+        for note in notes:
+            handled, file_path = self._xhs_process_note_payload(note, source=source)
+            if handled:
+                return True, file_path
+        return False, None
 
-                    elif img_count >= 2:
-                        # 多图合并逻辑
-                        process_count = min(img_count, self.xhs_max_images)
-                        self.logger.info(f"检测到多图 ({img_count} 张)，准备合并前 {process_count} 张为长图...")
-                        tmp_dir = self._temp_dir("images")
+    def process_xhs_note(self, share_url: str) -> Optional[str]:
+        """Resolve and process a Xiaohongshu note, returning an artifact path."""
+        resolved_share_url = self._xhs_resolve_share_url(share_url)
+        handled, ytdlp_path = self._process_xhs_note_with_ytdlp(resolved_share_url)
+        if handled:
+            return ytdlp_path
+        self.logger.info("🔄 小红书 yt-dlp 处理失败，优先回退免费 H5，再回退 TikHub")
 
-                        temp_files = []
-                        converted_images = []
+        h5_note = self._xhs_fetch_note_from_h5(resolved_share_url)
+        if h5_note:
+            handled, h5_path = self._xhs_process_note_payload(h5_note, source="H5")
+            if handled:
+                return h5_path
 
-                        try:
-                            for i, img_info in enumerate(images_list[:self.xhs_max_images]):
-                                img_url = self._xhs_static_image_url(img_info)
-                                if not img_url: continue
-
-                                raw_file = os.path.join(tmp_dir, f"temp_{uid}_{i}_raw")
-                                jpg_file = os.path.join(tmp_dir, f"temp_{uid}_{i}.jpg")
-
-                                self._xhs_download_file(img_url, raw_file)
-                                temp_files.append(raw_file)
-
-                                # 全部先转成 jpg 以便 Pillow 处理
-                                self._xhs_convert_to_jpg(raw_file, jpg_file)
-                                temp_files.append(jpg_file)
-                                converted_images.append(jpg_file)
-
-                            if converted_images:
-                                final_long_img = os.path.join(tmp_dir, f"xhs_long_img_{uid}.jpg")
-                                self._merge_images_vertically(converted_images, final_long_img)
-                                return final_long_img
-                        except Exception as e:
-                            self.logger.error(f"多图处理失败: {e}")
-                        finally:
-                            # 清理所有临时文件
-                            for f in temp_files:
-                                if os.path.exists(f):
-                                    try: os.remove(f)
-                                    except Exception:
-                                        pass
-                    else:
-                        self.logger.info(f"跳过处理: 图片数量为 {img_count}")
-
-                # 规则 3: 其他情况
-                else:
-                    self.logger.info(f"跳过处理: 类型为 {note_type}, 图片数量为 {len(images_list)}")
-
+        token = (os.getenv("TIKHUB_API_TOKEN") or "").strip()
+        if not token:
+            self.logger.warning("⚠️ 小红书 H5 未获取到可用媒体，且未配置 TikHub Token")
             return None
-        except Exception as e:
-            self.logger.error(f"处理小红书笔记时出错: {e}")
+
+        target_note_id = self._xhs_target_note_id(resolved_share_url)
+        res_json = self._xhs_fetch_note_response(token, resolved_share_url)
+        notes = self._xhs_extract_notes_from_response(res_json) if res_json else []
+        notes = self._xhs_select_target_notes(notes, target_note_id)
+        if not notes:
+            self.logger.warning("未获取到有效小红书数据")
             return None
+
+        _handled, file_path = self._xhs_process_note_payloads(notes, source="TikHub")
+        return file_path

@@ -21,10 +21,10 @@ logger = logging.getLogger(__name__)
 def check_summary_permission(chat_name: str) -> bool:
     """
     检查聊天是否启用了摘要功能
-    
+
     Args:
         chat_name: 聊天名称
-        
+
     Returns:
         是否启用摘要功能
     """
@@ -67,6 +67,7 @@ class WeChatMessage(BaseModel):
     message_id: Optional[str] = None
     url: Optional[str] = None
     quote_image_path: Optional[str] = None
+    quote_nickname: Optional[str] = None
     quote_content: Optional[str] = None
     has_quote_image: Optional[bool] = False
     file_id: Optional[str] = None
@@ -85,6 +86,10 @@ class WeChatMessage(BaseModel):
     quoted_file_status: Optional[str] = None
     quoted_file_candidate_count: Optional[int] = 0
     quoted_file_error: Optional[str] = None
+    is_tickle: bool = False
+    tickle_from: Optional[str] = None
+    tickle_to: Optional[str] = None
+    tickle_suffix: Optional[str] = None
     timestamp: float
 
 @router.post("/wechat_message")
@@ -95,7 +100,7 @@ async def receive_wechat_message(
 ):
     """接收来自wx_bot的消息并发布到事件总线"""
     logger.debug(f"Received internal message from wx_bot: {message.content[:50]}")
-    
+
     if not event_bus or not wechat_manager:
         logger.error("Event bus or WeChat manager not available")
         return {"status": "error", "message": "Core components not available"}
@@ -106,8 +111,10 @@ async def receive_wechat_message(
         or message.mtype == 'link' \
         or 'http' in message.content \
         or (message.type == 'other' and (message.content.strip().startswith('[链接]')))
-    
-    if is_link_message:
+
+    if message.is_tickle:
+        event_type = EventType.TICKLE_MESSAGE_RECEIVED
+    elif is_link_message:
         # 对于链接消息，先检查用户是否启用了摘要功能
         if check_summary_permission(message.chat_name):
             event_type = EventType.LINK_MESSAGE_RECEIVED
@@ -127,7 +134,7 @@ async def receive_wechat_message(
             event_type = EventType.QUOTE_IMAGE_MESSAGE_RECEIVED
         else:
             event_type = EventType.QUOTE_TEXT_MESSAGE_RECEIVED
-        
+
         # 同时发送通用的QUOTE事件以保持向后兼容
         general_quote_event = Event(
             type=EventType.QUOTE_MESSAGE_RECEIVED,
@@ -143,6 +150,7 @@ async def receive_wechat_message(
                 "message_id": message.message_id,
                 "url": message.url,
                 "quote_image_path": message.quote_image_path,
+                "quote_nickname": message.quote_nickname,
                 "quote_content": message.quote_content,
                 "has_quote_file": message.has_quote_file,
                 "quoted_file_id": message.quoted_file_id,
@@ -177,7 +185,7 @@ async def receive_wechat_message(
     elif message.mtype == 'note':
         event_type = EventType.NOTE_MESSAGE_RECEIVED
     elif message.mtype in {'other', 'miniapp', 'official', 'time', 'system'}:
-        # wxautox4 的公开类型集合比业务事件集合更细。当前没有这些类型的
+        # mabowx 的公开类型集合比业务事件集合更细。当前没有这些类型的
         # 专用插件事件，显式归一化为 OTHER，避免把“已识别但暂无专用消费者”误报为
         # 未知类型；原始 message_type 仍保留在 event.data 中供后续升级使用。
         event_type = EventType.OTHER_MESSAGE_RECEIVED
@@ -200,6 +208,7 @@ async def receive_wechat_message(
             "message_id": message.message_id,
             "url": message.url,
             "quote_image_path": message.quote_image_path,
+            "quote_nickname": message.quote_nickname,
             "quote_content": message.quote_content,
             "has_quote_image": message.has_quote_image,
             "file_id": message.file_id,
@@ -218,31 +227,35 @@ async def receive_wechat_message(
             "quoted_file_status": message.quoted_file_status,
             "quoted_file_candidate_count": message.quoted_file_candidate_count,
             "quoted_file_error": message.quoted_file_error,
+            "is_tickle": message.is_tickle,
+            "tickle_from": message.tickle_from,
+            "tickle_to": message.tickle_to,
+            "tickle_suffix": message.tickle_suffix,
             "timestamp": message.timestamp
         },
         context={
             "wx": wechat_manager
         }
     )
-    
+
     # 异步发布事件，避免阻塞请求
     await event_bus.publish_async(event)
-    
+
     # 更新WeChatManager统计信息
     if wechat_manager:
         wechat_manager._stats['messages_received'] += 1
         wechat_manager._stats['last_message_time'] = message.timestamp
-        
+
         # 更新聊天统计
         if message.chat_name in wechat_manager._listened_chats:
             wechat_manager._listened_chats[message.chat_name]['message_count'] += 1
-    
+
     logger.info(f"Published {event.type.value} event for chat: {message.chat_name}")
-    
+
     # 添加调试信息：检查用户权限
     from app.models.user_permission import WeChatUser
     from app.models.base import SessionLocal
-    
+
     try:
         db = SessionLocal()
         user = db.query(WeChatUser).filter(WeChatUser.chat_name == message.chat_name).first()
@@ -255,7 +268,7 @@ async def receive_wechat_message(
         logger.error(f"Error checking user permissions: {e}")
     finally:
         db.close()
-        
+
     return {"status": "success"}
 
 @router.get("/connectivity/websearch")

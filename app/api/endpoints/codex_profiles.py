@@ -17,7 +17,8 @@ router = APIRouter()
 class CodexProfileCreate(BaseModel):
     name: str = Field(min_length=1, max_length=48)
     auth_type: Literal["api_key", "chatgpt"] = "api_key"
-    model: str = Field(min_length=1, max_length=128)
+    auth_source: Literal["device_code", "local_cache"] = "device_code"
+    model: str = Field(default="", max_length=128)
     provider_name: str = Field(default="OpenAI Responses compatible", max_length=100)
     base_url: str = Field(default="", max_length=1000)
     api_key: str = Field(default="", max_length=4096)
@@ -27,6 +28,7 @@ class CodexProfileCreate(BaseModel):
     supports_vision: bool = False
     supports_web_search: bool = False
     make_default: bool = True
+    setup_pending: bool = False
 
 
 class CodexProfileUpdate(BaseModel):
@@ -42,11 +44,18 @@ class CodexProfileUpdate(BaseModel):
 
 
 class DefaultProfileUpdate(BaseModel):
-    profile_id: str = Field(default="", max_length=48)
+    profile_id: str = Field(min_length=1, max_length=48)
 
 
 class OAuthStartRequest(BaseModel):
     force: bool = False
+
+
+class CodexProfileFinalize(BaseModel):
+    model: str = Field(min_length=1, max_length=128)
+    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh", "max"]
+    model_verbosity: Literal["inherit", "low", "medium", "high"] = "inherit"
+    make_default: bool = True
 
 
 def _dump_set(model: BaseModel) -> Dict[str, Any]:
@@ -62,26 +71,112 @@ def _error(exc: CodexProfileError) -> HTTPException:
 @router.get("")
 def list_profiles() -> Dict[str, Any]:
     try:
-        return get_codex_profile_service().list_profiles()
+        result = get_codex_profile_service().list_profiles()
+        return {
+            **result,
+            "profiles": [
+                profile
+                for profile in result.get("profiles") or []
+                if profile.get("setup_status") != "pending"
+            ],
+        }
     except CodexProfileError as exc:
         raise _error(exc) from exc
 
+
+@router.post("/{profile_id}/setup/finalize")
+async def finalize_profile_setup(
+    profile_id: str,
+    request: CodexProfileFinalize,
+) -> Dict[str, Any]:
+    from app.services.codex_app_server import CodexAppServerError
+    from app.services.codex_oauth_service import get_codex_oauth_service
+
+    try:
+        return await asyncio.to_thread(
+            get_codex_oauth_service().finalize_setup,
+            profile_id,
+            _dump_set(request),
+        )
+    except (CodexProfileError, CodexAppServerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/{profile_id}/setup/cancel")
+async def cancel_profile_setup(profile_id: str) -> Dict[str, Any]:
+    from app.services.codex_app_server import CodexAppServerError
+    from app.services.codex_oauth_service import get_codex_oauth_service
+
+    service = get_codex_profile_service()
+    profile = service.get_profile(profile_id)
+    if not profile:
+        return {"name": profile_id, "deleted": False}
+    if profile.get("setup_status") != "pending":
+        raise HTTPException(status_code=409, detail="只能取消尚未完成的 Profile 创建向导")
+    oauth_service = get_codex_oauth_service()
+    try:
+        await asyncio.to_thread(oauth_service.cancel, profile_id)
+        result = await asyncio.to_thread(service.delete_profile, profile_id)
+        oauth_service.forget(profile_id)
+        return result
+    except (CodexProfileError, CodexAppServerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/{profile_id}/auth/sync")
+async def sync_profile_local_auth(profile_id: str) -> Dict[str, Any]:
+    """Force-copy and validate the current file-backed local Codex login."""
+    from app.services.codex_app_server import CodexAppServerError
+    from app.services.codex_oauth_service import get_codex_oauth_service
+
+    try:
+        return await asyncio.to_thread(
+            get_codex_oauth_service().import_local_auth,
+            profile_id,
+        )
+    except (CodexProfileError, CodexAppServerError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
 @router.post("")
-def create_profile(request: CodexProfileCreate) -> Dict[str, Any]:
+async def create_profile(request: CodexProfileCreate) -> Dict[str, Any]:
     from app.services.agent_runtime import get_agent_runtime
+    from app.services.codex_app_server import CodexAppServerError
+    from app.services.codex_oauth_service import get_codex_oauth_service
 
     runtime = get_agent_runtime()
     codex_bin = str(runtime.probe.codex_bin or "").strip()
     if not codex_bin:
         raise HTTPException(status_code=409, detail="请先完成 Codex 可执行文件配置")
+    service = get_codex_profile_service()
     try:
-        profile = get_codex_profile_service().create_profile(
+        profile = service.create_profile(
             _dump_set(request),
             codex_bin=codex_bin,
         )
-    except CodexProfileError as exc:
+        created_name = str(profile.get("name") or request.name).strip()
+        oauth_status = None
+        if request.auth_type == "chatgpt" and request.auth_source == "local_cache":
+            try:
+                oauth_status = await asyncio.to_thread(
+                    get_codex_oauth_service().import_local_auth,
+                    created_name,
+                )
+            except Exception:
+                # Creation and import form one operation. Do not retain a
+                # half-configured Profile when the copied login is invalid.
+                try:
+                    await asyncio.to_thread(service.delete_profile, created_name)
+                finally:
+                    get_codex_oauth_service().forget(created_name)
+                raise
+            profile = service.get_profile(created_name) or profile
+        return {
+            "profile": profile,
+            "requires_login": request.auth_type == "chatgpt" and oauth_status is None,
+            "oauth_status": oauth_status,
+        }
+    except (CodexProfileError, CodexAppServerError) as exc:
         raise _error(exc) from exc
-    return {"profile": profile, "requires_login": request.auth_type == "chatgpt"}
 
 
 @router.patch("/{profile_id}")

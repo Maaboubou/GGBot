@@ -5,6 +5,7 @@ FastAPI主应用程序
 import asyncio
 import logging
 import os
+from dotenv import load_dotenv
 
 from .utils.network_env import (
     configure_startup_network_environment,
@@ -13,7 +14,8 @@ from .utils.network_env import (
 from .utils.logging_utils import create_rotating_file_handler
 
 
-# app.main 也可能被 uvicorn 直接导入，因此在其他应用模块之前再次幂等配置。
+# app.main 也可能被 uvicorn 直接导入，因此在其他应用模块之前加载本地端口配置。
+load_dotenv()
 configure_startup_network_environment()
 preload_litellm_cost_map_direct()
 
@@ -32,15 +34,15 @@ from .core.plugin_manager import PluginManager
 from .core.wechat_manager import WeChatManager
 from .models.base import create_tables, SessionLocal
 from .api.endpoints import assistant, assistant_judges, assistant_roles, automation, backups, capabilities, chat_policies, codex_profiles, operations, system, settings, plugins, wechat, permissions, dashboard
+from .api.endpoints import codex_skills
 from .api import internal as internal_api
 from .api import codex_proxy
 from .api import codex_jobs
 from .api import llm_config
 from .api import litellm_updates
+from .api import tool_updates
 from .models import user_permission as models_permission
 from .models import setting as models_setting
-from dotenv import load_dotenv
-
 from .services.feishu_bitable_service import FeishuBitableService
 from .services.wechat_monitor_service import get_monitor_service
 from .utils.plugin_config import get_plugin_setting
@@ -62,7 +64,7 @@ logging.basicConfig(
 # 配置第三方库日志级别，减少噪音
 logging.getLogger("werkzeug").setLevel(logging.WARNING)  # 只记录警告以上
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)  # 禁用访问日志
-logging.getLogger("wxautox").setLevel(logging.INFO)  # 只记录INFO以上
+logging.getLogger("mabowx").setLevel(logging.INFO)
 logging.getLogger("requests").setLevel(logging.WARNING)  # requests库只记录警告
 logging.getLogger("urllib3").setLevel(logging.WARNING)  # urllib3库只记录警告
 logging.getLogger("app.plugins").setLevel(logging.WARNING)  # 插件注册日志设为警告以上
@@ -84,12 +86,12 @@ def ensure_initial_settings(db: SessionLocal):
 
     required_keys = [
         "OPENAI_API_KEY",
-        "LINKAI_API_KEY", 
+        "LINKAI_API_KEY",
         "PERPLEXITY_API_KEY",
         "GEMINI_API_KEY",
         "LINKAI_API_BASE",
         "FEISHU_APP_ID",
-        "FEISHU_APP_SECRET", 
+        "FEISHU_APP_SECRET",
         "FEISHU_APP_TYPE",
         "FEISHU_BITABLE_APP_TOKEN",
         "WECHAT_BOT_NAME",
@@ -113,8 +115,8 @@ def ensure_initial_settings(db: SessionLocal):
                 db.commit()
                 logger.debug(f"Successfully migrated '{key}' to database.")
             else:
-                logger.debug("'%s' 未配置；相关可选功能保持不可用", key)
-    
+                logger.warning(f"'{key}' not found in .env file. Some features may not work.")
+
     db.commit()
 
     _ensure_chatbot_role_output_columns(db)
@@ -123,7 +125,7 @@ def ensure_initial_settings(db: SessionLocal):
     _ensure_wechat_user_sender_blacklist_column(db)
     _ensure_wechat_user_bot_nickname_columns(db)
     _ensure_wechat_user_listener_preference_column(db)
-    
+
     # 创建默认的ChatBot角色
     _ensure_default_assistant_roles(db)
     # 创建默认的ChatBot Judge，并迁移绑定
@@ -328,7 +330,7 @@ def _ensure_default_assistant_roles(db: SessionLocal):
 def _get_system_default_judge_prompt() -> str:
     """系统内置默认 Judge 模板（template 模式）"""
     return """## Role
-你是一个谨慎的聊天群组观察员，负责判断 AI 助手是否应该参与当前对话。
+你是一个高情商的聊天群组观察员，你的名字是刘局(GG)。
 
 ## Context Background
 以下是最近约 30 条对话历史，用于你理解当前的聊天主题、语气和氛围。
@@ -346,8 +348,8 @@ def _get_system_default_judge_prompt() -> str:
    - 无法判断当前主题。
 2. **介入**：如果：
    - 用户表现出明显的困惑或在寻找答案。
-   - 有人明确提到机器人或请求 AI 帮助。
-   - 当前问题适合由 AI 提供事实、解释或建议。
+   - 话题出现冷场，且你有一个非常幽默的梗可以接（适合闲聊场景）。
+   - 有人提到了你的名字或暗示需要 AI 帮助。
 
 ## Output (Strict JSON)
 {
@@ -456,7 +458,7 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
         for name in (listener_status.get(key) or [])
         if name
     }
-    
+
     logger.debug("Syncing all listeners from database...")
     users = db.query(models_permission.WeChatUser).all()
     if not users:
@@ -482,7 +484,7 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
             logger.debug(f"Successfully started listening to '{user.chat_name}'.")
         else:
             logger.error(f"Failed to start listening to '{user.chat_name}'.")
-            
+
         current_permissions = {p.plugin_name for p in user.permissions}
         if not current_permissions:
             logger.debug(
@@ -500,9 +502,9 @@ def sync_all_listeners(db: SessionLocal, wechat_manager: WeChatManager, plugin_m
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     global event_bus, plugin_manager, wechat_manager, monitor_service, agent_runtime, assistant_runtime
-    
-    logger.info("Starting WeChat Automation Assistant...")
-    
+
+    logger.info("Starting Mabobot...")
+
     try:
         # 创建数据目录
         os.makedirs("data", exist_ok=True)
@@ -552,7 +554,7 @@ async def lifespan(app: FastAPI):
         event_bus = get_event_bus(db_session_factory=SessionLocal)
         await event_bus.start()
         logger.info("Event bus started")
-        
+
         # 4.1 初始化飞书服务并注入到事件总线上下文（需早于插件加载）
         try:
             feishu_service = FeishuBitableService()
@@ -577,7 +579,7 @@ async def lifespan(app: FastAPI):
                 "Core assistant is degraded; independent plugins remain available: %s",
                 assistant_runtime.status().get("error") or "unknown error",
             )
-        
+
         # 5. 初始化微信管理器
         wechat_manager = WeChatManager(event_bus=event_bus)
         if not wechat_manager.start():
@@ -589,12 +591,12 @@ async def lifespan(app: FastAPI):
                 event_bus.context["wx"] = wechat_manager
             except Exception:
                 pass
-        
+
         # 6. 同步所有已存在的监听器
         with SessionLocal() as db:
             if plugin_manager and wechat_manager:
                 sync_all_listeners(db, wechat_manager, plugin_manager)
-        
+
         # 注册微信重连事件监听，重连时从数据库全量恢复监听
         def on_wechat_reconnected(event):
             logger.info("Received WECHAT_RECONNECTED event, syncing listeners from database...")
@@ -602,7 +604,7 @@ async def lifespan(app: FastAPI):
             with SessionLocal() as db:
                 if plugin_manager and wechat_manager:
                     sync_all_listeners(db, wechat_manager, plugin_manager)
-                    
+
         if event_bus:
             event_bus.subscribe(
                 event_type=EventType.WECHAT_RECONNECTED,
@@ -610,7 +612,7 @@ async def lifespan(app: FastAPI):
                 plugin_name="system_main",
                 order_index=0
             )
-        
+
         # 7. 启动微信掉线监控服务
         if wechat_manager and wechat_manager.is_connected_cached():
             try:
@@ -624,7 +626,7 @@ async def lifespan(app: FastAPI):
                 logger.error(f"❌ 微信掉线监控服务初始化失败: {e}")
         else:
             logger.warning("⚠️ 微信管理器未连接，跳过掉线监控服务启动")
-        
+
         # 将管理器实例添加到应用状态
         app.state.event_bus = event_bus
         app.state.plugin_manager = plugin_manager
@@ -632,19 +634,19 @@ async def lifespan(app: FastAPI):
         app.state.monitor_service = monitor_service
         app.state.codex_runtime = agent_runtime
         app.state.assistant_runtime = assistant_runtime
-        
+
         logger.info("Application startup completed")
-        
+
         yield
-        
+
     except Exception as e:
         logger.error(f"Startup failed: {e}")
         raise
-    
+
     finally:
         # 清理资源
         logger.info("Shutting down application...")
-        
+
         if monitor_service:
             monitor_service.stop_monitoring()
             logger.info("WeChat monitor service stopped")
@@ -652,7 +654,7 @@ async def lifespan(app: FastAPI):
         if assistant_runtime:
             assistant_runtime.stop()
             logger.info("Core assistant stopped")
-        
+
         if plugin_manager:
             plugin_manager.stop_monitoring()
             unload_results = plugin_manager.unload_all_plugins()
@@ -681,11 +683,11 @@ async def lifespan(app: FastAPI):
         if wechat_manager:
             wechat_manager.stop()
             logger.info("WeChat manager stopped")
-        
+
         if event_bus:
             await event_bus.stop()
             logger.info("Event bus stopped")
-        
+
         logger.info("Application shutdown completed")
 
 
@@ -718,13 +720,14 @@ if cors_origins:
 app.include_router(system.router, prefix="/api/system", tags=["system"])
 app.include_router(backups.router, prefix="/api/backups", tags=["backups"])
 app.include_router(operations.router, prefix="/api/operations", tags=["operations"])
-app.include_router(settings.router, prefix="/api/settings", tags=["settings"])  
+app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 app.include_router(plugins.router, prefix="/api/plugins", tags=["plugins"])
 app.include_router(capabilities.router, prefix="/api/capabilities", tags=["capabilities"])
 app.include_router(automation.router, prefix="/api/automation", tags=["automation"])
 app.include_router(assistant.router, prefix="/api/assistant", tags=["assistant"])
 app.include_router(chat_policies.router, prefix="/api/chats", tags=["chat-policies"])
 app.include_router(codex_profiles.router, prefix="/api/codex/profiles", tags=["codex-profiles"])
+app.include_router(codex_skills.router, prefix="/api/codex/profiles", tags=["codex-skills"])
 app.include_router(wechat.router, prefix="/api/wechat", tags=["wechat"])
 app.include_router(internal_api.router, prefix="/api/internal", tags=["internal"])
 app.include_router(codex_proxy.router)
@@ -735,6 +738,7 @@ app.include_router(assistant_judges.router, prefix="/api/assistant/judges", tags
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(llm_config.router)  # LLM 配置管理 API（已包含 /api/llm 前缀）
 app.include_router(litellm_updates.router)
+app.include_router(tool_updates.router)
 
 # 静态文件服务（前端）
 # 挂载web目录作为静态文件服务
@@ -748,7 +752,7 @@ async def read_root():
     if os.path.exists(web_index):
         with open(web_index, 'r', encoding='utf-8') as f:
             return HTMLResponse(content=f.read())
-    
+
     # 如果没有前端文件，返回简单的状态页面
     return HTMLResponse(content="""
     <!DOCTYPE html>
@@ -809,7 +813,7 @@ if __name__ == "__main__":
     # 开发模式运行
     uvicorn.run(
         "app.main:app",
-        host=os.getenv("WEB_HOST", "0.0.0.0"),
+        host=os.getenv("WEB_HOST", "127.0.0.1"),
         port=int(os.getenv("WEB_PORT", "8888")),
         reload=True,
         log_level="info"

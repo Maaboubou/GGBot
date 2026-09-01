@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import math
 import os
 import re
 import shutil
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import requests
 
 from app.utils.plugin_config import get_config
+from app.utils.subprocess_utils import hidden_process_kwargs
 
 from .runtime_support import ArtifactLimitError
 from .ytdlp_cookie_service import ytdlp_browser_cookie_args
@@ -440,6 +442,57 @@ class MediaPipelineMixin:
             self.logger.warning("⚠️ 抖音 yt-dlp 下载异常，将回退 TikHub: %s", exc)
             return None
 
+    def _check_douyin_duration(self, share_url: str) -> Optional[int]:
+        """Use yt-dlp metadata to return a Douyin video's duration in seconds."""
+        share_url = self._extract_douyin_share_url(share_url or "") or ""
+        if not share_url:
+            return None
+
+        self.logger.info("⏱️ 正在通过 yt-dlp 检查抖音视频时长: %s", share_url)
+        try:
+            result = self._run_platform_ytdlp(
+                "douyin",
+                [
+                    "--skip-download",
+                    "--print",
+                    "%(duration)s",
+                    share_url,
+                ],
+                timeout_sec=30,
+            )
+        except subprocess.TimeoutExpired:
+            self.logger.warning("⚠️ 抖音 yt-dlp 获取时长超时（>30s）: %s", share_url)
+            return None
+        except FileNotFoundError:
+            self.logger.warning("⚠️ 未找到 yt-dlp，无法获取抖音视频时长")
+            return None
+        except Exception as exc:
+            self.logger.warning("⚠️ 抖音 yt-dlp 获取时长异常: %s", exc)
+            return None
+
+        if result.returncode != 0:
+            self._log_ytdlp_failure("抖音时长检测", result)
+            return None
+
+        for line in reversed((result.stdout or "").splitlines()):
+            value = line.strip()
+            if not value:
+                continue
+            try:
+                duration = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(duration) and duration > 0:
+                total_seconds = int(math.ceil(duration))
+                self.logger.info("✅ 抖音视频时长检测: %s秒", total_seconds)
+                return total_seconds
+
+        self.logger.warning(
+            "⚠️ 抖音 yt-dlp 未返回有效时长: %r",
+            (result.stdout or "").strip()[-200:],
+        )
+        return None
+
     def _download_video(self, url_list: List[str]) -> Optional[str]:
         """下载视频到临时文件，支持 fallback 机制遍历 url_list"""
         if not url_list:
@@ -553,6 +606,7 @@ class MediaPipelineMixin:
                 timeout=timeout_sec,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
             if result.returncode != 0:
                 self.logger.warning(
@@ -630,6 +684,7 @@ class MediaPipelineMixin:
                 timeout=timeout_sec,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
             if result.returncode != 0:
                 self.logger.warning(
@@ -722,7 +777,8 @@ class MediaPipelineMixin:
             result = subprocess.run(
                 cmd,
                 capture_output=True, text=True, timeout=yt_dlp_timeout_sec,
-                encoding='utf-8', errors='replace'
+                encoding='utf-8', errors='replace',
+                **hidden_process_kwargs(),
             )
 
             if result.returncode != 0:
@@ -805,7 +861,8 @@ class MediaPipelineMixin:
             result = subprocess.run(
                 cmd,
                 capture_output=True, text=True, timeout=600, # 增加超时到10分钟
-                encoding='utf-8', errors='replace'
+                encoding='utf-8', errors='replace',
+                **hidden_process_kwargs(),
             )
 
             if result.returncode == 0 and os.path.exists(filepath):
@@ -1056,6 +1113,7 @@ class MediaPipelineMixin:
                 timeout=20,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
             if result.returncode != 0:
                 return None
@@ -1084,6 +1142,7 @@ class MediaPipelineMixin:
                 timeout=20,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
             if result.returncode == 0:
                 codec = (result.stdout or "").strip().casefold()
@@ -1106,6 +1165,7 @@ class MediaPipelineMixin:
                 timeout=20,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
             if result.returncode == 0:
                 duration = float((result.stdout or "").strip())
@@ -1149,6 +1209,7 @@ class MediaPipelineMixin:
                 timeout=20,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
             if result.returncode != 0:
                 return None
@@ -1262,6 +1323,7 @@ class MediaPipelineMixin:
                 timeout=timeout_sec,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
         with ytdlp_browser_cookie_args(
             platform=platform,
@@ -1285,6 +1347,7 @@ class MediaPipelineMixin:
                 timeout=timeout_sec,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
 
     def _find_ytdlp_output(self, output_template: str) -> Optional[str]:
@@ -1412,6 +1475,7 @@ class MediaPipelineMixin:
                 timeout=900,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
         except subprocess.TimeoutExpired:
             self.logger.warning("⚠️ webmask 弹幕压制超时，将回退普通弹幕压制")
@@ -1513,7 +1577,15 @@ class MediaPipelineMixin:
                 output_path
             ]
 
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=600, encoding='utf-8', errors='replace')
+            result = subprocess.run(
+                ffmpeg_cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                encoding="utf-8",
+                errors="replace",
+                **hidden_process_kwargs(),
+            )
 
             if result.returncode == 0 and os.path.exists(output_path):
                 self.logger.info(f"✅ 弹幕压制与转换成功: {output_path}")
@@ -1545,14 +1617,29 @@ class MediaPipelineMixin:
         try:
             self.logger.info(f"🔄 正在转换视频为微信兼容格式: {input_path}")
             # ffmpeg -i 输入文件名.mp4 -c:v libx264 -pix_fmt yuv420p -c:a copy -movflags +faststart 输出文件名.mp4
-            result = subprocess.run([
-                self.ffmpeg_bin, '-y', '-i', input_path,
-                '-c:v', 'libx264',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'copy',
-                '-movflags', '+faststart',
-                output_path
-            ], capture_output=True, text=True, timeout=600, encoding='utf-8', errors='replace')
+            result = subprocess.run(
+                [
+                    self.ffmpeg_bin,
+                    "-y",
+                    "-i",
+                    input_path,
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    output_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                encoding="utf-8",
+                errors="replace",
+                **hidden_process_kwargs(),
+            )
 
             if result.returncode == 0 and os.path.exists(output_path):
                 self.logger.info(f"✅ 微信兼容格式转换成功: {output_path}")

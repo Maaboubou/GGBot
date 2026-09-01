@@ -2,8 +2,8 @@
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
   <dir>/usr/share/fonts</dir>
-  <dir>~/.local/share/fonts/wxautox</dir>
-  <cachedir>/tmp/wxautox-fontconfig-cache</cachedir>
+  <dir>~/.local/share/fonts/mabobot</dir>
+  <cachedir>/tmp/mabobot-fontconfig-cache</cachedir>
   <config>
     <rescan>
       <int>30</int>

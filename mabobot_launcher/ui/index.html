@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; style-src 'self'; script-src 'self' 'unsafe-eval'; img-src 'self' data:; font-src 'self' data:">
+    <meta name="theme-color" content="#faf9f5">
+    <title>Mabobot</title>
+    <link rel="icon" href="mabobot-icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <svg class="symbol-library" aria-hidden="true">
+        <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 12 16 8"/><path d="M5 18h14"/><path d="M7 12h.01M12 8h.01M17 12h.01"/></symbol>
+        <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></symbol>
+        <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 12h6M9 16h6"/></symbol>
+        <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
+        <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></symbol>
+        <symbol id="i-message" viewBox="0 0 24 24"><path d="M8.5 17.5c-3.6 0-6.5-2.4-6.5-5.4s2.9-5.4 6.5-5.4 6.5 2.4 6.5 5.4-2.9 5.4-6.5 5.4Z"/><path d="m5.2 16.5-1 3 3.1-2.2M15 9.5c3.9 0 7 2.4 7 5.4 0 1.5-.8 2.9-2 3.9l.8 2.2-2.8-1.5c-.9.4-1.9.7-3 .7-2.3 0-4.4-.9-5.6-2.3"/><path d="M6.5 12h.01M10.5 12h.01M13.5 15h.01M17.5 15h.01"/></symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-2 5"/></symbol>
+        <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 13v7H4V6h7"/></symbol>
+        <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4 10-10"/></symbol>
+        <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol>
+        <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 2v10M18.4 5.6a9 9 0 1 1-12.8 0"/></symbol>
+        <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5-5L12 3.6 9.6 6 7.3 3.7a4 4 0 0 0 5 5L21 17.4 17.4 21l-8.7-8.7"/></symbol>
+        <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v11H3z"/></symbol>
+        <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m5 7 4 4-4 4M11 17h8"/></symbol>
+        <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+        <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></symbol>
+        <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+        <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM7 7l1 14h8l1-14M10 11v6M14 11v6"/></symbol>
+    </svg>
+
+    <div class="window-shell">
+        <header class="titlebar pywebview-drag-region" id="titlebar">
+            <div class="brand-mark" aria-hidden="true"><img src="mabobot-icon.svg" alt=""></div>
+            <strong class="brand-name">Mabobot</strong>
+            <span class="brand-version" id="titleVersion">3.0.0</span>
+            <div class="titlebar-spacer"></div>
+            <div class="window-actions">
+                <button class="window-button" id="minimizeButton" aria-label="最小化"><span class="minus"></span></button>
+                <button class="window-button" id="maximizeButton" aria-label="最大化"><span class="square"></span></button>
+                <button class="window-button window-close" id="closeButton" aria-label="关闭到托盘"><span class="cross"></span></button>
+            </div>
+        </header>
+
+        <div class="workspace">
+            <aside class="sidebar">
+                <nav class="primary-nav" aria-label="启动器导航">
+                    <button class="nav-item is-active" data-page="overview"><svg><use href="#i-gauge"/></svg><span>概览</span></button>
+                    <button class="nav-item" data-page="services"><svg><use href="#i-layers"/></svg><span>服务</span></button>
+                    <button class="nav-item" data-page="logs"><svg><use href="#i-file"/></svg><span>日志</span><span class="nav-badge" id="logBadge" hidden>0</span></button>
+                    <button class="nav-item" data-page="settings"><svg><use href="#i-settings"/></svg><span>设置</span></button>
+                </nav>
+                <div class="sidebar-footer">
+                    <div class="quiet-status"><span class="presence-dot" id="sidebarDot"></span><span id="sidebarStatus">正在连接启动器</span></div>
+                    <button class="text-button" id="openFolderSide"><svg><use href="#i-folder"/></svg>项目目录</button>
+                </div>
+            </aside>
+
+            <main class="main-content">
+                <section class="page is-visible" id="page-overview" data-page-panel="overview">
+                    <div class="page-heading">
+                        <div><p class="eyebrow">MABOBOT DESKTOP</p><h1>运行与服务</h1></div>
+                    </div>
+
+                    <div class="status-strip">
+                        <div class="status-summary"><span class="presence-dot" id="overallDot"></span><strong id="overallLabel">正在读取状态</strong></div>
+                        <span class="strip-divider"></span>
+                        <div class="strip-stat"><span>微信</span><strong id="wechatStatus">检查中</strong></div>
+                        <span class="strip-divider"></span>
+                        <div class="strip-stat"><span>Web</span><strong id="webStatus">检查中</strong></div>
+                        <span class="strip-divider"></span>
+                        <div class="strip-stat"><span>已运行</span><strong id="uptimeValue">0 分钟</strong></div>
+                        <button class="button button-primary strip-action" data-action="open-web">打开控制台<svg><use href="#i-external"/></svg></button>
+                    </div>
+
+                    <div class="service-grid" id="overviewServices"></div>
+
+                    <div class="overview-grid">
+                        <article class="panel recent-panel">
+                            <div class="panel-heading"><h2>最近日志</h2><button class="inline-link" data-go-page="logs">查看全部 <span>→</span></button></div>
+                            <div class="recent-log-list" id="recentLogs"><div class="empty-state">等待服务日志</div></div>
+                        </article>
+
+                        <div class="overview-side">
+                            <article class="panel environment-panel">
+                                <div class="panel-heading"><h2>环境检查</h2><span class="subtle-label" id="environmentSummary">检查中</span></div>
+                                <div class="environment-list" id="environmentList"></div>
+                            </article>
+
+                            <article class="panel behavior-panel">
+                                <div class="panel-heading"><h2>启动行为</h2></div>
+                                <label class="switch-row" for="startupToggle">
+                                    <span class="setting-icon"><svg><use href="#i-power"/></svg></span>
+                                    <span class="switch-copy"><strong>随 Windows 登录启动</strong><small>当前用户 · 后台启动</small></span>
+                                    <input type="checkbox" id="startupToggle"><span class="switch" aria-hidden="true"></span>
+                                </label>
+                                <label class="switch-row dependent" for="autoLoginToggle" id="autoLoginRow">
+                                    <span class="setting-icon"><svg><use href="#i-check"/></svg></span>
+                                    <span class="switch-copy"><strong>启动前自动确认微信登录</strong><small id="autoLoginHint">依赖登录启动</small></span>
+                                    <input type="checkbox" id="autoLoginToggle"><span class="switch" aria-hidden="true"></span>
+                                </label>
+                            </article>
+                        </div>
+                    </div>
+
+                    <div class="page-actions">
+                        <button class="button button-secondary" data-action="repair"><svg><use href="#i-wrench"/></svg><span id="repairButtonText">修复环境</span></button>
+                        <button class="button button-danger" data-action="stop-all"><svg><use href="#i-stop"/></svg>停止全部</button>
+                    </div>
+                </section>
+
+                <section class="page" id="page-services" data-page-panel="services">
+                    <div class="page-heading page-heading-row">
+                        <div><p class="eyebrow">PROCESS SUPERVISOR</p><h1>服务</h1><p class="page-description">独立控制微信桥接与 Web 应用，异常退出时自动恢复。</p></div>
+                        <div class="heading-actions"><button class="button button-secondary" data-action="restart-all"><svg><use href="#i-refresh"/></svg>重启全部</button><button class="button button-primary" data-action="start-all"><svg><use href="#i-play"/></svg>启动全部</button></div>
+                    </div>
+                    <div class="detailed-services" id="detailedServices"></div>
+                    <article class="panel supervisor-note">
+                        <span class="setting-icon"><svg><use href="#i-info"/></svg></span>
+                        <div><h3>进程保护</h3><p>启动器只管理它创建的服务进程树；停止服务时保留可复用的浏览器进程。服务意外退出会退避重试，短时间频繁失败后自动暂停。</p></div>
+                    </article>
+                </section>
+
+                <section class="page page-logs" id="page-logs" data-page-panel="logs">
+                    <div class="page-heading page-heading-row">
+                        <div><p class="eyebrow">LIVE OUTPUT</p><h1>日志</h1><p class="page-description">汇总启动器、微信 Bot 与 Web 服务的实时输出。</p></div>
+                        <div class="heading-actions"><button class="button button-secondary" id="openLogsFolder"><svg><use href="#i-folder"/></svg>日志目录</button><button class="button button-quiet" id="clearLogs"><svg><use href="#i-trash"/></svg>清空视图</button></div>
+                    </div>
+                    <article class="panel log-panel">
+                        <div class="log-toolbar">
+                            <div class="segmented" id="logFilters">
+                                <button class="is-active" data-filter="all">全部</button>
+                                <button data-filter="系统">系统</button>
+                                <button data-filter="Web 服务">Web</button>
+                                <button data-filter="微信 Bot">微信 Bot</button>
+                                <button data-filter="error">异常</button>
+                            </div>
+                            <label class="follow-toggle"><input type="checkbox" id="followLogs" checked> 自动跟随</label>
+                        </div>
+                        <div class="log-stream" id="logStream"><div class="empty-state">尚无日志</div></div>
+                        <footer class="log-footer"><span id="logCount">0 条记录</span><span><span class="presence-dot is-running"></span>实时更新</span></footer>
+                    </article>
+                </section>
+
+                <section class="page" id="page-settings" data-page-panel="settings">
+                    <div class="page-heading"><div><p class="eyebrow">PREFERENCES</p><h1>设置</h1><p class="page-description">管理启动方式、窗口行为与本地环境。</p></div></div>
+                    <div class="settings-layout">
+                        <article class="panel settings-card">
+                            <div class="settings-card-heading"><span class="setting-icon"><svg><use href="#i-power"/></svg></span><div><h2>Windows 登录启动</h2><p>使用当前用户启动项，无需管理员权限。</p></div></div>
+                            <label class="settings-line" for="startupToggleSettings"><span><strong>随 Windows 登录启动</strong><small id="startupDetail">读取系统状态中</small></span><input type="checkbox" id="startupToggleSettings"><span class="switch" aria-hidden="true"></span></label>
+                            <label class="settings-line" for="autoLoginToggleSettings" id="autoLoginSettingsRow"><span><strong>自动确认微信登录</strong><small>桌面就绪后确认微信，再启动 Mabobot 服务</small></span><input type="checkbox" id="autoLoginToggleSettings"><span class="switch" aria-hidden="true"></span></label>
+                        </article>
+                        <article class="panel settings-card">
+                            <div class="settings-card-heading"><span class="setting-icon"><svg><use href="#i-gauge"/></svg></span><div><h2>窗口行为</h2><p>关闭窗口不会中断机器人运行。</p></div></div>
+                            <div class="settings-line readonly"><span><strong>关闭主窗口</strong><small>从托盘图标可以重新打开</small></span><span class="value-pill" id="closeBehavior">最小化到系统托盘</span></div>
+                            <div class="settings-line readonly"><span><strong>重复启动</strong><small>再次双击 START.bat 时恢复现有窗口</small></span><span class="value-pill">单实例</span></div>
+                        </article>
+                        <article class="panel settings-card wide-card">
+                            <div class="settings-card-heading"><span class="setting-icon"><svg><use href="#i-wrench"/></svg></span><div><h2>本地环境</h2><p>检查依赖、打开工作目录或执行完整修复。</p></div></div>
+                            <div class="settings-environment" id="settingsEnvironment"></div>
+                            <div class="settings-card-actions"><button class="button button-secondary" data-action="open-folder"><svg><use href="#i-folder"/></svg>打开项目目录</button><button class="button button-secondary" data-action="repair"><svg><use href="#i-wrench"/></svg>修复运行环境</button></div>
+                        </article>
+                    </div>
+                    <div class="danger-zone"><div><strong>退出 Mabobot</strong><p>停止微信 Bot 与 Web 服务，并关闭系统托盘进程。</p></div><button class="button button-danger" data-action="exit"><svg><use href="#i-power"/></svg>停止服务并退出</button></div>
+                </section>
+            </main>
+        </div>
+    </div>
+
+    <div class="modal-backdrop" id="confirmModal" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+            <span class="modal-icon"><svg><use href="#i-info"/></svg></span>
+            <h2 id="modalTitle">确认操作</h2>
+            <p id="modalMessage"></p>
+            <div class="modal-actions"><button class="button button-secondary" id="modalCancel">取消</button><button class="button button-danger" id="modalConfirm">确认</button></div>
+        </div>
+    </div>
+    <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+    <script src="app.js"></script>
+</body>
+</html>

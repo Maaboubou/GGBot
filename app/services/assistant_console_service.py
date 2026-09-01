@@ -207,7 +207,7 @@ class AssistantConsoleService:
             get_plugin_setting("assistant", "default_role", "default") or "default"
         )
         default_role = next((role for role in roles if role["name"] == default_role_name), None)
-        global_bot_name = str(get_setting("WECHAT_BOT_NAME", "微信助手") or "微信助手")
+        global_bot_name = str(get_setting("WECHAT_BOT_NAME", "刘局") or "刘局")
         from app.services.memory_console_service import MemoryConsoleService
 
         global_memory_config = MemoryConsoleService.global_memory_config()
@@ -403,15 +403,9 @@ class AssistantConsoleService:
                 if field_name == "codex_profile_id":
                     value = str(value or "").strip() or None
                     if value:
-                        from app.services.codex_profile_service import (
-                            CURRENT_CODEX_PROFILE_ID,
-                            get_codex_profile_service,
-                        )
+                        from app.services.codex_profile_service import get_codex_profile_service
 
-                        if (
-                            value != CURRENT_CODEX_PROFILE_ID
-                            and get_codex_profile_service().get_profile(value) is None
-                        ):
+                        if get_codex_profile_service().get_profile(value) is None:
                             raise AssistantConsoleError("Codex Profile 不存在")
                 setattr(permission, field_name, value)
             if "ignored_senders" in changes:

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mabobot Hermes"
+  short_description: "Operate and maintain local Mabobot over HTTP"
+  default_prompt: "Use $mabobot-hermes to operate the local Mabobot service and its logged-in WeChat account."

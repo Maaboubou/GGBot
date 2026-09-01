@@ -134,7 +134,7 @@ class CodexReplyGateway:
         requested_profile = str(request.codex_profile_id or "").strip()
         profile: Optional[Dict[str, Any]] = None
         runtime: Any = None
-        if requested_profile:
+        if requested_profile or self._runtime is None:
             try:
                 resolved = (
                     self._runtime_resolver(requested_profile)
@@ -148,6 +148,8 @@ class CodexReplyGateway:
             except Exception as exc:
                 raise AssistantReplyError(f"Codex Profile is unavailable: {exc}") from exc
         else:
+            # Explicit runtime injection is retained for isolated tests and
+            # embedders; production calls always resolve a managed Profile.
             runtime = self.runtime
 
         model = str((profile or {}).get("model") or self._model_resolver() or "").strip()
@@ -179,12 +181,13 @@ class CodexReplyGateway:
             if isinstance(item, dict) and str(item.get("path") or "").strip()
         ]
         if input_files:
-            payload["wxautox_input_files"] = input_files
+            payload["mabobot_input_files"] = input_files
         if request.allow_image_input:
-            payload["wxautox_allow_image_input"] = True
-            payload["extra_body"]["wxautox_allow_image_input"] = True
-        if requested_profile:
-            payload["codex_runtime_profile"] = requested_profile
+            payload["mabobot_allow_image_input"] = True
+            payload["extra_body"]["mabobot_allow_image_input"] = True
+        resolved_profile = str((profile or {}).get("name") or requested_profile)
+        if resolved_profile:
+            payload["codex_runtime_profile"] = resolved_profile
         try:
             profile_context_window = int((profile or {}).get("context_window") or 0)
         except (TypeError, ValueError):

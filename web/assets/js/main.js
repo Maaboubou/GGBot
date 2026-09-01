@@ -11,6 +11,7 @@ const App = {
     logControlsReady: false,
     isLoading: false,
     logFollowEnabled: false,
+    logProgrammaticScroll: false,
     currentLogContent: '',
     currentLogSearchQuery: '',
     currentLogSearchMatches: [],
@@ -19,6 +20,10 @@ const App = {
     lastLiveCodexStatus: null,
     webRestartSupported: false,
     webRestartUnavailableReason: '正在检查管理控制台状态…',
+    restartCapabilities: null,
+    botControlSupported: false,
+    botControlUnavailableReason: '正在检查管理控制台状态…',
+    botServiceRunning: null,
     automationView: 'library',
     automationCapabilities: [],
     automationRouting: null,
@@ -48,6 +53,7 @@ const App = {
         try {
             await API.system.checkHealth();
             await this.configureRestartControls();
+            await this.configureBotServiceControl();
 
             // Set up Polling
             this.startAutoRefresh();
@@ -72,6 +78,7 @@ const App = {
     async refreshCurrentTab() {
         if (document.hidden) return;
         if (this.isLoading) return;
+        await this.refreshBotServiceState({ quiet: true });
         // Don't auto-refresh settings or forms to avoid overwriting user input
         if (['settings', 'users', 'roles', 'llm'].includes(this.currentTab)) return;
 
@@ -149,6 +156,7 @@ const App = {
 
         try {
             const capabilities = await API.system.getRestartCapabilities();
+            this.restartCapabilities = capabilities;
             const webRestartSupported = capabilities?.signal_protocol >= 2
                 && capabilities?.services?.includes('web');
             this.webRestartSupported = webRestartSupported;
@@ -169,6 +177,92 @@ const App = {
             webButton.classList.add('text-secondary');
             webButton.setAttribute('aria-disabled', 'true');
             webButton.title = this.webRestartUnavailableReason;
+        }
+    },
+
+    async configureBotServiceControl() {
+        const toggle = document.getElementById('botServiceToggle');
+        if (!toggle) return;
+
+        try {
+            const capabilities = this.restartCapabilities || await API.system.getRestartCapabilities();
+            this.restartCapabilities = capabilities;
+            this.botControlSupported = capabilities?.signal_protocol >= 3
+                && capabilities?.controls?.includes('start-bot')
+                && capabilities?.controls?.includes('stop-bot');
+            this.botControlUnavailableReason = this.botControlSupported
+                ? ''
+                : '当前管理面板需要完整重启一次，才能使用 Bot 服务启停开关。';
+            await this.refreshBotServiceState();
+        } catch (error) {
+            this.botControlSupported = false;
+            this.botControlUnavailableReason = '无法确认 Bot 服务控制能力。请完整重启管理面板后重试。';
+            this.renderBotServiceControl({ running: false, supported: false });
+        }
+    },
+
+    renderBotServiceControl({ running, supported = this.botControlSupported, busy = false }) {
+        const control = document.getElementById('botServiceControl');
+        const toggle = document.getElementById('botServiceToggle');
+        const state = document.getElementById('botServiceState');
+        if (!control || !toggle || !state) return;
+
+        this.botServiceRunning = Boolean(running);
+        toggle.setAttribute('aria-checked', String(this.botServiceRunning));
+        toggle.disabled = !supported || busy;
+        control.classList.toggle('is-running', this.botServiceRunning && !busy);
+        control.classList.toggle('is-stopped', !this.botServiceRunning && !busy);
+        control.classList.toggle('is-unavailable', !supported);
+        control.classList.toggle('is-busy', busy);
+        state.textContent = busy ? (this.botServiceRunning ? '启动中' : '停止中') : (this.botServiceRunning ? '运行中' : '已停止');
+        control.title = supported
+            ? `Bot 服务${this.botServiceRunning ? '正在运行，关闭开关可停止服务' : '已停止，打开开关可启动服务'}`
+            : this.botControlUnavailableReason;
+    },
+
+    async refreshBotServiceState(options = {}) {
+        const toggle = document.getElementById('botServiceToggle');
+        if (!toggle) return false;
+        try {
+            const result = await API.system.getProcesses();
+            const running = Boolean(result?.processes?.wx_bot?.running);
+            this.renderBotServiceControl({ running });
+            return running;
+        } catch (error) {
+            if (!options.quiet) UI.showError('读取 Bot 服务状态失败：' + error.message);
+            return this.botServiceRunning;
+        }
+    },
+
+    async waitForBotServiceState(expectedRunning, timeoutMs = 12000) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const result = await API.system.getProcesses();
+            if (Boolean(result?.processes?.wx_bot?.running) === expectedRunning) return true;
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        return false;
+    },
+
+    async toggleBotService(enabled) {
+        const previousState = this.botServiceRunning;
+        if (!this.botControlSupported) {
+            this.renderBotServiceControl({ running: previousState, supported: false });
+            UI.showError(this.botControlUnavailableReason, 'alert');
+            return;
+        }
+
+        this.renderBotServiceControl({ running: enabled, busy: true });
+        try {
+            await API.system.controlBot(enabled ? 'start' : 'stop');
+            const reachedExpectedState = await this.waitForBotServiceState(enabled);
+            if (!reachedExpectedState) throw new Error(`等待 Bot 服务${enabled ? '启动' : '停止'}超时`);
+            this.renderBotServiceControl({ running: enabled });
+            UI.showSuccess(`Bot 服务已${enabled ? '启动' : '停止'}`);
+        } catch (error) {
+            const actualState = await this.refreshBotServiceState({ quiet: true });
+            this.renderBotServiceControl({ running: actualState });
+            UI.showError(`Bot 服务${enabled ? '启动' : '停止'}失败：${error.message}`);
         }
     },
 
@@ -2599,6 +2693,7 @@ const App = {
         const pluginFilter = document.getElementById('logPluginFilter');
         const searchInput = document.getElementById('logSearchInput');
         const linesSelect = document.getElementById('logLinesSelect');
+        const logContent = document.getElementById('logContent');
 
         if (pluginFilter) pluginFilter.addEventListener('change', debouncedLoad);
         if (linesSelect) linesSelect.addEventListener('change', debouncedLoad);
@@ -2613,6 +2708,16 @@ const App = {
                     this.applyLogSearch({ focus: false });
                 }
             });
+        }
+        if (logContent) {
+            let scrollFrame = null;
+            logContent.addEventListener('scroll', () => {
+                if (scrollFrame !== null) return;
+                scrollFrame = requestAnimationFrame(() => {
+                    scrollFrame = null;
+                    this.handleLogViewportScroll();
+                });
+            }, { passive: true });
         }
         this.logControlsReady = true;
     },
@@ -2713,7 +2818,10 @@ const App = {
 
                 // Show latest logs by default; keep following on subsequent refreshes when enabled.
                 if (!activeSearch && (this.logFollowEnabled || isInitialLoad || logTypeChanged)) {
+                    if (isInitialLoad || logTypeChanged) this.setLogFollowEnabled(true);
                     this.scrollLogToBottom(isInitialLoad);
+                } else {
+                    this.updateLogJumpLatest();
                 }
             }
         } catch (e) {
@@ -2724,24 +2832,54 @@ const App = {
     },
 
     toggleLogFollow() {
-        this.logFollowEnabled = !this.logFollowEnabled;
+        this.setLogFollowEnabled(!this.logFollowEnabled);
+        if (this.logFollowEnabled) this.scrollLogToBottom();
+    },
+
+    setLogFollowEnabled(enabled) {
+        this.logFollowEnabled = Boolean(enabled);
         const btn = document.getElementById('logFollowBtn');
         if (btn) {
-            if (this.logFollowEnabled) {
-                btn.classList.add('active');
-                btn.innerHTML = '<i class="bi bi-arrow-down-circle-fill"></i> 跟随中';
-                this.scrollLogToBottom();
-            } else {
-                btn.classList.remove('active');
-                btn.innerHTML = '<i class="bi bi-arrow-down-circle"></i> 跟随';
-            }
+            btn.classList.toggle('active', this.logFollowEnabled);
+            btn.setAttribute('aria-pressed', String(this.logFollowEnabled));
+            btn.title = this.logFollowEnabled ? '正在跟踪最新日志' : '自动跟踪最新日志';
+            const icon = btn.querySelector('i');
+            icon?.classList.toggle('bi-arrow-down-circle-fill', this.logFollowEnabled);
+            icon?.classList.toggle('bi-arrow-down-circle', !this.logFollowEnabled);
+            const label = btn.querySelector('.log-follow-label');
+            if (label) label.textContent = this.logFollowEnabled ? '跟随中' : '跟随';
         }
+    },
+
+    isLogViewportAtBottom() {
+        const container = document.getElementById('logContent');
+        if (!container) return true;
+        return container.scrollHeight - container.scrollTop - container.clientHeight <= 24;
+    },
+
+    updateLogJumpLatest() {
+        const button = document.getElementById('logJumpLatest');
+        if (!button) return;
+        button.classList.toggle('d-none', this.isLogViewportAtBottom());
+    },
+
+    handleLogViewportScroll() {
+        if (this.logProgrammaticScroll) return;
+        const atBottom = this.isLogViewportAtBottom();
+        if (!atBottom && this.logFollowEnabled) this.setLogFollowEnabled(false);
+        this.updateLogJumpLatest();
+    },
+
+    resumeLogFollow() {
+        this.setLogFollowEnabled(true);
+        this.scrollLogToBottom();
     },
 
     async applyLogSearch({ focus = true } = {}) {
         const input = document.getElementById('logSearchInput');
         const query = String(input?.value || '').trim();
         const queryChanged = query !== this.currentLogSearchQuery;
+        if (query) this.setLogFollowEnabled(false);
         await UI.renderLogs(this.currentLogContent, query);
         this.syncLogSearchMatches(query, {
             resetIndex: queryChanged,
@@ -2821,18 +2959,8 @@ const App = {
         const match = this.currentLogSearchMatches[this.currentLogSearchIndex];
         const line = match?.closest('.log-line');
         if (!container || !line) return;
-        const lineRect = line.getBoundingClientRect();
         const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-        if (window.innerWidth <= 768) {
-            const targetTop = window.scrollY + lineRect.top
-                - Math.max(0, (window.innerHeight - lineRect.height) / 2);
-            window.scrollTo({
-                top: Math.max(0, targetTop),
-                behavior: reducedMotion ? 'auto' : 'smooth',
-            });
-            return;
-        }
-
+        const lineRect = line.getBoundingClientRect();
         const containerRect = container.getBoundingClientRect();
         const targetTop = container.scrollTop
             + lineRect.top - containerRect.top
@@ -2844,30 +2972,17 @@ const App = {
         const el = document.getElementById('logContent');
         if (!el) return;
 
-        if (window.innerWidth <= 768) {
-            const scrollPageToLatest = () => {
-                const logsPage = document.getElementById('logs');
-                if (!logsPage || logsPage.classList.contains('d-none')) return;
-                const pageBottom = window.scrollY + logsPage.getBoundingClientRect().bottom;
-                window.scrollTo({ top: Math.max(0, pageBottom - window.innerHeight), behavior: 'auto' });
-            };
-            requestAnimationFrame(() => {
-                requestAnimationFrame(() => {
-                    scrollPageToLatest();
-                    window.setTimeout(scrollPageToLatest, 80);
-                });
-            });
-            return;
-        }
-
         if (resetViewport) {
             const mainContent = document.querySelector('.main-content');
             if (mainContent) mainContent.scrollTop = 0;
         }
+        this.logProgrammaticScroll = true;
         requestAnimationFrame(() => {
             el.scrollTop = el.scrollHeight;
             requestAnimationFrame(() => {
                 el.scrollTop = el.scrollHeight;
+                this.logProgrammaticScroll = false;
+                this.updateLogJumpLatest();
             });
         });
     },
@@ -2879,6 +2994,7 @@ const App = {
             UI.renderSystemSettings(settings);
             const activeGroup = document.getElementById('settings')?.dataset.activeSystemGroup;
             if (activeGroup === 'operations') await window.SystemOperations?.loadRuntime();
+            if (activeGroup === 'tools') await window.SystemTools?.load();
             if (activeGroup === 'backups') await window.SystemOperations?.loadBackups();
         } catch (e) {
             UI.showError('加载设置失败：' + e.message);

@@ -1,0 +1,119 @@
+{
+    "name": "image_editor",
+    "display_name": "图片编辑",
+    "version": "1.0.0",
+    "description": "使用Gemini API进行图片编辑，支持多张图片合成和文字描述",
+    "author": "System",
+    "category": "image",
+    "requires": [
+        "google-genai",
+        "boto3"
+    ],
+    "config_schema": {
+        "trigger_keyword": {
+            "type": "string",
+            "group": "trigger",
+            "description": "触发图片编辑的关键词（支持P图、P图2、P图 2等格式）",
+            "default": "P图"
+        },
+        "collect_timeout": {
+            "type": "integer",
+            "description": "图片收集超时时间(秒)",
+            "default": 30
+        },
+        "max_images": {
+            "type": "integer",
+            "description": "最多收集的图片数量",
+            "default": 5
+        },
+        "mode": {
+            "type": "select",
+            "description": "图片生成模式：apiqik 或 gemini",
+            "default": "gemini",
+            "options": [
+                "apiqik",
+                "gemini"
+            ]
+        },
+        "model_name": {
+            "type": "string",
+            "description": "使用的Gemini模型",
+            "default": "gemini-2.5-flash-image-preview"
+        },
+        "processing_timeout": {
+            "type": "integer",
+            "description": "图片处理超时时间(秒)",
+            "default": 60
+        },
+        "apiqik_models": {
+            "type": "array",
+            "description": "APIQIK模式按顺序尝试的模型列表",
+            "default": [
+                "gpt-image-2-flatfee-4k",
+                "gpt-image-2-flatfee",
+                "gpt-image-2-flatfee-2k",
+                "gpt-image-2-vip"
+            ]
+        },
+        "apiqik_concurrency": {
+            "type": "integer",
+            "description": "APIQIK每轮并发请求数量",
+            "default": 3
+        },
+        "apiqik_target_images": {
+            "type": "integer",
+            "description": "APIQIK每次最多成功发送的图片数量",
+            "default": 3
+        },
+        "apiqik_total_timeout": {
+            "type": "integer",
+            "description": "APIQIK一次任务的总等待时间(秒)",
+            "default": 300
+        },
+        "apiqik_group": {
+            "type": "string",
+            "description": "APIQIK 请求分组（group）",
+            "default": "mabobot-image-editor"
+        },
+        "apiqik_base_url": {
+            "type": "string",
+            "description": "APIQIK API 基础 URL",
+            "default": "https://value.apiqik.online"
+        },
+        "apiqik_env_file": {
+            "type": "string",
+            "description": "保存APIQIK与Cloudflare R2密钥的.env文件路径",
+            "default": ".env"
+        },
+        "apiqik_upload_cache_path": {
+            "type": "string",
+            "description": "本地参考图上传缓存文件路径；用感知哈希复用已上传到Cloudflare R2的图片URL",
+            "default": "data/image_editor_r2_upload_cache.json"
+        },
+        "apiqik_phash_distance": {
+            "type": "integer",
+            "description": "感知哈希匹配阈值，0表示只复用pHash完全一致的图片；可调到1-4允许轻微变化",
+            "default": 0
+        }
+    },
+    "trigger_keyword": "P图",
+    "collect_timeout": 30,
+    "max_images": 5,
+    "mode": "gemini",
+    "model_name": "gemini-2.5-flash-image-preview",
+    "processing_timeout": 60,
+    "apiqik_models": [
+        "gpt-image-2-flatfee-4k",
+        "gpt-image-2-flatfee",
+        "gpt-image-2-flatfee-2k",
+        "gpt-image-2-vip"
+    ],
+    "apiqik_concurrency": 3,
+    "apiqik_target_images": 3,
+    "apiqik_total_timeout": 300,
+    "apiqik_group": "mabobot-image-editor",
+    "apiqik_base_url": "https://value.apiqik.online",
+    "apiqik_env_file": ".env",
+    "apiqik_upload_cache_path": "data/image_editor_r2_upload_cache.json",
+    "apiqik_phash_distance": 0
+}

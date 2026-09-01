@@ -27,25 +27,39 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from app.services.codex_job_manager import codex_job_manager
+from app.services.codex_browser_tool import (
+    BrowserToolContext,
+    CodexBrowserToolError,
+    CodexBrowserToolService,
+    get_codex_browser_tool,
+)
 from app.services.file_tools_runtime import (
     build_codex_runtime_command,
     get_file_tools_runtime,
     runtime_permission_roots,
 )
+from app.utils.subprocess_utils import hidden_process_kwargs
 from app.services.codex_proxy.client import (
     CODEX_APPROVAL_POLICY,
     CODEX_APPROVALS_REVIEWER,
     CodexProxyError,
     _auto_review_config_args,
+    _artifact_output_dir_is_safe,
+    _artifact_request_dir_is_safe,
     _as_bool,
     _as_runtime_path,
     _collect_artifact_attachments,
     _detect_runtime_file_commands,
+    _direct_image_request_mode,
+    _is_link_like,
+    _materialize_codex_generated_image,
     _permission_profile_config_args,
+    _prepare_artifact_output_dir,
     _cleanup_expired_artifacts,
     _content_to_text,
     _default_text_for_attachments,
     _stage_input_files,
+    _successful_generated_image_paths,
     _write_image_url_to_file,
     _write_artifact_manifest,
     estimate_codex_usage,
@@ -56,6 +70,17 @@ from app.services.codex_proxy.client import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_EMPTY_RESPONSE_RECOVERY_PROMPT = (
+    "This is a one-shot recovery turn for the immediately preceding user request. "
+    "The preceding turn completed without an assistant final answer. Do not call any tools, "
+    "do not browse or search, and do not continue analysis. Using only the conversation, "
+    "images, and tool results already present in this same thread, answer the pending user "
+    "request now. Return only the final assistant answer and follow the required output schema "
+    "when one is configured."
+)
+_DYNAMIC_TOOL_BIND_TIMEOUT_SECONDS = 2.0
 
 
 class CodexAppServerError(CodexProxyError):
@@ -81,6 +106,7 @@ class _TurnTracker:
     unclassified_messages: List[str] = field(default_factory=list)
     commentary_messages: List[str] = field(default_factory=list)
     reasoning: List[str] = field(default_factory=list)
+    generated_image_paths: List[str] = field(default_factory=list)
     usage: Dict[str, Any] = field(default_factory=dict)
     usage_source: str = ""
     compacted: bool = False
@@ -98,6 +124,14 @@ class _MessageDelta:
     ephemeral_fingerprints: List[str]
     resume: bool
     rotation_reason: Optional[str] = None
+
+
+@dataclass
+class _ActiveDynamicToolContext:
+    token: str
+    browser: BrowserToolContext
+    turn_ids: set[str] = field(default_factory=set)
+    call_ids: set[str] = field(default_factory=set)
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -155,6 +189,7 @@ def _plan_message_delta(
     max_turns: int = 0,
     runtime_profile: str = "",
     access_signature: str = "",
+    dynamic_tool_signature: str = "",
     max_compactions: int = 0,
     idle_rotate_seconds: int = 0,
 ) -> _MessageDelta:
@@ -172,6 +207,8 @@ def _plan_message_delta(
         return _MessageDelta(list(messages), stable, ephemeral, False, "runtime_profile_changed")
     if access_signature and str(state.get("access_signature") or "") != access_signature:
         return _MessageDelta(list(messages), stable, ephemeral, False, "access_policy_changed")
+    if dynamic_tool_signature and str(state.get("dynamic_tool_signature") or "") != dynamic_tool_signature:
+        return _MessageDelta(list(messages), stable, ephemeral, False, "toolset_changed")
     if str(state.get("model") or "") != model:
         return _MessageDelta(list(messages), stable, ephemeral, False, "model_changed")
     if str(state.get("reasoning_effort") or "") != reasoning_effort:
@@ -443,6 +480,53 @@ def _accumulate_usage_total(
     }
 
 
+def _merge_attempt_usage(usages: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge the provider-reported usage of one logical request's retry turns."""
+    attempts = [dict(item) for item in usages if isinstance(item, dict) and item]
+    if not attempts:
+        return {}
+    if len(attempts) == 1:
+        return attempts[0]
+
+    merged = dict(attempts[-1])
+    merged["prompt_tokens"] = sum(int(item.get("prompt_tokens") or 0) for item in attempts)
+    merged["completion_tokens"] = sum(
+        int(item.get("completion_tokens") or 0) for item in attempts
+    )
+    merged["total_tokens"] = sum(int(item.get("total_tokens") or 0) for item in attempts)
+    merged["cache_miss_input_tokens"] = sum(
+        int(item.get("cache_miss_input_tokens") or 0) for item in attempts
+    )
+    merged["prompt_tokens_details"] = {
+        "cached_tokens": sum(
+            int((item.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+            for item in attempts
+            if isinstance(item.get("prompt_tokens_details"), dict)
+        )
+    }
+    merged["completion_tokens_details"] = {
+        "reasoning_tokens": sum(
+            int((item.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0)
+            for item in attempts
+            if isinstance(item.get("completion_tokens_details"), dict)
+        )
+    }
+    merged["estimated"] = any(bool(item.get("estimated")) for item in attempts)
+    merged["cache_data_available"] = all(
+        bool(item.get("cache_data_available")) for item in attempts
+    )
+    merged["source"] = "codex_app_server.empty_response_retry_aggregate"
+
+    # A provider's latest cumulative session total already includes both turns.
+    # Preserve it instead of summing cumulative values and double-counting history.
+    for item in reversed(attempts):
+        session_total = item.get("session_total")
+        if isinstance(session_total, dict):
+            merged["session_total"] = dict(session_total)
+            break
+    return merged
+
+
 def _merge_usage_accuracy(previous: Any, current: Any) -> str:
     """Describe whether an accumulated total is reported, estimated or partial."""
     prior = str(previous or "").strip().lower()
@@ -652,6 +736,8 @@ class CodexAppServerManager:
         codex_version: str = "",
         schema_hash: str = "",
         experimental_api: bool = False,
+        permission_read_roots: Optional[Iterable[str]] = None,
+        browser_tool: Optional[CodexBrowserToolService] = None,
     ) -> None:
         configured_bin = codex_bin or os.getenv("CODEX_PROXY_BIN")
         self.codex_bin = configured_bin or shutil.which("codex") or "codex"
@@ -680,6 +766,18 @@ class CodexAppServerManager:
         self.codex_version = str(codex_version or "")
         self.schema_hash = str(schema_hash or "")
         self.experimental_api = bool(experimental_api)
+        self.permission_read_roots = tuple(
+            dict.fromkeys(
+                str(path).strip()
+                for path in permission_read_roots or ()
+                if str(path).strip().startswith("/")
+            )
+        )
+        self.browser_tool = browser_tool or get_codex_browser_tool()
+        self.dynamic_tool_specs = (
+            self.browser_tool.dynamic_tool_specs() if self.browser_tool.enabled else []
+        )
+        self.dynamic_tool_signature = self.browser_tool.tool_signature()
 
         self._lifecycle_lock = threading.RLock()
         self._write_lock = threading.Lock()
@@ -689,6 +787,9 @@ class CodexAppServerManager:
         self._chat_locks: Dict[str, threading.Lock] = {}
         self._pending: Dict[int, _PendingRequest] = {}
         self._notification_lock = threading.RLock()
+        self._dynamic_tool_lock = threading.RLock()
+        self._dynamic_tool_condition = threading.Condition(self._dynamic_tool_lock)
+        self._dynamic_tool_contexts: Dict[str, _ActiveDynamicToolContext] = {}
         self._notification_handlers: Dict[str, List[Callable[[Dict[str, Any]], None]]] = {}
         self._turns: Dict[str, _TurnTracker] = {}
         self._loaded_threads: Dict[str, str] = {}
@@ -711,11 +812,15 @@ class CodexAppServerManager:
             if self.use_wsl
             else None
         )
+        permission_read_roots = (
+            *runtime_permission_roots(runtime_capabilities),
+            *self.permission_read_roots,
+        )
         args.extend(
             _permission_profile_config_args(
-                "wxautox-chat-isolated",
+                "mabobot-chat-isolated",
                 runtime_uid=(runtime_capabilities or {}).get("uid"),
-                runtime_read_roots=runtime_permission_roots(runtime_capabilities),
+                runtime_read_roots=permission_read_roots,
             )
         )
         return build_codex_runtime_command(
@@ -749,6 +854,11 @@ class CodexAppServerManager:
             "idle_rotate_seconds": self.idle_rotate_seconds,
             "last_error": self._last_error or None,
             "last_diagnostic": self._stderr_tail[-1] if self._stderr_tail else None,
+            "browser_tool": self.browser_tool.status(),
+            "dynamic_tool_count": sum(
+                len(spec.get("tools") or []) if spec.get("type") == "namespace" else 1
+                for spec in self.dynamic_tool_specs
+            ),
         }
 
     def invalidate_chat(self, chat_id: str, *, reason: str = "manual_reset") -> None:
@@ -976,7 +1086,7 @@ class CodexAppServerManager:
                 "bufsize": 1,
             }
             if os.name == "nt":
-                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                popen_kwargs.update(hidden_process_kwargs(new_process_group=True))
             else:
                 popen_kwargs["start_new_session"] = True
             try:
@@ -1005,8 +1115,8 @@ class CodexAppServerManager:
             try:
                 initialize_params: Dict[str, Any] = {
                     "clientInfo": {
-                        "name": "wxautox4",
-                        "title": "wxautox4",
+                        "name": "mabobot",
+                        "title": "mabobot",
                         "version": "2.0.0",
                     },
                 }
@@ -1146,6 +1256,15 @@ class CodexAppServerManager:
     def _handle_server_request(self, message: Dict[str, Any]) -> None:
         method = str(message.get("method") or "")
         request_id = message.get("id")
+        if method == "item/tool/call":
+            worker = threading.Thread(
+                target=self._execute_dynamic_tool_request,
+                args=(dict(message),),
+                name="codex-dynamic-tool",
+                daemon=True,
+            )
+            worker.start()
+            return
         # Eligible escalation requests are handled by Codex Auto-review before
         # they reach this client. Anything still surfaced here requires a
         # client or human decision, so keep the fallback fail-closed instead of
@@ -1167,6 +1286,123 @@ class CodexAppServerManager:
             self._send(response)
         except Exception:
             logger.debug("Failed to reject Codex App Server request %s", method, exc_info=True)
+
+    def _claim_dynamic_tool_context(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        call_id: str,
+    ) -> _ActiveDynamicToolContext:
+        if not thread_id or not turn_id or not call_id:
+            raise CodexBrowserToolError("dynamic browser call identifiers are incomplete")
+        deadline = time.monotonic() + _DYNAMIC_TOOL_BIND_TIMEOUT_SECONDS
+        with self._dynamic_tool_condition:
+            active = self._dynamic_tool_contexts.get(thread_id)
+            if active is None:
+                raise CodexBrowserToolError("browser call is not bound to an active chat turn")
+            while not active.turn_ids:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CodexBrowserToolError(
+                        "browser call arrived before its chat turn was bound"
+                    )
+                self._dynamic_tool_condition.wait(timeout=remaining)
+                active = self._dynamic_tool_contexts.get(thread_id)
+                if active is None:
+                    raise CodexBrowserToolError(
+                        "browser call is not bound to an active chat turn"
+                    )
+            if turn_id not in active.turn_ids:
+                raise CodexBrowserToolError("browser call turn does not match the active chat turn")
+            if call_id in active.call_ids:
+                raise CodexBrowserToolError("duplicate browser call was rejected")
+            active.call_ids.add(call_id)
+            return active
+
+    def _execute_dynamic_tool_request(self, message: Dict[str, Any]) -> None:
+        request_id = message.get("id")
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        thread_id = str(params.get("threadId") or "")
+        turn_id = str(params.get("turnId") or "")
+        call_id = str(params.get("callId") or "")
+        namespace = params.get("namespace")
+        tool = params.get("tool")
+        started_at = time.monotonic()
+        active: Optional[_ActiveDynamicToolContext] = None
+        success = False
+        try:
+            active = self._claim_dynamic_tool_context(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                call_id=call_id,
+            )
+            codex_job_manager.record_event(
+                active.browser.request_id,
+                "dynamic_tool_started",
+                {
+                    "namespace": str(namespace or ""),
+                    "tool": str(tool or ""),
+                    "turn_id": turn_id,
+                    "call_id": call_id,
+                },
+                current_item_type="dynamicToolCall",
+                current_item_status="in_progress",
+                current_item_summary=" / ".join(
+                    part for part in (str(namespace or ""), str(tool or "")) if part
+                ),
+            )
+            result = self.browser_tool.execute(
+                namespace=namespace,
+                tool=tool,
+                arguments=params.get("arguments"),
+                context=active.browser,
+            )
+            output_text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            success = True
+        except CodexBrowserToolError as exc:
+            output_text = json.dumps(
+                {"error": str(exc), "tool": str(tool or "")},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except Exception:
+            logger.exception("Unexpected Codex browser tool failure")
+            output_text = json.dumps(
+                {
+                    "error": "browser tool failed unexpectedly; inspect application logs",
+                    "tool": str(tool or ""),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        response = {
+            "id": request_id,
+            "result": {
+                "success": success,
+                "contentItems": [{"type": "inputText", "text": output_text}],
+            },
+        }
+        try:
+            self._send(response)
+        except Exception:
+            logger.debug("Failed to return Codex dynamic tool result", exc_info=True)
+        if active is not None:
+            elapsed_ms = max(0, int((time.monotonic() - started_at) * 1000))
+            codex_job_manager.record_event(
+                active.browser.request_id,
+                "dynamic_tool_completed" if success else "dynamic_tool_failed",
+                {
+                    "namespace": str(namespace or ""),
+                    "tool": str(tool or ""),
+                    "turn_id": turn_id,
+                    "call_id": call_id,
+                    "success": success,
+                    "duration_ms": elapsed_ms,
+                },
+                current_item_status="completed" if success else "failed",
+            )
 
     def _tracker(self, turn_id: str) -> _TurnTracker:
         with self._turn_lock:
@@ -1205,6 +1441,111 @@ class CodexAppServerManager:
                         self._append_unique(tracker.reasoning, part.get("text"))
                     else:
                         self._append_unique(tracker.reasoning, part)
+        for saved_path in _successful_generated_image_paths(item):
+            self._append_unique(tracker.generated_image_paths, saved_path)
+
+    def _collect_response_attachments(
+        self,
+        *,
+        output_dir: Path,
+        turn_trackers: Iterable[_TurnTracker],
+        image_request_mode: Optional[str],
+        request_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Collect outputs and host-recover direct imagegen results when needed."""
+        if not _artifact_output_dir_is_safe(output_dir):
+            codex_job_manager.record_event(
+                request_id,
+                "artifact_boundary_violation",
+                {},
+            )
+            raise CodexAppServerError("Codex artifact output directory became unsafe")
+        attachments = _collect_artifact_attachments(output_dir)
+        if not image_request_mode or any(
+            attachment.get("type") == "image" for attachment in attachments
+        ):
+            return attachments
+
+        generated_paths: List[str] = []
+        for tracker in turn_trackers:
+            for saved_path in tracker.generated_image_paths:
+                if saved_path and saved_path not in generated_paths:
+                    generated_paths.append(saved_path)
+        if not generated_paths:
+            return attachments
+
+        selected_paths = (
+            generated_paths
+            if image_request_mode == "multiple"
+            else generated_paths[-1:]
+        )
+        materialized_paths: List[Path] = []
+        for index, saved_path in enumerate(selected_paths, start=1):
+            materialized = _materialize_codex_generated_image(
+                saved_path,
+                output_dir=output_dir,
+                index=index,
+                use_wsl=self.use_wsl,
+            )
+            if materialized is not None:
+                materialized_paths.append(materialized)
+
+        if len(materialized_paths) != len(selected_paths):
+            for path in materialized_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove partial recovered image: %s", path)
+            codex_job_manager.record_event(
+                request_id,
+                "image_artifact_recovery_failed",
+                {
+                    "generated_path_count": len(generated_paths),
+                    "selected_path_count": len(selected_paths),
+                    "materialized_path_count": len(materialized_paths),
+                    "request_mode": image_request_mode,
+                },
+            )
+            raise CodexAppServerError(
+                "Codex App Server generated an image but could not materialize its attachment"
+                if not materialized_paths
+                else "Codex App Server generated image output was only partially materialized"
+            )
+
+        attachments = _collect_artifact_attachments(output_dir)
+        recovered_images = [
+            attachment for attachment in attachments if attachment.get("type") == "image"
+        ]
+        if recovered_images:
+            codex_job_manager.record_event(
+                request_id,
+                "image_artifact_recovered",
+                {
+                    "attachment_count": len(recovered_images),
+                    "generated_path_count": len(generated_paths),
+                    "request_mode": image_request_mode,
+                },
+            )
+            logger.info(
+                "Codex App Server recovered %s generated image attachment(s) for request %s",
+                len(recovered_images),
+                request_id,
+            )
+            return attachments
+
+        codex_job_manager.record_event(
+            request_id,
+            "image_artifact_recovery_failed",
+            {
+                "generated_path_count": len(generated_paths),
+                "selected_path_count": len(selected_paths),
+                "materialized_path_count": len(materialized_paths),
+                "request_mode": image_request_mode,
+            },
+        )
+        raise CodexAppServerError(
+            "Codex App Server generated an image but could not materialize its attachment"
+        )
 
     @staticmethod
     def _public_item_event(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1580,6 +1921,55 @@ class CodexAppServerManager:
                 tracker.status = "failed"
                 tracker.completed.set()
 
+    def _activate_dynamic_tool_context(
+        self,
+        *,
+        thread_id: str,
+        browser_context: BrowserToolContext,
+    ) -> str:
+        if not self.dynamic_tool_specs:
+            return ""
+        token = uuid.uuid4().hex
+        with self._dynamic_tool_lock:
+            if thread_id in self._dynamic_tool_contexts:
+                raise CodexAppServerError("Codex thread already has an active dynamic-tool context")
+            self._dynamic_tool_contexts[thread_id] = _ActiveDynamicToolContext(
+                token=token,
+                browser=browser_context,
+            )
+        return token
+
+    def _bind_dynamic_tool_turn(self, thread_id: str, turn_id: str) -> None:
+        with self._dynamic_tool_condition:
+            active = self._dynamic_tool_contexts.get(thread_id)
+            if active is not None and turn_id:
+                active.turn_ids.add(turn_id)
+                self._dynamic_tool_condition.notify_all()
+
+    def _deactivate_dynamic_tool_context(self, thread_id: str, token: str) -> None:
+        if not token:
+            return
+        active: Optional[_ActiveDynamicToolContext] = None
+        with self._dynamic_tool_condition:
+            candidate = self._dynamic_tool_contexts.get(thread_id)
+            if candidate is not None and candidate.token == token:
+                active = self._dynamic_tool_contexts.pop(thread_id)
+                self._dynamic_tool_condition.notify_all()
+        if active is None:
+            return
+        scratch_root = active.browser.scratch_root
+        request_dir = active.browser.request_dir
+        try:
+            if (
+                _artifact_request_dir_is_safe(request_dir)
+                and not _is_link_like(scratch_root)
+                and scratch_root.parent.resolve(strict=True) == request_dir.resolve(strict=True)
+                and scratch_root.is_dir()
+            ):
+                shutil.rmtree(scratch_root)
+        except OSError:
+            logger.warning("Could not clean browser scratch directory: %s", scratch_root)
+
     def _chat_lock(self, chat_id: str) -> threading.Lock:
         with self._chat_locks_lock:
             return self._chat_locks.setdefault(chat_id, threading.Lock())
@@ -1618,6 +2008,7 @@ class CodexAppServerManager:
                 str(workdir.resolve()),
                 permission_profile,
                 approval_policy,
+                self.dynamic_tool_signature,
             )
         )
 
@@ -1660,6 +2051,7 @@ class CodexAppServerManager:
                 "approvalPolicy": approval_policy,
                 "ephemeral": bool(ephemeral),
                 "config": thread_config,
+                **({"dynamicTools": self.dynamic_tool_specs} if self.dynamic_tool_specs else {}),
                 **execution_policy,
             },
             timeout=min(timeout, 120),
@@ -1735,6 +2127,74 @@ class CodexAppServerManager:
         if resumed_id != thread_id:
             raise _ResumeThreadError("Codex App Server resumed an unexpected thread")
         self._loaded_threads[thread_id] = config_signature
+
+    def _start_tracked_turn(
+        self,
+        *,
+        request_id: str,
+        thread_id: str,
+        turn_input: List[Dict[str, Any]],
+        turn_options: Dict[str, Any],
+        timeout: int,
+        recovery_attempt: bool = False,
+    ) -> Tuple[str, _TurnTracker]:
+        """Start one App Server turn and wait for its terminal notification."""
+        result = self._request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": turn_input,
+                **turn_options,
+            },
+            timeout=min(timeout, 120),
+        )
+        turn = result.get("turn") if isinstance(result, dict) else {}
+        turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
+        if not turn_id:
+            raise CodexAppServerError("Codex App Server turn/start returned no turn id")
+        self._bind_dynamic_tool_turn(thread_id, turn_id)
+
+        tracker = self._tracker(turn_id)
+        tracker.request_id = request_id
+        tracker.thread_id = thread_id
+        codex_job_manager.update(
+            request_id,
+            status="running",
+            turn_id=turn_id,
+            recovery_attempt=bool(recovery_attempt),
+            _cancel_callback=lambda: self._interrupt_turn(thread_id, turn_id),
+        )
+        if not tracker.started_recorded:
+            codex_job_manager.record_event(
+                request_id,
+                "turn_started",
+                {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "recovery_attempt": bool(recovery_attempt),
+                },
+                status="running",
+            )
+            tracker.started_recorded = True
+
+        try:
+            if not tracker.completed.wait(timeout=timeout):
+                self._interrupt_turn(thread_id, turn_id)
+                raise CodexAppServerError(
+                    f"Codex App Server turn timed out after {timeout}s"
+                )
+            if not tracker.usage:
+                tracker.usage_ready.wait(timeout=2)
+            if tracker.error or tracker.status not in {"completed", "complete"}:
+                raise CodexAppServerError(
+                    tracker.error
+                    or f"Codex App Server turn ended with status {tracker.status}"
+                )
+            return turn_id, tracker
+        except Exception:
+            with self._turn_lock:
+                self._turns.pop(turn_id, None)
+            raise
 
     def _interrupt_turn(self, thread_id: str, turn_id: str) -> None:
         try:
@@ -1864,7 +2324,7 @@ class CodexAppServerManager:
         if reasoning_summary not in {"inherit", "none", "auto", "concise", "detailed"}:
             reasoning_summary = "inherit"
         allow_image_input = _as_bool(
-            request.get("wxautox_allow_image_input", extra_body.get("wxautox_allow_image_input")),
+            request.get("mabobot_allow_image_input", extra_body.get("mabobot_allow_image_input")),
             False,
         )
         timeout = _positive_int(request.get("timeout"), 600)
@@ -1954,6 +2414,7 @@ class CodexAppServerManager:
             max_turns=max_turns,
             runtime_profile=runtime_profile,
             access_signature=access_signature,
+            dynamic_tool_signature=self.dynamic_tool_signature,
             max_compactions=self.max_compactions,
             idle_rotate_seconds=self.idle_rotate_seconds,
         )
@@ -2039,23 +2500,58 @@ class CodexAppServerManager:
         )
         if not artifact_root.is_absolute():
             artifact_root = Path(self.workdir) / artifact_root
+        request_dir, output_dir = _prepare_artifact_output_dir(
+            artifact_root,
+            request_id,
+            fail_closed=permission_profile == "mabobot-chat-isolated",
+        )
         _cleanup_expired_artifacts(artifact_root)
-        request_dir = artifact_root / request_id
-        output_dir = request_dir / "outputs"
-        output_dir.mkdir(parents=True, exist_ok=True)
         staged_input_files = _stage_input_files(
-            request.get("wxautox_input_files", extra_body.get("wxautox_input_files")),
+            request.get("mabobot_input_files", extra_body.get("mabobot_input_files")),
             request_dir=request_dir,
             use_wsl=self.use_wsl,
         )
         runtime_output_dir = _as_runtime_path(output_dir, self.use_wsl)
+        browser_context: Optional[BrowserToolContext] = None
+        if self.dynamic_tool_specs:
+            if not _artifact_request_dir_is_safe(request_dir):
+                raise CodexAppServerError("Codex browser request directory failed safety validation")
+            browser_scratch_root = request_dir / ".browser"
+            browser_scratch_root.mkdir()
+            if _is_link_like(browser_scratch_root) or not browser_scratch_root.is_dir():
+                raise CodexAppServerError("Codex browser scratch directory is unsafe")
+            browser_context = BrowserToolContext(
+                request_id=request_id,
+                chat_id=chat_id,
+                access_mode=str(request.get("codex_access_mode") or "isolated"),
+                workdir=workdir,
+                request_dir=request_dir,
+                output_dir=output_dir,
+                scratch_root=browser_scratch_root,
+                runtime_workdir=_as_runtime_path(workdir, self.use_wsl),
+                runtime_request_dir=_as_runtime_path(request_dir, self.use_wsl),
+                runtime_output_dir=runtime_output_dir,
+                use_wsl=self.use_wsl,
+            )
 
         image_urls = extract_image_urls(delta.messages, allow_image_input=allow_image_input)
+        image_request_mode = _direct_image_request_mode(
+            delta.messages,
+            has_image_input=bool(image_urls),
+        )
         temporary_image_paths: List[Path] = []
         runtime_image_paths: List[str] = []
+        image_staging_dir = (
+            request_dir / "inputs"
+            if permission_profile == "mabobot-chat-isolated"
+            else None
+        )
         for image_url in image_urls:
-            image_path = _write_image_url_to_file(image_url)
-            if image_url.startswith("data:"):
+            image_path = _write_image_url_to_file(
+                image_url,
+                destination_dir=image_staging_dir,
+            )
+            if image_staging_dir is None and image_url.startswith("data:"):
                 temporary_image_paths.append(image_path)
             runtime_image_paths.append(_as_runtime_path(image_path, self.use_wsl))
 
@@ -2116,6 +2612,8 @@ class CodexAppServerManager:
                 "prompt_chars": len(prompt),
                 "image_count": len(runtime_image_paths),
                 "input_file_count": len(staged_input_files),
+                "dynamic_tools": bool(self.dynamic_tool_specs),
+                "browser_tool": bool(self.dynamic_tool_specs),
                 "request_dir": str(request_dir),
                 "output_dir": str(output_dir),
                 "started_at": started_at,
@@ -2128,76 +2626,61 @@ class CodexAppServerManager:
         )
         turn_id = ""
         tracker: Optional[_TurnTracker] = None
-        try:
-            result = self._request(
-                "turn/start",
+        turn_ids: List[str] = []
+        turn_trackers: List[_TurnTracker] = []
+        recovery_prompt = ""
+        dynamic_context_token = ""
+        turn_options: Dict[str, Any] = {
+            "model": model,
+            "effort": reasoning_effort,
+            "cwd": _as_runtime_path(workdir, self.use_wsl),
+            "approvalPolicy": approval_policy,
+            **(
+                {"permissions": permission_profile}
+                if permission_profile
+                else {}
+            ),
+            **(
                 {
-                    "threadId": thread_id,
-                    "input": turn_input,
-                    "model": model,
-                    "effort": reasoning_effort,
-                    "cwd": _as_runtime_path(workdir, self.use_wsl),
-                    "approvalPolicy": approval_policy,
-                    **(
-                        {
-                            "permissions": permission_profile,
-                        }
-                        if permission_profile
-                        else {}
-                    ),
-                    **(
-                        {
-                            "runtimeWorkspaceRoots": [
-                                _as_runtime_path(path, self.use_wsl)
-                                for path in runtime_workspace_roots
-                            ]
-                        }
-                        if runtime_workspace_roots
-                        else {}
-                    ),
-                    **({"outputSchema": output_schema} if output_schema else {}),
-                    **(
-                        {"summary": reasoning_summary}
-                        if reasoning_summary != "inherit"
-                        else {}
-                    ),
-                },
-                timeout=min(timeout, 120),
-            )
-            turn = result.get("turn") if isinstance(result, dict) else {}
-            turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
-            if not turn_id:
-                raise CodexAppServerError("Codex App Server turn/start returned no turn id")
-            tracker = self._tracker(turn_id)
-            tracker.request_id = request_id
-            tracker.thread_id = thread_id
-            codex_job_manager.update(
-                request_id,
-                status="running",
-                turn_id=turn_id,
-                _cancel_callback=lambda: self._interrupt_turn(thread_id, turn_id),
-            )
-            if not tracker.started_recorded:
-                codex_job_manager.record_event(
-                    request_id,
-                    "turn_started",
-                    {"thread_id": thread_id, "turn_id": turn_id},
-                    status="running",
+                    "runtimeWorkspaceRoots": [
+                        _as_runtime_path(path, self.use_wsl)
+                        for path in runtime_workspace_roots
+                    ]
+                }
+                if runtime_workspace_roots
+                else {}
+            ),
+            **({"outputSchema": output_schema} if output_schema else {}),
+            **(
+                {"summary": reasoning_summary}
+                if reasoning_summary != "inherit"
+                else {}
+            ),
+        }
+        try:
+            if browser_context is not None:
+                dynamic_context_token = self._activate_dynamic_tool_context(
+                    thread_id=thread_id,
+                    browser_context=browser_context,
                 )
-                tracker.started_recorded = True
-            if not tracker.completed.wait(timeout=timeout):
-                self._interrupt_turn(thread_id, turn_id)
-                raise CodexAppServerError(f"Codex App Server turn timed out after {timeout}s")
-            if not tracker.usage:
-                tracker.usage_ready.wait(timeout=2)
-            if tracker.error or tracker.status not in {"completed", "complete"}:
-                raise CodexAppServerError(
-                    tracker.error or f"Codex App Server turn ended with status {tracker.status}"
-                )
+            turn_id, tracker = self._start_tracked_turn(
+                request_id=request_id,
+                thread_id=thread_id,
+                turn_input=turn_input,
+                turn_options=turn_options,
+                timeout=timeout,
+            )
+            turn_ids.append(turn_id)
+            turn_trackers.append(tracker)
 
             response_messages = tracker.final_messages or tracker.unclassified_messages
             text = response_messages[-1].strip() if response_messages else ""
-            attachments = _collect_artifact_attachments(output_dir)
+            attachments = self._collect_response_attachments(
+                output_dir=output_dir,
+                turn_trackers=turn_trackers,
+                image_request_mode=image_request_mode,
+                request_id=request_id,
+            )
             _write_artifact_manifest(
                 request_dir,
                 request_id=request_id,
@@ -2208,16 +2691,134 @@ class CodexAppServerManager:
             if not text and attachments:
                 text = _default_text_for_attachments(attachments)
             if not text:
-                raise CodexAppServerError("Codex App Server returned an empty response")
-            usage = _normalize_app_server_usage(
-                tracker.usage,
-                source=(
-                    tracker.usage_source
-                    or "codex_app_server.thread/tokenUsage/updated"
-                ),
+                logger.warning(
+                    "Codex App Server returned no final answer; retrying once in the same "
+                    "thread/profile without tools: chat=%s thread=%s profile=%s model=%s",
+                    chat_id,
+                    thread_id,
+                    runtime_profile or role_name,
+                    model,
+                )
+                recovery_prompt = _EMPTY_RESPONSE_RECOVERY_PROMPT
+                recovery_search_disabled = False
+                search_disable_error = ""
+                if not ephemeral and web_search_mode != "disabled":
+                    try:
+                        self._resume_thread(
+                            thread_id,
+                            model=model,
+                            reasoning_effort=reasoning_effort,
+                            web_search_mode="disabled",
+                            reasoning_summary=reasoning_summary,
+                            timeout=timeout,
+                            sandbox=sandbox,
+                            workdir=workdir,
+                            permission_profile=permission_profile,
+                            approval_policy=approval_policy,
+                            runtime_workspace_roots=runtime_workspace_roots,
+                        )
+                        recovery_search_disabled = True
+                    except Exception as exc:
+                        search_disable_error = str(exc)
+                        logger.warning(
+                            "Could not disable native web search for empty-response recovery; "
+                            "continuing with the no-tool recovery instruction: %s",
+                            exc,
+                        )
+                codex_job_manager.record_event(
+                    request_id,
+                    "empty_response_retry",
+                    {
+                        "thread_id": thread_id,
+                        "previous_turn_id": turn_id,
+                        "config_profile": runtime_profile or None,
+                        "model": model,
+                        "same_thread": True,
+                        "same_profile": True,
+                        "web_search_disabled": recovery_search_disabled
+                        or web_search_mode == "disabled",
+                        "search_disable_error": search_disable_error or None,
+                    },
+                    status="running",
+                    empty_response_retry_count=1,
+                )
+                try:
+                    turn_id, tracker = self._start_tracked_turn(
+                        request_id=request_id,
+                        thread_id=thread_id,
+                        turn_input=[{"type": "text", "text": recovery_prompt}],
+                        turn_options=turn_options,
+                        timeout=timeout,
+                        recovery_attempt=True,
+                    )
+                    turn_ids.append(turn_id)
+                    turn_trackers.append(tracker)
+                finally:
+                    if recovery_search_disabled:
+                        try:
+                            self._resume_thread(
+                                thread_id,
+                                model=model,
+                                reasoning_effort=reasoning_effort,
+                                web_search_mode=web_search_mode,
+                                reasoning_summary=reasoning_summary,
+                                timeout=timeout,
+                                sandbox=sandbox,
+                                workdir=workdir,
+                                permission_profile=permission_profile,
+                                approval_policy=approval_policy,
+                                runtime_workspace_roots=runtime_workspace_roots,
+                            )
+                        except Exception as exc:
+                            self._loaded_threads.pop(thread_id, None)
+                            logger.warning(
+                                "Could not restore Codex thread search configuration after "
+                                "empty-response recovery; the next turn will reload it: %s",
+                                exc,
+                            )
+                            codex_job_manager.record_event(
+                                request_id,
+                                "empty_response_retry_restore_failed",
+                                {"thread_id": thread_id, "message": str(exc)[:1000]},
+                            )
+
+                response_messages = tracker.final_messages or tracker.unclassified_messages
+                text = response_messages[-1].strip() if response_messages else ""
+                attachments = self._collect_response_attachments(
+                    output_dir=output_dir,
+                    turn_trackers=turn_trackers,
+                    image_request_mode=image_request_mode,
+                    request_id=request_id,
+                )
+                _write_artifact_manifest(
+                    request_dir,
+                    request_id=request_id,
+                    backend="codex_app_server",
+                    model=model,
+                    attachments=attachments,
+                )
+                if not text and attachments:
+                    text = _default_text_for_attachments(attachments)
+                if not text:
+                    raise CodexAppServerError(
+                        "Codex App Server returned an empty response after same-profile retry"
+                    )
+
+            usage = _merge_attempt_usage(
+                _normalize_app_server_usage(
+                    attempt_tracker.usage,
+                    source=(
+                        attempt_tracker.usage_source
+                        or "codex_app_server.thread/tokenUsage/updated"
+                    ),
+                )
+                for attempt_tracker in turn_trackers
             )
             if not usage:
-                usage = estimate_codex_usage(prompt, text)
+                usage = estimate_codex_usage(
+                    "\n\n".join(part for part in (prompt, recovery_prompt) if part),
+                    text,
+                )
                 usage["estimated"] = bool(usage)
                 usage["source"] = (
                     "codex_app_server_local_estimate_missing_notification"
@@ -2236,7 +2837,9 @@ class CodexAppServerManager:
                 "estimated"
                 if usage.get("estimated") and usage_available
                 else "reported"
-                if tracker.usage and usage_available
+                if turn_trackers
+                and all(attempt_tracker.usage for attempt_tracker in turn_trackers)
+                and usage_available
                 else "unknown"
             )
             previous_session_total = (
@@ -2285,7 +2888,14 @@ class CodexAppServerManager:
             completion_details = usage.get("completion_tokens_details")
             if not isinstance(completion_details, dict):
                 completion_details = {}
-            reasoning_text = "\n\n".join(tracker.reasoning).strip()
+            reasoning_text = "\n\n".join(
+                part
+                for attempt_tracker in turn_trackers
+                for part in attempt_tracker.reasoning
+            ).strip()
+            request_compacted = any(
+                attempt_tracker.compacted for attempt_tracker in turn_trackers
+            )
 
             assistant_fingerprint = _message_fingerprint(
                 {"role": "assistant", "content": text}
@@ -2317,16 +2927,16 @@ class CodexAppServerManager:
                     or 0
                 )
                 + 1,
-                "compaction_count": previous_compaction_count + int(tracker.compacted),
+                "compaction_count": previous_compaction_count + int(request_compacted),
                 "lifetime_compaction_count": int(
                     (state or {}).get("lifetime_compaction_count")
                     or (state or {}).get("compaction_count")
                     or 0
                 )
-                + int(tracker.compacted),
+                + int(request_compacted),
                 "last_compacted_at": (
                     now_iso
-                    if tracker.compacted
+                    if request_compacted
                     else (state or {}).get("last_compacted_at")
                     if delta.resume
                     else None
@@ -2388,6 +2998,7 @@ class CodexAppServerManager:
                     permission_profile=permission_profile,
                     approval_policy=approval_policy,
                 ),
+                "dynamic_tool_signature": self.dynamic_tool_signature,
                 "access_signature": access_signature or None,
                 "access_mode": request.get("codex_access_mode"),
                 "created_at": (state or {}).get("created_at") or now_iso,
@@ -2405,7 +3016,7 @@ class CodexAppServerManager:
                 completion_tokens=usage.get("completion_tokens", 0),
                 total_tokens=usage.get("total_tokens", 0),
                 usage_accuracy=usage_accuracy,
-                compacted=tracker.compacted,
+                compacted=request_compacted,
                 continuity_status="synchronized",
             )
             logger.info(
@@ -2463,18 +3074,20 @@ class CodexAppServerManager:
             )
             raise
         finally:
-            if turn_id:
+            self._deactivate_dynamic_tool_context(thread_id, dynamic_context_token)
+            if turn_ids:
                 with self._turn_lock:
-                    self._turns.pop(turn_id, None)
+                    for tracked_turn_id in turn_ids:
+                        self._turns.pop(tracked_turn_id, None)
             for image_path in temporary_image_paths:
                 try:
                     image_path.unlink(missing_ok=True)
                 except Exception:
                     pass
             try:
-                if output_dir.exists() and not any(output_dir.iterdir()):
+                if _artifact_output_dir_is_safe(output_dir) and not any(output_dir.iterdir()):
                     output_dir.rmdir()
-                if request_dir.exists() and not any(request_dir.iterdir()):
+                if _artifact_request_dir_is_safe(request_dir) and not any(request_dir.iterdir()):
                     request_dir.rmdir()
             except Exception:
                 pass

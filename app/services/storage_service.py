@@ -25,8 +25,8 @@ class StorageService:
             "data/person_rebuilds", "data/migration_backups",
         ],
         "generated": [
-            "data/daily_reports", "data/jr_inventory_report", "data/weekly_reports",
-            "data/feishu_dashboard_preview", "data/chat_summaries",
+            "data/daily_reports", "data/weekly_reports",
+            "data/chat_summaries",
         ],
         "chat_and_memory": [
             "data/database.db", "data/chat_memory.db", "data/chat_logs",

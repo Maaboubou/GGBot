@@ -495,6 +495,11 @@ def capture_window_rect(hwnd: int, bbox: tuple[int, int, int, int]):
 
     使用 PrintWindow(PW_RENDERFULLCONTENT) 从窗口 DC 截图，即使窗口
     被部分遮挡也能拿到正确内容；这比 ImageGrab 更适合消息方向判断。
+
+    PrintWindow 的坐标原点固定在窗口左上角。通过把内存 DC 的
+    viewport 反向移动到 ``bbox``，可以让 GDI 只为目标区域分配
+    bitmap，而不是先分配整个监听窗口再用 PIL 裁剪。监听窗口
+    通常高达 6000 像素，这一点对连续的缩略图身份采样很重要。
     """
     if not is_windows():
         raise RuntimeError("mabowx 截图功能只能在 Windows 上使用")
@@ -512,26 +517,70 @@ def capture_window_rect(hwnd: int, bbox: tuple[int, int, int, int]):
         raise ValueError(f"无效截图区域: {bbox}")
 
     win_left, win_top, win_right, win_bottom = win32gui.GetWindowRect(hwnd)
-    full_w = win_right - win_left
-    full_h = win_bottom - win_top
-    if full_w <= 0 or full_h <= 0:
+    window_width = win_right - win_left
+    window_height = win_bottom - win_top
+    if window_width <= 0 or window_height <= 0:
         raise RuntimeError(f"窗口尺寸无效: hwnd={hwnd}")
+
+    # bbox 是屏幕绝对坐标，PrintWindow 使用窗口相对坐标。
+    source_x = left - win_left
+    source_y = top - win_top
 
     hwnd_dc = win32gui.GetWindowDC(hwnd)
     mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
     save_dc = mfc_dc.CreateCompatibleDC()
     bitmap = win32ui.CreateBitmap()
-    bitmap.CreateCompatibleBitmap(mfc_dc, full_w, full_h)
-    save_dc.SelectObject(bitmap)
+    # Allocate only the requested message row/thumbnail region.  For the
+    # default 1600x6000 listener window this avoids a ~36.6 MiB bitmap on every
+    # fingerprint sample.
+    bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+    old_bitmap = save_dc.SelectObject(bitmap)
+    hdc = save_dc.GetSafeHdc()
+    saved_dc = 0
     try:
-        result = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+        # Keep pixels outside the window deterministic when bbox is one pixel
+        # beyond a rounded UIA/window boundary.
+        save_dc.PatBlt((0, 0), (width, height), win32con.BLACKNESS)
+        saved_dc = int(save_dc.SaveDC() or 0)
+        save_dc.SetViewportOrg(-source_x, -source_y)
+        result = ctypes.windll.user32.PrintWindow(hwnd, hdc, 2)
+        if saved_dc:
+            save_dc.RestoreDC(saved_dc)
+            saved_dc = 0
         if not result:
-            save_dc.BitBlt((0, 0), (full_w, full_h), mfc_dc, (0, 0), win32con.SRCCOPY)
+            # PrintWindow can fail for a temporarily busy window.  Preserve the
+            # previous visible-window fallback, but copy only the intersecting
+            # requested rectangle instead of the complete window.
+            copy_left = max(left, win_left)
+            copy_top = max(top, win_top)
+            copy_right = min(right, win_right)
+            copy_bottom = min(bottom, win_bottom)
+            copy_width = max(0, copy_right - copy_left)
+            copy_height = max(0, copy_bottom - copy_top)
+            if copy_width and copy_height:
+                save_dc.BitBlt(
+                    (copy_left - left, copy_top - top),
+                    (copy_width, copy_height),
+                    mfc_dc,
+                    (copy_left - win_left, copy_top - win_top),
+                    win32con.SRCCOPY,
+                )
         bits = bitmap.GetBitmapBits(True)
-        image = Image.frombuffer("RGB", (full_w, full_h), bits, "raw", "BGRX", 0, 1)
-        # bbox 是屏幕绝对坐标；PrintWindow 输出窗口原点在 (win_left, win_top)
-        return image.crop((left - win_left, top - win_top, right - win_left, bottom - win_top))
+        # Detach from the GDI bitmap before its handle is released below.
+        return Image.frombuffer(
+            "RGB", (width, height), bits, "raw", "BGRX", 0, 1
+        ).copy()
     finally:
+        if saved_dc:
+            try:
+                save_dc.RestoreDC(saved_dc)
+            except Exception:
+                pass
+        try:
+            if old_bitmap is not None:
+                save_dc.SelectObject(old_bitmap)
+        except Exception:
+            pass
         try:
             save_dc.DeleteDC()
         except Exception:

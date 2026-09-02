@@ -30,7 +30,11 @@ from mabowx.utils.tools import (
 from .base import BaseMessage, HumanMessage
 from .identity import (
     FILE_COLOR_MAX_DISTANCE,
+    FILE_DETAIL_MAX_DISTANCE,
+    FILE_MATCH_PROFILE,
+    FILE_MATCH_THRESHOLDS,
     FILE_VISUAL_MAX_DISTANCE,
+    MediaFileMismatchError,
     MediaIdentityError,
     compare_target_to_file,
     control_fully_visible,
@@ -1020,6 +1024,9 @@ class ImageMessage(HumanMessage):
             "color_distance": result.color_distance,
             "detail_distance": result.detail_distance,
             "variant": result.variant,
+            "match_rule": result.match_rule,
+            "match_profile": FILE_MATCH_PROFILE,
+            "match_thresholds": FILE_MATCH_THRESHOLDS,
             "delivery_id": target.delivery_id,
             "raw_message_id": target.raw_message_id,
             "route": str(getattr(self, "_last_media_route", "") or ""),
@@ -1030,6 +1037,7 @@ class ImageMessage(HumanMessage):
             "target_rect": getattr(target_visual, "rect", None),
             "phash_threshold": FILE_VISUAL_MAX_DISTANCE,
             "color_threshold": FILE_COLOR_MAX_DISTANCE,
+            "detail_threshold": FILE_DETAIL_MAX_DISTANCE,
             "variant_metrics": [
                 {
                     "variant": name,
@@ -1042,7 +1050,7 @@ class ImageMessage(HumanMessage):
             ],
         }
         if not result.matched:
-            raise MediaIdentityError(
+            raise MediaFileMismatchError(
                 "下载结果与接收时缩略图不一致，拒绝绑定: "
                 f"phash_distance={result.phash_distance} "
                 f"color_distance={result.color_distance} "

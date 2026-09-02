@@ -40,6 +40,21 @@ logger = logging.getLogger(__name__)
 # 全局锁：防止并发调用同时修改 HTTP_PROXY / HTTPS_PROXY 环境变量
 _proxy_env_lock = threading.Lock()
 
+
+def configure_litellm_sync_transport() -> None:
+    """Use HTTPX for synchronous LiteLLM calls made from worker threads.
+
+    LiteLLM defaults to an aiohttp transport even for ``completion()``. The
+    synchronous wrapper creates short-lived asyncio loops, so cached aiohttp
+    sessions can outlive their owning loop and are later reported as unclosed.
+    HTTPX is the stable transport for this long-lived, threaded service.
+    """
+    litellm.disable_aiohttp_transport = True
+
+
+# Apply this before any manager or model-test endpoint can issue a request.
+configure_litellm_sync_transport()
+
 # Google-only 工具名称集合（只有 gemini/ 直连才支持）
 _GOOGLE_ONLY_TOOLS: frozenset = frozenset({"google_search", "google_search_retrieval"})
 
@@ -263,19 +278,19 @@ class LLMManager:
 
     def apply_proxy_env_vars(self):
         """
-        将代理配置写入 os.environ 并同步更新 litellm 的 aiohttp transport。
+        将代理配置写入 os.environ，并同步更新 LiteLLM 的代理兼容开关。
 
-        技术背景：litellm 默认使用 aiohttp transport（非 httpx），
-        aiohttp 不读取 HTTP_PROXY 环境变量，除非 litellm.aiohttp_trust_env=True。
+        主服务的同步调用固定使用 HTTPX；保留 aiohttp_trust_env 是为了兼容
+        进程内可能显式启用 aiohttp 的第三方扩展。
 
-        性能优化：内部缓存代理 URL，若未发生变化则跳过 DB 读取和 session 重置。
+        性能优化：内部缓存代理 URL，若未发生变化则跳过 DB 读取和 transport 更新。
         调用时机：LLMManager 启动时 + Web UI 保存代理设置后（通过 mark_proxy_dirty()）
         """
         with _proxy_env_lock:
             # 读取当前配置
             new_proxy_url = self._get_proxy_url()
 
-            # 若缓存匹配且不是脏标记，直接返回（避免每次 call 都读 DB + 重置 session）
+            # 若缓存匹配且不是脏标记，直接返回（避免每次 call 都读 DB + 更新 transport）
             if not self._proxy_cache_dirty and new_proxy_url == self._proxy_cache:
                 return
 
@@ -300,13 +315,8 @@ class LLMManager:
                 litellm.aiohttp_trust_env = False
                 logger.info("🌐 代理已清除（直连模式，aiohttp_trust_env=False）")
 
-            # 重置 litellm 已缓存的 aiohttp ClientSession，使新 trust_env 立即生效
-            try:
-                from litellm.llms.custom_httpx.aiohttp_transport import LiteLLMAiohttpTransport
-                LiteLLMAiohttpTransport._shared_session = None
-                logger.debug("🔄 已重置 litellm aiohttp shared session")
-            except Exception:
-                pass
+            # 主服务固定走 HTTPX，不需要再通过丢弃 aiohttp shared session
+            # 引用来刷新代理，也避免重新引入无法 await close 的清理路径。
 
     def mark_proxy_dirty(self):
         """标记代理配置已变更，下次 call 时重新应用。供 Web UI 保存代理后调用。"""

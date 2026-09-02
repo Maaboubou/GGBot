@@ -700,8 +700,39 @@ class WeChatManager:
                     json={"chat_name": chat_name, "message_id": message_id},
                     timeout=timeout
                 )
-                response.raise_for_status()
-                data = response.json()
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = {}
+
+                if not response.ok:
+                    error_code = str(data.get("error_code") or "http_error")
+                    error_msg = str(data.get("message") or response.reason or "未知错误")
+                    last_exception = Exception(f"{error_code}: {error_msg}")
+
+                    if error_code == "image_identity_mismatch":
+                        self.logger.warning(
+                            "🖼️ 图片身份校验拒绝，不再重复下载: "
+                            f"message_id={message_id} reason={error_msg}"
+                        )
+                        return None
+
+                    retryable = response.status_code in {408, 429, 500, 502, 503, 504}
+                    if retryable and attempt < len(retry_configs):
+                        self.logger.warning(
+                            "🔄 图片下载暂时失败，准备重试: "
+                            f"message_id={message_id} attempt={attempt} "
+                            f"status={response.status_code} code={error_code}"
+                        )
+                        time.sleep(1)
+                        continue
+
+                    self.logger.error(
+                        "❌ 图片下载接口拒绝: "
+                        f"message_id={message_id} status={response.status_code} "
+                        f"code={error_code} reason={error_msg}"
+                    )
+                    return None
 
                 if data.get("status") == "success":
                     file_path = data.get("file_path")
@@ -716,15 +747,7 @@ class WeChatManager:
                     error_msg = data.get('message', '未知错误')
                     self.logger.error(f"❌ 第{attempt}次尝试失败: {error_msg}")
                     last_exception = Exception(f"API返回错误: {error_msg}")
-
-                    # 如果是服务器错误，等待后重试
-                    if response.status_code >= 500:
-                        self.logger.info(f"🔄 检测到服务器错误 (状态码: {response.status_code})，准备重试...")
-                        if attempt < len(retry_configs):
-                            time.sleep(1)  # 重试前等待1秒
-                    else:
-                        # 客户端错误（如400、404）直接返回失败
-                        break
+                    break
 
             except requests.exceptions.Timeout as e:
                 self.logger.warning(f"⏰ 第{attempt}次尝试超时 ({timeout}秒): {e}")
@@ -745,9 +768,11 @@ class WeChatManager:
                     time.sleep(1)  # 网络错误后等待1秒再重试
 
         # 所有重试都失败了
-        self.logger.error(f"❌ 图片下载失败 - 消息ID: {message_id}，已尝试{len(retry_configs)}次")
-        if last_exception:
-            self.logger.error(f"最后一次错误: {last_exception}")
+        self.logger.error(
+            "❌ 图片下载失败: "
+            f"message_id={message_id} attempts={len(retry_configs)} "
+            f"reason={last_exception or '未知错误'}"
+        )
         return None
 
 

@@ -30,12 +30,51 @@ VISUAL_REBIND_COLOR_MAX_DISTANCE = 24.0
 VISUAL_REBIND_DETAIL_MAX_DISTANCE = 28.0
 VISUAL_STABLE_MAX_DISTANCE = 5
 VISUAL_STABLE_COLOR_MAX_DISTANCE = 12.0
-FILE_VISUAL_MAX_DISTANCE = 22
-FILE_COLOR_MAX_DISTANCE = 40.0
-NARROW_THUMBNAIL_ASPECT_MAX = 0.35
-FILE_NARROW_VISUAL_MAX_DISTANCE = 24
-FILE_NARROW_COLOR_MAX_DISTANCE = 20.0
-FILE_NARROW_DETAIL_MAX_DISTANCE = 24.0
+# File verification is a secondary guard after the exact row has already been
+# rebound, stabilised and clicked. WeChat may aggressively crop, resize and
+# recompress the displayed thumbnail, so this stage deliberately uses a much
+# wider multi-signal envelope than the live-row checks above.
+FILE_MATCH_PROFILE = "relaxed-v2"
+FILE_VISUAL_MAX_DISTANCE = 34
+FILE_COLOR_MAX_DISTANCE = 56.0
+FILE_DETAIL_MAX_DISTANCE = 62.0
+FILE_LOW_COLOR_VISUAL_MAX_DISTANCE = 40
+FILE_LOW_COLOR_MAX_DISTANCE = 18.0
+FILE_LOW_COLOR_DETAIL_MAX_DISTANCE = 34.0
+FILE_PANORAMA_ASPECT_MIN = 1.8
+FILE_PANORAMA_VISUAL_MAX_DISTANCE = 36
+FILE_PANORAMA_COLOR_MAX_DISTANCE = 62.0
+FILE_PANORAMA_DETAIL_MAX_DISTANCE = 70.0
+NARROW_THUMBNAIL_ASPECT_MAX = 0.42
+FILE_NARROW_VISUAL_MAX_DISTANCE = 38
+FILE_NARROW_COLOR_MAX_DISTANCE = 35.0
+FILE_NARROW_DETAIL_MAX_DISTANCE = 52.0
+FILE_NO_DETAIL_VISUAL_MAX_DISTANCE = 28
+FILE_NO_DETAIL_COLOR_MAX_DISTANCE = 44.0
+FILE_MATCH_THRESHOLDS = {
+    "standard": {
+        "phash": FILE_VISUAL_MAX_DISTANCE,
+        "color": FILE_COLOR_MAX_DISTANCE,
+        "detail": FILE_DETAIL_MAX_DISTANCE,
+    },
+    "low_color": {
+        "phash": FILE_LOW_COLOR_VISUAL_MAX_DISTANCE,
+        "color": FILE_LOW_COLOR_MAX_DISTANCE,
+        "detail": FILE_LOW_COLOR_DETAIL_MAX_DISTANCE,
+    },
+    "narrow": {
+        "max_aspect": NARROW_THUMBNAIL_ASPECT_MAX,
+        "phash": FILE_NARROW_VISUAL_MAX_DISTANCE,
+        "color": FILE_NARROW_COLOR_MAX_DISTANCE,
+        "detail": FILE_NARROW_DETAIL_MAX_DISTANCE,
+    },
+    "panorama": {
+        "min_aspect": FILE_PANORAMA_ASPECT_MIN,
+        "phash": FILE_PANORAMA_VISUAL_MAX_DISTANCE,
+        "color": FILE_PANORAMA_COLOR_MAX_DISTANCE,
+        "detail": FILE_PANORAMA_DETAIL_MAX_DISTANCE,
+    },
+}
 LISTENER_MEDIA_CAPTURE_TIMEOUT_SEC = 1.2
 ACTION_MEDIA_STABLE_TIMEOUT_SEC = 1.2
 MEDIA_FOREGROUND_THRESHOLDS = (24, 14)
@@ -43,6 +82,10 @@ MEDIA_FOREGROUND_THRESHOLDS = (24, 14)
 
 class MediaIdentityError(RuntimeError):
     """The requested media row/file could not be proven to be the target."""
+
+
+class MediaFileMismatchError(MediaIdentityError):
+    """A downloaded file failed the final thumbnail-to-file comparison."""
 
 
 @dataclass(frozen=True)
@@ -92,6 +135,7 @@ class MediaVisualMatch:
     variant: str
     detail_distance: float | None = None
     variant_metrics: tuple[tuple[str, int, float, float | None], ...] = ()
+    match_rule: str = ""
 
 
 def ensure_delivery_id(message: Any) -> str:
@@ -889,20 +933,102 @@ def _image_variants(image, target_aspect: float):
         method=Image.Resampling.LANCZOS,
         centering=(0.5, 0.5),
     )
-    # Narrow long-image thumbnails in WeChat are biased slightly above center.
-    # Keep an explicit crop instead of weakening the global pHash threshold.
-    yield "upper_center_crop", ImageOps.fit(
+    if source_aspect > target_aspect:
+        # The source is wider than the bubble. Vary the horizontal anchor;
+        # changing the vertical anchor here would produce identical crops.
+        crop_centers = (
+            ("left_crop", (0.0, 0.5)),
+            ("left_center_crop", (0.25, 0.5)),
+            ("right_center_crop", (0.75, 0.5)),
+            ("right_crop", (1.0, 0.5)),
+        )
+    else:
+        # Tall screenshots can be biased toward their header or lower content.
+        crop_centers = (
+            ("top_crop", (0.5, 0.0)),
+            ("upper_center_crop", (0.5, 0.25)),
+            ("lower_center_crop", (0.5, 0.75)),
+            ("bottom_crop", (0.5, 1.0)),
+        )
+    for name, centering in crop_centers:
+        yield name, ImageOps.fit(
+            image,
+            (target_width, target_height),
+            method=Image.Resampling.LANCZOS,
+            centering=centering,
+        )
+
+    contained = ImageOps.contain(
         image,
         (target_width, target_height),
         method=Image.Resampling.LANCZOS,
-        centering=(0.5, 0.4),
     )
-    yield "top_crop", ImageOps.fit(
-        image,
-        (target_width, target_height),
-        method=Image.Resampling.LANCZOS,
-        centering=(0.5, 0.0),
-    )
+    for name, background in (
+        ("contain_light", (245, 245, 245)),
+        ("contain_dark", (24, 24, 24)),
+    ):
+        canvas = Image.new("RGB", (target_width, target_height), background)
+        canvas.paste(
+            contained,
+            (
+                (target_width - contained.width) // 2,
+                (target_height - contained.height) // 2,
+            ),
+        )
+        yield name, canvas
+
+
+def _file_match_rule(
+    target_visual: MediaVisualFingerprint,
+    distance: int,
+    color_distance: float,
+    detail_distance: float | None,
+) -> str | None:
+    """Return the relaxed match rule satisfied by one file variant."""
+
+    # Preserve the old high-confidence path as a named rule for audit logs.
+    if distance <= 22 and (color_distance <= 40.0 or distance <= 11):
+        return "legacy_strict"
+
+    if detail_distance is None:
+        if (
+            distance <= FILE_NO_DETAIL_VISUAL_MAX_DISTANCE
+            and color_distance <= FILE_NO_DETAIL_COLOR_MAX_DISTANCE
+        ):
+            return "relaxed_no_detail"
+        return None
+
+    if (
+        distance <= FILE_LOW_COLOR_VISUAL_MAX_DISTANCE
+        and color_distance <= FILE_LOW_COLOR_MAX_DISTANCE
+        and detail_distance <= FILE_LOW_COLOR_DETAIL_MAX_DISTANCE
+    ):
+        return "relaxed_low_color"
+
+    if (
+        target_visual.aspect_ratio <= NARROW_THUMBNAIL_ASPECT_MAX
+        and distance <= FILE_NARROW_VISUAL_MAX_DISTANCE
+        and color_distance <= FILE_NARROW_COLOR_MAX_DISTANCE
+        and detail_distance <= FILE_NARROW_DETAIL_MAX_DISTANCE
+    ):
+        return "relaxed_narrow"
+
+    if (
+        target_visual.aspect_ratio >= FILE_PANORAMA_ASPECT_MIN
+        and distance <= FILE_PANORAMA_VISUAL_MAX_DISTANCE
+        and color_distance <= FILE_PANORAMA_COLOR_MAX_DISTANCE
+        and detail_distance <= FILE_PANORAMA_DETAIL_MAX_DISTANCE
+    ):
+        return "relaxed_panorama"
+
+    if (
+        NARROW_THUMBNAIL_ASPECT_MAX < target_visual.aspect_ratio < FILE_PANORAMA_ASPECT_MIN
+        and distance <= FILE_VISUAL_MAX_DISTANCE
+        and color_distance <= FILE_COLOR_MAX_DISTANCE
+        and detail_distance <= FILE_DETAIL_MAX_DISTANCE
+    ):
+        return "relaxed_standard"
+    return None
 
 
 def compare_target_to_file(
@@ -912,13 +1038,19 @@ def compare_target_to_file(
     """Compare downloaded pixels with the thumbnail captured at receipt."""
 
     if target.visual is None:
-        return MediaVisualMatch(False, None, None, "missing_target")
+        return MediaVisualMatch(
+            False,
+            None,
+            None,
+            "missing_target",
+            match_rule="missing_target",
+        )
     from PIL import Image
 
     with Image.open(file_path) as opened:
         variants = list(_image_variants(opened.copy(), target.visual.aspect_ratio))
     best: tuple[int, float, float | None, str] | None = None
-    best_match: tuple[int, float, float | None, str] | None = None
+    best_match: tuple[int, float, float | None, str, str] | None = None
     variant_metrics: list[tuple[str, int, float, float | None]] = []
     for name, image in variants:
         try:
@@ -945,21 +1077,14 @@ def compare_target_to_file(
         ) if best is not None else None
         if best is None or (best_key is not None and result_key < best_key):
             best = result
-        standard_match = bool(
-            distance <= FILE_VISUAL_MAX_DISTANCE
-            and (
-                color_distance <= FILE_COLOR_MAX_DISTANCE
-                or distance <= max(8, FILE_VISUAL_MAX_DISTANCE // 2)
-            )
+        match_rule = _file_match_rule(
+            target.visual,
+            distance,
+            color_distance,
+            detail_distance,
         )
-        narrow_match = bool(
-            target.visual.aspect_ratio <= NARROW_THUMBNAIL_ASPECT_MAX
-            and detail_distance is not None
-            and distance <= FILE_NARROW_VISUAL_MAX_DISTANCE
-            and color_distance <= FILE_NARROW_COLOR_MAX_DISTANCE
-            and detail_distance <= FILE_NARROW_DETAIL_MAX_DISTANCE
-        )
-        if standard_match or narrow_match:
+        if match_rule:
+            matched_result = (*result, match_rule)
             match_key = (
                 best_match[0],
                 best_match[1],
@@ -968,7 +1093,7 @@ def compare_target_to_file(
                 else float("inf"),
             ) if best_match is not None else None
             if best_match is None or (match_key is not None and result_key < match_key):
-                best_match = result
+                best_match = matched_result
     if best is None:
         return MediaVisualMatch(
             False,
@@ -976,9 +1101,14 @@ def compare_target_to_file(
             None,
             "unreadable",
             variant_metrics=tuple(variant_metrics),
+            match_rule="unreadable",
         )
     matched = best_match is not None
-    distance, color_distance, detail_distance, name = best_match or best
+    if best_match is not None:
+        distance, color_distance, detail_distance, name, match_rule = best_match
+    else:
+        distance, color_distance, detail_distance, name = best
+        match_rule = "rejected"
     return MediaVisualMatch(
         matched,
         distance,
@@ -986,4 +1116,5 @@ def compare_target_to_file(
         name,
         detail_distance,
         tuple(variant_metrics),
+        match_rule,
     )

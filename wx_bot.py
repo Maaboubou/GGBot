@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from mabowx import WeChat
+from mabowx import MediaFileMismatchError, MediaIdentityError, WeChat
 import comtypes
 import sys
 import os
@@ -1025,38 +1025,57 @@ def _log_image_download_audit(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    matched = verification.get("matched")
+    result = (
+        "accepted"
+        if matched is True
+        else "rejected"
+        if matched is False
+        else "recorded"
+    )
+    file_name = os.path.basename(str(audit.get("path") or ""))
     logger.info(
-        "🧷 图片下载绑定审计: kind=%s chat=%r message_id=%s "
-        "delivery_id=%s raw_runtime_id=%s route=%s verified=%s phash_distance=%s "
-        "color_distance=%s detail_distance=%s variant=%s target=%sx%s "
-        "target_aspect=%s target_variance=%s target_rect=%s "
-        "phash_threshold=%s color_threshold=%s variants=%s "
-        "path=%r bytes=%s sha256=%s "
-        "dimensions=%sx%s format=%s",
+        "🧷 图片绑定: result=%s rule=%s profile=%s kind=%s chat=%r "
+        "message_id=%s route=%s phash=%s color=%s detail=%s variant=%s "
+        "target=%sx%s file=%sx%s name=%r",
+        result,
+        verification.get("match_rule") or "unknown",
+        verification.get("match_profile") or "unknown",
         kind,
         chat_name,
         message_id,
-        verification.get("delivery_id") or getattr(msg, "delivery_id", ""),
-        verification.get("raw_message_id") or getattr(msg, "id", ""),
         verification.get("route"),
-        verification.get("matched"),
         verification.get("phash_distance"),
         verification.get("color_distance"),
         verification.get("detail_distance"),
         verification.get("variant"),
         verification.get("target_width"),
         verification.get("target_height"),
+        audit.get("width"),
+        audit.get("height"),
+        file_name,
+    )
+    logger.debug(
+        "🧷 图片绑定详情: chat=%r message_id=%s delivery_id=%s raw_runtime_id=%s "
+        "target_aspect=%s target_variance=%s target_rect=%s "
+        "thresholds=%s variants=%s "
+        "path=%r bytes=%s sha256=%s format=%s",
+        chat_name,
+        message_id,
+        verification.get("delivery_id") or getattr(msg, "delivery_id", ""),
+        verification.get("raw_message_id") or getattr(msg, "id", ""),
         verification.get("target_aspect_ratio"),
         verification.get("target_variance"),
         verification.get("target_rect"),
-        verification.get("phash_threshold"),
-        verification.get("color_threshold"),
+        json.dumps(
+            verification.get("match_thresholds") or {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
         variant_metrics,
         audit.get("path"),
         audit.get("bytes"),
         audit.get("sha256"),
-        audit.get("width"),
-        audit.get("height"),
         audit.get("format"),
     )
     return audit
@@ -2016,11 +2035,11 @@ def download_image_message():
         response.status_code = 503
         response.headers["Retry-After"] = "5"
         return response
-    except Exception as e:
+    except MediaFileMismatchError as e:
         get_media_audit = getattr(msg, "get_media_audit", None)
         verification = dict(get_media_audit() if callable(get_media_audit) else {})
         rejected_path = str(verification.get("candidate_path") or "")
-        if rejected_path and os.path.isfile(rejected_path) and verification.get("matched") is False:
+        if rejected_path and os.path.isfile(rejected_path):
             _log_image_download_audit(
                 "image_rejected",
                 chat_name,
@@ -2028,8 +2047,46 @@ def download_image_message():
                 rejected_path,
                 msg=msg,
             )
-        logger.error("Error downloading image message: %s", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        else:
+            logger.warning(
+                "图片绑定拒绝: chat=%r message_id=%s reason=%s",
+                chat_name,
+                message_id,
+                e,
+            )
+        return jsonify({
+            "status": "identity_rejected",
+            "error_code": "image_identity_mismatch",
+            "message": str(e),
+        }), 422
+    except MediaIdentityError as e:
+        logger.warning(
+            "图片界面身份暂时失效: chat=%r message_id=%s reason=%s",
+            chat_name,
+            message_id,
+            e,
+        )
+        response = jsonify({
+            "status": "retryable",
+            "error_code": "image_ui_identity_changed",
+            "message": str(e),
+        })
+        response.status_code = 503
+        response.headers["Retry-After"] = "1"
+        return response
+    except Exception as e:
+        logger.error(
+            "图片下载发生未预期错误: chat=%r message_id=%s error=%s",
+            chat_name,
+            message_id,
+            e,
+            exc_info=True,
+        )
+        return jsonify({
+            "status": "error",
+            "error_code": "image_download_internal_error",
+            "message": str(e),
+        }), 500
 
 
 

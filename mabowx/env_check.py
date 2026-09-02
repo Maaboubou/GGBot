@@ -21,8 +21,14 @@ _REQUIRED = [
     ("psutil", "psutil"),
     ("tenacity", "tenacity"),
     ("yaml", "PyYAML"),
-    ("win32gui", "pywin32"),
+    ("win32api", "pywin32"),
     ("win32con", "pywin32"),
+    ("win32event", "pywin32"),
+    ("win32gui", "pywin32"),
+    ("win32process", "pywin32"),
+    ("win32security", "pywin32"),
+    ("win32ts", "pywin32"),
+    ("win32ui", "pywin32"),
 ]
 
 _OPTIONAL = [

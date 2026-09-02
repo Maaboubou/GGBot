@@ -55,7 +55,7 @@ $EnvironmentReady = $false
 if (-not $Force -and (Test-Path $VenvPython) -and (Test-Path $HashMarker)) {
     $SavedHash = (Get-Content $HashMarker -Raw).Trim()
     if ($SavedHash -eq $RequirementHash) {
-        & $VenvPython -c "import fastapi, flask, mabowx, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair, webview, pystray" 2>$null
+        & $VenvPython -c "import fastapi, flask, mabowx, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair, webview, pystray, win32api, win32con, win32event, win32gui, win32process, win32security, win32ts, win32ui" 2>$null
         $EnvironmentReady = ($LASTEXITCODE -eq 0)
         if ($EnvironmentReady) {
             & $VenvPython -c "from pathlib import Path; from playwright.sync_api import sync_playwright; p = sync_playwright().start(); path = p.chromium.executable_path; p.stop(); raise SystemExit(0 if Path(path).is_file() else 1)" 2>$null
@@ -111,7 +111,7 @@ if (-not $EnvironmentReady) {
         Stop-Install "依赖安装失败，请检查网络、Python 版本和上方 pip 错误。"
     }
 
-    & $VenvPython -c "import fastapi, flask, mabowx, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair, webview, pystray"
+    & $VenvPython -c "import fastapi, flask, mabowx, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair, webview, pystray, win32api, win32con, win32event, win32gui, win32process, win32security, win32ts, win32ui"
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "依赖安装完成，但关键模块导入检查失败。"
     }

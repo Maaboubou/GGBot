@@ -60,7 +60,7 @@ function Test-EnvironmentReady {
     if ($CurrentHash -ne $SavedHash) {
         return $false
     }
-    & $VenvPython -c "import webview, pystray, psutil, dotenv" 2>$null
+    & $VenvPython -c "import webview, pystray, psutil, dotenv, win32api, win32con, win32event, win32gui, win32process, win32security, win32ts, win32ui" 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 

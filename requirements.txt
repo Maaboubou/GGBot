@@ -48,6 +48,7 @@ watchdog
 python-dotenv
 loguru
 comtypes
+pywin32>=311; sys_platform == "win32"
 pywebview>=6.2,<7
 pystray>=0.19,<1
 pytz

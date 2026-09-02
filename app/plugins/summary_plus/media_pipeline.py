@@ -590,7 +590,7 @@ class MediaPipelineMixin:
 
         try:
             cmd = [
-                self.yt_dlp_bin,
+                *self.yt_dlp_command,
                 "--ignore-config",
                 "--no-playlist",
                 "--max-filesize",
@@ -612,9 +612,7 @@ class MediaPipelineMixin:
                 self.logger.warning(
                     f"⚠️ 虎扑 yt-dlp 下载失败，返回码 {result.returncode}: {url}"
                 )
-                err_lines = (result.stderr or "").strip().split("\n")
-                if err_lines:
-                    self.logger.warning(f"⚠️ yt-dlp 错误输出(尾部): {chr(10).join(err_lines[-5:])}")
+                self._log_ytdlp_failure("虎扑下载", result)
                 return None
 
             matched_files = []
@@ -663,7 +661,7 @@ class MediaPipelineMixin:
 
         try:
             cmd = [
-                self.yt_dlp_bin,
+                *self.yt_dlp_command,
                 "--no-playlist",
                 "--max-filesize",
                 f"{getattr(self, 'max_artifact_size_mb', 512)}M",
@@ -690,11 +688,7 @@ class MediaPipelineMixin:
                 self.logger.warning(
                     f"⚠️ 微博 yt-dlp 下载失败，返回码 {result.returncode}: {url}"
                 )
-                err_lines = (result.stderr or "").strip().splitlines()
-                if err_lines:
-                    self.logger.warning(
-                        f"⚠️ yt-dlp 错误输出(尾部): {chr(10).join(err_lines[-5:])}"
-                    )
+                self._log_ytdlp_failure("微博下载", result)
                 return None
 
             prefix = output_tpl.replace("%(ext)s", "")
@@ -764,7 +758,7 @@ class MediaPipelineMixin:
 
             # 使用 yt-dlp --get-duration 获取视频时长
             cookies_path = self._get_bili_cookies_path()
-            cmd = [self.yt_dlp_bin, '--get-duration', '--no-playlist', '--proxy', '']
+            cmd = [*self.yt_dlp_command, '--get-duration', '--no-playlist', '--proxy', '']
 
             # 添加反爬和身份标识
             cmd.extend(['--add-headers', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'])
@@ -782,7 +776,7 @@ class MediaPipelineMixin:
             )
 
             if result.returncode != 0:
-                self.logger.warning(f"⚠️ 获取视频时长失败: yt-dlp 返回码 {result.returncode}, 错误信息: {result.stderr.strip()}")
+                self._log_ytdlp_failure("Bilibili 时长检测", result)
                 return None
 
             duration_str = result.stdout.strip()
@@ -832,7 +826,7 @@ class MediaPipelineMixin:
 
             cookies_path = self._get_bili_cookies_path()
             cmd = [
-                self.yt_dlp_bin,
+                *self.yt_dlp_command,
                 '-f', format_str,
                 '--ffmpeg-location', self.ffmpeg_bin,
                 '--merge-output-format', 'mp4',
@@ -870,10 +864,7 @@ class MediaPipelineMixin:
                 return filepath
             else:
                 self.logger.error(f"❌ yt-dlp 下载失败，返回码: {result.returncode}")
-                # 记录最后几行错误输出以供调试
-                err_lines = result.stderr.strip().split('\n')
-                if err_lines:
-                    self.logger.error(f"yt-dlp 倒数错误: {chr(10).join(err_lines[-5:])}")
+                self._log_ytdlp_failure("Bilibili 下载", result)
                 return None
 
         except subprocess.TimeoutExpired:
@@ -1285,18 +1276,9 @@ class MediaPipelineMixin:
 
         return tool_name
 
-    def _resolve_ytdlp_tool(self) -> str:
-        """优先使用当前 Python/虚拟环境中由 pip 安装的 yt-dlp 命令。"""
-        executable_name = "yt-dlp.exe" if os.name == "nt" else "yt-dlp"
-        environment_candidate = os.path.join(
-            os.path.dirname(os.path.abspath(sys.executable)),
-            executable_name,
-        )
-        if os.path.isfile(environment_candidate):
-            return environment_candidate
-
-        resolved_path = shutil.which("yt-dlp")
-        return resolved_path or "yt-dlp"
+    def _resolve_ytdlp_command(self) -> List[str]:
+        """Use the active interpreter so moving the project cannot stale a pip launcher."""
+        return [sys.executable, "-m", "yt_dlp"]
 
     def _run_platform_ytdlp(
         self,
@@ -1310,7 +1292,7 @@ class MediaPipelineMixin:
         if cookie_args is not None:
             return subprocess.run(
                 [
-                    self.yt_dlp_bin,
+                    *self.yt_dlp_command,
                     "--ignore-config",
                     "--no-playlist",
                     "--max-filesize",
@@ -1334,7 +1316,7 @@ class MediaPipelineMixin:
         ) as cookie_args:
             return subprocess.run(
                 [
-                    self.yt_dlp_bin,
+                    *self.yt_dlp_command,
                     "--ignore-config",
                     "--no-playlist",
                     "--max-filesize",
@@ -1371,13 +1353,25 @@ class MediaPipelineMixin:
             platform,
             result.returncode,
         )
-        err_lines = (result.stderr or "").strip().splitlines()
-        if err_lines:
+        command = getattr(result, "args", None)
+        if command:
+            rendered = command if isinstance(command, str) else subprocess.list2cmdline(command)
+            self.logger.warning("⚠️ %s yt-dlp 调用命令: %s", platform, rendered)
+
+        has_output = False
+        for stream_name, output in (("stderr", result.stderr), ("stdout", result.stdout)):
+            lines = (output or "").strip().splitlines()
+            if not lines:
+                continue
+            has_output = True
             self.logger.warning(
-                "⚠️ %s yt-dlp 错误输出(尾部): %s",
+                "⚠️ %s yt-dlp %s(尾部): %s",
                 platform,
-                chr(10).join(err_lines[-5:]),
+                stream_name,
+                chr(10).join(lines[-5:]),
             )
+        if not has_output:
+            self.logger.warning("⚠️ %s yt-dlp 未返回 stdout/stderr", platform)
 
     def _escape_ffmpeg_filter_path(self, path: str) -> str:
         return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")

@@ -228,11 +228,11 @@ class SystemToolService:
             healthy = bool(installed and executable)
             card.update(
                 health="ready" if healthy else "missing",
-                health_label="正常" if healthy else "命令缺失",
+                health_label="正常" if healthy else "模块缺失",
                 message=(
-                    "升级后独立校验命令版本，失败时自动恢复"
+                    "通过当前 Python 模块调用，升级后独立校验"
                     if healthy
-                    else "包已安装但没有找到 Summary Plus 可调用的 yt-dlp 命令"
+                    else "当前 Python 环境中的 yt-dlp 模块不可用"
                 ),
                 installed_version=installed or None,
                 available_version=status.get("available_version"),

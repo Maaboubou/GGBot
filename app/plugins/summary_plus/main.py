@@ -5,6 +5,7 @@ summary_plus 摘要插件
 
 import logging
 import os
+import subprocess
 import threading
 import time
 import uuid
@@ -228,10 +229,10 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
             plugin_name=plugin_name,
             configured_path=str(get_config("ffprobe_path", plugin_name=plugin_name, default="") or ""),
         )
-        self.yt_dlp_bin = self._resolve_ytdlp_tool()
+        self.yt_dlp_command = self._resolve_ytdlp_command()
         self.logger.info(f"🎞️ FFmpeg: {self.ffmpeg_bin}")
         self.logger.info(f"🎞️ FFprobe: {self.ffprobe_bin}")
-        self.logger.info(f"📥 yt-dlp: {self.yt_dlp_bin}")
+        self.logger.info("📥 yt-dlp: %s", subprocess.list2cmdline(self.yt_dlp_command))
 
         # Local ASR settings
         self.local_asr_enabled = bool(
@@ -833,7 +834,7 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
         return bili_transcribe_local(
             url=url,
             cookies_path=self._get_bili_cookies_path(),
-            yt_dlp_bin=self.yt_dlp_bin,
+            yt_dlp_command=self.yt_dlp_command,
             ffmpeg_bin=self.ffmpeg_bin,
             runtime_path=self.local_asr_runtime_path,
             model_path=self.local_asr_model_path,
@@ -859,7 +860,7 @@ class SummaryService(BrowserRuntimeMixin, MediaPipelineMixin, XiaohongshuMixin):
             return douyin_transcribe_local(
                 url=url,
                 cookie_args=cookie_args,
-                yt_dlp_bin=self.yt_dlp_bin,
+                yt_dlp_command=self.yt_dlp_command,
                 ffmpeg_bin=self.ffmpeg_bin,
                 runtime_path=self.local_asr_runtime_path,
                 model_path=self.local_asr_model_path,

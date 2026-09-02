@@ -10,7 +10,7 @@ import subprocess
 import threading
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from app.utils.subprocess_utils import hidden_creation_flags
@@ -107,7 +107,7 @@ def _download_bilibili_audio(
     *,
     output_base: Path,
     cookies_path: str,
-    yt_dlp_bin: str,
+    yt_dlp_command: Sequence[str],
     ffmpeg_bin: str,
     logger=None,
 ) -> Path:
@@ -115,7 +115,7 @@ def _download_bilibili_audio(
     _log(logger, "info", f"[*] 正在为本地 ASR 下载音频: {clean_url}")
 
     command = [
-        yt_dlp_bin,
+        *yt_dlp_command,
         "--no-playlist",
         "--proxy",
         "",
@@ -153,13 +153,13 @@ def _download_douyin_audio(
     *,
     output_base: Path,
     cookie_args: list[str],
-    yt_dlp_bin: str,
+    yt_dlp_command: Sequence[str],
     ffmpeg_bin: str,
     logger=None,
 ) -> Path:
     _log(logger, "info", f"[*] 正在为本地 ASR 下载抖音音频: {url}")
     command = [
-        yt_dlp_bin,
+        *yt_dlp_command,
         "--ignore-config",
         "--no-playlist",
         *cookie_args,
@@ -279,7 +279,7 @@ def bili_transcribe_local(
     url: str,
     *,
     cookies_path: str,
-    yt_dlp_bin: str,
+    yt_dlp_command: Sequence[str],
     ffmpeg_bin: str,
     runtime_path: str,
     model_path: str,
@@ -315,7 +315,7 @@ def bili_transcribe_local(
             url,
             output_base=output_base,
             cookies_path=cookies_path,
-            yt_dlp_bin=yt_dlp_bin,
+            yt_dlp_command=yt_dlp_command,
             ffmpeg_bin=ffmpeg_bin,
             logger=logger,
         )
@@ -348,7 +348,7 @@ def douyin_transcribe_local(
     url: str,
     *,
     cookie_args: list[str],
-    yt_dlp_bin: str,
+    yt_dlp_command: Sequence[str],
     ffmpeg_bin: str,
     runtime_path: str,
     model_path: str,
@@ -387,7 +387,7 @@ def douyin_transcribe_local(
             url,
             output_base=output_base,
             cookie_args=list(cookie_args or []),
-            yt_dlp_bin=yt_dlp_bin,
+            yt_dlp_command=yt_dlp_command,
             ffmpeg_bin=ffmpeg_bin,
             logger=logger,
         )

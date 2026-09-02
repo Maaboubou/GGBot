@@ -1,17 +1,15 @@
-"""Managed updates for the yt-dlp executable used by Summary Plus."""
+"""Managed updates for the yt-dlp module used by Summary Plus."""
 
 from __future__ import annotations
 
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import threading
 import uuid
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version as package_version
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -74,12 +72,13 @@ class YtDlpUpdateService:
             configured = 900
         return max(120, min(configured, 3600))
 
+    def command(self) -> list[str]:
+        """Return a relocation-safe yt-dlp invocation for this Python environment."""
+        return [self.python_executable, "-m", "yt_dlp"]
+
     def executable_path(self) -> str:
-        executable_name = "yt-dlp.exe" if os.name == "nt" else "yt-dlp"
-        candidate = Path(self.python_executable).resolve().parent / executable_name
-        if candidate.is_file():
-            return str(candidate)
-        return str(shutil.which("yt-dlp") or "")
+        """Return the display form kept for the existing system-tools API."""
+        return subprocess.list2cmdline(self.command())
 
     @staticmethod
     def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess:
@@ -134,18 +133,15 @@ class YtDlpUpdateService:
         if metadata.returncode != 0:
             raise YtDlpUpdateError("新版 yt-dlp 未通过独立进程包版本校验")
 
-        executable = self.executable_path()
-        if not executable:
-            raise YtDlpUpdateError("安装后未找到当前 Python 环境中的 yt-dlp 命令")
         version_result = self._run(
-            [executable, "--version"],
+            [*self.command(), "--version"],
             timeout=min(self._timeout_seconds(), 60),
         )
         reported = str(version_result.stdout or "").strip().splitlines()
         reported_version = reported[-1].strip() if reported else ""
         if version_result.returncode != 0 or _normalized_version(reported_version) != target:
             raise YtDlpUpdateError(
-                f"yt-dlp 命令版本校验失败：期望 {target}，实际 {reported_version or '未知'}"
+                f"yt-dlp 模块版本校验失败：期望 {target}，实际 {reported_version or '未知'}"
             )
 
     def check_latest(self, *, allow_during_update: bool = False) -> Dict[str, Any]:
@@ -231,24 +227,24 @@ class YtDlpUpdateService:
             if not latest["update_available"]:
                 try:
                     self._verify_fresh_process(previous_version)
-                    self._complete("succeeded", "当前已是最新版本且命令可用", previous_version)
+                    self._complete("succeeded", "当前已是最新版本且模块可用", previous_version)
                     return
                 except Exception:
                     self._set_stage("install", 35, f"重新安装 yt-dlp {previous_version}")
                     install_attempted = True
                     self._install_exact(previous_version, force=True)
-                    self._set_stage("verify", 82, "验证修复后的 yt-dlp 命令")
+                    self._set_stage("verify", 82, "验证修复后的 yt-dlp 模块")
                     self._verify_fresh_process(previous_version)
                     self._complete(
                         "succeeded",
-                        f"yt-dlp {previous_version} 命令入口已修复并立即生效",
+                        f"yt-dlp {previous_version} 模块调用已修复并立即生效",
                         previous_version,
                     )
                     self._record_audit(
                         status="success",
                         before=previous_version,
                         after=previous_version,
-                        summary=f"yt-dlp {previous_version} 命令入口已修复",
+                        summary=f"yt-dlp {previous_version} 模块调用已修复",
                     )
                     return
 
@@ -256,7 +252,7 @@ class YtDlpUpdateService:
             install_attempted = True
             self._install_exact(target_version)
 
-            self._set_stage("verify", 82, "验证 yt-dlp 命令与包版本")
+            self._set_stage("verify", 82, "验证 yt-dlp 模块与包版本")
             installed = self._installed_version()
             if _normalized_version(installed) != _normalized_version(target_version):
                 raise YtDlpUpdateError(

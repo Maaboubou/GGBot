@@ -213,8 +213,22 @@ class CodexProfileService:
         }
 
     def create_profile(self, payload: dict[str, Any], *, codex_bin: str) -> dict[str, Any]:
+        configured_bin = str(codex_bin or "").strip()
+        runtime = get_file_tools_runtime(
+            use_wsl=self.use_wsl,
+            codex_bin=configured_bin,
+        )
+        codex = runtime.get("codex") if isinstance(runtime.get("codex"), dict) else {}
+        resolved_bin = str(codex.get("path") or "").strip()
+        if not codex.get("available") or not resolved_bin:
+            detail = str(runtime.get("error") or "").strip()
+            message = "无法解析当前 Linux/WSL 环境中的 Codex 可执行文件"
+            if detail:
+                message = f"{message}：{detail}"
+            raise CodexProfileError(message)
+
         request = dict(payload)
-        request["codex_bin"] = str(codex_bin or "").strip()
+        request["codex_bin"] = resolved_bin
         profile = public_profile(self._run("create", request))
         if not profile:
             raise CodexProfileError("新建 Profile 返回内容不完整")

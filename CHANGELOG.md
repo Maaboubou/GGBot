@@ -21,6 +21,7 @@
 - 显式声明 Windows 必需的 `pywin32`，修复全新安装后缺少 `win32api` 的问题。
 - 安装器和启动引导会验证 mabowx 实际使用的全部 Win32 模块，并在依赖缺失时自动修复。
 - Codex Profile、Skill、运行环境探测和升级命令统一按 UTF-8 读取 WSL 输出，避免 Windows 默认 GBK 导致页面无数据。
+- 创建 Codex Profile 前会在实际 Linux/WSL 环境中解析 CLI 的绝对路径，避免新机把 `codex` 命令名误当作不存在的文件路径。
 
 ### 安全
 

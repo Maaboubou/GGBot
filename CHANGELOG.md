@@ -13,7 +13,7 @@
 ### 新增
 
 - 新增独立桌面启动器，统一管理微信 Bot 与 Web 服务的启动、停止、重启、日志、环境检查和系统托盘。
-- 新增 Codex Profile、Skill、聊天隔离、会话连续性、模型路由及文件处理能力。
+- 新增 Codex Profile、Skill、聊天隔离、会话连续性、模型路由及文件处理能力；Codex CLI 作为执行框架，Profile 可使用 ChatGPT 账号或第三方 Responses 兼容模型。
 - 微信附件建立持久索引，可在后续消息中精确绑定并交给 Codex 处理。
 
 ### 修复

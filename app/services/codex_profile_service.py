@@ -374,7 +374,7 @@ class CodexProfileService:
             normalized = ""
         resolved = normalized or cls.default_profile_id()
         if not resolved:
-            raise CodexProfileError("尚未配置默认 Codex Profile，请先新建并完成登录")
+            raise CodexProfileError("尚未配置默认 Codex Profile，请先新建并完成模型认证配置")
         return resolved
 
     def set_default_profile(self, name: str) -> None:

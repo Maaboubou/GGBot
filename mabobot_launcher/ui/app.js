@@ -70,20 +70,11 @@
             : 'stopped';
     }
 
-    function primaryCommand(service) {
-        return ['running', 'starting', 'degraded'].includes(service.status) ? 'restart' : 'start';
-    }
-
-    function primaryLabel(service) {
-        if (service.status === 'starting') return '启动中';
-        if (service.status === 'stopping') return '停止中';
-        return primaryCommand(service) === 'restart' ? '重启' : '启动';
-    }
-
     function render(snapshot) {
         ui.snapshot = snapshot;
         $('#titleVersion').textContent = snapshot.version || '3.0.0';
         renderOverall();
+        renderGlobalControls();
         renderOverviewServices();
         renderDetailedServices();
         renderRecentLogs();
@@ -120,11 +111,35 @@
         element.className = ready ? '' : (['error', 'degraded'].includes(serviceStatus) ? 'is-warning' : 'is-muted');
     }
 
+    function renderGlobalControls() {
+        const services = ui.snapshot?.services || [];
+        const transition = services.find(service => ['starting', 'stopping'].includes(service.status));
+        const fullyActive = services.length > 0 && services.every(service => ['running', 'degraded'].includes(service.status));
+        const anyActive = services.some(service => ['running', 'starting', 'stopping', 'degraded'].includes(service.status));
+        const stopping = transition?.status === 'stopping';
+        const stopMode = fullyActive || stopping;
+        const action = fullyActive ? 'stop-all' : 'start-all';
+        const label = transition ? (stopping ? '停止中' : '启动中') : (fullyActive ? '停止' : '启动');
+
+        $$('[data-service-toggle]').forEach(button => {
+            button.dataset.action = action;
+            button.disabled = Boolean(transition);
+            button.classList.toggle('button-primary', !stopMode);
+            button.classList.toggle('button-secondary', stopMode);
+            button.classList.toggle('is-stop', stopMode);
+            button.querySelector('use').setAttribute('href', stopMode ? '#i-stop' : '#i-play');
+            button.querySelector('span').textContent = label;
+            button.setAttribute('aria-label', `${label} Mabobot 服务`);
+        });
+
+        $$('[data-service-restart]').forEach(button => {
+            button.disabled = Boolean(transition) || !anyActive;
+        });
+    }
+
     function renderOverviewServices() {
         const container = $('#overviewServices');
         container.innerHTML = (ui.snapshot.services || []).map(service => {
-            const command = primaryCommand(service);
-            const busy = ['starting', 'stopping'].includes(service.status);
             return `
                 <article class="service-card">
                     <div class="service-card-top">
@@ -133,7 +148,6 @@
                             <h3>${escapeHtml(service.label)}</h3>
                             <span class="service-state ${statusClass(service.status)}"><span class="presence-dot ${statusClass(service.status)}"></span>${escapeHtml(service.status_label)}</span>
                         </div>
-                        <button class="button button-secondary service-action" data-service="${escapeHtml(service.key)}" data-command="${command}" ${busy ? 'disabled' : ''}>${command === 'restart' ? icon('refresh') : icon('play')}${primaryLabel(service)}</button>
                     </div>
                     <div class="service-address"><span>${escapeHtml(service.address)}</span><span>${service.pid ? `PID ${service.pid}` : '等待启动'}</span></div>
                 </article>`;
@@ -143,8 +157,6 @@
     function renderDetailedServices() {
         const container = $('#detailedServices');
         container.innerHTML = (ui.snapshot.services || []).map(service => {
-            const active = ['running', 'starting', 'degraded'].includes(service.status);
-            const busy = ['starting', 'stopping'].includes(service.status);
             return `
                 <article class="detailed-service">
                     <div class="detailed-main">
@@ -159,10 +171,6 @@
                                 <span class="service-fact">${icon('info')}${escapeHtml(service.detail)}</span>
                             </div>
                         </div>
-                    </div>
-                    <div class="detailed-actions">
-                        ${active ? `<button class="button button-quiet" data-service="${escapeHtml(service.key)}" data-command="stop" ${busy ? 'disabled' : ''}>${icon('stop')}停止</button>` : ''}
-                        <button class="button ${active ? 'button-secondary' : 'button-primary'}" data-service="${escapeHtml(service.key)}" data-command="${active ? 'restart' : 'start'}" ${busy ? 'disabled' : ''}>${active ? icon('refresh') + '重启' : icon('play') + '启动'}</button>
                     </div>
                 </article>`;
         }).join('');
@@ -248,8 +256,11 @@
         $('#closeBehavior').textContent = settings.close_behavior === 'tray' ? '最小化到系统托盘' : '最小化窗口';
 
         const repairText = ui.snapshot.repairing ? '正在修复环境' : '修复环境';
-        $('#repairButtonText').textContent = repairText;
-        $$('[data-action="repair"]').forEach(button => { button.disabled = Boolean(ui.snapshot.repairing); });
+        $$('[data-action="repair"]').forEach(button => {
+            button.disabled = Boolean(ui.snapshot.repairing);
+            const label = button.querySelector('[data-repair-label]');
+            if (label) label.textContent = repairText;
+        });
     }
 
     function mergeLogs(items) {
@@ -352,23 +363,15 @@
             const pageLink = event.target.closest('[data-go-page]');
             if (pageLink) return showPage(pageLink.dataset.goPage);
 
-            const serviceButton = event.target.closest('[data-service][data-command]');
-            if (serviceButton) {
-                serviceButton.disabled = true;
-                const { service, command } = serviceButton.dataset;
-                await execute(`${command}_service`, [service], `${service === 'web' ? 'Web 服务' : '微信 Bot'}操作已提交`);
-                return;
-            }
-
             const actionButton = event.target.closest('[data-action]');
             if (!actionButton) return;
             const action = actionButton.dataset.action;
             if (action === 'open-web') return execute('open_web_console');
             if (action === 'open-folder') return execute('open_project_folder');
-            if (action === 'start-all') return execute('start_all', [], '全部服务启动请求已提交');
-            if (action === 'restart-all') return execute('restart_all', [], '全部服务已重启');
+            if (action === 'start-all') return execute('start_all', [], 'Mabobot 启动请求已提交');
+            if (action === 'restart-all') return execute('restart_all', [], 'Mabobot 已重启');
             if (action === 'stop-all') {
-                return confirmAction('停止全部服务', '微信消息监听与 Web 控制台都会停止，桌面启动器仍会保持打开。', '停止全部', () => execute('stop_all', [], '全部服务已停止'));
+                return confirmAction('停止 Mabobot', '微信消息监听与 Web 控制台都会停止，桌面启动器仍会保持打开。', '停止', () => execute('stop_all', [], 'Mabobot 已停止'));
             }
             if (action === 'repair') {
                 return confirmAction('修复运行环境', '将先停止服务，重新校验并安装项目依赖；完成后会自动恢复服务。该过程可能需要数分钟。', '开始修复', () => execute('repair_environment', [], '环境修复已在后台开始'));
@@ -379,11 +382,29 @@
         });
 
         $('#minimizeButton').addEventListener('click', () => execute('minimize_window'));
-        $('#maximizeButton').addEventListener('click', () => execute('toggle_maximize'));
+        const toggleWindowMaximize = async () => {
+            try {
+                const result = await apiCall('toggle_maximize');
+                document.body.classList.toggle('is-maximized', Boolean(result?.maximized));
+            } catch (error) {
+                toast(error.message || String(error), 'error');
+            }
+        };
+        $('#maximizeButton').addEventListener('click', toggleWindowMaximize);
         $('#closeButton').addEventListener('click', () => execute('hide_window'));
         $('.window-actions').addEventListener('mousedown', event => event.stopPropagation());
         $('#titlebar').addEventListener('dblclick', event => {
-            if (!event.target.closest('.window-actions')) execute('toggle_maximize');
+            if (!event.target.closest('.window-actions')) toggleWindowMaximize();
+        });
+        $$('[data-resize-edge]').forEach(handle => {
+            handle.addEventListener('mousedown', event => {
+                if (event.button !== 0) return;
+                event.preventDefault();
+                event.stopPropagation();
+                apiCall('begin_window_resize', handle.dataset.resizeEdge).catch(error => {
+                    toast(error.message || String(error), 'error');
+                });
+            });
         });
         $('#openFolderSide').addEventListener('click', () => execute('open_project_folder'));
         $('#openLogsFolder').addEventListener('click', () => execute('open_logs_folder'));

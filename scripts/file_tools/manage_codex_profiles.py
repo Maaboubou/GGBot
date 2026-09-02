@@ -28,6 +28,17 @@ CHATGPT_AUTH_SOURCES = {"device_code", "local_cache"}
 SETUP_STATUSES = {"pending", "ready"}
 SECRET_ENV_NAME = "MABOBOT_CODEX_PROFILE_API_KEY"
 MAX_AUTH_CACHE_BYTES = 1024 * 1024
+PROFILE_DIRECTORY_NAME = "mabobot-profiles"
+LEGACY_PROFILE_DIRECTORY_NAMES = ("wxautox-profiles",)
+LEGACY_PROFILE_ARTIFACTS = {
+    ".wxautox-local-auth.sha256": ".mabobot-local-auth.sha256",
+    ".wxautox-skill-manager.json": ".mabobot-skill-manager.json",
+    ".wxautox-skill-manager.lock": ".mabobot-skill-manager.lock",
+    ".wxautox-skill-audit.jsonl": ".mabobot-skill-audit.jsonl",
+    ".wxautox-skill-trash": ".mabobot-skill-trash",
+    ".wxautox-skill-history": ".mabobot-skill-history",
+    ".wxautox-skill-staging": ".mabobot-skill-staging",
+}
 
 
 class ProfileError(ValueError):
@@ -186,8 +197,13 @@ def _validate(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _paths(home: Path, name: str) -> dict[str, Path]:
-    metadata = home / ".codex" / "mabobot-profiles"
+def _paths(
+    home: Path,
+    name: str,
+    *,
+    directory_name: str = PROFILE_DIRECTORY_NAME,
+) -> dict[str, Path]:
+    metadata = home / ".codex" / directory_name
     codex_home = metadata / name
     return {
         "metadata": metadata,
@@ -200,6 +216,189 @@ def _paths(home: Path, name: str) -> dict[str, Path]:
         "manifest": metadata / f"{name}.json",
         "wrapper": home / ".local" / "bin" / f"codex-profile-{name}",
     }
+
+
+def _legacy_profile(profile: Any, *, name: str, paths: dict[str, Path]) -> dict[str, Any]:
+    """Validate old public metadata and derive every path from the new home."""
+    if not isinstance(profile, dict) or str(profile.get("name") or "") != name:
+        raise ProfileError(f"旧版 Codex Profile 清单与名称不匹配：{name}")
+
+    auth_type = str(profile.get("auth_type") or "api_key").strip().lower()
+    if auth_type not in AUTH_TYPES:
+        raise ProfileError(f"旧版 Codex Profile 登录方式无效：{name}")
+    auth_source = str(profile.get("auth_source") or "device_code").strip().lower()
+    if auth_type == "chatgpt":
+        if auth_source not in CHATGPT_AUTH_SOURCES:
+            auth_source = "device_code"
+    else:
+        auth_source = "api_key"
+
+    model = str(profile.get("model") or "").strip()
+    if not MODEL_ID_RE.fullmatch(model):
+        raise ProfileError(f"旧版 Codex Profile 模型 ID 无效：{name}")
+    provider_default = "ChatGPT 官方登录" if auth_type == "chatgpt" else "OpenAI Responses compatible"
+    provider_name = str(profile.get("provider_name") or provider_default).strip()
+    if not provider_name or len(provider_name) > 100 or "\x00" in provider_name:
+        raise ProfileError(f"旧版 Codex Profile 供应商名称无效：{name}")
+    base_url = "" if auth_type == "chatgpt" else _validate_base_url(profile.get("base_url"))
+
+    reasoning_effort = str(profile.get("reasoning_effort") or "high").strip().lower()
+    if reasoning_effort not in REASONING_EFFORTS:
+        reasoning_effort = "high"
+    model_verbosity = str(profile.get("model_verbosity") or "inherit").strip().lower()
+    if model_verbosity not in VERBOSITY_VALUES:
+        model_verbosity = "inherit"
+    try:
+        context_window = int(profile.get("context_window") or 128000)
+    except (TypeError, ValueError) as exc:
+        raise ProfileError(f"旧版 Codex Profile 上下文窗口无效：{name}") from exc
+    if not 4096 <= context_window <= 10_000_000:
+        raise ProfileError(f"旧版 Codex Profile 上下文窗口无效：{name}")
+
+    codex_bin = str(profile.get("codex_bin") or "").strip()
+    if not codex_bin or "\x00" in codex_bin or not Path(codex_bin).expanduser().is_absolute():
+        raise ProfileError(f"旧版 Codex Profile 的 Codex 路径无效：{name}")
+    setup_status = str(profile.get("setup_status") or "ready").strip().lower()
+    if setup_status not in SETUP_STATUSES:
+        setup_status = "ready"
+
+    migrated = {
+        "name": name,
+        "auth_type": auth_type,
+        "auth_source": auth_source,
+        "model": model,
+        "provider_name": provider_name,
+        "base_url": base_url,
+        "reasoning_effort": reasoning_effort,
+        "model_verbosity": model_verbosity,
+        "context_window": context_window,
+        "supports_vision": _as_bool(profile.get("supports_vision")),
+        "supports_web_search": _as_bool(profile.get("supports_web_search")),
+        "wire_api": "chatgpt" if auth_type == "chatgpt" else "responses",
+        "codex_bin": codex_bin,
+        "wrapper_path": str(paths["wrapper"]),
+        "config_path": str(paths["config"]),
+        "codex_home": str(paths["codex_home"]),
+        "created_at": str(profile.get("created_at") or datetime.now(timezone.utc).isoformat()),
+        "setup_status": setup_status,
+    }
+    for key in ("account_email", "plan_type"):
+        value = str(profile.get(key) or "").strip()
+        if value and len(value) <= 320 and "\x00" not in value:
+            migrated[key] = value
+    return migrated
+
+
+def _rename_legacy_profile_artifacts(codex_home: Path) -> None:
+    for old_name, new_name in LEGACY_PROFILE_ARTIFACTS.items():
+        source = codex_home / old_name
+        target = codex_home / new_name
+        if not source.exists() and not source.is_symlink():
+            continue
+        if source.is_symlink():
+            raise ProfileError(f"旧版 Codex Profile 状态文件不安全：{source}")
+        if target.exists() or target.is_symlink():
+            continue
+        os.replace(source, target)
+
+
+def _migrate_legacy_profiles(home: Path) -> dict[str, list[str]]:
+    """Move pre-Mabobot managed homes without copying or exposing credentials.
+
+    The legacy manifest is removed last.  If the process is interrupted after
+    moving a profile directory, the next run can safely resume from the new
+    directory while the old manifest still records the pending migration.
+    """
+    resolved_home = home.resolve()
+    current_metadata = resolved_home / ".codex" / PROFILE_DIRECTORY_NAME
+    result: dict[str, list[str]] = {"migrated": [], "conflicts": []}
+
+    for legacy_directory_name in LEGACY_PROFILE_DIRECTORY_NAMES:
+        legacy_metadata = resolved_home / ".codex" / legacy_directory_name
+        if not legacy_metadata.exists():
+            continue
+        if legacy_metadata.is_symlink() or not legacy_metadata.is_dir():
+            raise ProfileError(f"旧版 Codex Profile 目录不安全：{legacy_metadata}")
+        try:
+            manifests = sorted(legacy_metadata.glob("*.json"))
+        except OSError as exc:
+            raise ProfileError(f"无法检查旧版 Codex Profile：{exc}") from exc
+        if not manifests:
+            continue
+        _safe_directory(current_metadata)
+
+        for legacy_manifest in manifests:
+            if legacy_manifest.is_symlink() or not legacy_manifest.is_file():
+                continue
+            name = legacy_manifest.stem
+            if not PROFILE_NAME_RE.fullmatch(name):
+                continue
+            legacy_paths = _paths(
+                resolved_home,
+                name,
+                directory_name=legacy_directory_name,
+            )
+            current_paths = _paths(resolved_home, name)
+
+            if current_paths["manifest"].exists() or current_paths["manifest"].is_symlink():
+                # A completed interrupted migration has no legacy profile home;
+                # only then is its now-redundant old manifest safe to retire.
+                if (
+                    not legacy_paths["codex_home"].exists()
+                    and current_paths["codex_home"].is_dir()
+                    and not current_paths["codex_home"].is_symlink()
+                ):
+                    try:
+                        current_data = json.loads(
+                            current_paths["manifest"].read_text(encoding="utf-8")
+                        )
+                    except (OSError, ValueError, TypeError):
+                        current_data = None
+                    if isinstance(current_data, dict) and current_data.get("name") == name:
+                        legacy_manifest.unlink()
+                        continue
+                result["conflicts"].append(name)
+                continue
+
+            legacy_home = legacy_paths["codex_home"]
+            current_home = current_paths["codex_home"]
+            if legacy_home.exists() or legacy_home.is_symlink():
+                if legacy_home.is_symlink() or not legacy_home.is_dir():
+                    raise ProfileError(f"旧版 Codex Profile 目录不安全：{name}")
+                if current_home.exists() or current_home.is_symlink():
+                    result["conflicts"].append(name)
+                    continue
+                os.replace(legacy_home, current_home)
+            elif current_home.is_symlink() or not current_home.is_dir():
+                raise ProfileError(f"旧版 Codex Profile 数据不完整：{name}")
+
+            try:
+                legacy_data = json.loads(legacy_manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError) as exc:
+                raise ProfileError(f"旧版 Codex Profile 清单已损坏：{name}") from exc
+            _rename_legacy_profile_artifacts(current_home)
+            profile = _legacy_profile(legacy_data, name=name, paths=current_paths)
+            rendered_config = _render_config(profile, current_paths)
+            rendered_catalog = (
+                json.dumps(_model_catalog(profile), ensure_ascii=False, indent=2) + "\n"
+                if profile["auth_type"] == "api_key"
+                else None
+            )
+            rendered_wrapper = _render_wrapper(profile, current_paths)
+            rendered_manifest = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
+
+            _safe_directory(current_paths["wrapper"].parent)
+            _atomic_write(current_paths["config"], rendered_config, 0o600)
+            if rendered_catalog is not None:
+                _atomic_write(current_paths["catalog"], rendered_catalog, 0o600)
+            _atomic_write(current_paths["wrapper"], rendered_wrapper, 0o700)
+            _atomic_write(current_paths["manifest"], rendered_manifest, 0o600)
+            legacy_manifest.unlink()
+            result["migrated"].append(name)
+
+    result["migrated"].sort()
+    result["conflicts"] = sorted(set(result["conflicts"]))
+    return result
 
 
 def _local_auth_status(home: Path) -> dict[str, Any]:
@@ -805,7 +1004,8 @@ def delete_profile(payload: dict[str, Any], *, home: Path) -> dict[str, Any]:
 
 
 def list_profiles(*, home: Path) -> dict[str, Any]:
-    metadata = home.resolve() / ".codex" / "mabobot-profiles"
+    migration = _migrate_legacy_profiles(home)
+    metadata = home.resolve() / ".codex" / PROFILE_DIRECTORY_NAME
     local_auth = _local_auth_status(home)
     profiles: list[dict[str, Any]] = []
     try:
@@ -869,6 +1069,7 @@ def list_profiles(*, home: Path) -> dict[str, Any]:
         "codex_home": str(metadata),
         "local_auth": local_auth,
         "profiles": profiles,
+        "migration": migration,
     }
 
 
@@ -895,16 +1096,21 @@ def main() -> int:
     try:
         if options.action == "list":
             result = list_profiles(home=home)
-        elif options.action == "create":
-            result = create_profile(_request(), home=home)
-        elif options.action == "update":
-            result = update_profile(_request(), home=home)
-        elif options.action == "import-local-auth":
-            result = import_local_auth(_request(), home=home)
-        elif options.action == "clear-auth":
-            result = clear_profile_auth(_request(), home=home)
         else:
-            result = delete_profile(_request(), home=home)
+            # Every mutating action first reconciles data created by wxautox4.
+            # This prevents a duplicate create from hiding an existing legacy
+            # profile and makes migration independent of which screen opens first.
+            _migrate_legacy_profiles(home)
+            if options.action == "create":
+                result = create_profile(_request(), home=home)
+            elif options.action == "update":
+                result = update_profile(_request(), home=home)
+            elif options.action == "import-local-auth":
+                result = import_local_auth(_request(), home=home)
+            elif options.action == "clear-auth":
+                result = clear_profile_auth(_request(), home=home)
+            else:
+                result = delete_profile(_request(), home=home)
         print(json.dumps({"status": "success", "data": result}, ensure_ascii=False, separators=(",", ":")))
         return 0
     except (ProfileError, OSError) as exc:

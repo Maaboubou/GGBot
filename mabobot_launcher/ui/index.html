@@ -32,6 +32,15 @@
         <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 3h6l1 4H8l1-4ZM7 7l1 14h8l1-14M10 11v6M14 11v6"/></symbol>
     </svg>
 
+    <div class="resize-handle resize-n" data-resize-edge="n" aria-hidden="true"></div>
+    <div class="resize-handle resize-ne" data-resize-edge="ne" aria-hidden="true"></div>
+    <div class="resize-handle resize-e" data-resize-edge="e" aria-hidden="true"></div>
+    <div class="resize-handle resize-se" data-resize-edge="se" aria-hidden="true"></div>
+    <div class="resize-handle resize-s" data-resize-edge="s" aria-hidden="true"></div>
+    <div class="resize-handle resize-sw" data-resize-edge="sw" aria-hidden="true"></div>
+    <div class="resize-handle resize-w" data-resize-edge="w" aria-hidden="true"></div>
+    <div class="resize-handle resize-nw" data-resize-edge="nw" aria-hidden="true"></div>
+
     <div class="window-shell">
         <header class="titlebar pywebview-drag-region" id="titlebar">
             <div class="brand-mark" aria-hidden="true"><img src="mabobot-icon.svg" alt=""></div>
@@ -61,8 +70,12 @@
 
             <main class="main-content">
                 <section class="page is-visible" id="page-overview" data-page-panel="overview">
-                    <div class="page-heading">
+                    <div class="page-heading page-heading-row">
                         <div><p class="eyebrow">MABOBOT DESKTOP</p><h1>运行与服务</h1></div>
+                        <div class="heading-actions service-controls" aria-label="服务控制">
+                            <button class="button button-secondary" data-action="restart-all" data-service-restart><svg><use href="#i-refresh"/></svg>重启</button>
+                            <button class="button button-primary service-toggle" data-action="start-all" data-service-toggle><svg><use href="#i-play"/></svg><span>启动</span></button>
+                        </div>
                     </div>
 
                     <div class="status-strip">
@@ -106,16 +119,15 @@
                         </div>
                     </div>
 
-                    <div class="page-actions">
-                        <button class="button button-secondary" data-action="repair"><svg><use href="#i-wrench"/></svg><span id="repairButtonText">修复环境</span></button>
-                        <button class="button button-danger" data-action="stop-all"><svg><use href="#i-stop"/></svg>停止全部</button>
-                    </div>
                 </section>
 
                 <section class="page" id="page-services" data-page-panel="services">
                     <div class="page-heading page-heading-row">
-                        <div><p class="eyebrow">PROCESS SUPERVISOR</p><h1>服务</h1><p class="page-description">独立控制微信桥接与 Web 应用，异常退出时自动恢复。</p></div>
-                        <div class="heading-actions"><button class="button button-secondary" data-action="restart-all"><svg><use href="#i-refresh"/></svg>重启全部</button><button class="button button-primary" data-action="start-all"><svg><use href="#i-play"/></svg>启动全部</button></div>
+                        <div><p class="eyebrow">PROCESS SUPERVISOR</p><h1>服务</h1><p class="page-description">统一管理微信桥接与 Web 应用，异常退出时自动恢复。</p></div>
+                        <div class="heading-actions service-controls" aria-label="服务控制">
+                            <button class="button button-secondary" data-action="restart-all" data-service-restart><svg><use href="#i-refresh"/></svg>重启</button>
+                            <button class="button button-primary service-toggle" data-action="start-all" data-service-toggle><svg><use href="#i-play"/></svg><span>启动</span></button>
+                        </div>
                     </div>
                     <div class="detailed-services" id="detailedServices"></div>
                     <article class="panel supervisor-note">
@@ -161,7 +173,7 @@
                         <article class="panel settings-card wide-card">
                             <div class="settings-card-heading"><span class="setting-icon"><svg><use href="#i-wrench"/></svg></span><div><h2>本地环境</h2><p>检查依赖、打开工作目录或执行完整修复。</p></div></div>
                             <div class="settings-environment" id="settingsEnvironment"></div>
-                            <div class="settings-card-actions"><button class="button button-secondary" data-action="open-folder"><svg><use href="#i-folder"/></svg>打开项目目录</button><button class="button button-secondary" data-action="repair"><svg><use href="#i-wrench"/></svg>修复运行环境</button></div>
+                            <div class="settings-card-actions"><button class="button button-secondary" data-action="open-folder"><svg><use href="#i-folder"/></svg>打开项目目录</button><button class="button button-secondary" data-action="repair"><svg><use href="#i-wrench"/></svg><span data-repair-label>修复运行环境</span></button></div>
                         </article>
                     </div>
                     <div class="danger-zone"><div><strong>退出 Mabobot</strong><p>停止微信 Bot 与 Web 服务，并关闭系统托盘进程。</p></div><button class="button button-danger" data-action="exit"><svg><use href="#i-power"/></svg>停止服务并退出</button></div>

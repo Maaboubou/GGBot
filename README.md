@@ -92,7 +92,6 @@ app/               应用核心、AI 助手、服务与插件
 mabowx/            微信 UI 自动化、选择器与消息模型
 web/               Web 控制台
 scripts/           安装、运维与文件工具
-skills/            提供给 Codex 的项目技能
 tests/             自动化测试
 ```
 

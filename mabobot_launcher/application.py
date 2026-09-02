@@ -133,6 +133,9 @@ class LauncherApi:
     def toggle_maximize(self) -> dict[str, Any]:
         return {"ok": True, "maximized": self._application.toggle_maximize()}
 
+    def begin_window_resize(self, edge: str) -> dict[str, Any]:
+        return {"ok": self._application.begin_window_resize(str(edge))}
+
     def hide_window(self) -> dict[str, Any]:
         self._application.hide_window()
         return {"ok": True}
@@ -207,8 +210,9 @@ class DesktopLauncher:
             str(UI_DIR / "index.html"),
             js_api=self.api,
             width=1180,
-            height=760,
-            min_size=(980, 640),
+            height=780,
+            min_size=(980, 700),
+            resizable=True,
             frameless=True,
             easy_drag=False,
             shadow=True,
@@ -544,10 +548,50 @@ class DesktopLauncher:
         self._maximized = not self._maximized
         return self._maximized
 
+    def begin_window_resize(self, edge: str) -> bool:
+        """Start a native Windows resize gesture for the frameless window."""
+        if os.name != "nt" or not self.window or self._maximized:
+            return False
+
+        hit_tests = {
+            "n": 12,
+            "ne": 14,
+            "e": 11,
+            "se": 17,
+            "s": 15,
+            "sw": 16,
+            "w": 10,
+            "nw": 13,
+        }
+        hit_test = hit_tests.get(edge.lower())
+        native = getattr(self.window, "native", None)
+        if hit_test is None or native is None:
+            return False
+
+        try:
+            import ctypes
+
+            handle = int(native.Handle.ToInt64())
+            user32 = ctypes.windll.user32
+            user32.ReleaseCapture()
+            user32.SendMessageW(
+                ctypes.c_void_p(handle),
+                ctypes.c_uint(0x00A1),
+                ctypes.c_size_t(hit_test),
+                ctypes.c_ssize_t(0),
+            )
+            return True
+        except Exception as exc:
+            self.supervisor.logs.add(
+                "系统", f"调整启动器窗口大小失败：{exc}", "warning"
+            )
+            return False
+
     def show_window(self) -> None:
         if self.window:
             self.window.show()
             self.window.restore()
+            self._maximized = False
 
     def hide_window(self) -> None:
         if not self.window:

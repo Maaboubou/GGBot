@@ -44,7 +44,11 @@ class CodexSkillService:
 
     def _command(self, action: str) -> list[str]:
         script = _as_wsl_path(SKILL_SCRIPT) if self.use_wsl else str(SKILL_SCRIPT)
-        command = ["wsl.exe", "python3", script] if self.use_wsl else [sys.executable, script]
+        command = (
+            ["wsl.exe", "python3", "-X", "utf8", script]
+            if self.use_wsl
+            else [sys.executable, "-X", "utf8", script]
+        )
         return [*command, "--action", action]
 
     def _profile_payload(self, profile_id: str) -> dict[str, str]:
@@ -64,6 +68,8 @@ class CodexSkillService:
             "input": json.dumps(payload, ensure_ascii=False),
             "capture_output": True,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
             "timeout": timeout,
             "check": False,
         }

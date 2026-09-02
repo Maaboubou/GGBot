@@ -134,6 +134,9 @@ class CodexCompatibilityProbe:
         )
 
     def _run_probe_command(self, command: List[str], **kwargs: Any) -> Any:
+        if kwargs.get("text"):
+            kwargs.setdefault("encoding", "utf-8")
+            kwargs.setdefault("errors", "replace")
         kwargs = apply_hidden_process_defaults(kwargs)
         if self.use_wsl:
             return run_guarded_wsl_command(command, runner=subprocess.run, **kwargs)

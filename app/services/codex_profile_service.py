@@ -111,7 +111,11 @@ class CodexProfileService:
 
     def _command(self, action: str) -> list[str]:
         script = _as_wsl_path(PROFILE_SCRIPT) if self.use_wsl else str(PROFILE_SCRIPT)
-        command = ["wsl.exe", "python3", script] if self.use_wsl else [sys.executable, script]
+        command = (
+            ["wsl.exe", "python3", "-X", "utf8", script]
+            if self.use_wsl
+            else [sys.executable, "-X", "utf8", script]
+        )
         return [*command, "--action", action]
 
     def _run(self, action: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -121,6 +125,8 @@ class CodexProfileService:
                 "input": json.dumps(payload, ensure_ascii=False) if payload is not None else None,
                 "capture_output": True,
                 "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
                 "timeout": 30,
                 "check": False,
             }

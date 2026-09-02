@@ -72,7 +72,7 @@
 
     function render(snapshot) {
         ui.snapshot = snapshot;
-        $('#titleVersion').textContent = snapshot.version || '3.0.1';
+        $('#titleVersion').textContent = snapshot.version || '3.0.0';
         renderOverall();
         renderGlobalControls();
         renderOverviewServices();
@@ -460,7 +460,7 @@
     function demoSnapshot() {
         const now = Date.now() / 1000;
         return {
-            version: '3.0.1',
+            version: '3.0.0',
             uptime_seconds: 2580,
             overall: { status: 'running', label: '系统运行正常' },
             services: [

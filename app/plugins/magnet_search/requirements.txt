@@ -1,5 +1,0 @@
-cloudscraper
-beautifulsoup4
-selenium
-Pillow>=10
-NudeNet>=3.4,<4

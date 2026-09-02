@@ -44,9 +44,7 @@ Thumbs.db
 # Plugin-generated data and reports
 /app/plugins/boc_rate/exchange_rate_cache/
 /app/plugins/feishu_container_tracking/cma_result.json
-/app/plugins/landinfo_bg/screenshots/
 /app/plugins/magnet_check/reports/
-/app/plugins/magnet_search/pdfs/
 /app/plugins/menu_translator/images/
 /app/plugins/menu_translator/pdfs/
 /app/plugins/summary_plus/bili_cookies.txt
@@ -54,5 +52,4 @@ Thumbs.db
 /app/plugins/summary_plus/node_modules/
 /app/plugins/summary_plus/package-lock.json
 /app/plugins/summary_plus/package.json
-/temp_apiqik_images/
 /msc_state.json

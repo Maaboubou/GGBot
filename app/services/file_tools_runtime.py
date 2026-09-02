@@ -100,7 +100,11 @@ def persist_wsl_codex_bin(path: str) -> str:
 
 def _probe_command(*, use_wsl: bool, codex_bin: str) -> list[str]:
     script = _as_wsl_path(PROBE_SCRIPT) if use_wsl else str(PROBE_SCRIPT)
-    command = ["wsl.exe", "python3", script] if use_wsl else [sys.executable, script]
+    command = (
+        ["wsl.exe", "python3", "-X", "utf8", script]
+        if use_wsl
+        else [sys.executable, "-X", "utf8", script]
+    )
     command.extend(["--json", "--codex-bin", codex_bin or "codex"])
     for root in _configured_tool_roots():
         command.extend(["--trusted-root", root])
@@ -148,6 +152,8 @@ def get_file_tools_runtime(
         run_kwargs = {
             "capture_output": True,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
             "timeout": 20,
             "check": False,
         }

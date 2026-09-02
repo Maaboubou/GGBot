@@ -14,6 +14,7 @@ const CodexCenter = {
     oauthAuthSource: '',
     oauthPollTimer: null,
     oauthModels: [],
+    oauthEditingProfile: false,
     profileProviderBases: {
         openai: 'https://api.openai.com/v1',
         deepseek: 'https://api.deepseek.com',
@@ -505,6 +506,19 @@ const CodexCenter = {
             UI.showError('Codex Profile 不存在，请刷新后重试');
             return;
         }
+        if (profile?.auth_type === 'chatgpt') {
+            await this.startOAuth(
+                profile.name,
+                Boolean(profile.is_default),
+                false,
+                null,
+                {
+                    authSource: profile.auth_source || 'device_code',
+                    editingConfiguration: true
+                }
+            );
+            return;
+        }
         this.editingProfile = profile;
         form.reset();
         this.profileCatalogModels = [];
@@ -763,11 +777,19 @@ const CodexCenter = {
         const cancel = document.getElementById('codexOAuthCancel');
         if (cancel) cancel.textContent = '取消授权';
         const finish = document.getElementById('codexOAuthFinish');
-        if (finish) finish.textContent = this.oauthSetupDraft ? '完成创建' : '保存并使用';
+        if (finish) finish.textContent = this.oauthSetupDraft
+            ? '完成创建'
+            : (this.oauthEditingProfile ? '保存更改' : '保存并使用');
+        const editingProfile = this.oauthEditingProfile
+            ? this.profiles.find(item => item.name === this.oauthProfile)
+            : null;
         const makeDefault = document.getElementById('codexOAuthMakeDefault');
-        if (makeDefault) makeDefault.checked = this.oauthMakeDefault;
+        if (makeDefault) {
+            makeDefault.checked = this.oauthMakeDefault;
+            makeDefault.disabled = Boolean(editingProfile?.is_default);
+        }
         const verbosity = document.getElementById('codexOAuthVerbosity');
-        if (verbosity) verbosity.value = 'inherit';
+        if (verbosity) verbosity.value = editingProfile?.model_verbosity || 'inherit';
     },
 
     async startOAuth(
@@ -775,12 +797,13 @@ const CodexCenter = {
         makeDefault = false,
         force = false,
         initialStatus = null,
-        { setupDraft = false, authSource = '' } = {}
+        { setupDraft = false, authSource = '', editingConfiguration = false } = {}
     ) {
         if (!profileName) return;
         this.oauthProfile = profileName;
         this.oauthMakeDefault = Boolean(makeDefault);
         this.oauthSetupDraft = Boolean(setupDraft);
+        this.oauthEditingProfile = Boolean(editingConfiguration);
         this.resetOAuthView();
         const profile = this.profiles.find(item => item.name === profileName);
         this.oauthAuthSource = authSource || profile?.auth_source || 'device_code';
@@ -788,11 +811,13 @@ const CodexCenter = {
         const title = document.getElementById('codexOAuthModalTitle');
         if (title) title.textContent = this.oauthSetupDraft
             ? '配置官方 Codex Profile'
-            : '绑定 ChatGPT';
+            : (this.oauthEditingProfile ? `编辑官方 Profile · ${profileName}` : '绑定 ChatGPT');
         const subtitle = document.getElementById('codexOAuthSubtitle');
-        if (subtitle) subtitle.textContent = importedLogin
-            ? `${profileName} · 导入并验证本机 Codex 登录副本`
-            : `${profileName} · 扫码完成 Codex 官方授权`;
+        if (subtitle) subtitle.textContent = this.oauthEditingProfile
+            ? `${profileName} · 从当前 ChatGPT 账号的可用目录选择模型`
+            : (importedLogin
+                ? `${profileName} · 导入并验证本机 Codex 登录副本`
+                : `${profileName} · 扫码完成 Codex 官方授权`);
         bootstrap.Modal.getOrCreateInstance(document.getElementById('codexOAuthModal')).show();
         try {
             const status = initialStatus || await API.codexProfiles.startOAuth(profileName, force);
@@ -834,17 +859,25 @@ const CodexCenter = {
                 subtitle.textContent = `${this.oauthProfile} · 登录完成，请选择账号可用配置`;
             }
             this.oauthModels = Array.isArray(status.models) ? status.models : [];
+            const editingProfile = this.oauthEditingProfile
+                ? this.profiles.find(item => item.name === this.oauthProfile)
+                : null;
+            const configuredModelId = String(editingProfile?.model || '');
+            const hasConfiguredModel = this.oauthModels.some(model => model.id === configuredModelId);
             const select = document.getElementById('codexOAuthModel');
             if (select) {
                 select.innerHTML = this.oauthModels.map(model => `<option value="${this.escape(model.id)}" ${model.is_default ? 'selected' : ''}>${this.escape(model.display_name || model.id)} · ${this.escape(model.id)}</option>`).join('');
+                if (hasConfiguredModel) select.value = configuredModelId;
                 select.disabled = !this.oauthModels.length;
             }
-            this.syncOAuthModelConfig();
+            this.syncOAuthModelConfig({ preserveProfile: hasConfiguredModel });
             const finish = document.getElementById('codexOAuthFinish');
             finish?.classList.remove('d-none');
             if (finish) finish.disabled = !this.oauthModels.length;
             const cancel = document.getElementById('codexOAuthCancel');
-            if (cancel) cancel.textContent = this.oauthSetupDraft ? '放弃创建' : '稍后使用';
+            if (cancel) cancel.textContent = this.oauthSetupDraft
+                ? '放弃创建'
+                : (this.oauthEditingProfile ? '取消' : '稍后使用');
             return;
         }
         this.showOAuthError(status?.error || (state === 'expired' ? '授权已过期，请重新发起登录。' : 'ChatGPT 授权未完成。'));
@@ -882,7 +915,7 @@ const CodexCenter = {
         }
     },
 
-    syncOAuthModelConfig() {
+    syncOAuthModelConfig({ preserveProfile = false } = {}) {
         const modelId = document.getElementById('codexOAuthModel')?.value || '';
         const model = this.oauthModels.find(item => item.id === modelId) || {};
         const efforts = Array.isArray(model.supported_reasoning_efforts)
@@ -891,11 +924,18 @@ const CodexCenter = {
         const defaultEffort = efforts.includes(model.default_reasoning_effort)
             ? model.default_reasoning_effort
             : (efforts[0] || model.default_reasoning_effort || 'high');
+        const editingProfile = preserveProfile && this.oauthEditingProfile
+            ? this.profiles.find(item => item.name === this.oauthProfile)
+            : null;
+        const configuredEffort = String(editingProfile?.reasoning_effort || '');
+        const selectedEffort = configuredEffort && (!efforts.length || efforts.includes(configuredEffort))
+            ? configuredEffort
+            : defaultEffort;
         const reasoning = document.getElementById('codexOAuthReasoning');
         if (reasoning) {
-            const values = efforts.length ? efforts : [defaultEffort];
+            const values = efforts.length ? efforts : [selectedEffort];
             reasoning.innerHTML = values.map(value => `<option value="${this.escape(value)}">${this.escape(value)}</option>`).join('');
-            reasoning.value = defaultEffort;
+            reasoning.value = selectedEffort;
             reasoning.disabled = !modelId;
         }
         const contextWindow = Number(model.context_window || 0);
@@ -937,6 +977,7 @@ const CodexCenter = {
             }
         }
         this.oauthSetupDraft = false;
+        this.oauthEditingProfile = false;
         this.oauthProfile = '';
         bootstrap.Modal.getInstance(document.getElementById('codexOAuthModal'))?.hide();
         await this.load();
@@ -948,6 +989,7 @@ const CodexCenter = {
 
     async finishOAuth() {
         const profileName = this.oauthProfile;
+        const editingConfiguration = this.oauthEditingProfile;
         const modelId = document.getElementById('codexOAuthModel')?.value || '';
         const button = document.getElementById('codexOAuthFinish');
         if (!profileName || !modelId) {
@@ -981,9 +1023,12 @@ const CodexCenter = {
             const madeDefault = payload.make_default
                 || result?.default_profile_id === profileName;
             this.oauthSetupDraft = false;
+            this.oauthEditingProfile = false;
             this.oauthProfile = '';
             bootstrap.Modal.getInstance(document.getElementById('codexOAuthModal'))?.hide();
-            UI.showSuccess(madeDefault ? 'ChatGPT 已连接并设为默认 Profile' : 'ChatGPT Profile 已创建');
+            UI.showSuccess(editingConfiguration
+                ? '官方 Codex Profile 已更新'
+                : (madeDefault ? 'ChatGPT 已连接并设为默认 Profile' : 'ChatGPT Profile 已创建'));
             await this.load();
         } catch (error) {
             this.showOAuthError(error.message);

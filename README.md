@@ -10,7 +10,7 @@ Mabobot 是运行在 Windows 上的本地微信自动化与 AI 助手。它使�
 
 - Windows 10/11 与可交互的桌面会话；
 - 已安装并登录的微信 4.1 客户端；
-- 64 位 Python 3.11 或 3.12，并加入 PATH；
+- 可访问 Python、Microsoft 与 PyPI 官方下载源的网络；
 - 如需 Codex 助手，请在 WSL 中安装 Codex CLI 运行框架；模型既可使用 ChatGPT 账号认证，也可在 Profile 中配置第三方 Responses 兼容接口，并非必须登录官方账号。
 
 使用 Git 获取项目：
@@ -24,7 +24,7 @@ cd Mabobot
 
 也可以从 GitHub 下载 ZIP，完整解压后双击根目录的 **`START.bat`**。
 
-首次启动会自动创建 `.venv`、安装项目依赖与浏览器组件，并生成本机 `.env`。准备完成后会打开 Mabobot 桌面面板，微信 Bot 与 Web 服务会自动启动。
+无需提前安装 Python。首次启动发现缺少 64 位 Python 3.11/3.12 或 Microsoft WebView2 Runtime 时，会先列出组件并征得确认，再从官方源下载、验证数字签名并安装到当前用户。随后会自动创建 `.venv`、安装项目依赖与浏览器组件，并生成本机 `.env`。准备完成后会打开 Mabobot 桌面面板，微信 Bot 与 Web 服务会自动启动。
 
 日常使用只需要这一个入口。面板中可以：
 

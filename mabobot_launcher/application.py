@@ -484,6 +484,7 @@ class DesktopLauncher:
                     "-File",
                     str(INSTALL_SCRIPT),
                     "-Force",
+                    "-InstallMissingRuntimes",
                 ],
                 cwd=str(PROJECT_ROOT),
                 stdin=subprocess.DEVNULL,

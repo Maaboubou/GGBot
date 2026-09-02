@@ -1,6 +1,7 @@
 ﻿param(
     [switch]$Force,
-    [string]$StatusFile = ""
+    [string]$StatusFile = "",
+    [switch]$InstallMissingRuntimes
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,6 +10,7 @@ $VenvDir = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $Requirements = Join-Path $ProjectRoot "requirements.txt"
 $HashMarker = Join-Path $VenvDir ".requirements.sha256"
+$RuntimeModule = Join-Path $ProjectRoot "scripts\launcher\runtime_bootstrap.psm1"
 $PlaywrightReady = $false
 
 function Write-Step([string]$Message) {
@@ -47,12 +49,22 @@ Set-Location $ProjectRoot
 if (-not (Test-Path $Requirements)) {
     Stop-Install "requirements.txt 不存在。"
 }
+if (-not (Test-Path -LiteralPath $RuntimeModule)) {
+    Stop-Install "基础环境引导模块不存在：$RuntimeModule"
+}
+Import-Module $RuntimeModule -Force
 
 Remove-StaleLiteLLMMetadata
 
 $RequirementHash = (Get-FileHash $Requirements -Algorithm SHA256).Hash
 $EnvironmentReady = $false
-if (-not $Force -and (Test-Path $VenvPython) -and (Test-Path $HashMarker)) {
+$VenvPythonInfo = if (Test-Path -LiteralPath $VenvPython) {
+    Get-MabobotPythonInfo -FilePath $VenvPython
+}
+else {
+    $null
+}
+if (-not $Force -and $null -ne $VenvPythonInfo -and (Test-Path $HashMarker)) {
     $SavedHash = (Get-Content $HashMarker -Raw).Trim()
     if ($SavedHash -eq $RequirementHash) {
         & $VenvPython -c "import fastapi, flask, mabowx, playwright, static_ffmpeg, yt_dlp, youtube_transcript_api, json_repair, webview, pystray, win32api, win32con, win32event, win32gui, win32process, win32security, win32ts, win32ui" 2>$null
@@ -65,37 +77,37 @@ if (-not $Force -and (Test-Path $VenvPython) -and (Test-Path $HashMarker)) {
 }
 
 if (-not $EnvironmentReady) {
-    $Candidates = @(
-        @{ Exe = "py"; Args = @("-3.11") },
-        @{ Exe = "py"; Args = @("-3.12") },
-        @{ Exe = "python"; Args = @() }
-    )
-    $PythonExe = $null
-    $PythonArgs = @()
-
-    foreach ($Candidate in $Candidates) {
-        if (-not (Get-Command $Candidate.Exe -ErrorAction SilentlyContinue)) {
-            continue
+    if ($null -eq $VenvPythonInfo) {
+        $PythonInfo = Get-MabobotCompatiblePython
+        if ($null -eq $PythonInfo -and $InstallMissingRuntimes) {
+            try {
+                $PythonInfo = Install-MabobotPython -Status {
+                    param([string]$Message)
+                    Write-Step $Message
+                }
+            }
+            catch {
+                Stop-Install "Python 自动安装失败：$($_.Exception.Message)"
+            }
         }
-        $Exe = $Candidate.Exe
-        $ArgsPrefix = @($Candidate.Args)
-        $Version = & $Exe @ArgsPrefix -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $Version -in @("3.11", "3.12")) {
-            $PythonExe = $Exe
-            $PythonArgs = $ArgsPrefix
-            break
+        if ($null -eq $PythonInfo) {
+            Stop-Install "未找到 64 位 Python 3.11/3.12。请通过 START.bat 启动，并同意自动准备缺失组件。"
         }
-    }
 
-    if (-not $PythonExe) {
-        Stop-Install "未找到 Python 3.11 或 3.12（64 位）。请先从 python.org 安装，并勾选 Add Python to PATH。"
-    }
-
-    if (-not (Test-Path $VenvPython)) {
+        if (Test-Path -LiteralPath $VenvDir) {
+            $BackupName = ".venv.invalid-{0}" -f (Get-Date -Format "yyyyMMdd-HHmmssfff")
+            $BackupPath = Join-Path $ProjectRoot $BackupName
+            Move-Item -LiteralPath $VenvDir -Destination $BackupPath
+            Write-Step "原虚拟环境不可用，已保留为 $BackupName"
+        }
         Write-Step "创建虚拟环境 .venv"
-        & $PythonExe @PythonArgs -m venv $VenvDir
+        & $PythonInfo.FilePath @($PythonInfo.Arguments) -m venv $VenvDir
         if ($LASTEXITCODE -ne 0) {
             Stop-Install "创建虚拟环境失败。"
+        }
+        $VenvPythonInfo = Get-MabobotPythonInfo -FilePath $VenvPython
+        if ($null -eq $VenvPythonInfo) {
+            Stop-Install "虚拟环境已创建，但 Python 运行检查失败。"
         }
     }
 
@@ -121,6 +133,23 @@ if (-not $EnvironmentReady) {
 else {
     Write-Step "虚拟环境和依赖已就绪，跳过重复安装"
 }
+
+$WebView2Version = Get-MabobotWebView2Version
+if (-not $WebView2Version) {
+    if (-not $InstallMissingRuntimes) {
+        Stop-Install "未检测到 Microsoft Edge WebView2 Runtime。请通过 START.bat 启动，并同意自动准备缺失组件。"
+    }
+    try {
+        $WebView2Version = Install-MabobotWebView2Runtime -Status {
+            param([string]$Message)
+            Write-Step $Message
+        }
+    }
+    catch {
+        Stop-Install "Microsoft WebView2 Runtime 自动安装失败：$($_.Exception.Message)"
+    }
+}
+Write-Step "Microsoft WebView2 Runtime 已就绪（$WebView2Version）"
 
 if (-not $PlaywrightReady) {
     Write-Step "安装链接摘要脑图所需的 Chromium（首次运行需要下载）"
@@ -155,5 +184,5 @@ foreach ($Directory in @("data", "logs", "tmp")) {
 if ($StatusFile) {
     Set-Content -LiteralPath $StatusFile -Value "运行环境准备完成" -Encoding UTF8
 }
-Write-Host "[OK] Python 环境准备完成：$VenvPython" -ForegroundColor Green
+Write-Host "[OK] Mabobot 运行环境准备完成：$VenvPython" -ForegroundColor Green
 exit 0

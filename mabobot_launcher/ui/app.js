@@ -374,7 +374,7 @@
                 return confirmAction('停止 Mabobot', '微信消息监听与 Web 控制台都会停止，桌面启动器仍会保持打开。', '停止', () => execute('stop_all', [], 'Mabobot 已停止'));
             }
             if (action === 'repair') {
-                return confirmAction('修复运行环境', '将先停止服务，重新校验并安装项目依赖；完成后会自动恢复服务。该过程可能需要数分钟。', '开始修复', () => execute('repair_environment', [], '环境修复已在后台开始'));
+                return confirmAction('修复运行环境', '将先停止服务，检查基础组件并重新安装项目依赖；缺失的 Python 或 WebView2 会从官方源自动补齐，完成后恢复服务。该过程可能需要数分钟。', '开始修复', () => execute('repair_environment', [], '环境修复已在后台开始'));
             }
             if (action === 'exit') {
                 return confirmAction('退出 Mabobot', '这会停止全部受管服务并退出系统托盘。确定继续吗？', '停止并退出', () => execute('exit_application'));

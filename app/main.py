@@ -613,8 +613,10 @@ async def lifespan(app: FastAPI):
                 order_index=0
             )
 
-        # 7. 启动微信掉线监控服务
-        if wechat_manager and wechat_manager.is_connected_cached():
+        # 7. 启动微信掉线监控服务。即使启动瞬间微信已经离线，也必须让
+        # 监控线程运行，才能推进重新登录并发送二维码；连接恢复由
+        # WeChatManager 自身的后台监控同步。
+        if wechat_manager:
             try:
                 monitor_service = get_monitor_service()
                 monitor_service.set_wechat_manager(wechat_manager)
@@ -625,7 +627,7 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"❌ 微信掉线监控服务初始化失败: {e}")
         else:
-            logger.warning("⚠️ 微信管理器未连接，跳过掉线监控服务启动")
+            logger.warning("⚠️ 微信管理器未初始化，跳过掉线监控服务启动")
 
         # 将管理器实例添加到应用状态
         app.state.event_bus = event_bus

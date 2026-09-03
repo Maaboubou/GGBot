@@ -6,13 +6,19 @@
 支持独立运行（如 Ping_notify.py），此时从环境变量读取配置。
 """
 
+import html
 import logging
+import mimetypes
 import os
 import smtplib
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Iterable, Optional
 
 # config_service 依赖数据库，独立运行时可能不可用，做安全导入
 try:
@@ -55,13 +61,25 @@ class EmailService:
 
         return auth_code
 
-    def send_email(self, body_text: str, subject: str = "微信助手通知") -> bool:
+    def send_email(
+        self,
+        body_text: str,
+        subject: str = "微信助手通知",
+        attachment_paths: Optional[Iterable[str | os.PathLike[str]]] = None,
+        body_html: Optional[str] = None,
+        inline_image_paths: Optional[
+            Iterable[tuple[str, str | os.PathLike[str]]]
+        ] = None,
+    ) -> bool:
         """
         发送邮件
 
         Args:
             body_text: 正文内容
             subject: 邮件标题，默认为 "微信助手通知"
+            attachment_paths: 可选附件路径列表
+            body_html: 可选 HTML 正文；提供时与纯文本正文组成兼容内容
+            inline_image_paths: 可选的 ``(Content-ID, 图片路径)`` 列表
 
         Returns:
             bool: 发送成功返回True，失败返回False
@@ -77,12 +95,55 @@ class EmailService:
             return False
 
         try:
-            msg = MIMEMultipart()
+            msg = MIMEMultipart("mixed")
             msg['From'] = qq_email
             msg['To'] = qq_email  # 发给自己
             msg['Subject'] = subject
 
-            msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+            inline_images = tuple(inline_image_paths or ())
+            if body_html or inline_images:
+                related = MIMEMultipart("related")
+                alternatives = MIMEMultipart("alternative")
+                alternatives.attach(MIMEText(body_text, 'plain', 'utf-8'))
+                if body_html:
+                    alternatives.attach(MIMEText(body_html, 'html', 'utf-8'))
+                related.attach(alternatives)
+
+                for content_id, inline_image_path in inline_images:
+                    path = Path(inline_image_path)
+                    content_type, _encoding = mimetypes.guess_type(path.name)
+                    if not content_type or not content_type.startswith("image/"):
+                        raise ValueError(f"内嵌内容不是受支持的图片: {path.name}")
+                    _maintype, subtype = content_type.split("/", 1)
+                    part = MIMEImage(path.read_bytes(), _subtype=subtype)
+                    part.add_header("Content-ID", f"<{content_id}>")
+                    part.add_header(
+                        "Content-Disposition",
+                        "inline",
+                        filename=path.name,
+                    )
+                    part.add_header("Content-Location", path.name)
+                    related.attach(part)
+
+                msg.attach(related)
+            else:
+                msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+
+            for attachment_path in attachment_paths or ():
+                path = Path(attachment_path)
+                content_type, _encoding = mimetypes.guess_type(path.name)
+                if not content_type:
+                    content_type = "application/octet-stream"
+                maintype, subtype = content_type.split("/", 1)
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(path.read_bytes())
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    "attachment",
+                    filename=path.name,
+                )
+                msg.attach(part)
 
             server = smtplib.SMTP_SSL('smtp.qq.com', 465)
             server.login(qq_email, auth_code)
@@ -113,6 +174,62 @@ class EmailService:
         """.strip()
 
         return self.send_email(email_body, f"🚨 {bot_name} 掉线通知")
+
+    def send_login_qr_notification(
+        self,
+        qr_image_path: str | os.PathLike[str],
+        bot_name: str = "微信助手",
+        reason: str = "微信要求重新扫码登录",
+    ) -> bool:
+        """发送正文内嵌当前登录二维码的掉线通知。"""
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        host = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "unknown"
+        email_body = f"""
+{bot_name} 已掉线，自动化已进入微信扫码登录页。
+
+机器人名称: {bot_name}
+主机: {host}
+时间: {current_time}
+状态: {reason}
+
+请尽快使用微信扫描正文中的登录二维码。二维码可能失效；如果扫码失败，请远程查看电脑上的微信窗口。
+请勿转发本邮件或其中的二维码。
+
+此消息由微信掉线监控系统自动发送。
+        """.strip()
+
+        escaped_bot_name = html.escape(str(bot_name))
+        escaped_host = html.escape(str(host))
+        escaped_time = html.escape(current_time)
+        escaped_reason = html.escape(str(reason))
+        email_html = f"""<!doctype html>
+<html lang="zh-CN">
+<body style="margin:0;padding:24px;background:#f5f5f5;color:#222;font-family:'Microsoft YaHei',Arial,sans-serif;">
+  <div style="max-width:620px;margin:0 auto;padding:28px;background:#fff;border-radius:12px;">
+    <h2 style="margin:0 0 18px;font-size:20px;">{escaped_bot_name} 需要扫码登录</h2>
+    <p style="margin:0 0 16px;line-height:1.7;">微信已掉线，自动化已进入扫码登录页。</p>
+    <p style="margin:0 0 20px;line-height:1.7;">
+      机器人名称：{escaped_bot_name}<br>
+      主机：{escaped_host}<br>
+      时间：{escaped_time}<br>
+      状态：{escaped_reason}
+    </p>
+    <div style="margin:20px 0;text-align:center;">
+      <img src="cid:wechat-login-qr" alt="微信登录二维码" width="544"
+           style="display:inline-block;width:100%;max-width:544px;height:auto;border:0;image-rendering:pixelated;">
+    </div>
+    <p style="margin:18px 0 0;line-height:1.7;">请尽快使用微信扫描上方二维码。二维码可能失效；如果扫码失败，请远程查看电脑上的微信窗口。</p>
+    <p style="margin:12px 0 0;color:#b42318;line-height:1.7;">请勿转发本邮件或其中的二维码。</p>
+  </div>
+</body>
+</html>"""
+
+        return self.send_email(
+            email_body,
+            f"🔐 {bot_name} 需要扫码登录",
+            body_html=email_html,
+            inline_image_paths=[("wechat-login-qr", qr_image_path)],
+        )
 
     def send_recovery_notification(self, bot_name: str = "微信助手") -> bool:
         """发送恢复通知邮件"""

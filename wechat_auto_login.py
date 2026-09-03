@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-开机后自动处理微信登录确认，并按需在确认在线后启动 Mabobot。
+自动处理微信登录确认，并按需截取扫码登录二维码。
+
+本模块同时供开机启动助手和运行中的微信掉线监控复用。
 
 流程：
 1. 等待 Windows / 微信自动启动稳定。
-2. 查找微信登录确认窗口，置前后发送 Enter。
+2. 自动确认账号安全掉线提示并点击“进入微信”。
 3. 通过 wx_bot 健康接口或微信主窗口确认已登录。
-4. 在线后通知统一启动器继续，或在独立运行时启动 START.bat；超时仍未在线则发送邮件通知。
+4. 需要扫码时截取二维码；在线后按需继续启动 Mabobot。
 """
 
 from __future__ import annotations
@@ -18,11 +20,12 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from dotenv import load_dotenv
 
@@ -36,6 +39,11 @@ LOG_FILE = LOG_DIR / "wechat_auto_login.log"
 WECHAT_TITLES = {"微信", "WeChat"}
 VK_RETURN = 0x0D
 SW_RESTORE = 9
+
+LOGIN_ACKNOWLEDGE_NAMES = ("我知道了",)
+LOGIN_ENTER_NAMES = ("进入微信",)
+LOGIN_QR_NAMES = ("二维码",)
+LOGIN_QR_CLASS_NAME = "mmui::XImageView"
 
 
 @dataclass
@@ -79,6 +87,15 @@ class DisplayInfo:
     @property
     def ready(self) -> bool:
         return self.primary_width >= 1280 and self.primary_height >= 720
+
+
+@dataclass(frozen=True)
+class ReloginResult:
+    """一次掉线重登录推进结果。"""
+
+    status: str
+    reason: str
+    qr_image_path: Path | None = None
 
 
 def setup_logging() -> None:
@@ -269,6 +286,172 @@ def press_enter_on_login_window(window: WindowInfo) -> None:
     focus_window(window.hwnd)
     press_enter()
     logging.info("已向微信登录窗口发送 Enter")
+
+
+def _login_descendants(window: WindowInfo) -> list[Any]:
+    """读取登录窗 UIA 控件；Qt 顶层 Win32 类名本身不包含业务语义。"""
+    from mabowx.core import uia
+
+    root = uia.control_from_handle(window.hwnd)
+    return list(uia.iter_descendants(root, max_nodes=300))
+
+
+def _find_login_control(
+    controls: Iterable[Any],
+    *,
+    names: Iterable[str] = (),
+    class_name: str | None = None,
+) -> Any | None:
+    expected_names = set(names)
+    for control in controls:
+        try:
+            if expected_names and control.Name not in expected_names:
+                continue
+            if class_name and control.ClassName != class_name:
+                continue
+            return control
+        except Exception:
+            continue
+    return None
+
+
+def _bounding_rect(control: Any) -> tuple[int, int, int, int]:
+    rect = control.BoundingRectangle
+    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+
+
+def capture_login_qr(
+    window: WindowInfo,
+    qr_control: Any,
+    *,
+    output_dir: str | os.PathLike[str] | None = None,
+) -> Path:
+    """抓取并放大二维码，返回待发送的临时 PNG 路径。
+
+    微信 4.x 的 Qt 渲染会忽略 PrintWindow 的 viewport 偏移，因此不能
+    直接请求二维码子区域。登录窗很小，先抓完整窗口再裁剪既可靠也便宜。
+    """
+    from PIL import Image
+
+    from mabowx.core import win32
+
+    qr_left, qr_top, qr_right, qr_bottom = _bounding_rect(qr_control)
+    full_image = win32.capture_window_rect(
+        window.hwnd,
+        (window.left, window.top, window.right, window.bottom),
+    )
+    crop_box = (
+        max(0, qr_left - window.left),
+        max(0, qr_top - window.top),
+        min(window.width, qr_right - window.left),
+        min(window.height, qr_bottom - window.top),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        raise RuntimeError(f"二维码控件边界超出登录窗口: qr={crop_box}")
+
+    qr_image = full_image.crop(crop_box).convert("RGB")
+    if qr_image.width < 80 or qr_image.height < 80:
+        raise RuntimeError(f"二维码截图尺寸异常: {qr_image.size}")
+
+    # 整数倍最近邻放大不会模糊二维码边缘，邮件客户端预览也更容易扫码。
+    scale = max(1, min(4, 544 // max(qr_image.size)))
+    if scale > 1:
+        qr_image = qr_image.resize(
+            (qr_image.width * scale, qr_image.height * scale),
+            Image.Resampling.NEAREST,
+        )
+
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix="wechat-login-qr-",
+        suffix=".png",
+        dir=output_dir,
+        delete=False,
+    )
+    output_path = Path(temp_file.name)
+    temp_file.close()
+    try:
+        qr_image.save(output_path, format="PNG")
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+    return output_path
+
+
+def prepare_relogin_qr(
+    *,
+    timeout: float = 20,
+    poll_interval: float = 0.5,
+    output_dir: str | os.PathLike[str] | None = None,
+) -> ReloginResult:
+    """推进掉线后的确认/重新登录流程，必要时返回二维码截图。"""
+    deadline = time.monotonic() + max(0, timeout)
+    last_reason = "尚未发现微信登录窗口"
+    last_fallback_enter_at = 0.0
+
+    while time.monotonic() <= deadline:
+        if mabobot_already_running() or find_main_window():
+            return ReloginResult("online", "微信已恢复在线")
+
+        window = find_login_window()
+        if not window:
+            time.sleep(max(0.1, poll_interval))
+            continue
+
+        try:
+            controls = _login_descendants(window)
+            qr_control = _find_login_control(
+                controls,
+                names=LOGIN_QR_NAMES,
+                class_name=LOGIN_QR_CLASS_NAME,
+            )
+            if qr_control is not None:
+                focus_window(window.hwnd)
+                path = capture_login_qr(
+                    window,
+                    qr_control,
+                    output_dir=output_dir,
+                )
+                logging.info("已截取微信登录二维码: %s", path)
+                return ReloginResult(
+                    "qr_required",
+                    "微信要求扫码登录",
+                    qr_image_path=path,
+                )
+
+            acknowledge = _find_login_control(
+                controls,
+                names=LOGIN_ACKNOWLEDGE_NAMES,
+            )
+            if acknowledge is not None:
+                last_reason = "已确认微信账号安全掉线提示"
+                logging.info("发现微信安全掉线提示，点击“我知道了”")
+                acknowledge.Click()
+                time.sleep(max(0.2, poll_interval))
+                continue
+
+            enter_wechat = _find_login_control(
+                controls,
+                names=LOGIN_ENTER_NAMES,
+            )
+            if enter_wechat is not None:
+                last_reason = "已点击“进入微信”，等待扫码页"
+                logging.info("发现微信重新登录页，点击“进入微信”")
+                enter_wechat.Click()
+                time.sleep(max(0.5, poll_interval))
+                continue
+
+            last_reason = "已找到登录窗口，但未识别当前页面控件"
+        except Exception as exc:
+            last_reason = f"读取或操作微信登录控件失败: {exc}"
+            logging.warning("%s", last_reason)
+
+        # UIA 短暂不可用时保留原有 Enter 兜底，但限制频率。
+        if time.monotonic() >= last_fallback_enter_at:
+            press_enter_on_login_window(window)
+            last_fallback_enter_at = time.monotonic() + 5
+        time.sleep(max(0.1, poll_interval))
+
+    return ReloginResult("unavailable", last_reason)
 
 
 def log_display_info() -> None:

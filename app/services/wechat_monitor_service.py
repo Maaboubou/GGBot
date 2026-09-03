@@ -8,7 +8,10 @@
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Optional
+
+from wechat_auto_login import prepare_relogin_qr
 
 from .config_service import get_setting
 from .email_service import get_email_service
@@ -21,10 +24,10 @@ class WeChatMonitorService:
     微信掉线监控服务
     - 定期检查微信是否在线
     - 监听窗口缺失时自动调用聊天恢复入口
-    - 掉线时发送邮件通知
+    - 掉线时自动推进重新登录，并通过邮件发送二维码
     - 恢复时可选发送恢复通知
     """
-    
+
     def __init__(self, wechat_manager=None):
         self.wechat_manager = wechat_manager
         self.email_service = get_email_service()
@@ -40,6 +43,10 @@ class WeChatMonitorService:
         self.offline_failure_count = 0
         self.offline_alert_threshold = 3
         self.last_online_status = None
+        self.auto_relogin_enabled = True
+        self.relogin_in_progress = False
+        self.last_relogin_result = None
+        self._relogin_lock = threading.Lock()
         self.last_listener_status = None
         self.last_missing_listeners = []
 
@@ -149,7 +156,7 @@ class WeChatMonitorService:
                                 "❌ 连续 %s 次检测到微信离线，发送邮件通知...",
                                 self.offline_failure_count,
                             )
-                            if self.email_service.send_offline_notification(self.bot_name):
+                            if self._handle_offline_alert():
                                 self.offline_email_sent = True
                             else:
                                 self.logger.error("掉线通知邮件发送失败")
@@ -193,6 +200,65 @@ class WeChatMonitorService:
         except Exception as e:
             self.logger.debug(f"检查微信在线状态异常: {e}")
             return False
+
+    def _handle_offline_alert(self) -> bool:
+        """尝试推进重新登录；能拿到二维码时随邮件发送附件。"""
+        if not self.auto_relogin_enabled:
+            return self.email_service.send_offline_notification(self.bot_name)
+
+        if not self._relogin_lock.acquire(blocking=False):
+            self.logger.info("微信重新登录自动化已在执行，本次跳过")
+            return False
+
+        qr_path: Path | None = None
+        self.relogin_in_progress = True
+        try:
+            self.logger.warning("🔐 正在自动确认微信掉线提示并准备登录二维码...")
+            result = prepare_relogin_qr(timeout=20, poll_interval=0.5)
+            qr_path = result.qr_image_path
+            self.last_relogin_result = {
+                "status": result.status,
+                "reason": result.reason,
+                "timestamp": time.time(),
+                "qr_captured": bool(qr_path),
+            }
+
+            if result.status == "online":
+                self.logger.warning(
+                    "微信客户端界面已在线，但桥接健康检查尚未恢复，发送普通掉线通知"
+                )
+                return self.email_service.send_offline_notification(self.bot_name)
+
+            if qr_path:
+                self.logger.warning("已生成微信登录二维码，正在发送邮件附件")
+                return self.email_service.send_login_qr_notification(
+                    qr_path,
+                    bot_name=self.bot_name,
+                    reason=result.reason,
+                )
+
+            self.logger.warning(
+                "未能获取微信登录二维码，退回普通掉线通知: %s",
+                result.reason,
+            )
+            return self.email_service.send_offline_notification(self.bot_name)
+        except Exception as exc:
+            self.logger.exception("微信重新登录自动化异常: %s", exc)
+            self.last_relogin_result = {
+                "status": "error",
+                "reason": str(exc),
+                "timestamp": time.time(),
+                "qr_captured": False,
+            }
+            return self.email_service.send_offline_notification(self.bot_name)
+        finally:
+            if qr_path:
+                try:
+                    qr_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.logger.warning("清理临时微信二维码失败: %s", exc)
+            self.relogin_in_progress = False
+            self._relogin_lock.release()
 
     def _check_listener_status(self) -> Optional[dict]:
         """检查 wx_bot 监听窗口健康状态。"""
@@ -362,6 +428,11 @@ class WeChatMonitorService:
             "offline_failure_count": self.offline_failure_count,
             "offline_alert_threshold": self.offline_alert_threshold,
             "last_online_status": self.last_online_status,
+            "auto_relogin_enabled": self.auto_relogin_enabled,
+            "relogin_in_progress": self.relogin_in_progress,
+            "last_relogin_result": (
+                dict(self.last_relogin_result) if self.last_relogin_result else None
+            ),
             "last_listener_status": self.last_listener_status,
             "last_missing_listeners": self.last_missing_listeners,
             "listener_auto_recovery_enabled": self.listener_auto_recovery_enabled,

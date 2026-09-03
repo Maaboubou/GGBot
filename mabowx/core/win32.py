@@ -542,7 +542,9 @@ def capture_window_rect(hwnd: int, bbox: tuple[int, int, int, int]):
         # beyond a rounded UIA/window boundary.
         save_dc.PatBlt((0, 0), (width, height), win32con.BLACKNESS)
         saved_dc = int(save_dc.SaveDC() or 0)
-        save_dc.SetViewportOrg(-source_x, -source_y)
+        # PyCDC.SetViewportOrg accepts one POINT tuple, unlike APIs such as
+        # BitBlt that expose the coordinates as separate arguments.
+        save_dc.SetViewportOrg((-source_x, -source_y))
         result = ctypes.windll.user32.PrintWindow(hwnd, hdc, 2)
         if saved_dc:
             save_dc.RestoreDC(saved_dc)

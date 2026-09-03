@@ -135,10 +135,10 @@ def read_event_source(
         )
         if time_messages is not None:
             return time_messages
-        return manager.get_messages_range(
+        return manager.get_messages_after_sequence(
             chat_name,
-            start_cursor=source_start - 1,
-            end_cursor=source_end,
+            after_sequence=source_start - 1,
+            through_sequence=source_end,
             limit=safe_limit,
         )
 

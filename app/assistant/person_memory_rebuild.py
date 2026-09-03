@@ -2232,7 +2232,8 @@ def catch_up_live_after_activation(
               AND (
                 source_namespace IN(
                   'live_chat_log',
-                  'live_chat_log_catchup'
+                  'live_chat_log_catchup',
+                  'live_chat_log_sequence'
                 )
                 OR source_namespace LIKE 'live_activation_catchup:%'
               )

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 PERSON_MEMORY_SCHEMA_VERSION = 3
+LIVE_PERSON_SOURCE_NAMESPACE = "live_chat_log_sequence"
 OBSERVATION_FIELDS = {
     "identity",
     "group_role",
@@ -571,7 +572,7 @@ def _iso_day(value: Any) -> str:
 class PersonMemoryStore:
     """Persistence and deterministic validation for person memory."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, store: MemoryStore) -> None:
         self.store = store
@@ -919,31 +920,6 @@ class PersonMemoryStore:
                         f"ALTER TABLE memory_person_state "
                         f"ADD COLUMN {column} {definition}"
                     )
-            connection.execute(
-                """
-                UPDATE memory_person_state SET
-                    ingestion_cursor = MAX(
-                        ingestion_cursor,
-                        COALESCE((
-                            SELECT MAX(source_cursor)
-                            FROM memory_person_source_messages AS source
-                            WHERE source.chat_name = memory_person_state.chat_name
-                              AND source.source_namespace =
-                                  memory_person_state.source_namespace
-                        ), 0)
-                    ),
-                    ingestion_message_count = MAX(
-                        ingestion_message_count,
-                        COALESCE((
-                            SELECT MAX(source_cursor)
-                            FROM memory_person_source_messages AS source
-                            WHERE source.chat_name = memory_person_state.chat_name
-                              AND source.source_namespace =
-                                  memory_person_state.source_namespace
-                        ), 0)
-                    )
-                """
-            )
             self.store.set_schema_component_version(
                 "person_memory",
                 self.SCHEMA_VERSION,
@@ -1040,8 +1016,13 @@ class PersonMemoryStore:
         source_cursor: int,
         source_message_count: int,
         monotonic: bool = True,
+        source_namespace: Optional[str] = None,
     ) -> Dict[str, Any]:
-        self.ensure_chat_state(chat_name, source_namespace="live_chat_log")
+        namespace = _clean_text(source_namespace, 100)
+        self.ensure_chat_state(
+            chat_name,
+            source_namespace=namespace or "live_chat_log",
+        )
         now = self.now()
         assignment = (
             "ingestion_cursor = MAX(ingestion_cursor, ?), "
@@ -1049,19 +1030,24 @@ class PersonMemoryStore:
             if monotonic
             else "ingestion_cursor = ?, ingestion_message_count = ?"
         )
+        namespace_assignment = (
+            ", source_namespace = ?" if namespace else ""
+        )
+        parameters: List[Any] = [
+            max(0, int(source_cursor)),
+            max(0, int(source_message_count)),
+        ]
+        if namespace:
+            parameters.append(namespace)
+        parameters.extend((now, chat_name))
         with self.store._connection() as connection:
             connection.execute(
                 f"""
                 UPDATE memory_person_state SET
-                    {assignment}, updated_at = ?
+                    {assignment}{namespace_assignment}, updated_at = ?
                 WHERE chat_name = ?
                 """,
-                (
-                    max(0, int(source_cursor)),
-                    max(0, int(source_message_count)),
-                    now,
-                    chat_name,
-                ),
+                parameters,
             )
         return self.get_chat_state(chat_name)
 

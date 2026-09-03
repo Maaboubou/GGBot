@@ -342,13 +342,17 @@ def detect_message_direction(
         left_unique, left_var = stats(left)
         right_unique, right_var = stats(right)
 
-        if left_unique > right_unique * 2 and left_unique > 20:
-            return "friend"
-        if right_unique > left_unique * 2 and right_unique > 20:
-            return "self"
+        # 头像通常会让所在一侧产生远高于背景的像素方差。颜色种类数则
+        # 很容易被另一侧较长的文字/气泡抬高；真机上曾出现左侧朋友头像
+        # 方差高 9 倍、但右侧颜色数较多，旧规则因此把来信判成 self。
+        # 先采用强方差信号，方差不够明确时再退回颜色种类数。
         if left_var > right_var * 2 and left_var > 50:
             return "friend"
         if right_var > left_var * 2 and right_var > 50:
+            return "self"
+        if left_unique > right_unique * 2 and left_unique > 20:
+            return "friend"
+        if right_unique > left_unique * 2 and right_unique > 20:
             return "self"
         return None
     except Exception:

@@ -22,7 +22,10 @@ from app.assistant.memory_output_schemas import (
     codex_memory_output_schema,
 )
 from app.assistant.memory_scheduler import MemoryBackgroundScheduler
-from app.assistant.person_memory import PersonMemoryEngine
+from app.assistant.person_memory import (
+    LIVE_PERSON_SOURCE_NAMESPACE,
+    PersonMemoryEngine,
+)
 from app.services.llm_manager import get_llm_manager
 
 logger = logging.getLogger(__name__)
@@ -158,6 +161,7 @@ class ChatMemoryService:
         cumulative_count = int(
             self.chat_log_manager.count_messages(chat_name) or physical_count
         )
+        retained_floor = max(0, cumulative_count - physical_count)
         if (
             state.get("source_cursor", 0) == 0
             and state.get("source_message_count", 0) == 0
@@ -170,9 +174,25 @@ class ChatMemoryService:
             kept = min(physical_count, backfill)
             state = self.store.initialize_cursor(
                 chat_name,
-                source_cursor=max(0, physical_count - kept),
+                source_cursor=max(0, cumulative_count - kept),
                 source_message_count=max(0, cumulative_count - kept),
             )
+        else:
+            # Older versions persisted a physical JSONL line number in
+            # source_cursor and a cumulative count in source_message_count.
+            # The cumulative value is the only one that survives truncation.
+            durable_cursor = int(state.get("source_message_count") or 0)
+            if durable_cursor < retained_floor or durable_cursor > cumulative_count:
+                durable_cursor = retained_floor
+            if (
+                int(state.get("source_cursor") or 0) != durable_cursor
+                or int(state.get("source_message_count") or 0) != durable_cursor
+            ):
+                state = self.store.set_ingestion_cursor(
+                    chat_name,
+                    source_cursor=durable_cursor,
+                    source_message_count=durable_cursor,
+                )
         return state
 
     def _available_messages(
@@ -184,12 +204,10 @@ class ChatMemoryService:
         cumulative_count = int(
             self.chat_log_manager.count_messages(chat_name) or physical_count
         )
-        cumulative_delta = max(
-            0,
-            cumulative_count - int(state.get("source_message_count") or 0),
-        )
-        available = min(physical_count, cumulative_delta)
-        start_cursor = max(0, physical_count - available)
+        retained_floor = max(0, cumulative_count - physical_count)
+        state_cursor = int(state.get("source_cursor") or 0)
+        start_cursor = min(cumulative_count, max(retained_floor, state_cursor))
+        available = min(physical_count, max(0, cumulative_count - start_cursor))
         return physical_count, cumulative_count, available, start_cursor
 
     def _event_ingestion_is_due(self, chat_name: str, config: Dict[str, Any]) -> bool:
@@ -212,13 +230,25 @@ class ChatMemoryService:
     ) -> Dict[str, Any]:
         state = self.person_memory.ledger.ensure_chat_state(
             chat_name,
-            source_namespace="live_chat_log",
+            source_namespace=LIVE_PERSON_SOURCE_NAMESPACE,
         )
         physical_count = int(self.chat_log_manager.count_log_messages(chat_name) or 0)
         cumulative_count = int(
             self.chat_log_manager.count_messages(chat_name) or physical_count
         )
-        if (
+        retained_floor = max(0, cumulative_count - physical_count)
+        if state.get("source_namespace") != LIVE_PERSON_SOURCE_NAMESPACE:
+            # Historical imports and the old physical-cursor live stream used
+            # incompatible cursor spaces. Start the durable live namespace at
+            # the oldest retained row so no available live message is lost.
+            state = self.person_memory.ledger.set_ingestion_cursor(
+                chat_name,
+                source_cursor=retained_floor,
+                source_message_count=retained_floor,
+                monotonic=False,
+                source_namespace=LIVE_PERSON_SOURCE_NAMESPACE,
+            )
+        elif (
             int(state.get("ingestion_cursor") or 0) == 0
             and int(state.get("ingestion_message_count") or 0) == 0
             and physical_count > 0
@@ -230,10 +260,26 @@ class ChatMemoryService:
             kept = min(physical_count, backfill)
             state = self.person_memory.ledger.set_ingestion_cursor(
                 chat_name,
-                source_cursor=max(0, physical_count - kept),
+                source_cursor=max(0, cumulative_count - kept),
                 source_message_count=max(0, cumulative_count - kept),
                 monotonic=False,
+                source_namespace=LIVE_PERSON_SOURCE_NAMESPACE,
             )
+        else:
+            durable_cursor = int(state.get("ingestion_message_count") or 0)
+            if durable_cursor < retained_floor or durable_cursor > cumulative_count:
+                durable_cursor = retained_floor
+            if (
+                int(state.get("ingestion_cursor") or 0) != durable_cursor
+                or int(state.get("ingestion_message_count") or 0) != durable_cursor
+            ):
+                state = self.person_memory.ledger.set_ingestion_cursor(
+                    chat_name,
+                    source_cursor=durable_cursor,
+                    source_message_count=durable_cursor,
+                    monotonic=False,
+                    source_namespace=LIVE_PERSON_SOURCE_NAMESPACE,
+                )
         return state
 
     def _person_available_messages(
@@ -245,12 +291,10 @@ class ChatMemoryService:
         cumulative_count = int(
             self.chat_log_manager.count_messages(chat_name) or physical_count
         )
-        cumulative_delta = max(
-            0,
-            cumulative_count - int(state.get("ingestion_message_count") or 0),
-        )
-        available = min(physical_count, cumulative_delta)
-        start_cursor = max(0, physical_count - available)
+        retained_floor = max(0, cumulative_count - physical_count)
+        state_cursor = int(state.get("ingestion_cursor") or 0)
+        start_cursor = min(cumulative_count, max(retained_floor, state_cursor))
+        available = min(physical_count, max(0, cumulative_count - start_cursor))
         return physical_count, cumulative_count, available, start_cursor
 
     def _person_ingestion_is_due(
@@ -301,10 +345,10 @@ class ChatMemoryService:
                 break
             requested = min(available, batch_limit)
             end_cursor = start_cursor + requested
-            messages = self.chat_log_manager.get_messages_range(
+            messages = self.chat_log_manager.get_messages_after_sequence(
                 chat_name,
-                start_cursor=start_cursor,
-                end_cursor=end_cursor,
+                after_sequence=start_cursor,
+                through_sequence=end_cursor,
                 limit=max(1, requested),
             )
             selected = [
@@ -329,7 +373,7 @@ class ChatMemoryService:
             indexed = self.person_memory.ledger.index_person_messages(
                 chat_name,
                 selected,
-                source_namespace="live_chat_log",
+                source_namespace=LIVE_PERSON_SOURCE_NAMESPACE,
                 core_cursors=[
                     int(message.get("_log_cursor") or 0) for message in selected
                 ],
@@ -340,15 +384,11 @@ class ChatMemoryService:
                     config.get("memory_person_excluded_sender_ids") or []
                 ),
             )
-            processed_delta = max(0, selected_end - start_cursor)
             self.person_memory.ledger.set_ingestion_cursor(
                 chat_name,
                 source_cursor=selected_end,
-                source_message_count=min(
-                    cumulative_count,
-                    int(state.get("ingestion_message_count") or 0)
-                    + processed_delta,
-                ),
+                source_message_count=selected_end,
+                source_namespace=LIVE_PERSON_SOURCE_NAMESPACE,
             )
             totals["chunks"] += 1
             totals["messages"] += len(selected)
@@ -540,7 +580,7 @@ class ChatMemoryService:
                     if (
                         person_state.get("mode") == "building"
                         and person_state.get("source_namespace")
-                        == "live_chat_log"
+                        == LIVE_PERSON_SOURCE_NAMESPACE
                     ):
                         self.person_memory.ledger.set_chat_mode(chat_name, "active")
             maintenance = self.store.maybe_prune_transient_candidates(
@@ -612,13 +652,13 @@ class ChatMemoryService:
         requested_core_end_cursor = start_cursor + requested
         context_start = max(0, start_cursor - before_count)
         context_end = min(
-            int(self.chat_log_manager.count_log_messages(chat_name) or 0),
+            cumulative_count,
             requested_core_end_cursor + (0 if force_tail else after_count),
         )
-        raw_messages = self.chat_log_manager.get_messages_range(
+        raw_messages = self.chat_log_manager.get_messages_after_sequence(
             chat_name,
-            start_cursor=context_start,
-            end_cursor=context_end,
+            after_sequence=context_start,
+            through_sequence=context_end,
             limit=max(1, context_end - context_start),
         )
         selected, selected_core_end_cursor = self._select_event_window_messages(
@@ -708,14 +748,10 @@ class ChatMemoryService:
 
         cards = [*eligible_cards, *quarantined_cards]
         created_ids = self.store.add_events(chat_name, cards)
-        processed_delta = max(0, selected_core_end_cursor - start_cursor)
         self.store.advance_cursor(
             chat_name,
             source_cursor=selected_core_end_cursor,
-            source_message_count=min(
-                cumulative_count,
-                int(state.get("source_message_count") or 0) + processed_delta,
-            ),
+            source_message_count=selected_core_end_cursor,
         )
         self.invalidate(chat_name)
         logger.info(
@@ -3843,7 +3879,7 @@ class ChatMemoryService:
         self.store.clear_chat(
             chat_name,
             scope=scope,
-            reset_cursor=int(self.chat_log_manager.count_log_messages(chat_name) or 0),
+            reset_cursor=int(self.chat_log_manager.count_messages(chat_name) or 0),
             source_message_count=int(self.chat_log_manager.count_messages(chat_name) or 0),
         )
         self.invalidate(chat_name)

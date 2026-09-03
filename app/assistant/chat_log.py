@@ -460,6 +460,11 @@ class ChatLogManager:
                     if self._is_internal_action_message(message):
                         continue
                     message["_log_sequence"] = sequence
+                    # Memory consumers historically read ``_log_cursor``.
+                    # Keep that field as a compatibility alias, but give it
+                    # the durable sequence value rather than a physical line
+                    # number that can be reused after retention cleanup.
+                    message["_log_cursor"] = sequence
                     messages.append(message)
                     if len(messages) >= limit:
                         break

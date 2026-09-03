@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from mabowx.core import uia
 from mabowx.core.clipboard import set_files, set_text
 from mabowx.core.locks import ui_transaction, uilock
 from mabowx.core.operation_sequencer import OrderedOperationSequencer
-from mabowx.core.win32 import post_right_click
+from mabowx.core.win32 import enum_windows_by_pid, get_window_owner, post_right_click
 from mabowx.logger import wxlog
 from mabowx.msgs import classify, make_message, parse_content
 from mabowx.msgs.identity import attach_delivery_context
@@ -23,6 +24,9 @@ from .base import BaseUISubWnd, BaseUIWnd
 
 GROUP_SENDER_HEAD_CLASS = "mmui::ContactHeadView"
 GROUP_SENDER_FOCUS_TIMEOUT_SEC = 0.22
+AVATAR_MENU_NATIVE_CLASSES = frozenset(
+    {"mmui::XMenu", "Qt51514QWindowToolSaveBits"}
+)
 MENTION_OBJECT_CHARACTER = "\ufffc"
 
 
@@ -38,8 +42,10 @@ def group_sender_head_point(control, direction: str | None) -> tuple[int, int] |
         return None
     if width < 110 or height < 35:
         return None
-    horizontal = min(51, max(20, width // 8))
-    vertical = min(30, max(12, height // 3), height - 2)
+    # 原版 wxautox4 使用消息行左/右上角固定 (51, 30) 偏移。仅在异常窄行
+    # 中向内收缩，正常微信消息行保持同一命中位置。
+    horizontal = min(int(WxParam.DEFAULT_MESSAGE_XBIAS), max(20, width // 8))
+    vertical = min(int(WxParam.DEFAULT_MESSAGE_YBIAS), height - 2)
     x = int(rect.left) + horizontal
     if direction == "self":
         x = int(rect.right) - horizontal
@@ -58,18 +64,36 @@ def group_sender_from_focused_control(
     就是群里显示的发送者。这里同时校验类名、顶层 HWND、矩形包含关系
     和左右方向，避免把其他窗口或消息菜单的焦点误认成发送者。
     """
+    matched, name = message_avatar_from_focused_control(
+        message_control,
+        focused_control,
+        direction,
+    )
+    return name if matched and name else ""
+
+
+def message_avatar_from_focused_control(
+    message_control,
+    focused_control,
+    direction: str | None,
+) -> tuple[bool, str]:
+    """校验一次头像焦点命中，并返回 ``(命中, 显示名)``。
+
+    方向识别只需要确认真实的 ``ContactHeadView`` 位于消息对应一侧；
+    群发送者解析则额外使用其 ``Name``。自己的头像在少数微信状态下可能
+    暂时没有 Name，因此 Name 为空不能否定一个几何和窗口身份都有效的
+    方向命中。
+    """
     if message_control is None or focused_control is None:
-        return ""
+        return False, ""
     if direction not in {"friend", "self"}:
-        return ""
+        return False, ""
     try:
         if str(getattr(focused_control, "ClassName", "") or "") != GROUP_SENDER_HEAD_CLASS:
-            return ""
+            return False, ""
         if str(getattr(focused_control, "ControlTypeName", "") or "") != "ButtonControl":
-            return ""
+            return False, ""
         name = str(getattr(focused_control, "Name", "") or "").strip()
-        if not name:
-            return ""
 
         message_rect = message_control.BoundingRectangle
         head_rect = focused_control.BoundingRectangle
@@ -82,7 +106,7 @@ def group_sender_from_focused_control(
         head_right = int(head_rect.right)
         head_bottom = int(head_rect.bottom)
         if head_right <= head_left or head_bottom <= head_top:
-            return ""
+            return False, ""
         margin = 4
         if (
             head_left < message_left - margin
@@ -90,14 +114,14 @@ def group_sender_from_focused_control(
             or head_top < message_top - margin
             or head_bottom > message_bottom + margin
         ):
-            return ""
+            return False, ""
         width = message_right - message_left
         head_center = (head_left + head_right) / 2
         side_limit = min(240, max(110, int(width * 0.28)))
         if direction == "friend" and head_center > message_left + side_limit:
-            return ""
+            return False, ""
         if direction == "self" and head_center < message_right - side_limit:
-            return ""
+            return False, ""
 
         try:
             message_top_control = message_control.GetTopLevelControl()
@@ -105,14 +129,14 @@ def group_sender_from_focused_control(
             message_hwnd = int(getattr(message_top_control, "NativeWindowHandle", 0) or 0)
             head_hwnd = int(getattr(head_top_control, "NativeWindowHandle", 0) or 0)
             if message_hwnd and head_hwnd and message_hwnd != head_hwnd:
-                return ""
+                return False, ""
         except Exception:
             # 某些测试替身和旧 UIA Provider 没有顶层句柄；矩形/类名校验
             # 仍足以使用，真机对象则会走上面的严格分支。
             pass
-        return name
+        return True, name
     except Exception:
-        return ""
+        return False, ""
 
 
 def _message_signature_content(message) -> str:
@@ -136,8 +160,140 @@ def message_anchor_signature(message) -> str:
     return f"{message.type}|{_message_signature_content(message)}|{message.attr}"
 
 
+def control_anchor_token(control) -> tuple[str, str]:
+    """生成无需截图/发送者识别的轻量 UIA 锚点 token。
+
+    RuntimeId 用于同一轮 UIA 生命周期内的精确匹配；类名与原始 Name
+    用于控件虚拟化后 RuntimeId 改变时的内容匹配。扫描历史页只读取这
+    三个 UIA 属性，避免逐条截图判断方向拖慢翻页。
+    """
+    try:
+        runtime_id = "-".join(str(part) for part in control.GetRuntimeId())
+    except Exception:
+        runtime_id = ""
+    class_name = str(getattr(control, "ClassName", "") or "")
+    raw_name = str(getattr(control, "Name", "") or "")
+    signature = f"{class_name}\x1f{raw_name}"
+    if not runtime_id:
+        try:
+            rect = control.BoundingRectangle
+            runtime_id = (
+                f"rect:{int(rect.left)}:{int(rect.top)}:"
+                f"{int(rect.right)}:{int(rect.bottom)}"
+            )
+        except Exception:
+            runtime_id = ""
+    return runtime_id, signature
+
+
+def find_control_snapshot_overlap(
+    current_snapshot: tuple[tuple[str, str], ...] | list[tuple[str, str]],
+    previous_snapshot: tuple[tuple[str, str], ...] | list[tuple[str, str]],
+) -> tuple[int, int, str] | None:
+    """在历史页中寻找上一轮可见列表的可靠重叠项。
+
+    返回 ``(previous_index, current_index, mode)``。先匹配完整 token；
+    RuntimeId 被微信虚拟化重建后，要求连续两个原始签名相同，或单个签名
+    在两侧都唯一。这样既允许“任意重叠消息”恢复，也避免连续的 ``?``、
+    动画表情等同内容消息产生模糊命中。
+    """
+    current = [tuple(token) for token in current_snapshot]
+    previous = [tuple(token) for token in previous_snapshot]
+    if not current or not previous:
+        return None
+
+    for previous_index in range(len(previous) - 1, -1, -1):
+        token = previous[previous_index]
+        if not token[0]:
+            continue
+        for current_index in range(len(current) - 1, -1, -1):
+            if current[current_index] == token:
+                return previous_index, current_index, "runtime_id"
+
+    # 两条相邻消息的原始签名序列足以消除绝大多数重复内容歧义。
+    for previous_index in range(len(previous) - 1, 0, -1):
+        pair = (previous[previous_index - 1][1], previous[previous_index][1])
+        if not all(pair):
+            continue
+        for current_index in range(len(current) - 1, 0, -1):
+            if pair == (
+                current[current_index - 1][1],
+                current[current_index][1],
+            ):
+                return previous_index, current_index, "signature_pair"
+
+    previous_counts: dict[str, int] = {}
+    current_counts: dict[str, int] = {}
+    for _runtime_id, signature in previous:
+        previous_counts[signature] = previous_counts.get(signature, 0) + 1
+    for _runtime_id, signature in current:
+        current_counts[signature] = current_counts.get(signature, 0) + 1
+    for previous_index in range(len(previous) - 1, -1, -1):
+        signature = previous[previous_index][1]
+        if not signature or previous_counts.get(signature) != 1:
+            continue
+        if current_counts.get(signature) != 1:
+            continue
+        for current_index in range(len(current) - 1, -1, -1):
+            if current[current_index][1] == signature:
+                return previous_index, current_index, "unique_signature"
+    return None
+
+
+def _message_control_token(message) -> tuple[str, str]:
+    token = getattr(message, "ui_anchor_token", None)
+    if token is not None:
+        return tuple(token)
+    return (
+        str(getattr(message, "id", "") or ""),
+        message_anchor_signature(message),
+    )
+
+
+def message_page_overlap_length(previous_page: list, current_page: list) -> int:
+    """返回相邻历史页的最长“前页后缀 / 后页前缀”重叠长度。"""
+    previous_tokens = [_message_control_token(message) for message in previous_page]
+    current_tokens = [_message_control_token(message) for message in current_page]
+    limit = min(len(previous_tokens), len(current_tokens))
+    for length in range(limit, 0, -1):
+        if previous_tokens[-length:] == current_tokens[:length]:
+            return length
+
+    previous_signatures = [token[1] for token in previous_tokens]
+    current_signatures = [token[1] for token in current_tokens]
+    for length in range(limit, 1, -1):
+        if previous_signatures[-length:] == current_signatures[:length]:
+            return length
+
+    if previous_signatures and current_signatures:
+        boundary = previous_signatures[-1]
+        if (
+            boundary
+            and boundary == current_signatures[0]
+            and previous_signatures.count(boundary) == 1
+            and current_signatures.count(boundary) == 1
+        ):
+            return 1
+    return 0
+
+
+def merge_overlapping_message_pages(pages: list[list]) -> tuple[list, bool]:
+    """按时间顺序合并相邻可见页；任何页间无重叠都保守失败。"""
+    nonempty = [list(page) for page in pages if page]
+    if not nonempty:
+        return [], True
+    merged = list(nonempty[0])
+    for page in nonempty[1:]:
+        overlap = message_page_overlap_length(merged, page)
+        if overlap <= 0:
+            return merged, False
+        merged.extend(page[overlap:])
+    return merged, True
+
+
 MESSAGE_SIGNATURE_TTL_SEC = 15.0
 MUTABLE_MEDIA_ANCHOR_TYPES = frozenset({"image", "video", "voice", "file"})
+ANCHOR_RECOVERY_MAX_FAILURES = 3
 
 
 def _anchor_type_attr(signature: str) -> tuple[str, str]:
@@ -621,11 +777,21 @@ class ChatBox(BaseUISubWnd):
         self._tail_message_id = ""
         self._tail_message_signature = ""
         self._visible_message_snapshot: tuple[tuple[str, str], ...] = ()
+        self._visible_control_snapshot: tuple[tuple[str, str], ...] = ()
         self._anchor_miss_snapshot: tuple[tuple[str, str], ...] | None = None
         self._anchor_miss_rounds = 0
+        self._last_anchor_missing = False
+        self._anchor_recovery_last_attempt = 0.0
+        self._anchor_recovery_failures = 0
+        self._anchor_recovery_circuit_logged = False
+        self._last_anchor_recovery_result: dict[str, object] = {}
+        self._message_read_lock = threading.Lock()
         self._sent_texts: dict[str, float] = {}
         self._sent_filenames: dict[str, float] = {}
         self._direction_cache: dict[str, str] = {}
+        self._avatar_direction_cache: dict[tuple[str, str], str] = {}
+        self._avatar_sender_cache: dict[tuple[str, str], str] = {}
+        self._direction_source_cache: dict[tuple[str, str], str] = {}
         self._cache_chat_name: str | None = None
         self._delivery_sequence = 0
         self._media_operation_sequencer = OrderedOperationSequencer()
@@ -1334,22 +1500,164 @@ class ChatBox(BaseUISubWnd):
                 continue
         return False
 
-    def _direction_for(self, control) -> str | None:
-        """优先用窗口 DC 截图判断方向，结果按消息键缓存。"""
+    def _probe_avatar_side(
+        self,
+        control,
+        direction: str,
+        *,
+        focus_timeout: float = GROUP_SENDER_FOCUS_TIMEOUT_SEC,
+    ) -> tuple[bool, str]:
+        """在消息指定一侧命中真实头像控件；始终收尾本次弹出菜单。"""
+        if direction not in {"friend", "self"}:
+            return False, ""
+        try:
+            if not control.Exists(0):
+                return False, ""
+            root_hwnd = int(
+                getattr(self.root, "HWND", 0)
+                or getattr(getattr(self.root, "control", None), "NativeWindowHandle", 0)
+                or 0
+            )
+            if not root_hwnd:
+                return False, ""
+            message_top = control.GetTopLevelControl()
+            message_hwnd = int(getattr(message_top, "NativeWindowHandle", 0) or 0)
+            if message_hwnd and message_hwnd != root_hwnd:
+                return False, ""
+            point = group_sender_head_point(control, direction)
+            if point is None:
+                return False, ""
+        except Exception:
+            return False, ""
+
+        # Do not overwrite a menu the user already has open in this chat.  A
+        # probe-created popup is selected below by exact PID + owner + UIA class
+        # and by being absent from this pre-click visible set.
+        root_pid = int(getattr(self.root, "pid", 0) or 0)
+        baseline_menu_hwnds: set[int] = set()
+        if root_pid:
+            try:
+                for window in enum_windows_by_pid(root_pid):
+                    if (
+                        not window.visible
+                        or window.class_name not in AVATAR_MENU_NATIVE_CLASSES
+                        or get_window_owner(window.hwnd) != root_hwnd
+                    ):
+                        continue
+                    candidate = uia.control_from_handle(window.hwnd)
+                    if str(getattr(candidate, "ClassName", "") or "") == "mmui::XMenu":
+                        baseline_menu_hwnds.add(int(window.hwnd))
+            except Exception:
+                baseline_menu_hwnds = set()
+        if baseline_menu_hwnds:
+            wxlog.debug(
+                "头像方向探测跳过: "
+                f"chat={self.who!r} existing_menu={sorted(baseline_menu_hwnds)!r}"
+            )
+            return False, ""
+
+        posted = False
+        matched = False
+        sender = ""
+        try:
+            control.SetFocus()
+            posted = post_right_click(root_hwnd, point[0], point[1])
+            if not posted:
+                return False, ""
+            deadline = time.monotonic() + max(0.02, float(focus_timeout))
+            while True:
+                focused = uia.get_focused_control()
+                matched, sender = message_avatar_from_focused_control(
+                    control,
+                    focused,
+                    direction,
+                )
+                if matched:
+                    return True, sender
+                if time.monotonic() >= deadline:
+                    return False, ""
+                time.sleep(0.02)
+        except Exception as exc:
+            wxlog.debug(
+                f"头像方向探测失败: chat={self.who!r} "
+                f"direction={direction} error={exc}"
+            )
+            return False, ""
+        finally:
+            if posted:
+                try:
+                    from mabowx.ui.component import Menu
+
+                    Menu(
+                        self.root,
+                        timeout=0.25,
+                        # 微信会把头像菜单重排到聊天窗口右上角，不能用点击点
+                        # 邻近性判断；新 HWND + PID + owner 足以精确归属。
+                        anchor=None,
+                        baseline_hwnds=baseline_menu_hwnds,
+                        require_new=True,
+                        expected_owner_hwnd=root_hwnd,
+                    ).close()
+                except Exception:
+                    pass
+
+    def _detect_avatar_direction(self, control) -> tuple[str, str] | None:
+        """复刻原版顺序：每轮先左后右，最多两轮且绝不猜测。"""
+        started = time.monotonic()
+        for attempt in range(2):
+            for direction in ("friend", "self"):
+                matched, sender = self._probe_avatar_side(control, direction)
+                if matched:
+                    wxlog.debug(
+                        "头像方向探测命中: "
+                        f"chat={self.who!r} direction={direction} "
+                        f"attempt={attempt + 1} "
+                        f"elapsed_ms={(time.monotonic() - started) * 1000:.1f}"
+                    )
+                    return direction, sender
+        wxlog.debug(
+            "头像方向探测未命中: "
+            f"chat={self.who!r} elapsed_ms={(time.monotonic() - started) * 1000:.1f}"
+        )
+        return None
+
+    def _direction_for(
+        self,
+        control,
+        *,
+        probe_avatar: bool = True,
+        anchor_token: tuple[str, str] | None = None,
+    ) -> str | None:
+        """真实头像控件优先，窗口截图只作为有界失败后的兜底。"""
         class_name = str(getattr(control, "ClassName", "") or "")
         if class_name in ("mmui::ChatItemView", "mmui::ChatSystemInfoItemView", "mmui::ChatAppReaderItemView"):
             return None
         try:
+            token = anchor_token or control_anchor_token(control)
+            authoritative = self._avatar_direction_cache.get(token)
+            if authoritative in {"friend", "self"}:
+                return authoritative
+            if probe_avatar:
+                avatar_result = self._detect_avatar_direction(control)
+                if avatar_result is not None:
+                    direction, sender = avatar_result
+                    self._avatar_direction_cache[token] = direction
+                    self._avatar_sender_cache[token] = sender
+                    self._direction_source_cache[token] = "avatar"
+                    return direction
+
             runtime_id = "-".join(str(part) for part in control.GetRuntimeId())
             name = str(getattr(control, "Name", "") or "")[:80]
             key = f"{runtime_id}|{class_name}|{name}"
             cached = self._direction_cache.get(key)
             if cached is not None:
+                self._direction_source_cache.setdefault(token, "visual")
                 return cached
             hwnd = getattr(self.root, "HWND", None)
             direction = detect_message_direction(control, hwnd=int(hwnd) if hwnd else None)
             if direction is not None:
                 self._direction_cache[key] = direction
+                self._direction_source_cache[token] = "visual"
             return direction
         except Exception:
             return None
@@ -1398,67 +1706,26 @@ class ChatBox(BaseUISubWnd):
         """对单条群消息执行一次头像焦点探测。"""
         control = getattr(message, "control", None)
         direction = str(getattr(message, "direction", "") or "")
-        try:
-            if not control.Exists(0):
-                return ""
-        except Exception:
+        if direction != "friend" or control is None:
             return ""
+        token = tuple(
+            getattr(message, "ui_anchor_token", None)
+            or control_anchor_token(control)
+        )
+        cached_sender = self._avatar_sender_cache.get(token, "")
+        if cached_sender:
+            return cached_sender
 
-        root_hwnd = int(getattr(self.root, "HWND", 0) or 0)
-        if not root_hwnd:
-            return ""
-        try:
-            message_top = control.GetTopLevelControl()
-            message_hwnd = int(
-                getattr(message_top, "NativeWindowHandle", 0) or 0
-            )
-            if message_hwnd and message_hwnd != root_hwnd:
-                return ""
-        except Exception:
-            return ""
-
-        last_point = None
-        try:
-            # 原版会先探测左头像、失败后再探测右头像。mabowx 已经有独立
-            # 的方向判断，因此每条来信只探测左侧。后台 WM_RBUTTON 精确
-            # 投递给所属 HWND，多个聊天窗口完全重叠时也不会误点前台窗口。
-            for _attempt in range(2):
-                point = group_sender_head_point(control, direction)
-                if point is None:
-                    break
-                last_point = point
-                control.SetFocus()
-                if not post_right_click(root_hwnd, point[0], point[1]):
-                    break
-                deadline = time.monotonic() + GROUP_SENDER_FOCUS_TIMEOUT_SEC
-                while True:
-                    focused = uia.get_focused_control()
-                    sender = group_sender_from_focused_control(
-                        control,
-                        focused,
-                        direction,
-                    )
-                    if sender:
-                        return sender
-                    if time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.02)
-                # 新消息布局仍在调整时，用实时 BoundingRectangle 再投递一次。
-                time.sleep(0.04)
-        except Exception as exc:
-            wxlog.debug(f"群聊发送者头像焦点探测失败: {exc}")
-        finally:
-            # 右击头像成功取到隐藏焦点后，微信仍会异步弹出“@ / 拍一拍”
-            # 联系人菜单。此前成功分支直接 return，菜单残留后会污染紧随
-            # 其后的文件右键下载。成功或失败都必须收尾；Menu.close 只会
-            # 定向关闭已验证的独立 XMenu HWND，绝不向聊天窗口发送 Esc。
-            if last_point is not None:
-                try:
-                    from mabowx.ui.component import Menu
-
-                    Menu(self, timeout=0.15, anchor=last_point).close()
-                except Exception:
-                    pass
+        # 方向探测已确定为左侧后，这里只需在同一侧补取可能暂时为空的 Name。
+        for _attempt in range(2):
+            matched, sender = self._probe_avatar_side(control, "friend")
+            if matched:
+                self._avatar_direction_cache[token] = "friend"
+                self._direction_source_cache[token] = "avatar"
+                if sender:
+                    self._avatar_sender_cache[token] = sender
+                    return sender
+            time.sleep(0.04)
         return ""
 
     @uilock
@@ -1511,30 +1778,66 @@ class ChatBox(BaseUISubWnd):
             self._tail_message_id = ""
             self._tail_message_signature = ""
             self._visible_message_snapshot = ()
+            self._visible_control_snapshot = ()
             self._anchor_miss_snapshot = None
             self._anchor_miss_rounds = 0
+            self._last_anchor_missing = False
+            self._anchor_recovery_failures = 0
+            self._anchor_recovery_circuit_logged = False
+            self._last_anchor_recovery_result = {}
             self._direction_cache.clear()
+            self._avatar_direction_cache.clear()
+            self._avatar_sender_cache.clear()
+            self._direction_source_cache.clear()
 
     @uilock
-    def get_messages(self, resolve_group_senders: bool = True) -> list:
-        """读取当前可见消息并解析为消息对象。"""
+    def get_messages(
+        self,
+        resolve_group_senders: bool = True,
+        *,
+        probe_avatar_direction: bool = True,
+        only_unseen_direction: bool = False,
+    ) -> list:
+        """读取当前可见消息并解析为消息对象。
+
+        监听初始化可关闭头像探测，只建立轻量基线；正常轮询则用
+        ``only_unseen_direction`` 只探测上一轮快照中没有的新控件。
+        """
         self._sync_chat_cache()
         result: list = []
+        known_tokens = set(self._visible_control_snapshot) if only_unseen_direction else set()
         for control in self.get_visible_messages():
             try:
                 raw_name = str(getattr(control, "Name", "") or "")
                 msg_cls = classify(control)
                 msg_type = getattr(msg_cls, "type", "other")
                 content = parse_content(msg_type, raw_name)
-                direction = self._direction_for(control)
+                anchor_token = control_anchor_token(control)
+                should_probe_avatar = bool(
+                    probe_avatar_direction
+                    and (not only_unseen_direction or anchor_token not in known_tokens)
+                )
+                direction = self._direction_for(
+                    control,
+                    probe_avatar=should_probe_avatar,
+                    anchor_token=anchor_token,
+                )
                 if direction is None:
                     direction = self._direction_for_message(msg_type, raw_name, content)
+                    self._direction_source_cache.setdefault(anchor_token, "fallback")
                 msg = make_message(control, self, direction, self._last_time)
+                msg.ui_anchor_token = anchor_token
+                msg.direction_source = self._direction_source_cache.get(
+                    anchor_token,
+                    "fallback",
+                )
                 if getattr(msg, "is_time", False):
                     self._last_time = msg.content
                     msg.sender = "系统"
                 else:
                     msg.sender = self._sender_for(direction, msg.type)
+                    if direction == "friend" and not msg.sender:
+                        msg.sender = self._avatar_sender_cache.get(anchor_token, "")
                 result.append(msg)
             except Exception as exc:
                 try:
@@ -1553,10 +1856,24 @@ class ChatBox(BaseUISubWnd):
     def _consume_messages(self, messages: list) -> list:
         """更新缓存并返回本轮真正位于旧尾锚点之后的消息。"""
         had_anchor = bool(self._tail_message_id or self._tail_message_signature)
+        self._last_anchor_missing = False
         current_snapshot = tuple(
             (
                 str(getattr(message, "id", "") or ""),
                 message_anchor_signature(message),
+            )
+            for message in messages
+        )
+        current_control_snapshot = tuple(
+            tuple(
+                getattr(
+                    message,
+                    "ui_anchor_token",
+                    (
+                        str(getattr(message, "id", "") or ""),
+                        message_anchor_signature(message),
+                    ),
+                )
             )
             for message in messages
         )
@@ -1593,8 +1910,11 @@ class ChatBox(BaseUISubWnd):
             self._tail_message_id = str(getattr(tail, "id", "") or "")
             self._tail_message_signature = message_anchor_signature(tail)
             self._visible_message_snapshot = current_snapshot
+            self._visible_control_snapshot = current_control_snapshot
             self._anchor_miss_snapshot = None
             self._anchor_miss_rounds = 0
+            self._anchor_recovery_failures = 0
+            self._anchor_recovery_circuit_logged = False
         elif messages and had_anchor and not anchor_found:
             snapshot = tuple(
                 (
@@ -1608,16 +1928,15 @@ class ChatBox(BaseUISubWnd):
             else:
                 self._anchor_miss_snapshot = snapshot
                 self._anchor_miss_rounds = 1
-            # 如果锚点长期不再出现（窗口真正重建或一次涌入大量消息），
-            # 在稳定三轮后静默重建基线，避免监听永久卡死。
-            if self._anchor_miss_rounds >= 3:
-                tail = messages[-1]
-                self._tail_message_id = str(getattr(tail, "id", "") or "")
-                self._tail_message_signature = message_anchor_signature(tail)
-                self._visible_message_snapshot = current_snapshot
-                self._anchor_miss_snapshot = None
-                self._anchor_miss_rounds = 0
-                wxlog.debug("消息尾锚点连续三轮缺失，已按稳定可见列表静默重建")
+            self._last_anchor_missing = True
+            # 绝不能像旧实现那样在三轮后静默重建基线；那会把整批消息永久
+            # 吞掉。由 get_new_messages 启动有界历史恢复，失败时保留旧锚点
+            # 并退避重试，同时留下明确告警。
+            if self._anchor_miss_rounds in {1, 3}:
+                wxlog.warning(
+                    "消息尾锚点缺失，保留旧基线等待有界历史恢复: "
+                    f"chat={self.who!r} rounds={self._anchor_miss_rounds}"
+                )
 
         if recovered_from_overlap and new_messages:
             wxlog.debug(
@@ -1640,21 +1959,303 @@ class ChatBox(BaseUISubWnd):
             }
         return new_messages
 
-    @uilock
+    def _adopt_visible_baseline(self, messages: list) -> None:
+        """在成功恢复后把最终底部页原子地设为下一轮监听基线。"""
+        if not messages:
+            return
+        tail = messages[-1]
+        self._tail_message_id = str(getattr(tail, "id", "") or "")
+        self._tail_message_signature = message_anchor_signature(tail)
+        self._visible_message_snapshot = tuple(
+            (
+                str(getattr(message, "id", "") or ""),
+                message_anchor_signature(message),
+            )
+            for message in messages
+        )
+        self._visible_control_snapshot = tuple(
+            _message_control_token(message) for message in messages
+        )
+        self._used_msg_ids = {
+            str(getattr(message, "id", "") or "")
+            for message in messages
+            if str(getattr(message, "id", "") or "")
+        }
+        self._last_signatures = {
+            str(getattr(message, "id", "") or ""): message_signature(message)
+            for message in messages
+            if str(getattr(message, "id", "") or "")
+        }
+        now = time.monotonic()
+        for message in messages:
+            self._recent_signatures[message_signature(message)] = now
+        self._anchor_miss_snapshot = None
+        self._anchor_miss_rounds = 0
+        self._last_anchor_missing = False
+        self._anchor_recovery_failures = 0
+        self._anchor_recovery_circuit_logged = False
+
+    def _prepare_recovered_messages(self, visible_page: list, messages: list) -> None:
+        """在历史页仍可见时固化图片身份，并逐条补齐群发送者。"""
+        if not messages:
+            return
+        for message in messages:
+            try:
+                if str(getattr(message, "type", "") or "") == "image":
+                    with ui_transaction(timeout=1.0):
+                        attach_delivery_context(visible_page, [message])
+                else:
+                    attach_delivery_context(visible_page, [message])
+            except Exception as exc:
+                wxlog.debug(f"恢复消息身份固化失败: {exc}")
+
+        try:
+            with ui_transaction(timeout=0.75):
+                group_chat = self.is_group_chat()
+        except Exception:
+            group_chat = False
+        if not group_chat:
+            return
+        for message in messages:
+            if (
+                str(getattr(message, "direction", "") or "") != "friend"
+                or str(getattr(message, "sender", "") or "").strip()
+                or str(getattr(message, "type", "") or "")
+                in {"system", "time", "official"}
+            ):
+                continue
+            try:
+                # 一条消息一个短事务，避免一整页头像探测长期占用全局 UI 锁。
+                with ui_transaction(timeout=0.75):
+                    sender = self._extract_group_sender(message)
+                if sender:
+                    message.sender = sender
+            except Exception as exc:
+                wxlog.debug(f"恢复消息发送者探测失败: {exc}")
+            time.sleep(0.02)
+
+    def _recover_messages_after_missing_anchor(
+        self,
+        *,
+        max_pages: int = 8,
+        timeout: float = 8.0,
+        wheel_times: int = 4,
+        settle_interval: float = 0.12,
+    ) -> tuple[list | None, list, dict[str, object]]:
+        """找到旧锚点后逐页向下重建消息，并在末尾重新读取最新页。
+
+        返回 ``(recovered_or_none, final_visible, metrics)``。``None`` 表示
+        无法证明页间连续，调用方必须保留旧锚点；空列表则表示恢复成功但
+        没有新增。翻页期间到达的消息会在最后一次 ``End`` 后并入。
+        """
+        previous_message_snapshot = tuple(self._visible_message_snapshot)
+        previous_control_snapshot = tuple(self._visible_control_snapshot)
+        result: dict[str, object] = {
+            "status": "not_started",
+            "messages_recovered": 0,
+            "collection_pages": 0,
+            "collection_elapsed_ms": 0.0,
+        }
+        if not previous_control_snapshot:
+            result["status"] = "missing_control_snapshot"
+            return None, [], result
+
+        probe = self.find_previous_snapshot_upward(
+            previous_control_snapshot,
+            max_pages=max_pages,
+            timeout=timeout,
+            wheel_times=wheel_times,
+            settle_interval=settle_interval,
+            no_progress_rounds=2,
+            restore_latest=False,
+        )
+        result["probe"] = probe
+        final_visible: list = []
+        accumulated: list = []
+        collection_started = time.monotonic()
+        collection_ok = bool(probe.get("found"))
+        down_scrolls = max(0, int(probe.get("scrolls", 0) or 0))
+
+        try:
+            if collection_ok:
+                anchor_page = self.get_messages(
+                    resolve_group_senders=False,
+                    only_unseen_direction=True,
+                )
+                result["collection_pages"] = 1
+                candidates, anchor_found = messages_after_anchor(
+                    anchor_page,
+                    self._tail_message_id,
+                    self._tail_message_signature,
+                )
+                if not anchor_found:
+                    candidates, anchor_found = messages_after_previous_overlap(
+                        anchor_page,
+                        previous_message_snapshot,
+                    )
+                if not anchor_found:
+                    result["status"] = "collection_anchor_lost"
+                    collection_ok = False
+                else:
+                    accumulated = list(anchor_page)
+                    self._prepare_recovered_messages(anchor_page, candidates)
+
+            for _ in range(down_scrolls if collection_ok else 0):
+                if time.monotonic() - collection_started >= timeout * 2:
+                    result["status"] = "collection_timeout"
+                    collection_ok = False
+                    break
+                with ui_transaction(timeout=0.75):
+                    if self.message_list is None or not self.message_list.Exists(0):
+                        result["status"] = "window_unavailable"
+                        collection_ok = False
+                        break
+                    self.message_list.WheelDown(
+                        wheelTimes=max(1, int(wheel_times)),
+                        interval=0.015,
+                        waitTime=0.0,
+                    )
+                time.sleep(max(0.0, float(settle_interval)))
+                page = self.get_messages(
+                    resolve_group_senders=False,
+                    only_unseen_direction=True,
+                )
+                result["collection_pages"] = int(result["collection_pages"]) + 1
+                overlap = message_page_overlap_length(accumulated, page)
+                if overlap <= 0:
+                    result["status"] = "collection_page_gap"
+                    collection_ok = False
+                    break
+                appended = list(page[overlap:])
+                accumulated.extend(appended)
+                self._prepare_recovered_messages(page, appended)
+        except Exception as exc:
+            result["status"] = "collection_error"
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            collection_ok = False
+        finally:
+            try:
+                with ui_transaction(timeout=0.75):
+                    self._return_to_latest(wait_time=0.1)
+                time.sleep(max(0.12, float(settle_interval)))
+                final_visible = self.get_messages(
+                    resolve_group_senders=False,
+                    only_unseen_direction=True,
+                )
+            except Exception as exc:
+                result["status"] = "restore_error"
+                result["restore_error"] = f"{type(exc).__name__}: {exc}"
+                collection_ok = False
+
+        result["collection_elapsed_ms"] = round(
+            (time.monotonic() - collection_started) * 1000,
+            1,
+        )
+        if not collection_ok or not final_visible or not accumulated:
+            if result["status"] == "not_started":
+                result["status"] = str(probe.get("status") or "not_found")
+            return None, final_visible, result
+
+        final_overlap = message_page_overlap_length(accumulated, final_visible)
+        if final_overlap <= 0:
+            result["status"] = "concurrent_bottom_gap"
+            return None, final_visible, result
+        final_appended = list(final_visible[final_overlap:])
+        accumulated.extend(final_appended)
+        self._prepare_recovered_messages(final_visible, final_appended)
+
+        recovered, anchor_found = messages_after_anchor(
+            accumulated,
+            self._tail_message_id,
+            self._tail_message_signature,
+        )
+        if not anchor_found:
+            recovered, anchor_found = messages_after_previous_overlap(
+                accumulated,
+                previous_message_snapshot,
+            )
+        if not anchor_found:
+            result["status"] = "merged_anchor_lost"
+            return None, final_visible, result
+        result["status"] = "found"
+        result["messages_recovered"] = len(recovered)
+        return list(recovered), final_visible, result
+
     def get_new_messages(self) -> list:
         """返回自上次读取后出现的新消息。
 
         微信 4.x 消息列表是虚拟化列表，RuntimeId 会复用。因此综合使用
         RuntimeId、内容签名和上一轮尾消息锚点，避免旧页被重复回调。
         """
-        visible_messages = self.get_messages(resolve_group_senders=False)
+        with self._message_read_lock:
+            return self._get_new_messages_serialized()
+
+    def _get_new_messages_serialized(self) -> list:
+        visible_messages = self.get_messages(
+            resolve_group_senders=False,
+            only_unseen_direction=True,
+        )
         messages = self._consume_messages(visible_messages)
+
+        if (
+            self._last_anchor_missing
+            and self._visible_control_snapshot
+            and self._anchor_recovery_failures < ANCHOR_RECOVERY_MAX_FAILURES
+        ):
+            now = time.monotonic()
+            retry_delay = min(15.0, float(2 ** self._anchor_recovery_failures))
+            if now - self._anchor_recovery_last_attempt >= retry_delay:
+                self._anchor_recovery_last_attempt = now
+                recovered, final_visible, recovery_result = (
+                    self._recover_messages_after_missing_anchor()
+                )
+                self._last_anchor_recovery_result = recovery_result
+                if recovered is not None:
+                    visible_messages = final_visible
+                    messages = recovered
+                    self._adopt_visible_baseline(final_visible)
+                    self._anchor_recovery_failures = 0
+                    self._anchor_recovery_circuit_logged = False
+                    wxlog.warning(
+                        "消息尾锚点历史恢复成功: "
+                        f"chat={self.who!r} count={len(messages)} "
+                        f"metrics={recovery_result}"
+                    )
+                else:
+                    self._anchor_recovery_failures += 1
+                    wxlog.error(
+                        "消息尾锚点历史恢复未能证明连续性，未重建基线: "
+                        f"chat={self.who!r} failures={self._anchor_recovery_failures} "
+                        f"metrics={recovery_result}"
+                    )
+        elif (
+            self._last_anchor_missing
+            and self._anchor_recovery_failures >= ANCHOR_RECOVERY_MAX_FAILURES
+            and not self._anchor_recovery_circuit_logged
+        ):
+            self._anchor_recovery_circuit_logged = True
+            self._last_anchor_recovery_result = {
+                **self._last_anchor_recovery_result,
+                "status": "circuit_open",
+                "failures": self._anchor_recovery_failures,
+            }
+            wxlog.error(
+                "消息尾锚点自动恢复连续失败，已熔断且保留旧基线，"
+                "不会继续无限翻页: "
+                f"chat={self.who!r} failures={self._anchor_recovery_failures}"
+            )
 
         # RuntimeId belongs to a recyclable UI row, so it must never become the
         # durable identity used by an asynchronous plugin.  Attach a UUID to
         # every delivered occurrence.  Direct images additionally capture their
         # visual/neighbor identity before sender probing opens any context menu.
-        attach_delivery_context(visible_messages, messages)
+        context_candidates = [
+            message
+            for message in messages
+            if str(getattr(message, "type", "") or "") != "image"
+            or getattr(message, "media_target_identity", None) is None
+        ]
+        attach_delivery_context(visible_messages, context_candidates)
         for message in messages:
             self._delivery_sequence += 1
             message.delivery_sequence = self._delivery_sequence
@@ -1686,7 +2287,10 @@ class ChatBox(BaseUISubWnd):
         previous: tuple[tuple[str, str], ...] | None = None
         stable = 0
         while True:
-            messages = self.get_messages(resolve_group_senders=False)
+            messages = self.get_messages(
+                resolve_group_senders=False,
+                probe_avatar_direction=False,
+            )
             self._consume_messages(messages)
             snapshot = tuple(
                 (
@@ -1753,7 +2357,164 @@ class ChatBox(BaseUISubWnd):
             self._return_to_latest()
         return list(collected.values())
 
-    def _return_to_latest(self) -> None:
+    def _read_control_anchor_snapshot(self) -> tuple[tuple[str, str], ...]:
+        """在调用方持有 UI 锁时读取轻量可见锚点。"""
+        if self.message_list is None or not self.message_list.Exists(0):
+            return ()
+        try:
+            return tuple(
+                control_anchor_token(control)
+                for control in self.message_list.GetChildren()
+            )
+        except Exception:
+            return ()
+
+    @uilock
+    def get_control_anchor_snapshot(self) -> tuple[tuple[str, str], ...]:
+        """返回当前可见页的轻量锚点快照，供独立恢复窗口使用。"""
+        return self._read_control_anchor_snapshot()
+
+    def find_previous_snapshot_upward(
+        self,
+        previous_snapshot: tuple[tuple[str, str], ...] | list[tuple[str, str]],
+        *,
+        max_pages: int = 8,
+        timeout: float = 4.0,
+        wheel_times: int = 4,
+        settle_interval: float = 0.12,
+        no_progress_rounds: int = 2,
+        restore_latest: bool = True,
+    ) -> dict[str, object]:
+        """有限地向上翻页寻找上一轮任意可靠重叠消息。
+
+        此方法应由当前聊天的单一读取线程或专用恢复窗口调用，不能和同一
+        窗口的其他滚动操作并发。每一页只在“读取快照 + 滚轮”期间持有 UI
+        锁，页间等待会释放锁；同时受页数、总时长和页面不再变化三重上限
+        保护，因此不会无限向上翻页。
+        """
+        max_pages = max(1, int(max_pages))
+        timeout = max(0.1, float(timeout))
+        wheel_times = max(1, int(wheel_times))
+        settle_interval = max(0.0, float(settle_interval))
+        no_progress_rounds = max(1, int(no_progress_rounds))
+        previous_snapshot = tuple(tuple(token) for token in previous_snapshot)
+        started = time.monotonic()
+        deadline = started + timeout
+        result: dict[str, object] = {
+            "status": "not_found",
+            "found": False,
+            "match_mode": "",
+            "previous_index": -1,
+            "current_index": -1,
+            "pages_scanned": 0,
+            "scrolls": 0,
+            "items_scanned": 0,
+            "scan_elapsed_ms": 0.0,
+            "lock_hold_total_ms": 0.0,
+            "lock_hold_max_ms": 0.0,
+            "restore_elapsed_ms": 0.0,
+        }
+        last_page_fingerprint: tuple[str, ...] | None = None
+        repeated_pages = 0
+
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result["status"] = "timeout"
+                    break
+                try:
+                    with ui_transaction(timeout=min(0.5, max(0.01, remaining))):
+                        lock_started = time.monotonic()
+                        try:
+                            snapshot = self._read_control_anchor_snapshot()
+                            result["pages_scanned"] = int(result["pages_scanned"]) + 1
+                            result["items_scanned"] = int(
+                                result["items_scanned"]
+                            ) + len(snapshot)
+                            overlap = find_control_snapshot_overlap(
+                                snapshot,
+                                previous_snapshot,
+                            )
+                            if overlap is not None:
+                                previous_index, current_index, match_mode = overlap
+                                result.update(
+                                    {
+                                        "status": "found",
+                                        "found": True,
+                                        "match_mode": match_mode,
+                                        "previous_index": previous_index,
+                                        "current_index": current_index,
+                                    }
+                                )
+                                break
+
+                            page_fingerprint = tuple(
+                                signature for _id, signature in snapshot
+                            )
+                            if page_fingerprint == last_page_fingerprint:
+                                repeated_pages += 1
+                            else:
+                                repeated_pages = 0
+                                last_page_fingerprint = page_fingerprint
+                            if repeated_pages >= no_progress_rounds:
+                                result["status"] = "no_progress"
+                                break
+                            if int(result["pages_scanned"]) >= max_pages:
+                                result["status"] = "max_pages"
+                                break
+                            if time.monotonic() >= deadline:
+                                result["status"] = "timeout"
+                                break
+                            if self.message_list is None or not self.message_list.Exists(0):
+                                result["status"] = "window_unavailable"
+                                break
+                            self.message_list.SetFocus()
+                            self.message_list.WheelUp(
+                                wheelTimes=wheel_times,
+                                interval=0.015,
+                                waitTime=0.0,
+                            )
+                            result["scrolls"] = int(result["scrolls"]) + 1
+                        finally:
+                            lock_hold_ms = (time.monotonic() - lock_started) * 1000
+                            result["lock_hold_total_ms"] = round(
+                                float(result["lock_hold_total_ms"]) + lock_hold_ms,
+                                1,
+                            )
+                            result["lock_hold_max_ms"] = round(
+                                max(float(result["lock_hold_max_ms"]), lock_hold_ms),
+                                1,
+                            )
+                except TimeoutError:
+                    result["status"] = "ui_busy"
+                    break
+                if settle_interval:
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(min(settle_interval, remaining))
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            result["scan_elapsed_ms"] = round(
+                (time.monotonic() - started) * 1000,
+                1,
+            )
+            if restore_latest:
+                restore_started = time.monotonic()
+                try:
+                    with ui_transaction(timeout=0.75):
+                        self._return_to_latest(wait_time=0.1)
+                except Exception as exc:
+                    result["restore_error"] = f"{type(exc).__name__}: {exc}"
+                result["restore_elapsed_ms"] = round(
+                    (time.monotonic() - restore_started) * 1000,
+                    1,
+                )
+        return result
+
+    def _return_to_latest(self, wait_time: float = 0.5) -> None:
         """把消息列表滚回最新位置。
 
         不点击消息列表内容，避免误触卡片/图片等消息；优先 SetFocus + End。
@@ -1761,7 +2522,10 @@ class ChatBox(BaseUISubWnd):
         try:
             if self.message_list is not None and self.message_list.Exists(0):
                 self.message_list.SetFocus()
-                self.message_list.SendKeys("{End}", waitTime=0.5)
+                self.message_list.SendKeys(
+                    "{End}",
+                    waitTime=max(0.0, float(wait_time)),
+                )
                 return
         except Exception:
             pass

@@ -109,7 +109,6 @@ class Chat:
             return []
         return self.core.get_chatbox().get_messages()
 
-    @uilock
     def GetNewMessage(self):
         if not self.core.exists():
             return []
